@@ -172,6 +172,11 @@ function initSchema() {
         'ALTER TABLE downloads ADD COLUMN nsfw_score REAL',
         'ALTER TABLE downloads ADD COLUMN nsfw_checked_at INTEGER',
         'ALTER TABLE downloads ADD COLUMN nsfw_whitelist INTEGER DEFAULT 0',
+        // user_deleted: set to 1 when the operator manually deletes a file via
+        // the viewer. The row is kept (not DELETEd) so isDownloaded() still
+        // returns true for this (group_id, message_id) pair, preventing
+        // backfill from re-downloading the file from Telegram.
+        'ALTER TABLE downloads ADD COLUMN user_deleted INTEGER DEFAULT 0',
     ];
     for (const sql of migrations) {
         try {
@@ -875,6 +880,7 @@ export function getShareLinkForServe(id, now = Date.now()) {
           FROM share_links s
           JOIN downloads d ON d.id = s.download_id
          WHERE s.id = ?
+           AND (d.user_deleted IS NULL OR d.user_deleted = 0)
     `)
         .get(Number(id));
     if (!row) return null;
@@ -930,7 +936,7 @@ export function listShareLinks({
     offset = 0,
     search = null,
 } = {}) {
-    const where = [];
+    const where = ['(d.user_deleted IS NULL OR d.user_deleted = 0)'];
     const args = [];
     if (downloadId != null) {
         where.push('s.download_id = ?');
@@ -971,7 +977,7 @@ export function listShareLinks({
  * `hasMore` envelope without a second round trip.
  */
 export function countShareLinks({ downloadId = null, includeRevoked = true, search = null } = {}) {
-    const where = [];
+    const where = ['(d.user_deleted IS NULL OR d.user_deleted = 0)'];
     const args = [];
     if (downloadId != null) {
         where.push('s.download_id = ?');
@@ -1072,11 +1078,11 @@ export function getRescueStats() {
     const db = getDb();
     const pending = db
         .prepare(
-            `SELECT COUNT(*) as c FROM downloads WHERE pending_until IS NOT NULL AND rescued_at IS NULL`,
+            `SELECT COUNT(*) as c FROM downloads WHERE pending_until IS NOT NULL AND rescued_at IS NULL AND (user_deleted IS NULL OR user_deleted = 0)`,
         )
         .get().c;
     const rescued = db
-        .prepare(`SELECT COUNT(*) as c FROM downloads WHERE rescued_at IS NOT NULL`)
+        .prepare(`SELECT COUNT(*) as c FROM downloads WHERE rescued_at IS NOT NULL AND (user_deleted IS NULL OR user_deleted = 0)`)
         .get().c;
     return { pending, rescued, lastSweepCleared: _rescueLastSwept };
 }
@@ -1155,7 +1161,7 @@ export function getAllDownloads(limit = 50, offset = 0, type = 'all', opts = {})
     const lim = Math.max(1, Math.min(500, parseInt(limit, 10) || 50));
     const off = Math.max(0, parseInt(offset, 10) || 0);
     const typeMap = { images: 'photo', videos: 'video', documents: 'document', audio: 'audio' };
-    const clauses = [];
+    const clauses = ['(d.user_deleted IS NULL OR d.user_deleted = 0)'];
     const params = [];
     if (type !== 'all' && typeMap[type]) {
         clauses.push('d.file_type = ?');
@@ -1181,7 +1187,7 @@ export function getAllDownloads(limit = 50, offset = 0, type = 'all', opts = {})
 
 export function getDownloads(groupId, limit = 50, offset = 0, type = 'all', opts = {}) {
     let query =
-        'SELECT d.*, sb.duration_sec FROM downloads d LEFT JOIN seekbar_sprites sb ON sb.download_id = d.id WHERE d.group_id = ?';
+        'SELECT d.*, sb.duration_sec FROM downloads d LEFT JOIN seekbar_sprites sb ON sb.download_id = d.id WHERE d.group_id = ? AND (d.user_deleted IS NULL OR d.user_deleted = 0)';
     const params = [groupId];
 
     if (type !== 'all') {
@@ -1208,7 +1214,7 @@ export function getDownloads(groupId, limit = 50, offset = 0, type = 'all', opts
         .prepare(query)
         .all(...params);
 
-    let countQuery = 'SELECT COUNT(*) as total FROM downloads d WHERE d.group_id = ?';
+    let countQuery = 'SELECT COUNT(*) as total FROM downloads d WHERE d.group_id = ? AND (d.user_deleted IS NULL OR d.user_deleted = 0)';
     const countParams = [groupId];
 
     if (params.length > 3) {
@@ -1260,6 +1266,7 @@ export function searchDownloads(query, opts = {}) {
                      LEFT JOIN seekbar_sprites sb ON sb.download_id = d.id
                      INNER JOIN downloads_fts fts ON fts.rowid = d.id
                      WHERE downloads_fts MATCH ?${groupFilter}
+                     AND (d.user_deleted IS NULL OR d.user_deleted = 0)
                      ORDER BY fts.rank
                      LIMIT ? OFFSET ?`,
                 )
@@ -1268,7 +1275,8 @@ export function searchDownloads(query, opts = {}) {
                 .prepare(
                     `SELECT COUNT(*) as c FROM downloads d
                      INNER JOIN downloads_fts fts ON fts.rowid = d.id
-                     WHERE downloads_fts MATCH ?${groupFilter}`,
+                     WHERE downloads_fts MATCH ?${groupFilter}
+                     AND (d.user_deleted IS NULL OR d.user_deleted = 0)`,
                 )
                 .get(...params).c;
             return { files: rows, total };
@@ -1280,7 +1288,7 @@ export function searchDownloads(query, opts = {}) {
     // LIKE fallback
     const q = `%${raw}%`;
     const params = [q, q];
-    let where = '(d.file_name LIKE ? OR d.group_name LIKE ?)';
+    let where = '(d.file_name LIKE ? OR d.group_name LIKE ?) AND (d.user_deleted IS NULL OR d.user_deleted = 0)';
     if (opts.groupId) {
         where += ' AND d.group_id = ?';
         params.push(String(opts.groupId));
@@ -1378,7 +1386,7 @@ export function getAllDownloadsFederated(limit = 50, offset = 0, type = 'all', o
 
     // Build the WHERE clause for both sides. Pinned filter only applies
     // to the local side because peer rows are always pinned=0.
-    const localWhereParts = [];
+    const localWhereParts = ['(user_deleted IS NULL OR user_deleted = 0)'];
     const peerWhereParts = [];
     const localParams = [];
     const peerParams = [];
@@ -1444,7 +1452,7 @@ export function getDownloadsForGroupFederated(
         type !== 'all' && _FEDERATED_TYPE_MAP[type] ? _FEDERATED_TYPE_MAP[type] : null;
     const gid = String(groupId);
 
-    const localWhereParts = ['group_id = ?'];
+    const localWhereParts = ['group_id = ?', '(user_deleted IS NULL OR user_deleted = 0)'];
     const peerWhereParts = ['group_id = ?'];
     const localParams = [gid];
     const peerParams = [gid];
@@ -1506,7 +1514,7 @@ export function searchDownloadsFederated(query, opts = {}) {
     const off = Math.max(0, parseInt(opts.offset, 10) || 0);
     const q = `%${String(query || '').trim()}%`;
 
-    const localWhereParts = ['(file_name LIKE ? OR group_name LIKE ?)'];
+    const localWhereParts = ['(file_name LIKE ? OR group_name LIKE ?)', '(user_deleted IS NULL OR user_deleted = 0)'];
     const peerWhereParts = ['(file_name LIKE ? OR group_name LIKE ?)'];
     const localParams = [q, q];
     const peerParams = [q, q];
@@ -1601,16 +1609,18 @@ export function getDownloadById(id) {
 }
 
 /** Bulk-delete by ids (preferred) or file_paths. Returns the number removed.
- *  Also purges orphaned people rows whose faces were cascade-deleted. */
+ *  Also purges orphaned people rows whose faces were cascade-deleted.
+ *  Rows are marked user_deleted=1 rather than hard-deleted so that
+ *  isDownloaded() still returns true and backfill does not re-fetch them. */
 export function deleteDownloadsBy(opts) {
     const db = getDb();
     let removed = 0;
     if (Array.isArray(opts?.ids) && opts.ids.length) {
-        const stmt = db.prepare('DELETE FROM downloads WHERE id = ?');
+        const stmt = db.prepare('UPDATE downloads SET user_deleted = 1 WHERE id = ?');
         const tx = db.transaction(() => opts.ids.reduce((n, id) => n + stmt.run(id).changes, 0));
         removed = tx();
     } else if (Array.isArray(opts?.filePaths) && opts.filePaths.length) {
-        const stmt = db.prepare('DELETE FROM downloads WHERE file_path = ?');
+        const stmt = db.prepare('UPDATE downloads SET user_deleted = 1 WHERE file_path = ?');
         const tx = db.transaction(() =>
             opts.filePaths.reduce((n, p) => n + stmt.run(p).changes, 0),
         );
@@ -1632,7 +1642,7 @@ export function purgeOrphanPeople() {
 
 export function getStats() {
     const r = getDb()
-        .prepare('SELECT COUNT(*) AS count, COALESCE(SUM(file_size), 0) AS size FROM downloads')
+        .prepare('SELECT COUNT(*) AS count, COALESCE(SUM(file_size), 0) AS size FROM downloads WHERE (user_deleted IS NULL OR user_deleted = 0)')
         .get();
     return { totalFiles: r.count, totalSize: r.size };
 }
@@ -1642,7 +1652,7 @@ export function getStats() {
  * Used by the disk rotator to decide whether the cap is exceeded.
  */
 export function getTotalSizeBytes() {
-    const r = getDb().prepare('SELECT COALESCE(SUM(file_size), 0) as size FROM downloads').get();
+    const r = getDb().prepare('SELECT COALESCE(SUM(file_size), 0) as size FROM downloads WHERE (user_deleted IS NULL OR user_deleted = 0)').get();
     return Number(r?.size || 0);
 }
 
@@ -1658,6 +1668,7 @@ export function getOldestDownloads(count = 50) {
             SELECT id, group_id, group_name, file_name, file_size, file_type, file_path, created_at, pinned
             FROM downloads
             WHERE pinned = 0
+              AND (user_deleted IS NULL OR user_deleted = 0)
             ORDER BY created_at ASC, id ASC
             LIMIT ?
         `)
@@ -1685,6 +1696,7 @@ export function getGroupStats(groupId) {
                    MAX(created_at) AS lastDownloadAt
               FROM downloads
              WHERE group_id = ?
+               AND (user_deleted IS NULL OR user_deleted = 0)
         `)
             .get(String(groupId)) || {};
     const rows = db
@@ -1692,6 +1704,7 @@ export function getGroupStats(groupId) {
             SELECT file_type, COUNT(*) AS n
               FROM downloads
              WHERE group_id = ?
+               AND (user_deleted IS NULL OR user_deleted = 0)
              GROUP BY file_type
         `)
         .all(String(groupId));
@@ -1716,7 +1729,7 @@ export function listGroupFiles({ groupId, limit = 50, offset = 0, type = null } 
     const db = getDb();
     const lim = Math.max(1, Math.min(500, Number(limit) || 50));
     const off = Math.max(0, Number(offset) || 0);
-    const where = ['group_id = ?'];
+    const where = ['group_id = ?', '(user_deleted IS NULL OR user_deleted = 0)'];
     const args = [String(groupId)];
     if (type && typeof type === 'string') {
         where.push('file_type = ?');
@@ -1822,11 +1835,11 @@ export function getNsfwStats(fileTypes, threshold) {
     const placeholders = types.map(() => '?').join(',');
     const db = getDb();
     const total = db
-        .prepare(`SELECT COUNT(*) AS n FROM downloads WHERE file_type IN (${placeholders})`)
+        .prepare(`SELECT COUNT(*) AS n FROM downloads WHERE file_type IN (${placeholders}) AND (user_deleted IS NULL OR user_deleted = 0)`)
         .get(...types).n;
     const scanned = db
         .prepare(
-            `SELECT COUNT(*) AS n FROM downloads WHERE file_type IN (${placeholders}) AND nsfw_checked_at IS NOT NULL`,
+            `SELECT COUNT(*) AS n FROM downloads WHERE file_type IN (${placeholders}) AND nsfw_checked_at IS NOT NULL AND (user_deleted IS NULL OR user_deleted = 0)`,
         )
         .get(...types).n;
     // candidates = LOW-score rows (likely not 18+) — what the admin reviews.
@@ -1836,7 +1849,8 @@ export function getNsfwStats(fileTypes, threshold) {
          WHERE file_type IN (${placeholders})
            AND nsfw_score IS NOT NULL
            AND nsfw_score < ?
-           AND nsfw_whitelist = 0`,
+           AND nsfw_whitelist = 0
+           AND (user_deleted IS NULL OR user_deleted = 0)`,
         )
         .get(...types, Number(threshold)).n;
     // keep = HIGH-score rows (likely 18+) — the curated content stays put.
@@ -1845,15 +1859,16 @@ export function getNsfwStats(fileTypes, threshold) {
             `SELECT COUNT(*) AS n FROM downloads
          WHERE file_type IN (${placeholders})
            AND nsfw_score IS NOT NULL
-           AND nsfw_score >= ?`,
+           AND nsfw_score >= ?
+           AND (user_deleted IS NULL OR user_deleted = 0)`,
         )
         .get(...types, Number(threshold)).n;
     const whitelisted = db
-        .prepare(`SELECT COUNT(*) AS n FROM downloads WHERE nsfw_whitelist = 1`)
+        .prepare(`SELECT COUNT(*) AS n FROM downloads WHERE nsfw_whitelist = 1 AND (user_deleted IS NULL OR user_deleted = 0)`)
         .get().n;
     const lastCheckedAt = db
         .prepare(
-            `SELECT MAX(nsfw_checked_at) AS t FROM downloads WHERE file_type IN (${placeholders})`,
+            `SELECT MAX(nsfw_checked_at) AS t FROM downloads WHERE file_type IN (${placeholders}) AND (user_deleted IS NULL OR user_deleted = 0)`,
         )
         .get(...types).t;
     return { totalEligible: total, scanned, candidates, keep, whitelisted, lastCheckedAt };
@@ -1875,6 +1890,7 @@ export function getUnscannedNsfwBatch(fileTypes, limit = 50) {
          WHERE file_type IN (${placeholders})
            AND nsfw_checked_at IS NULL
            AND nsfw_whitelist = 0
+           AND (user_deleted IS NULL OR user_deleted = 0)
          ORDER BY created_at ASC
          LIMIT ?
     `)
@@ -1943,6 +1959,7 @@ export function getNsfwDeleteCandidates({ fileTypes, threshold, page = 1, limit 
            AND nsfw_score IS NOT NULL
            AND nsfw_score < ?
            AND nsfw_whitelist = 0
+           AND (user_deleted IS NULL OR user_deleted = 0)
     `)
         .get(...types, t);
     const rows = db
@@ -1954,6 +1971,7 @@ export function getNsfwDeleteCandidates({ fileTypes, threshold, page = 1, limit 
            AND nsfw_score IS NOT NULL
            AND nsfw_score < ?
            AND nsfw_whitelist = 0
+           AND (user_deleted IS NULL OR user_deleted = 0)
          ORDER BY nsfw_score ASC, id ASC
          LIMIT ? OFFSET ?
     `)
@@ -2056,12 +2074,13 @@ export function getNsfwTierCounts(fileTypes) {
                COUNT(*) AS total_eligible
               FROM downloads
              WHERE file_type IN (${placeholders})
+               AND (user_deleted IS NULL OR user_deleted = 0)
         `)
         .get(...types);
     const tiers = {};
     for (const t of NSFW_TIERS) tiers[t.id] = row[`tier_${t.id}`] || 0;
     const whitelisted = db
-        .prepare(`SELECT COUNT(*) AS n FROM downloads WHERE nsfw_whitelist = 1`)
+        .prepare(`SELECT COUNT(*) AS n FROM downloads WHERE nsfw_whitelist = 1 AND (user_deleted IS NULL OR user_deleted = 0)`)
         .get().n;
     const scanned = row.scanned || 0;
     const totalEligible = row.total_eligible || 0;
@@ -2105,6 +2124,7 @@ export function getNsfwHistogram(fileTypes, bins = 20) {
               FROM downloads
              WHERE file_type IN (${placeholders})
                AND nsfw_score IS NOT NULL
+               AND (user_deleted IS NULL OR user_deleted = 0)
              GROUP BY bin
         `)
         .all(n, n, n, n, ...types);
@@ -2132,7 +2152,7 @@ export function getNsfwListByTier({
 }) {
     const types = Array.isArray(fileTypes) && fileTypes.length ? fileTypes : ['photo'];
     const placeholders = types.map(() => '?').join(',');
-    const where = [`file_type IN (${placeholders})`, 'nsfw_score IS NOT NULL'];
+    const where = [`file_type IN (${placeholders})`, 'nsfw_score IS NOT NULL', '(user_deleted IS NULL OR user_deleted = 0)'];
     const params = [...types];
     if (fileKind && fileKind !== 'all') {
         where.push('file_type = ?');
@@ -2197,7 +2217,7 @@ export function getNsfwIdsByTier({
 } = {}) {
     const types = Array.isArray(fileTypes) && fileTypes.length ? fileTypes : ['photo'];
     const placeholders = types.map(() => '?').join(',');
-    const where = [`file_type IN (${placeholders})`, 'nsfw_score IS NOT NULL'];
+    const where = [`file_type IN (${placeholders})`, 'nsfw_score IS NOT NULL', '(user_deleted IS NULL OR user_deleted = 0)'];
     const params = [...types];
     if (tier) {
         const bounds = _tierBounds(tier);
@@ -2292,6 +2312,7 @@ export function getUnindexedAiBatch({ fileTypes = ['photo'], limit = 50 } = {}) 
          WHERE file_type IN (${placeholders})
            AND ai_indexed_at IS NULL
            AND file_path NOT LIKE '%.part'
+           AND (user_deleted IS NULL OR user_deleted = 0)
          ORDER BY created_at ASC, id ASC
          LIMIT ?
     `)
@@ -2314,11 +2335,11 @@ export function getAiCounts({ fileTypes = ['photo'] } = {}) {
     const placeholders = types.map(() => '?').join(',');
     const db = getDb();
     const total = db
-        .prepare(`SELECT COUNT(*) AS n FROM downloads WHERE file_type IN (${placeholders})`)
+        .prepare(`SELECT COUNT(*) AS n FROM downloads WHERE file_type IN (${placeholders}) AND (user_deleted IS NULL OR user_deleted = 0)`)
         .get(...types).n;
     const indexed = db
         .prepare(
-            `SELECT COUNT(*) AS n FROM downloads WHERE file_type IN (${placeholders}) AND ai_indexed_at IS NOT NULL`,
+            `SELECT COUNT(*) AS n FROM downloads WHERE file_type IN (${placeholders}) AND ai_indexed_at IS NOT NULL AND (user_deleted IS NULL OR user_deleted = 0)`,
         )
         .get(...types).n;
     const withEmbedding = db.prepare(`SELECT COUNT(*) AS n FROM image_embeddings`).get().n;
@@ -2728,7 +2749,13 @@ export function listPeople({ limit = 500, offset = 0 } = {}) {
     const db = getDb();
     const rows = db
         .prepare(`
-        SELECT p.id, p.label, p.face_count, p.created_at, p.updated_at,
+        SELECT p.id, p.label, p.created_at, p.updated_at,
+               COALESCE((
+                   SELECT COUNT(*) FROM faces fl
+                    JOIN downloads dl ON dl.id = fl.download_id
+                   WHERE fl.person_id = p.id
+                     AND (dl.user_deleted IS NULL OR dl.user_deleted = 0)
+               ), 0) AS face_count,
                f.download_id AS cover_download_id,
                f.id          AS cover_face_id,
                f.x           AS cover_x,
@@ -2739,23 +2766,42 @@ export function listPeople({ limit = 500, offset = 0 } = {}) {
                    SELECT COUNT(*) FROM faces fv
                     JOIN downloads dv ON dv.id = fv.download_id
                    WHERE fv.person_id = p.id AND dv.file_type = 'video'
+                     AND (dv.user_deleted IS NULL OR dv.user_deleted = 0)
                ), 0) AS video_face_count,
                COALESCE((
                    SELECT AVG(f3.quality_score) FROM faces f3
+                    JOIN downloads d3 ON d3.id = f3.download_id
                     WHERE f3.person_id = p.id AND f3.quality_score IS NOT NULL
+                      AND (d3.user_deleted IS NULL OR d3.user_deleted = 0)
                ), 0) AS avg_quality
           FROM people p
           LEFT JOIN faces f ON f.id = (
             SELECT ff.id FROM faces ff
+              JOIN downloads dff ON dff.id = ff.download_id
              WHERE ff.person_id = p.id
+               AND (dff.user_deleted IS NULL OR dff.user_deleted = 0)
              ORDER BY COALESCE(ff.quality_score, 0) DESC, ff.w * ff.h DESC
              LIMIT 1
           )
-         ORDER BY p.face_count DESC, p.id ASC
+         WHERE (
+               SELECT COUNT(*) FROM faces fex
+                JOIN downloads dex ON dex.id = fex.download_id
+               WHERE fex.person_id = p.id
+                 AND (dex.user_deleted IS NULL OR dex.user_deleted = 0)
+         ) > 0
+         ORDER BY face_count DESC, p.id ASC
          LIMIT ? OFFSET ?
     `)
         .all(lim, off);
-    const total = db.prepare('SELECT COUNT(*) AS n FROM people').get().n;
+    const total = db.prepare(`
+        SELECT COUNT(*) AS n FROM people p
+         WHERE (
+               SELECT COUNT(*) FROM faces fex
+                JOIN downloads dex ON dex.id = fex.download_id
+               WHERE fex.person_id = p.id
+                 AND (dex.user_deleted IS NULL OR dex.user_deleted = 0)
+         ) > 0
+    `).get().n;
     return { people: rows, total };
 }
 
@@ -2778,7 +2824,7 @@ export function listPhotosForPerson(personId, { limit = 50, offset = 0 } = {}) {
     const rows = db
         .prepare(`
         SELECT d.id, d.file_name, d.file_path, d.file_type, d.file_size,
-               d.created_at, d.group_id, d.group_name, d.message_id,
+               d.created_at, d.group_id, d.group_name, d.message_id, d.pinned,
                f.id AS face_id,
                f.x AS face_x, f.y AS face_y, f.w AS face_w, f.h AS face_h
           FROM (
@@ -2788,7 +2834,9 @@ export function listPhotosForPerson(personId, { limit = 50, offset = 0 } = {}) {
                        ORDER BY COALESCE(f2.quality_score, 0) DESC, f2.w * f2.h DESC
                    ) AS rn
               FROM faces f2
+              JOIN downloads d2 ON d2.id = f2.download_id
              WHERE f2.person_id = ?
+               AND (d2.user_deleted IS NULL OR d2.user_deleted = 0)
           ) f
           JOIN downloads d ON d.id = f.download_id
          WHERE f.rn = 1
@@ -2797,7 +2845,13 @@ export function listPhotosForPerson(personId, { limit = 50, offset = 0 } = {}) {
     `)
         .all(Number(personId), lim, off);
     const total = db
-        .prepare(`SELECT COUNT(DISTINCT download_id) AS n FROM faces WHERE person_id = ?`)
+        .prepare(`
+            SELECT COUNT(DISTINCT f.download_id) AS n
+              FROM faces f
+              JOIN downloads d ON d.id = f.download_id
+             WHERE f.person_id = ?
+               AND (d.user_deleted IS NULL OR d.user_deleted = 0)
+        `)
         .get(Number(personId)).n;
     return { files: rows, total };
 }
@@ -2850,12 +2904,18 @@ export function listPhotosForTag(tag, { limit = 50, offset = 0 } = {}) {
           FROM image_tags t
           JOIN downloads d ON d.id = t.download_id
          WHERE t.tag = ?
+           AND (d.user_deleted IS NULL OR d.user_deleted = 0)
          ORDER BY t.score DESC, d.created_at DESC
          LIMIT ? OFFSET ?
     `)
         .all(String(tag), lim, off);
     const total = getDb()
-        .prepare('SELECT COUNT(*) AS n FROM image_tags WHERE tag = ?')
+        .prepare(`
+            SELECT COUNT(*) AS n FROM image_tags t
+              JOIN downloads d ON d.id = t.download_id
+             WHERE t.tag = ?
+               AND (d.user_deleted IS NULL OR d.user_deleted = 0)
+        `)
         .get(String(tag)).n;
     return { files: rows, total };
 }
@@ -3599,6 +3659,7 @@ export function listOwnDownloadsSince({ sinceId = 0, limit = 500 } = {}) {
                 file_hash, status, created_at, nsfw_score
            FROM downloads
           WHERE id > ?
+            AND (user_deleted IS NULL OR user_deleted = 0)
           ORDER BY id ASC
           LIMIT ?`,
     ).all(since, lim);
@@ -3879,6 +3940,7 @@ export function pageMissingSeekbarVideos({ beforeId, limit = 200 } = {}) {
          WHERE d.file_type = 'video'
            AND d.file_path IS NOT NULL
            AND s.download_id IS NULL
+           AND (d.user_deleted IS NULL OR d.user_deleted = 0)
            AND d.id < ?
          ORDER BY d.id DESC
          LIMIT ?
@@ -3906,13 +3968,29 @@ export function pageSeekbarSprites({ beforeId, limit = 200 } = {}) {
 }
 
 export function countSeekbarSprites() {
-    return Number(getDb().prepare('SELECT COUNT(*) AS n FROM seekbar_sprites').get().n) || 0;
+    return (
+        Number(
+            getDb()
+                .prepare(
+                    `SELECT COUNT(*) AS n FROM seekbar_sprites s
+                      JOIN downloads d ON d.id = s.download_id
+                     WHERE (d.user_deleted IS NULL OR d.user_deleted = 0)`,
+                )
+                .get().n,
+        ) || 0
+    );
 }
 
 export function sumSeekbarBytes() {
     return (
         Number(
-            getDb().prepare('SELECT COALESCE(SUM(bytes), 0) AS s FROM seekbar_sprites').get().s,
+            getDb()
+                .prepare(
+                    `SELECT COALESCE(SUM(s.bytes), 0) AS s FROM seekbar_sprites s
+                      JOIN downloads d ON d.id = s.download_id
+                     WHERE (d.user_deleted IS NULL OR d.user_deleted = 0)`,
+                )
+                .get().s,
         ) || 0
     );
 }
@@ -3922,7 +4000,7 @@ export function countVideoDownloads() {
         Number(
             getDb()
                 .prepare(
-                    "SELECT COUNT(*) AS n FROM downloads WHERE file_type = 'video' AND file_path IS NOT NULL",
+                    "SELECT COUNT(*) AS n FROM downloads WHERE file_type = 'video' AND file_path IS NOT NULL AND (user_deleted IS NULL OR user_deleted = 0)",
                 )
                 .get().n,
         ) || 0

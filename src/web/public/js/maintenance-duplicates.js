@@ -455,10 +455,44 @@ async function _stopScan() {
     _stopRequested = true;
     _setScanUi(true, { stopRequested: true });
     try {
-        await api.post('/api/maintenance/dedup/scan/stop', {});
-        // Don't change UI here — wait for `dedup_done` which fires when
-        // the scan actually stops. If the scan wasn't running, dedup_done
-        // won't fire but the next _refreshStats will update the panel.
+        const r = await api.post('/api/maintenance/dedup/scan/stop', {});
+        // `wasRunning: false` means the tracker had no scan in flight —
+        // the UI got stuck because a previous dedup_done WS event was
+        // missed (tab inactive, WS reconnect, etc.). dedup_done will NOT
+        // fire, so we must reset the UI here instead of waiting for it.
+        if (!r?.wasRunning) {
+            _stopRequested = false;
+            _setScanUi(false);
+        } else {
+            // wasRunning: true — the scan is winding down. dedup_done fires
+            // when it exits cleanly (including after the server-side 30 s
+            // force-reset). Belt-and-suspenders: if dedup_done is still missed
+            // (WS disconnected, forceReset never broadcast), force-clear the
+            // UI after 60 s and try to show whatever results are available.
+            setTimeout(async () => {
+                if (!_stopRequested) return; // dedup_done already handled it
+                _stopRequested = false;
+                _setScanUi(false);
+                // Try to surface results so the user isn't left with a blank list.
+                try {
+                    const status = await api.get('/api/maintenance/dedup/status');
+                    if (status?.result?.duplicateSets?.length) {
+                        _renderSets(status.result.duplicateSets);
+                        return;
+                    }
+                } catch {
+                    /* non-fatal */
+                }
+                try {
+                    const r = await api.get('/api/maintenance/dedup/sets');
+                    if (Array.isArray(r?.duplicateSets) && r.duplicateSets.length) {
+                        _renderSets(r.duplicateSets);
+                    }
+                } catch {
+                    /* non-fatal */
+                }
+            }, 60_000);
+        }
     } catch (e) {
         _stopRequested = false;
         showToast(e?.data?.error || e.message || 'Failed to stop', 'error');
@@ -473,25 +507,35 @@ async function _stopScan() {
 // + verify trackers so a job started on one client disables the buttons
 // on this tab until it finishes.
 async function _recoverScanState() {
+    let inMemoryHasSets = false;
+    let isRunning = false;
     try {
         const r = await api.get('/api/maintenance/dedup/status');
         if (r?.running) {
+            isRunning = true;
             _setScanUi(true);
-        } else if (r?.result?.duplicateSets) {
-            // Last run finished with results — show them and check if it
-            // was a partial run so the Resume label appears.
-            const wasAborted = !!r.result.aborted;
+        } else {
+            // Always reset the scan UI when the server confirms no scan is
+            // running. Without this, a missed dedup_done WS event (tab
+            // inactive, WS reconnect, scan finished with 0 duplicates)
+            // leaves "Scanning…" / "Stopping…" on-screen across all future
+            // page visits until the user manually triggers another scan.
+            const wasAborted = !!r?.result?.aborted;
             _setScanUi(false, { resume: wasAborted });
-            _renderSets(r.result.duplicateSets);
+            if (r?.result?.duplicateSets) {
+                _renderSets(r.result.duplicateSets);
+                inMemoryHasSets = true;
+            }
         }
     } catch {
         /* non-fatal */
     }
     // If the scan was stopped and the server restarted (result cleared),
     // check for persisted partial-progress from the stats endpoint.
+    let statsData = null;
     try {
-        const stats = await api.get('/api/maintenance/dedup/stats');
-        if (stats?.partialProgress?.partial) {
+        statsData = await api.get('/api/maintenance/dedup/stats');
+        if (statsData?.partialProgress?.partial) {
             // Only show resume label if not already in running/result state.
             const scanBtn = $('dup-scan-btn');
             if (scanBtn && !scanBtn.classList.contains('hidden')) {
@@ -500,6 +544,22 @@ async function _recoverScanState() {
         }
     } catch {
         /* non-fatal */
+    }
+    // After a server restart the in-memory JobTracker result is cleared but
+    // file_hash values remain in the DB. Whenever no result is in memory and
+    // the scan is not running, rebuild the list from hashes already in the DB
+    // (no re-hashing, returns in milliseconds). This covers both completed
+    // scans (lastScan exists) and partial/aborted scans (partialProgress.partial
+    // is true) so the user always sees whatever duplicates were found.
+    if (!inMemoryHasSets && !isRunning) {
+        try {
+            const r = await api.get('/api/maintenance/dedup/sets');
+            if (Array.isArray(r?.duplicateSets) && r.duplicateSets.length) {
+                _renderSets(r.duplicateSets);
+            }
+        } catch {
+            /* non-fatal */
+        }
     }
     try {
         const r = await api.get('/api/maintenance/dedup/delete/status');
@@ -669,9 +729,46 @@ async function _runReindex() {
     }
 }
 
+// Re-sync scan state whenever the WS reconnects. The WS client defers
+// reconnect while the tab is in the background (ws.js scheduleReconnect),
+// so dedup_done events that fired while the tab was hidden are permanently
+// lost. Without this handler the UI stays stuck in "Scanning…"/"Stopping…"
+// across all future visits until the user navigates away and back.
+async function _resyncOnReconnect() {
+    try {
+        const r = await api.get('/api/maintenance/dedup/status');
+        if (r?.running) {
+            _setScanUi(true, { stopRequested: _stopRequested });
+        } else {
+            _stopRequested = false;
+            const wasAborted = !!r?.result?.aborted;
+            _setScanUi(false, { resume: wasAborted });
+            if (r?.result?.duplicateSets?.length) {
+                _renderSets(r.result.duplicateSets);
+            } else {
+                // In-memory result is empty or gone (e.g. server restart).
+                // Fall back to the DB-derived sets so the list is still shown.
+                try {
+                    const sets = await api.get('/api/maintenance/dedup/sets');
+                    if (Array.isArray(sets?.duplicateSets) && sets.duplicateSets.length) {
+                        _renderSets(sets.duplicateSets);
+                    }
+                } catch {
+                    /* non-fatal */
+                }
+            }
+        }
+    } catch {
+        /* non-fatal */
+    }
+    _refreshStats();
+}
+
 function _wireWs() {
     if (_wsWired) return;
     _wsWired = true;
+
+    ws.on('__ws_open', _resyncOnReconnect);
 
     ws.on('dedup_progress', (m) => {
         // Make sure the running UI is visible — handles the case where a

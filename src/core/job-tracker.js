@@ -169,6 +169,13 @@ export function createJobTracker({ kind, broadcast, log, eventPrefix } = {}) {
                     ..._state,
                     running: false,
                     stage: 'done',
+                    // Clear accumulated progress fields — leaving the last
+                    // onProgress payload in place would let stale keys
+                    // (e.g. a caller-supplied `running: true`) survive
+                    // into every future getStatus()/status-endpoint read
+                    // until the next tryStart(), silently contradicting
+                    // the authoritative `running: false` set above.
+                    progress: {},
                     finishedAt,
                     durationMs: finishedAt - startedAt,
                     result: result && typeof result === 'object' ? result : (result ?? null),
@@ -193,6 +200,9 @@ export function createJobTracker({ kind, broadcast, log, eventPrefix } = {}) {
                     ..._state,
                     running: false,
                     stage: 'error',
+                    // See the success-path comment above — must not leak a
+                    // stale `progress.running`/etc. into future reads.
+                    progress: {},
                     finishedAt,
                     durationMs: finishedAt - startedAt,
                     error: msg,
@@ -230,7 +240,43 @@ export function createJobTracker({ kind, broadcast, log, eventPrefix } = {}) {
         return true;
     }
 
-    return { tryStart, cancel, getStatus, isRunning };
+    /**
+     * Hard-reset internal state and broadcast a done event with `aborted:true`.
+     * Use only as a last resort when `cancel()` has been called but the runFn
+     * is stuck (e.g. hanging I/O) and has not exited within a grace period.
+     * The runFn may still be executing in the background after this call; this
+     * just unblocks the tracker so new runs can start.
+     */
+    function forceReset() {
+        if (!_running) return false;
+        _running = false;
+        _abort = null;
+        const finishedAt = Date.now();
+        _state = {
+            ..._state,
+            running: false,
+            stage: 'error',
+            // See tryStart()'s success/error paths — must not leak a stale
+            // progress payload (which may contain a caller-supplied
+            // `running: true`) into future getStatus()/status-endpoint reads.
+            progress: {},
+            finishedAt,
+            durationMs: finishedAt - (_state.startedAt || finishedAt),
+            error: 'force reset — scan took too long to stop',
+            failures: (_state.failures || 0) + 1,
+        };
+        _safeBroadcast({
+            type: `${_prefix}_done`,
+            aborted: true,
+            forceReset: true,
+            durationMs: _state.durationMs,
+            kind,
+        });
+        _safeLog({ source: kind, level: 'warn', msg: `${kind} force-reset after cancel` });
+        return true;
+    }
+
+    return { tryStart, cancel, forceReset, getStatus, isRunning };
 }
 
 function _shortProgress(p) {

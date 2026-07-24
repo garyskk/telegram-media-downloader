@@ -739,7 +739,9 @@ async function viewDownloads() {
         const rows = db
             .prepare(`
             SELECT group_id, COUNT(*) as count, SUM(file_size) as size
-            FROM downloads GROUP BY group_id ORDER BY size DESC
+            FROM downloads
+            WHERE (user_deleted IS NULL OR user_deleted = 0)
+            GROUP BY group_id ORDER BY size DESC
         `)
             .all();
 

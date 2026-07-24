@@ -10,9 +10,9 @@
 
 services:
   telegram-downloader:
-    image: ghcr.io/botnick/telegram-media-downloader:latest
-    pull_policy: always
-    # build: .
+    # image: ghcr.io/botnick/telegram-media-downloader:latest
+    # pull_policy: always
+    build: .
     container_name: telegram-downloader
     restart: unless-stopped
     ports:
@@ -26,7 +26,8 @@ services:
       # - /mnt/ssd/tgdl/data:/app/data
       # - /mnt/hdd/tgdl/downloads:/mnt/hdd/downloads
     environment:
-      - NODE_ENV=production
+      # - NODE_ENV=production
+      - NODE_ENV=development
       - TZ=${TZ:-UTC}
       - TGDL_DEBUG=${TGDL_DEBUG:-}
       # V8 heap ceiling. Default 8 GiB so a 1M-row library doesn't trip
@@ -364,83 +365,83 @@ services:
         max-size: "10m"
         max-file: "5"
 
-  # Auto-restart on hangs. Docker's `restart: unless-stopped` policy only
-  # fires when the process *exits*; a wedged event loop, deadlocked DB
-  # handle, or AI worker that hangs but doesn't crash leaves the container
-  # running with healthcheck stuck on "unhealthy" indefinitely.
-  #
-  # `willfarrell/autoheal` polls the docker socket every AUTOHEAL_INTERVAL
-  # seconds, finds containers whose health is "unhealthy" AND that carry
-  # the AUTOHEAL_CONTAINER_LABEL ("autoheal=true"), and `docker restart`s
-  # them. The label scoping means the sidecar can NEVER touch an unrelated
-  # container on the same host even if it wanted to.
-  #
-  # Disabled-by-default: comment out this service if you'd rather rely on
-  # an external supervisor (systemd, k8s, NAS health monitors, etc.).
-  autoheal:
-    image: willfarrell/autoheal:1.2.0
-    container_name: telegram-downloader-autoheal
-    restart: unless-stopped
-    # autoheal only needs the docker socket — no inbound network. `none`
-    # makes a hypothetical RCE in autoheal unable to phone home.
-    network_mode: none
-    environment:
-      # Only restart containers explicitly opted-in via label. The main
-      # service above carries `autoheal=true`.
-      - AUTOHEAL_CONTAINER_LABEL=autoheal
-      # Poll cadence — matches the dashboard healthcheck interval.
-      - AUTOHEAL_INTERVAL=30
-      # Don't act during the container's own start_period — gives boot
-      # time without the sidecar racing the first healthcheck. Compose
-      # already passes `start_period: 30s`; this is the upper bound.
-      - AUTOHEAL_START_PERIOD=60
-      # Graceful stop timeout before SIGKILL during a restart attempt.
-      - AUTOHEAL_DEFAULT_STOP_TIMEOUT=10
-      - TZ=${TZ:-UTC}
-    volumes:
-      # Read+write because autoheal calls `POST /containers/<id>/restart`.
-      # If you need defence-in-depth against a compromised sidecar, swap
-      # this for a docker-socket-proxy (tecnativa/docker-socket-proxy)
-      # configured with CONTAINERS=1 + POST=1 and nothing else.
-      - /var/run/docker.sock:/var/run/docker.sock
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "1m"
-        max-file: "3"
+  # # Auto-restart on hangs. Docker's `restart: unless-stopped` policy only
+  # # fires when the process *exits*; a wedged event loop, deadlocked DB
+  # # handle, or AI worker that hangs but doesn't crash leaves the container
+  # # running with healthcheck stuck on "unhealthy" indefinitely.
+  # #
+  # # `willfarrell/autoheal` polls the docker socket every AUTOHEAL_INTERVAL
+  # # seconds, finds containers whose health is "unhealthy" AND that carry
+  # # the AUTOHEAL_CONTAINER_LABEL ("autoheal=true"), and `docker restart`s
+  # # them. The label scoping means the sidecar can NEVER touch an unrelated
+  # # container on the same host even if it wanted to.
+  # #
+  # # Disabled-by-default: comment out this service if you'd rather rely on
+  # # an external supervisor (systemd, k8s, NAS health monitors, etc.).
+  # autoheal:
+  #   image: willfarrell/autoheal:1.2.0
+  #   container_name: telegram-downloader-autoheal
+  #   restart: unless-stopped
+  #   # autoheal only needs the docker socket — no inbound network. `none`
+  #   # makes a hypothetical RCE in autoheal unable to phone home.
+  #   network_mode: none
+  #   environment:
+  #     # Only restart containers explicitly opted-in via label. The main
+  #     # service above carries `autoheal=true`.
+  #     - AUTOHEAL_CONTAINER_LABEL=autoheal
+  #     # Poll cadence — matches the dashboard healthcheck interval.
+  #     - AUTOHEAL_INTERVAL=30
+  #     # Don't act during the container's own start_period — gives boot
+  #     # time without the sidecar racing the first healthcheck. Compose
+  #     # already passes `start_period: 30s`; this is the upper bound.
+  #     - AUTOHEAL_START_PERIOD=60
+  #     # Graceful stop timeout before SIGKILL during a restart attempt.
+  #     - AUTOHEAL_DEFAULT_STOP_TIMEOUT=10
+  #     - TZ=${TZ:-UTC}
+  #   volumes:
+  #     # Read+write because autoheal calls `POST /containers/<id>/restart`.
+  #     # If you need defence-in-depth against a compromised sidecar, swap
+  #     # this for a docker-socket-proxy (tecnativa/docker-socket-proxy)
+  #     # configured with CONTAINERS=1 + POST=1 and nothing else.
+  #     - /var/run/docker.sock:/var/run/docker.sock
+  #   logging:
+  #     driver: "json-file"
+  #     options:
+  #       max-size: "1m"
+  #       max-file: "3"
 
-  # Optional one-click updater. ENABLE WITH:
-  #   docker compose --profile auto-update up -d
-  # Without the `--profile` flag the sidecar isn't started and the dashboard
-  # falls back to "click the GitHub link and run docker compose up -d".
-  #
-  # Security model:
-  #   - watchtower is the ONLY container that touches /var/run/docker.sock.
-  #     The main app calls watchtower over the internal docker network via
-  #     an HTTP token; it never sees the socket itself, so a hypothetical
-  #     RCE in the dashboard cannot escalate to host root.
-  #   - WATCHTOWER_LABEL_ENABLE=true scopes operations to ONLY the labeled
-  #     telegram-downloader container — watchtower can't sweep up
-  #     unrelated apps even if it wanted to.
-  #   - HTTP API requires WATCHTOWER_HTTP_API_TOKEN (random hex). Set this
-  #     in .env BEFORE first boot of the profile; absence disables the
-  #     dashboard button entirely.
-  watchtower:
-    image: containrrr/watchtower:1.7.1
-    profiles: ["auto-update"]
-    container_name: telegram-downloader-updater
-    restart: unless-stopped
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-    environment:
-      - WATCHTOWER_HTTP_API_UPDATE=true
-      - WATCHTOWER_HTTP_API_TOKEN=${WATCHTOWER_HTTP_API_TOKEN:-}
-      - WATCHTOWER_HTTP_API_PERIODIC_POLLS=false
-      - WATCHTOWER_LABEL_ENABLE=true
-      - WATCHTOWER_CLEANUP=true
-      - WATCHTOWER_INCLUDE_RESTARTING=true
-      - WATCHTOWER_NO_STARTUP_MESSAGE=true
-      - TZ=${TZ:-UTC}
+  # # Optional one-click updater. ENABLE WITH:
+  # #   docker compose --profile auto-update up -d
+  # # Without the `--profile` flag the sidecar isn't started and the dashboard
+  # # falls back to "click the GitHub link and run docker compose up -d".
+  # #
+  # # Security model:
+  # #   - watchtower is the ONLY container that touches /var/run/docker.sock.
+  # #     The main app calls watchtower over the internal docker network via
+  # #     an HTTP token; it never sees the socket itself, so a hypothetical
+  # #     RCE in the dashboard cannot escalate to host root.
+  # #   - WATCHTOWER_LABEL_ENABLE=true scopes operations to ONLY the labeled
+  # #     telegram-downloader container — watchtower can't sweep up
+  # #     unrelated apps even if it wanted to.
+  # #   - HTTP API requires WATCHTOWER_HTTP_API_TOKEN (random hex). Set this
+  # #     in .env BEFORE first boot of the profile; absence disables the
+  # #     dashboard button entirely.
+  # watchtower:
+  #   image: containrrr/watchtower:1.7.1
+  #   profiles: ["auto-update"]
+  #   container_name: telegram-downloader-updater
+  #   restart: unless-stopped
+  #   volumes:
+  #     - /var/run/docker.sock:/var/run/docker.sock:ro
+  #   environment:
+  #     - WATCHTOWER_HTTP_API_UPDATE=true
+  #     - WATCHTOWER_HTTP_API_TOKEN=${WATCHTOWER_HTTP_API_TOKEN:-}
+  #     - WATCHTOWER_HTTP_API_PERIODIC_POLLS=false
+  #     - WATCHTOWER_LABEL_ENABLE=true
+  #     - WATCHTOWER_CLEANUP=true
+  #     - WATCHTOWER_INCLUDE_RESTARTING=true
+  #     - WATCHTOWER_NO_STARTUP_MESSAGE=true
+  #     - TZ=${TZ:-UTC}
 
 # First-time setup:
 #   docker compose up -d

@@ -12,7 +12,7 @@
 
 import { api } from './api.js';
 import { t as i18nT, tf as i18nTf } from './i18n.js';
-import { showToast, escapeHtml } from './utils.js';
+import { showToast, escapeHtml, formatBytes } from './utils.js';
 import { ws } from './ws.js';
 import { confirmSheet, promptSheet, openSheet } from './sheet.js';
 import { openMediaViewerForReview } from './viewer.js';
@@ -1755,6 +1755,7 @@ function _personPhotoToViewerFile(tile) {
                   : fileType === 'audio'
                     ? 'audio'
                     : 'files';
+        const size = Number(meta.file_size) || 0;
         return {
             id: Number(meta.id) || 0,
             name: meta.file_name || '',
@@ -1762,8 +1763,11 @@ function _personPhotoToViewerFile(tile) {
             fullPath: filePath,
             type,
             file_type: fileType,
-            size: Number(meta.file_size) || 0,
-            sizeFormatted: '',
+            size,
+            sizeFormatted: size ? formatBytes(size) : '',
+            groupId: meta.group_id || null,
+            groupName: meta.group_name || '',
+            pinned: !!meta.pinned,
             modified: null,
         };
     } catch {
@@ -1783,6 +1787,9 @@ function _photoTile(row) {
             file_type: row.file_type || '',
             file_path: String(row.file_path || '').replace(/\\/g, '/'),
             file_size: Number(row.file_size) || 0,
+            group_id: row.group_id || null,
+            group_name: row.group_name || '',
+            pinned: !!row.pinned,
         }),
     );
 

@@ -6,6 +6,7 @@ import { getMediaUrl, getDownloadUrl } from './media-url.js';
 import { ws } from './ws.js';
 import { renderTextInto, renderCodeInto, renderMarkdownInto, langFromExt } from './viewer-text.js';
 import { renderArchiveInto } from './viewer-archive.js';
+import { api } from './api.js';
 
 // ---- Seekbar feature flag — lazy, module-scoped --------------------------
 //
@@ -391,14 +392,19 @@ async function _runReviewAction(action) {
         return;
     }
     if (outcome === 'remove-and-advance') {
-        const removed = state.files.splice(idx, 1);
+        // Remove by identity rather than by stale index: if a WS 'file_deleted'
+        // event arrived while the handler was awaited, state.files may have
+        // already been re-filtered and idx no longer points to `file`.
+        const prevLen = state.files.length;
+        state.files = state.files.filter((f) => f !== file);
+        const removed = prevLen > state.files.length ? [file] : [];
         if (!state.files.length) {
             closeMediaViewer();
             return;
         }
         const nextIdx = Math.min(idx, state.files.length - 1);
         openMediaViewer(nextIdx);
-        if (typeof action.afterRemove === 'function') {
+        if (typeof action.afterRemove === 'function' && removed.length) {
             try {
                 action.afterRemove(removed[0]);
             } catch {}
@@ -777,6 +783,7 @@ export function openMediaViewer(index) {
         .join(' • ');
     document.getElementById('modal-counter').textContent = `${index + 1} / ${state.files.length}`;
     document.getElementById('modal-download').href = downloadUrl;
+    _updatePinButton(file);
     _setTypeChip(file);
 
     modal.classList.remove('hidden');
@@ -838,6 +845,93 @@ function _escape(text) {
         .replace(/"/g, '&quot;')
         .replace(/'/g, '&#039;');
 }
+
+// ---- Viewer pin button ---------------------------------------------------
+
+let _pinBtnWired = false;
+
+/** Reflect `file.pinned` state onto the #modal-pin button. Hidden when the
+ *  file has no DB id (peer tiles that can't be locally pinned). */
+function _updatePinButton(file) {
+    const btn = document.getElementById('modal-pin');
+    if (!btn) return;
+    if (!file?.id) {
+        btn.classList.add('hidden');
+        return;
+    }
+    btn.classList.remove('hidden');
+    const pinned = !!file.pinned;
+    const ico = btn.querySelector('i');
+    const lbl = btn.querySelector('span');
+    if (ico) {
+        ico.className = pinned ? 'ri-pushpin-2-fill sm:mr-1.5' : 'ri-pushpin-2-line sm:mr-1.5';
+    }
+    if (lbl) lbl.textContent = pinned ? i18nT('favorites.unpin', 'Unpin') : i18nT('favorites.pin', 'Pin');
+    btn.title = pinned ? i18nT('favorites.unpin', 'Unpin') : i18nT('favorites.pin', 'Pin');
+    // Yellow tint when pinned — matches the selection-bar Pin button style.
+    btn.classList.toggle('text-yellow-300', pinned);
+    btn.classList.toggle('bg-yellow-500/20', pinned);
+    btn.classList.toggle('hover:bg-yellow-500/30', pinned);
+    btn.classList.toggle('text-tg-text', !pinned);
+    btn.classList.toggle('bg-tg-panel', !pinned);
+    btn.classList.toggle('hover:bg-tg-hover', !pinned);
+
+    if (_pinBtnWired) return;
+    _pinBtnWired = true;
+    btn.addEventListener('click', async () => {
+        const f = state.files?.[state.currentFileIndex];
+        if (!f?.id) return;
+        const next = !f.pinned;
+        try {
+            await api.post(`/api/downloads/${encodeURIComponent(f.id)}/pin`, { pinned: next });
+            f.pinned = next;
+            // Mirror state onto the matching gallery tile (if rendered).
+            const tile = document.querySelector(`.media-item[data-id="${f.id}"]`);
+            if (tile) {
+                tile.classList.toggle('is-pinned', next);
+                const chip = tile.querySelector('[data-tile-pin] i');
+                if (chip) {
+                    chip.classList.toggle('ri-pushpin-2-fill', next);
+                    chip.classList.toggle('ri-pushpin-2-line', !next);
+                }
+            }
+            _updatePinButton(f);
+        } catch (e) {
+            showToast(
+                i18nTf('viewer.pin.failed', { msg: e.message }, `Pin failed: ${e.message}`),
+                'error',
+            );
+        }
+    });
+}
+
+// Keep the pin button in sync when another tab/device toggles the pin.
+try {
+    ws.on('download_pinned', ({ id, pinned }) => {
+        const f = state.files?.find((x) => x.id === id);
+        if (f) {
+            f.pinned = pinned;
+            // If the viewer is open on this file, refresh the button.
+            if (state.files?.[state.currentFileIndex]?.id === id) {
+                _updatePinButton(f);
+            }
+            // Mirror onto gallery tile.
+            const tile = document.querySelector(`.media-item[data-id="${id}"]`);
+            if (tile) {
+                tile.classList.toggle('is-pinned', pinned);
+                const chip = tile.querySelector('[data-tile-pin] i');
+                if (chip) {
+                    chip.classList.toggle('ri-pushpin-2-fill', pinned);
+                    chip.classList.toggle('ri-pushpin-2-line', !pinned);
+                }
+            }
+        }
+    });
+} catch {
+    /* ws not available in tests */
+}
+
+// -------------------------------------------------------------------------
 
 let _prefetchLink = null;
 function prefetchNeighbor(nextIndex) {

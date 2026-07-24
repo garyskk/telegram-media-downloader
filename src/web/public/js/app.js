@@ -3788,10 +3788,20 @@ async function confirmDeleteFile() {
         return;
 
     try {
+        const deletedIdx = state.currentFileIndex;
         await api.delete(`/api/file?path=${encodeURIComponent(file.fullPath)}`);
-        state.files.splice(state.currentFileIndex, 1);
-        Viewer.closeMediaViewer();
+        // Remove by identity rather than by index: the WS 'file_deleted' event
+        // can arrive before the HTTP response (server broadcasts first) and
+        // pre-filter state.files, making state.currentFileIndex stale and
+        // causing splice() to remove the wrong file.
+        state.files = state.files.filter((f) => f !== file && f.fullPath !== file.fullPath);
         renderMediaGrid();
+        if (state.files.length > 0) {
+            // Advance to the next file, or step back when we were on the last one.
+            Viewer.openMediaViewer(Math.min(deletedIdx, state.files.length - 1));
+        } else {
+            Viewer.closeMediaViewer();
+        }
         showToast(i18nT('viewer.delete.success', 'File deleted'), 'success');
     } catch (e) {
         showToast(

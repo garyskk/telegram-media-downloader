@@ -262,11 +262,18 @@ async function _renameWithRetry(from, to, { retries = 6 } = {}) {
     }
 }
 
-async function _remuxInPlace(absPath) {
-    const tmp = absPath + '.faststart.tmp';
-    // Stream-copy both A and V, only rewrite container metadata. `-y`
-    // overwrites any stale .tmp left over from a prior crash.
-    await _runFfmpeg([
+// iPhone/QuickTime-originated MP4s often carry `mebx` "metadata binary"
+// data tracks (motion/exposure telemetry used for Cinematic mode /
+// stabilization — camera sensor data, not anything a player renders).
+// They show up as `codec_type=data, codec_tag_string=mebx` in ffprobe.
+// The MP4 muxer (unlike MOV) has no tag mapping for that data-track
+// type, so `-map 0` + `-f mp4` fails outright with "Could not find tag
+// for codec none in stream #N" and the file is left un-optimised
+// forever (retried on every sweep, always erroring the same way).
+// Dropping data streams (`-map -0:d`) is safe — they carry no audio/
+// video/subtitle payload — and unblocks the remux.
+function _ffmpegArgs(absPath, tmp, { dropData = false } = {}) {
+    const args = [
         '-hide_banner',
         '-loglevel',
         'error',
@@ -276,13 +283,34 @@ async function _remuxInPlace(absPath) {
         'copy',
         '-map',
         '0', // copy every stream (video + audio + subs + …)
+    ];
+    if (dropData) args.push('-map', '-0:d');
+    args.push(
         '-movflags',
         '+faststart',
         '-f',
         'mp4', // explicit muxer — `.tmp` defeats inference (same lesson as thumbs.js)
         '-y',
         tmp,
-    ]);
+    );
+    return args;
+}
+
+async function _remuxInPlace(absPath) {
+    const tmp = absPath + '.faststart.tmp';
+    // Stream-copy both A and V, only rewrite container metadata. `-y`
+    // overwrites any stale .tmp left over from a prior crash.
+    try {
+        await _runFfmpeg(_ffmpegArgs(absPath, tmp));
+    } catch (e) {
+        // Retry once, dropping data tracks — covers the `mebx`
+        // metadata-track case above without masking genuine remux
+        // failures (bad/truncated source, missing codec support, …).
+        if (!/Could not find tag for codec.*codec not currently supported/i.test(e?.message || '')) {
+            throw e;
+        }
+        await _runFfmpeg(_ffmpegArgs(absPath, tmp, { dropData: true }));
+    }
     if (!existsSync(tmp)) throw new Error('ffmpeg produced no output');
     // Sanity check: tmp must be within a reasonable range of the source.
     // Faststart is a lossless remux — the output can be slightly smaller
@@ -441,6 +469,7 @@ export async function optimizeAll(opts = {}) {
         .prepare(`
         SELECT COUNT(*) AS n FROM downloads
          WHERE file_type = 'video' AND file_path IS NOT NULL
+           AND (user_deleted IS NULL OR user_deleted = 0)
     `)
         .get().n;
     const PAGE_SIZE = 50;
@@ -448,6 +477,7 @@ export async function optimizeAll(opts = {}) {
     const pageStmt = db.prepare(`
         SELECT id FROM downloads
          WHERE file_type = 'video' AND file_path IS NOT NULL
+           AND (user_deleted IS NULL OR user_deleted = 0)
            AND id < ?
          ORDER BY id DESC
          LIMIT ?
@@ -523,6 +553,7 @@ export async function getStats() {
     const pageStmt = db.prepare(`
         SELECT id, file_path FROM downloads
          WHERE file_type = 'video' AND file_path IS NOT NULL
+           AND (user_deleted IS NULL OR user_deleted = 0)
            AND id < ?
          ORDER BY id DESC
          LIMIT ?

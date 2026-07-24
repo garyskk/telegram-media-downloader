@@ -179,7 +179,12 @@ export async function resolveConflict(conflictId, keep) {
                 } catch {
                     await fs.unlink(abs).catch(() => {});
                 }
-                getDb().prepare('DELETE FROM downloads WHERE id = ?').run(id);
+                // Mark as user_deleted=1 instead of hard-deleting so
+                // isDownloaded() still returns true and backfill does not
+                // re-fetch this file after the cluster dedup sweep.
+                getDb()
+                    .prepare('UPDATE downloads SET user_deleted = 1 WHERE id = ?')
+                    .run(id);
                 purgeThumbsForDownload(id).catch(() => {});
                 purgeSeekbarForDownload(id, seekbarRow || undefined).catch(() => {});
                 unlinked++;

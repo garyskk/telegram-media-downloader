@@ -4,7 +4,13 @@
 // event that leaves the DB referencing a path that no longer exists on
 // disk, the gallery should self-heal — no manual SQL, no SSH. We walk
 // every row, stat the file at row.file_path (relative to DOWNLOADS_DIR),
-// and delete the row if the file is missing or zero bytes.
+// and mark the row as user_deleted=1 if the file is missing or zero bytes.
+//
+// We intentionally do NOT hard-delete missing-file rows. Keeping the row
+// with user_deleted=1 means isDownloaded(groupId, messageId) still returns
+// true, so a subsequent backfill will not re-download a file the operator
+// has deliberately removed. Gallery queries already filter out user_deleted
+// rows, so stale entries never surface in the UI.
 //
 // Counterpart guards already in place:
 //   - downloader.js verifies file size after every fs.rename
@@ -30,9 +36,10 @@ let _broadcast = () => {};
 let _batchSize = 64;
 
 /**
- * Walk every row, stat each file, drop rows where the file is missing
- * or zero-bytes. Returns `{ scanned, pruned, sizeFixed }`. Concurrency-
- * guarded — a second call while the first is in-flight is a no-op.
+ * Walk every non-deleted row, stat each file, and mark rows as
+ * user_deleted=1 where the file is missing or zero-bytes. Returns
+ * `{ scanned, pruned, sizeFixed }`. Concurrency-guarded — a second call
+ * while the first is in-flight is a no-op.
  *
  * Optional `onProgress({ processed, total, stage, sizeFixed })` fires
  * after every batch so the verify-files admin page can render a
@@ -61,7 +68,11 @@ export async function sweep(onProgress) {
         // async stat checks that follow.
         const db = getDb();
         const total = db
-            .prepare(`SELECT COUNT(*) AS n FROM downloads WHERE file_path IS NOT NULL`)
+            .prepare(
+                `SELECT COUNT(*) AS n FROM downloads
+                  WHERE file_path IS NOT NULL
+                    AND (user_deleted IS NULL OR user_deleted = 0)`,
+            )
             .get().n;
         result.scanned = total;
         _emit({ processed: 0, total, stage: 'scanning' });
@@ -83,6 +94,7 @@ export async function sweep(onProgress) {
             `SELECT id, file_path, file_name, group_id, file_size
                FROM downloads
               WHERE file_path IS NOT NULL
+                AND (user_deleted IS NULL OR user_deleted = 0)
                 AND id < ?
               ORDER BY id DESC
               LIMIT ?`,
@@ -151,13 +163,17 @@ export async function sweep(onProgress) {
         if (deleteIds.length) {
             _emit({ processed, total, stage: 'pruning' });
             const seekbarMap = collectSeekbarPaths(deleteIds);
-            const DELETE_CHUNK = 500;
+            // Mark rows as user_deleted=1 instead of hard-deleting them.
+            // This keeps isDownloaded(groupId, messageId) returning true so
+            // a subsequent backfill does not re-fetch files the operator
+            // intentionally removed. Gallery queries already filter these rows.
+            const UPDATE_CHUNK = 500;
             const tx = getDb().transaction((ids) => {
                 let changed = 0;
-                for (let i = 0; i < ids.length; i += DELETE_CHUNK) {
-                    const slice = ids.slice(i, i + DELETE_CHUNK);
+                for (let i = 0; i < ids.length; i += UPDATE_CHUNK) {
+                    const slice = ids.slice(i, i + UPDATE_CHUNK);
                     const stmt = getDb().prepare(
-                        `DELETE FROM downloads WHERE id IN (${slice.map(() => '?').join(',')})`,
+                        `UPDATE downloads SET user_deleted = 1 WHERE id IN (${slice.map(() => '?').join(',')})`,
                     );
                     changed += stmt.run(...slice).changes;
                 }

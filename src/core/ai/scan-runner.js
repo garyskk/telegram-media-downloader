@@ -218,13 +218,14 @@ export function startFacesScan(cfg, onProgress, onDone, onLog) {
                     SELECT COUNT(*) AS n FROM downloads
                      WHERE file_type IN (${fileTypes.map(() => '?').join(',')})
                        AND ai_indexed_at IS NULL
+                       AND (user_deleted IS NULL OR user_deleted = 0)
                 `)
                 .get(...fileTypes).n;
             const scanVideos = facesCfgIn.scanVideos === true;
             const videoTotal = scanVideos
                 ? db
                       .prepare(
-                          `SELECT COUNT(*) AS n FROM downloads WHERE file_type = 'video' AND ai_indexed_at IS NULL`,
+                          `SELECT COUNT(*) AS n FROM downloads WHERE file_type = 'video' AND ai_indexed_at IS NULL AND (user_deleted IS NULL OR user_deleted = 0)`,
                       )
                       .get().n
                 : 0;

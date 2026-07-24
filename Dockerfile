@@ -11,6 +11,12 @@
 
 FROM node:24.16.0-bookworm-slim AS deps
 WORKDIR /app
+# `websocket` (gramJS/telegram) depends on `bufferutil`, which compiles via
+# node-gyp when no prebuilt binary exists (common on linux/arm64 + Node 24).
+# Install build tooling in this stage only — the runtime image stays slim.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3 make g++ \
+    && rm -rf /var/lib/apt/lists/*
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --no-audit --no-fund
 
@@ -51,7 +57,8 @@ ENV NODE_ENV=production \
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         tini gosu ffmpeg procps \
-        intel-media-va-driver i965-va-driver vainfo \
+        # intel-media-va-driver i965-va-driver vainfo \
+        vainfo \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

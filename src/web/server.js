@@ -80,6 +80,7 @@ import * as integrity from '../core/integrity.js';
 import {
     findDuplicates as dedupFindDuplicates,
     deleteByIds as dedupDeleteByIds,
+    getDuplicateSets as dedupGetSets,
 } from '../core/dedup.js';
 import {
     ensureShareSecret,
@@ -4361,6 +4362,7 @@ app.get('/api/downloads', async (req, res) => {
                    COUNT(*) as count,
                    SUM(file_size) as size
               FROM downloads
+             WHERE (user_deleted IS NULL OR user_deleted = 0)
              GROUP BY group_id
         `)
             .all();
@@ -5097,18 +5099,23 @@ app.delete('/api/file', async (req, res) => {
         }
         console.log(`🗑️ Deleted: ${filePath}`);
 
-        // Remove from DB (by basename — the DB stores filenames, not paths).
+        // Mark as user-deleted rather than removing the DB row. Keeping the
+        // row means isDownloaded(groupId, messageId) still returns true, so
+        // backfill won't re-download this file from Telegram. Gallery queries
+        // filter out user_deleted rows so the file won't reappear in the UI.
         // Capture matching ids first so we can wipe their cached thumbnails;
         // a stale thumb pointing at a deleted file would otherwise serve
         // bytes from cache until the next "Rebuild thumbnails".
         const db = getDb();
         const fileName = path.basename(r.real);
-        const matchingIds = db
-            .prepare('SELECT id FROM downloads WHERE file_name = ?')
-            .all(fileName)
-            .map((row) => row.id);
+        const matchingRows = db
+            .prepare('SELECT id, file_size FROM downloads WHERE file_name = ?')
+            .all(fileName);
+        const matchingIds = matchingRows.map((row) => row.id);
+        const freedBytes = matchingRows.reduce((s, row) => s + (Number(row.file_size) || 0), 0);
         const seekbarMap = collectSeekbarPaths(matchingIds);
-        db.prepare('DELETE FROM downloads WHERE file_name = ?').run(fileName);
+        db.prepare('UPDATE downloads SET user_deleted = 1 WHERE file_name = ?').run(fileName);
+        runtime.decrementDiskUsage(freedBytes);
         for (const id of matchingIds) {
             try {
                 await purgeThumbsForDownload(id);
@@ -5122,8 +5129,8 @@ app.delete('/api/file', async (req, res) => {
         } catch {}
         import('../core/deferred-delete.js').then((m) => m.startDrain()).catch(() => {});
 
-        broadcast({ type: 'file_deleted', path: filePath });
         res.json({ success: true });
+        broadcast({ type: 'file_deleted', path: filePath });
     } catch (error) {
         if (error.code === 'ENOENT') return res.status(404).json({ error: 'File not found' });
         console.error('DELETE /api/file:', error);
@@ -5965,7 +5972,10 @@ app.post('/api/maintenance/reindex', async (req, res) => {
 
 app.get('/api/maintenance/reindex/status', async (req, res) => {
     const snap = _jobTrackers.reindex.getStatus();
-    res.json({ ...snap, ...(snap.progress || {}) });
+    // Authoritative snapshot fields must win over stale leftovers in
+    // `progress` from a finished run — see dedup/status for the bug this
+    // ordering prevents.
+    res.json({ ...(snap.progress || {}), ...snap });
 });
 
 app.get('/api/maintenance/reindex/stats', async (req, res) => {
@@ -6044,10 +6054,23 @@ app.get('/api/maintenance/db/vacuum/status', async (req, res) => {
 app.post('/api/maintenance/dedup/scan', async (req, res) => {
     const tracker = _jobTrackers.dedupScan;
     const r = tracker.tryStart(async ({ onProgress, signal }) => {
-        const result = await dedupFindDuplicates({
-            onProgress: (p) => onProgress({ ...p, running: true }),
-            signal,
-        });
+        // Safety net: auto-abort if the scan runs longer than the configured
+        // ceiling. Prevents a permanently stuck scan (e.g. NFS hang during
+        // hash, worker deadlock) from keeping the UI in "Scanning…" forever.
+        // The hash-level timeout (DEDUP_HASH_TIMEOUT_MS) covers individual
+        // slow files; this covers the whole-scan worst case.
+        const MAX_SCAN_MS =
+            parseInt(process.env.DEDUP_MAX_SCAN_MS, 10) || 30 * 60 * 1000; // 30 min
+        const autoAbortTimer = setTimeout(() => tracker.cancel(), MAX_SCAN_MS);
+        let result;
+        try {
+            result = await dedupFindDuplicates({
+                onProgress,
+                signal,
+            });
+        } finally {
+            clearTimeout(autoAbortTimer);
+        }
         // Persist a small summary so a server restart still surfaces
         // "Last scan: 2 h ago — N duplicates" on the duplicates page
         // without having to recompute. The full duplicate-sets payload
@@ -6125,20 +6148,58 @@ app.post('/api/maintenance/dedup/scan', async (req, res) => {
 // accumulated. Returns instantly; the caller doesn't need to wait for the
 // scan to wind down (it's typically one-file-latency, i.e. milliseconds).
 app.post('/api/maintenance/dedup/scan/stop', (req, res) => {
-    const wasRunning = _jobTrackers.dedupScan.cancel();
+    const tracker = _jobTrackers.dedupScan;
+    const wasRunning = tracker.cancel();
+    // If the scan was in flight, give the runFn 30 s to honour the abort
+    // signal before force-resetting the tracker. This unblocks the UI even
+    // when a per-file hash is hanging and hasn't hit its own timeout yet.
+    // The runFn continues running in the background (we can't kill async
+    // work mid-flight), but the tracker is free for new scans.
+    if (wasRunning) {
+        const FORCE_RESET_MS =
+            parseInt(process.env.DEDUP_STOP_FORCE_RESET_MS, 10) || 30_000;
+        setTimeout(() => tracker.forceReset(), FORCE_RESET_MS);
+    }
     res.json({ stopped: true, wasRunning });
 });
 
 app.get('/api/maintenance/dedup/status', async (req, res) => {
     const snap = _jobTrackers.dedupScan.getStatus();
-    // Re-attach the non-enumerable duplicateSets so the frontend can
-    // pull the full result via this endpoint (the WS done event strips
-    // it to avoid multi-MB frames).
-    const out = { ...snap, ...(snap.progress || {}) };
-    if (snap.result && !out.result?.duplicateSets && snap.result.duplicateSets) {
+    // Flatten progress fields (processed/total/stage/etc.) onto the top
+    // level for legacy consumers, but authoritative snapshot fields
+    // (running, stage, error, ...) must always win over anything left
+    // behind in `progress` from a prior run — `progress` is only reset
+    // when a NEW run starts, so a stale `{running:true}` merged into it
+    // by a previous run's onProgress callback would otherwise leak
+    // "running" forever after the scan has actually finished.
+    const out = { ...(snap.progress || {}), ...snap };
+    // `duplicateSets` is stored as a non-enumerable property on snap.result so
+    // that JSON.stringify (used by WS broadcast) skips it and avoids multi-MB
+    // frames. But `res.json` also uses JSON.stringify, so we must explicitly
+    // re-attach it as an enumerable own property before serialising.
+    // The old guard `!out.result?.duplicateSets` was wrong: non-enumerable
+    // properties ARE reachable via direct access, so the guard always evaluated
+    // to false and the block never ran.
+    if (snap.result?.duplicateSets) {
         out.result = { ...snap.result, duplicateSets: snap.result.duplicateSets };
     }
     res.json(out);
+});
+
+// Reconstruct the current duplicate sets from the DB without re-hashing.
+// All files hashed by a previous scan have their SHA-256 stored in
+// `downloads.file_hash`. This endpoint skips the expensive hash pass and
+// goes straight to the GROUP BY + file-detail build, returning in
+// milliseconds. Used by the frontend to restore the duplicate list after a
+// server restart (when the in-memory JobTracker result has been cleared but
+// the stats KV entry confirms a completed scan exists).
+app.get('/api/maintenance/dedup/sets', async (req, res) => {
+    try {
+        const result = await dedupGetSets();
+        res.json(result);
+    } catch (e) {
+        res.status(500).json({ error: e?.message || String(e) });
+    }
 });
 
 // Library hash-coverage stats — total rows, how many already have a SHA-256
@@ -6151,9 +6212,9 @@ app.get('/api/maintenance/dedup/status', async (req, res) => {
 app.get('/api/maintenance/dedup/stats', async (req, res) => {
     try {
         const db = getDb();
-        const totalFiles = db.prepare('SELECT COUNT(*) AS n FROM downloads').get().n || 0;
+        const totalFiles = db.prepare('SELECT COUNT(*) AS n FROM downloads WHERE (user_deleted IS NULL OR user_deleted = 0)').get().n || 0;
         const hashed =
-            db.prepare('SELECT COUNT(*) AS n FROM downloads WHERE file_hash IS NOT NULL').get().n ||
+            db.prepare('SELECT COUNT(*) AS n FROM downloads WHERE file_hash IS NOT NULL AND (user_deleted IS NULL OR user_deleted = 0)').get().n ||
             0;
         // Same predicate the dedup scanner uses to decide what to hash —
         // mirrors src/core/dedup.js findDuplicates() so the "Awaiting hash"
@@ -6165,6 +6226,7 @@ app.get('/api/maintenance/dedup/stats', async (req, res) => {
                  WHERE file_hash IS NULL
                    AND file_path IS NOT NULL
                    AND COALESCE(file_size, 0) > 0
+                   AND (user_deleted IS NULL OR user_deleted = 0)
             `)
                 .get().n || 0;
         let lastScan = null;
@@ -6480,7 +6542,10 @@ app.post('/api/maintenance/thumbs/build/cancel', async (req, res) => {
 
 app.get('/api/maintenance/thumbs/build/status', async (req, res) => {
     const snap = _jobTrackers.thumbsBuild.getStatus();
-    res.json({ ...snap, ...(snap.progress || {}) });
+    // Authoritative snapshot fields must win over stale leftovers in
+    // `progress` from a finished run — see dedup/status for the bug this
+    // ordering prevents.
+    res.json({ ...(snap.progress || {}), ...snap });
 });
 
 app.get('/api/maintenance/thumbs/build/stats', async (req, res) => {
@@ -6516,7 +6581,7 @@ app.get('/api/maintenance/thumbs/list', async (req, res) => {
         // `file_path IS NOT NULL` matches what `buildAllThumbnails` walks —
         // hides rows whose files were deleted but whose DB entries linger,
         // so the gallery doesn't paint tiles that will only ever 404.
-        let where = `file_type IN (${placeholders}) AND file_path IS NOT NULL`;
+        let where = `file_type IN (${placeholders}) AND file_path IS NOT NULL AND (user_deleted IS NULL OR user_deleted = 0)`;
         if (cursor !== null) {
             where += ' AND id < ?';
             args.push(cursor);
@@ -6551,7 +6616,7 @@ app.get('/api/maintenance/thumbs/list', async (req, res) => {
                 db
                     .prepare(
                         `SELECT COUNT(*) AS c FROM downloads
-                     WHERE file_type IN (${placeholders}) AND file_path IS NOT NULL`,
+                     WHERE file_type IN (${placeholders}) AND file_path IS NOT NULL AND (user_deleted IS NULL OR user_deleted = 0)`,
                     )
                     .get(...types).c || 0;
         }
@@ -6730,6 +6795,7 @@ app.get('/api/maintenance/seekbar/list', async (req, res) => {
                         s.format, s.generated_at, d.file_name
                    FROM seekbar_sprites s
                    JOIN downloads d ON d.id = s.download_id
+                  WHERE (d.user_deleted IS NULL OR d.user_deleted = 0)
                   ORDER BY s.generated_at DESC
                   LIMIT ? OFFSET ?`,
             )
@@ -6912,7 +6978,10 @@ app.post('/api/maintenance/faststart/scan', async (req, res) => {
 
 app.get('/api/maintenance/faststart/status', async (req, res) => {
     const snap = _jobTrackers.faststart.getStatus();
-    res.json({ ...snap, ...(snap.progress || {}) });
+    // Authoritative snapshot fields must win over stale leftovers in
+    // `progress` from a finished run — see dedup/status for the bug this
+    // ordering prevents.
+    res.json({ ...(snap.progress || {}), ...snap });
 });
 
 app.get('/api/maintenance/faststart/stats', async (req, res) => {
@@ -8319,10 +8388,26 @@ app.get('/api/ai/group-by-person', async (req, res) => {
         const limit = Math.max(1, Math.min(200, Number(req.query?.limit) || 50));
         const rows = aiGetDb()
             .prepare(`
-                SELECT p.id, p.label, p.face_count,
-                       (SELECT f.download_id FROM faces f WHERE f.person_id = p.id LIMIT 1) AS cover_download_id
+                SELECT p.id, p.label,
+                       COALESCE((
+                           SELECT COUNT(*) FROM faces fl
+                            JOIN downloads dl ON dl.id = fl.download_id
+                           WHERE fl.person_id = p.id
+                             AND (dl.user_deleted IS NULL OR dl.user_deleted = 0)
+                       ), 0) AS face_count,
+                       (SELECT f.download_id FROM faces f
+                          JOIN downloads d ON d.id = f.download_id
+                         WHERE f.person_id = p.id
+                           AND (d.user_deleted IS NULL OR d.user_deleted = 0)
+                         LIMIT 1) AS cover_download_id
                   FROM people p
-                 ORDER BY p.face_count DESC, p.id ASC
+                 WHERE (
+                       SELECT COUNT(*) FROM faces fex
+                        JOIN downloads dex ON dex.id = fex.download_id
+                       WHERE fex.person_id = p.id
+                         AND (dex.user_deleted IS NULL OR dex.user_deleted = 0)
+                 ) > 0
+                 ORDER BY face_count DESC, p.id ASC
                  LIMIT ?
             `)
             .all(limit);
@@ -8386,6 +8471,7 @@ app.get('/api/ai/person/:id/face', async (req, res) => {
                    FROM faces f
                    JOIN downloads d ON d.id = f.download_id
                   WHERE f.person_id = ?
+                    AND (d.user_deleted IS NULL OR d.user_deleted = 0)
                   ORDER BY CASE WHEN d.file_type = 'photo' THEN 0 ELSE 1 END,
                            COALESCE(f.quality_score, 0) DESC, f.w * f.h DESC
                   LIMIT 1`,
@@ -8441,7 +8527,8 @@ app.get('/api/ai/faces/:id/crop', async (req, res) => {
                 `SELECT f.x, f.y, f.w, f.h, d.file_path
                    FROM faces f
                    JOIN downloads d ON d.id = f.download_id
-                  WHERE f.id = ?`,
+                  WHERE f.id = ?
+                    AND (d.user_deleted IS NULL OR d.user_deleted = 0)`,
             )
             .get(faceId);
         if (!row) return res.status(404).json({ error: 'face not found' });
@@ -9238,6 +9325,7 @@ app.get('/api/maintenance/recovery/list', async (req, res) => {
                 .prepare(`
                     SELECT group_id, COUNT(*) AS files, MAX(created_at) AS lastSeen
                       FROM downloads
+                     WHERE (user_deleted IS NULL OR user_deleted = 0)
                      GROUP BY group_id
                 `)
                 .all();
@@ -9975,6 +10063,7 @@ app.get('/api/cluster/downloads', (req, res) => {
                     `SELECT id, group_id, group_name, message_id, file_name, file_size,
                             file_type, file_path, file_hash, status, created_at, nsfw_score
                        FROM downloads
+                      WHERE (user_deleted IS NULL OR user_deleted = 0)
                       ORDER BY id DESC LIMIT ? OFFSET ?`,
                 )
                 .all(limit, offset);
@@ -10292,7 +10381,10 @@ app.post('/api/cluster/files/delete', async (req, res) => {
         const seekbarRow = getDb()
             .prepare('SELECT sprite_path, meta_path FROM seekbar_sprites WHERE download_id = ?')
             .get(Number(row.id));
-        getDb().prepare('DELETE FROM downloads WHERE id = ?').run(Number(row.id));
+        // Mark as user_deleted=1 instead of hard-deleting so isDownloaded()
+        // still returns true and backfill does not re-fetch this file.
+        getDb().prepare('UPDATE downloads SET user_deleted = 1 WHERE id = ?').run(Number(row.id));
+        if (freedBytes > 0) runtime.decrementDiskUsage(freedBytes);
         purgeThumbsForDownload(row.id).catch(() => {});
         purgeSeekbarForDownload(row.id, seekbarRow || undefined).catch(() => {});
         try {
@@ -10333,7 +10425,8 @@ app.get('/api/cluster/search/peer', (req, res) => {
                 `SELECT id, group_id, group_name, message_id, file_name, file_size, file_type,
                         file_path, file_hash, status, created_at, nsfw_score
                    FROM downloads
-                  WHERE file_name LIKE ? ESCAPE '\\' OR group_name LIKE ? ESCAPE '\\'
+                  WHERE (file_name LIKE ? ESCAPE '\\' OR group_name LIKE ? ESCAPE '\\')
+                    AND (user_deleted IS NULL OR user_deleted = 0)
                   ORDER BY created_at DESC
                   LIMIT ?`,
             )
@@ -10357,7 +10450,8 @@ app.get('/api/cluster/search', async (req, res) => {
                 `SELECT id, group_id, group_name, message_id, file_name, file_size, file_type,
                         file_path, file_hash, status, created_at, nsfw_score
                    FROM downloads
-                  WHERE file_name LIKE ? ESCAPE '\\' OR group_name LIKE ? ESCAPE '\\'
+                  WHERE (file_name LIKE ? ESCAPE '\\' OR group_name LIKE ? ESCAPE '\\')
+                    AND (user_deleted IS NULL OR user_deleted = 0)
                   ORDER BY created_at DESC LIMIT ?`,
             )
             .all(like, like, limit);
@@ -10438,7 +10532,7 @@ app.get('/api/cluster/stats', async (_req, res) => {
         const localBytes = (() => {
             try {
                 return getDb()
-                    .prepare('SELECT COALESCE(SUM(file_size),0) AS n FROM downloads')
+                    .prepare('SELECT COALESCE(SUM(file_size),0) AS n FROM downloads WHERE (user_deleted IS NULL OR user_deleted = 0)')
                     .get().n;
             } catch {
                 return 0;
@@ -10590,9 +10684,11 @@ app.post('/api/share/links', async (req, res) => {
         if (!Number.isInteger(did) || did <= 0) {
             return res.status(400).json({ error: 'downloadId required' });
         }
-        // Confirm the download row exists — otherwise the link would
-        // perpetually 404, and we'd be storing useless rows.
-        const exists = getDb().prepare('SELECT id FROM downloads WHERE id = ?').get(did);
+        // Confirm the download row exists and is not soft-deleted — otherwise
+        // the link would perpetually 404, and we'd be storing useless rows.
+        const exists = getDb()
+            .prepare('SELECT id FROM downloads WHERE id = ? AND (user_deleted IS NULL OR user_deleted = 0)')
+            .get(did);
         if (!exists) return res.status(404).json({ error: 'Download not found' });
 
         // Pass through whatever the caller sent (including null/undefined).
@@ -12078,8 +12174,14 @@ app.use('/files', async (req, res, next) => {
                             .map((r) => r.id);
                         if (!matchIds.length) return;
                         const seekbarMap = collectSeekbarPaths(matchIds);
+                        // Mark as user_deleted=1 instead of hard-deleting. Keeping
+                        // the row means isDownloaded() still returns true, so a
+                        // subsequent backfill will not re-download this file.
+                        // Gallery queries already filter out user_deleted rows.
                         const result = db
-                            .prepare(`DELETE FROM downloads WHERE file_path = ? OR file_path = ?`)
+                            .prepare(
+                                `UPDATE downloads SET user_deleted = 1 WHERE file_path = ? OR file_path = ?`,
+                            )
                             .run(fwd, bwd);
                         if (result.changes > 0) {
                             for (const id of matchIds) {

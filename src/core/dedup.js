@@ -48,6 +48,28 @@ function resolveStoredPath(stored) {
     return null;
 }
 
+// Per-file hash timeout. If a file's read stream stalls (unresponsive
+// NFS/FUSE mount, broken bind-mount, locked pipe), the scan would hang
+// indefinitely without this guard. The stuck worker thread eventually
+// frees itself when the OS unblocks the read — the race just lets the
+// scan skip the file and mark it as errored rather than blocking forever.
+// Value is intentionally generous (5 min) to accommodate multi-GB files
+// on slow disks, but overridable for constrained environments.
+const HASH_TIMEOUT_MS =
+    parseInt(process.env.DEDUP_HASH_TIMEOUT_MS, 10) || 5 * 60 * 1000;
+
+function _raceTimeout(promise) {
+    return Promise.race([
+        promise,
+        new Promise((_, reject) =>
+            setTimeout(
+                () => reject(new Error(`hash timed out after ${HASH_TIMEOUT_MS}ms`)),
+                HASH_TIMEOUT_MS,
+            ),
+        ),
+    ]);
+}
+
 // Wrap the canonical helper so existing call sites in this file keep
 // the same name. Hashing semantics are owned by `core/checksum.js`.
 // Catch-up dedup hashes thousands of multi-MB files in a row — route
@@ -55,9 +77,9 @@ function resolveStoredPath(stored) {
 // loop for the full duration.
 async function hashFile(absPath) {
     try {
-        return await sha256OfFileViaPool(absPath);
+        return await _raceTimeout(sha256OfFileViaPool(absPath));
     } catch {
-        return await sha256OfFile(absPath);
+        return await _raceTimeout(sha256OfFile(absPath));
     }
 }
 
@@ -97,6 +119,7 @@ export async function findDuplicates(opts = {}) {
          WHERE file_hash IS NULL
            AND file_path IS NOT NULL
            AND COALESCE(file_size, 0) > 0
+           AND (user_deleted IS NULL OR user_deleted = 0)
     `)
         .get().n;
 
@@ -117,6 +140,7 @@ export async function findDuplicates(opts = {}) {
          WHERE file_hash IS NULL
            AND file_path IS NOT NULL
            AND COALESCE(file_size, 0) > 0
+           AND (user_deleted IS NULL OR user_deleted = 0)
            AND id < ?
          ORDER BY id DESC
          LIMIT ?
@@ -154,7 +178,11 @@ export async function findDuplicates(opts = {}) {
     // grouping 5000 distinct hashes per page. Each page blocks ~10-50ms
     // instead of the old single-query approach that blocked 3-15s on 1M rows.
     const totalHashes = db
-        .prepare('SELECT COUNT(DISTINCT file_hash) AS n FROM downloads WHERE file_hash IS NOT NULL')
+        .prepare(
+            `SELECT COUNT(DISTINCT file_hash) AS n FROM downloads
+              WHERE file_hash IS NOT NULL
+                AND (user_deleted IS NULL OR user_deleted = 0)`,
+        )
         .get().n;
     if (onProgress)
         onProgress({ stage: 'grouping', processed: 0, total: totalHashes, hashed, errored });
@@ -171,6 +199,7 @@ export async function findDuplicates(opts = {}) {
                MAX(file_size) AS max_size
           FROM downloads
          WHERE file_hash IS NOT NULL
+           AND (user_deleted IS NULL OR user_deleted = 0)
            AND file_hash > ?
          GROUP BY file_hash
          ORDER BY file_hash ASC
@@ -211,6 +240,7 @@ export async function findDuplicates(opts = {}) {
                file_type, created_at
           FROM downloads
          WHERE file_hash = ?
+           AND (user_deleted IS NULL OR user_deleted = 0)
          ORDER BY created_at ASC, id ASC
     `);
     const SETS_BATCH = 25;
@@ -254,6 +284,92 @@ export async function findDuplicates(opts = {}) {
         errored,
         duplicateSets: sets,
     };
+}
+
+/**
+ * Read the current duplicate sets directly from the DB without re-hashing.
+ *
+ * All files hashed by a previous `findDuplicates()` run have their SHA-256
+ * stored in `downloads.file_hash`. This function skips the expensive hash
+ * pass (stage 1) and goes straight to the GROUP BY + file-detail build
+ * (stages 2-3), so it returns in milliseconds even on a large library.
+ *
+ * Intended for the "recover after server restart" path: stats survive a
+ * restart (persisted to KV) but the in-memory sets do not. Calling this
+ * endpoint lets the UI restore the duplicate list without asking the user
+ * to re-run the full scan.
+ *
+ * @returns {Promise<{ duplicateSets: Array<{hash:string, fileSize:number, count:number, files:Array}> }>}
+ */
+export async function getDuplicateSets() {
+    const db = getDb();
+
+    const totalHashes = db
+        .prepare(
+            `SELECT COUNT(DISTINCT file_hash) AS n FROM downloads
+              WHERE file_hash IS NOT NULL
+                AND (user_deleted IS NULL OR user_deleted = 0)`,
+        )
+        .get().n;
+
+    const HASH_PAGE = 5000;
+    const allDupes = [];
+    let afterHash = '';
+
+    const groupStmt = db.prepare(`
+        SELECT file_hash AS hash,
+               COUNT(*)  AS cnt,
+               MAX(file_size) AS max_size
+          FROM downloads
+         WHERE file_hash IS NOT NULL
+           AND (user_deleted IS NULL OR user_deleted = 0)
+           AND file_hash > ?
+         GROUP BY file_hash
+         ORDER BY file_hash ASC
+         LIMIT ?
+    `);
+
+    while (true) {
+        const page = groupStmt.all(afterHash, HASH_PAGE);
+        if (!page.length) break;
+        for (const row of page) {
+            if (row.cnt > 1) allDupes.push(row);
+        }
+        afterHash = page[page.length - 1].hash;
+        await new Promise((r) => setImmediate(r));
+        if (page.length < HASH_PAGE) break;
+    }
+
+    allDupes.sort((a, b) => b.max_size * (b.cnt - 1) - a.max_size * (a.cnt - 1) || b.cnt - a.cnt);
+
+    const filesQ = db.prepare(`
+        SELECT id, group_id, group_name, file_name, file_path, file_size,
+               file_type, created_at
+          FROM downloads
+         WHERE file_hash = ?
+           AND (user_deleted IS NULL OR user_deleted = 0)
+         ORDER BY created_at ASC, id ASC
+    `);
+
+    const sets = [];
+    const SETS_BATCH = 25;
+    for (let i = 0; i < allDupes.length; i++) {
+        const d = allDupes[i];
+        const files = filesQ.all(d.hash).map((r) => ({
+            id: r.id,
+            groupId: r.group_id,
+            groupName: r.group_name,
+            fileName: r.file_name,
+            filePath: r.file_path,
+            fileSize: r.file_size,
+            fileType: r.file_type,
+            createdAt: r.created_at,
+        }));
+        sets.push({ hash: d.hash, fileSize: d.max_size || 0, count: d.cnt, files });
+        if ((i + 1) % SETS_BATCH === 0) await new Promise((r) => setImmediate(r));
+    }
+
+    return { duplicateSets: sets };
 }
 
 /**
@@ -305,11 +421,18 @@ export function deleteByIds(ids) {
         }
     }
 
+    // Mark as user_deleted=1 instead of hard-deleting. The on-disk file is
+    // already queued for removal by deferDelete above. Keeping the row means
+    // isDownloaded(groupId, messageId) still returns true, so a subsequent
+    // backfill will not re-download files the operator removed via dedup.
+    // Gallery queries already filter out user_deleted rows.
     let removed = 0;
     for (let i = 0; i < idsToDrop.length; i += SQL_IN_CHUNK) {
         const slice = idsToDrop.slice(i, i + SQL_IN_CHUNK);
         const ph = slice.map(() => '?').join(',');
-        const r = db.prepare(`DELETE FROM downloads WHERE id IN (${ph})`).run(...slice);
+        const r = db
+            .prepare(`UPDATE downloads SET user_deleted = 1 WHERE id IN (${ph})`)
+            .run(...slice);
         removed += r.changes;
     }
     return { removed, freedBytes: freed, missingFiles: missing };

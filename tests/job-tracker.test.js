@@ -78,6 +78,35 @@ describe('createJobTracker', () => {
         expect(t.isRunning()).toBe(false);
     });
 
+    // Regression test for a bug where the dedup scan route's onProgress
+    // wrapper attached `running: true` to every progress tick (to expose
+    // it on the flattened WS payload). That value got folded into
+    // `_state.progress` and, unlike `_state.running`, was never cleared
+    // when the run finished — so a status endpoint that flattens
+    // `{...snap, ...snap.progress}` (server.js's dedup/reindex/thumbs/
+    // faststart status routes) would report `running: true` forever
+    // after the very first completed run, including on a brand-new
+    // client's first status check. Guard the tracker's own contract:
+    // `progress` must not leak stale fields past a completed run.
+    it('clears accumulated progress fields once a run finishes, even if runFn injects a `running` key', async () => {
+        const t = createJobTracker({ kind: 'leaky', broadcast: () => {} });
+        t.tryStart(async ({ onProgress }) => {
+            // Mirrors server.js's `onProgress: (p) => onProgress({ ...p, running: true })`.
+            onProgress({ stage: 'working', processed: 1, total: 1, running: true });
+            return { done: true };
+        });
+        await flushAsync(10);
+        const s = t.getStatus();
+        expect(s.running).toBe(false);
+        // The bug: this would previously still be `true`, left over from
+        // the last onProgress payload merged into `_state.progress`.
+        expect(s.progress.running).toBeUndefined();
+        // Simulate the server.js status-endpoint merge pattern that a
+        // fresh page load / hub card hits — must not resurrect `running`.
+        const flattened = { ...(s.progress || {}), ...s };
+        expect(flattened.running).toBe(false);
+    });
+
     it('subsequent tryStart works after a previous run completed', async () => {
         const t = createJobTracker({ kind: 'reusable', broadcast: () => {} });
         t.tryStart(async () => ({ run: 1 }));

@@ -18,6 +18,7 @@ import {
     pushQueueBacklog,
     popQueueBacklog,
     queueBacklogSize,
+    getTotalSizeBytes,
 } from './db.js';
 import { sha256OfFile, sha256OfFileViaPool } from './checksum.js';
 import { pregenerateThumb } from './thumbs.js';
@@ -698,9 +699,10 @@ export class DownloadManager extends EventEmitter {
         const maxRetries = this.config.download?.retries || 5;
 
         try {
-            // 1. Check Disk Quota
+            // 1. Check Disk Quota — use a live DB sum (excludes user_deleted rows)
+            // rather than the filesystem cache which is never decremented on deletion.
             if (this.config.diskManagement?.maxTotalSize) {
-                const usage = await this.getDiskUsage();
+                const usage = getTotalSizeBytes();
                 const limit = this.parseSize(this.config.diskManagement.maxTotalSize);
                 if (usage > limit) {
                     throw new Error(`Disk Quota Exceeded: ${usage} / ${limit} bytes`);
@@ -1269,6 +1271,13 @@ export class DownloadManager extends EventEmitter {
     incrementDiskUsage(bytes) {
         if (!this._diskUsageCache) this._diskUsageCache = { size: 0, timestamp: Date.now() };
         this._diskUsageCache.size += bytes;
+        if (this._saveTimeout) clearTimeout(this._saveTimeout);
+        this._saveTimeout = setTimeout(() => this.saveDiskUsageCache(), 10000);
+    }
+
+    decrementDiskUsage(bytes) {
+        if (!this._diskUsageCache) return;
+        this._diskUsageCache.size = Math.max(0, this._diskUsageCache.size - bytes);
         if (this._saveTimeout) clearTimeout(this._saveTimeout);
         this._saveTimeout = setTimeout(() => this.saveDiskUsageCache(), 10000);
     }
