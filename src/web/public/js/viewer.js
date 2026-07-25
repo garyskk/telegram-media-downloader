@@ -137,7 +137,7 @@ async function _fetchFaces(downloadId) {
     }
 }
 
-function _renderFaceOverlay(faces) {
+function _renderFaceOverlay(faces, highlightFaceId) {
     const layer = document.getElementById('face-overlay-layer');
     const toolbar = document.getElementById('face-toolbar');
     const countEl = document.getElementById('face-count');
@@ -157,6 +157,7 @@ function _renderFaceOverlay(faces) {
     _positionFaceLayerToImage(layer, img);
     const naturalW = img.naturalWidth;
     const naturalH = img.naturalHeight;
+    const highlightId = Number(highlightFaceId) || null;
     let html = '';
     for (const f of faces) {
         const x = (Number(f.x) / naturalW) * 100;
@@ -169,8 +170,15 @@ function _renderFaceOverlay(faces) {
             : f.person_id
               ? `#${f.person_id}`
               : i18nT('viewer.faces.unlabeled', 'Unlabeled');
-        const cls = f.person_label || f.person_id ? 'face-label' : 'face-label unlabeled';
-        html += `<div class="face-box" style="left:${x.toFixed(3)}%;top:${y.toFixed(3)}%;width:${w.toFixed(3)}%;height:${h.toFixed(3)}%" title="${label}" tabindex="0">`;
+        const isHighlighted = highlightId != null && Number(f.id) === highlightId;
+        const cls = [
+            'face-label',
+            f.person_label || f.person_id ? '' : 'unlabeled',
+        ]
+            .filter(Boolean)
+            .join(' ');
+        const boxCls = isHighlighted ? 'face-box face-box-highlighted' : 'face-box';
+        html += `<div class="${boxCls}" data-face-id="${Number(f.id) || ''}" style="left:${x.toFixed(3)}%;top:${y.toFixed(3)}%;width:${w.toFixed(3)}%;height:${h.toFixed(3)}%" title="${label}" tabindex="0">`;
         html += `<span class="${cls}">${label}</span></div>`;
     }
     layer.innerHTML = html;
@@ -184,7 +192,17 @@ function _renderFaceOverlay(faces) {
             : i18nT('viewer.faces.hide', 'Hide');
         toggleBtn.setAttribute('aria-pressed', hidden ? 'false' : 'true');
     }
-    layer.classList.toggle('hidden', _facesOverlayHidden);
+    // Opening from a face-review tile is an explicit "show me this face"
+    // action — force the overlay visible for this image even if the
+    // operator had previously toggled it off, so the highlight isn't
+    // silently hidden. Subsequent navigation without a highlight target
+    // reverts to the persisted preference as normal.
+    layer.classList.toggle('hidden', _facesOverlayHidden && highlightId == null);
+
+    if (highlightId != null) {
+        const box = layer.querySelector(`.face-box[data-face-id="${highlightId}"]`);
+        box?.focus?.({ preventScroll: true });
+    }
 }
 
 function _positionFaceLayerToImage(layer, img) {
@@ -229,7 +247,7 @@ async function _refreshFacesForCurrent() {
         return;
     }
     const faces = await _fetchFaces(Number(file.id));
-    _renderFaceOverlay(faces);
+    _renderFaceOverlay(faces, file.highlightFaceId);
 }
 
 function _wireFacesToolbarOnce() {

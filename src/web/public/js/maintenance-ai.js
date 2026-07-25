@@ -62,6 +62,17 @@ let _scanPhase = 'A'; // 'A' | 'B'
 let _splitModeActive = false;
 const _splitSelectedDlIds = new Set();
 
+// Face review — additive, opt-in detail view (one tile per detected face,
+// cropped) toggled on top of the existing photo grid via "Review faces".
+// It never replaces the default photo-grid flow; closing it just hides
+// this panel and the photo grid remains as it was.
+let _faceReviewActive = false;
+let _faceReviewOffset = 0;
+let _faceReviewTotal = 0;
+let _faceReviewToken = 0;
+let _faceReviewGridClickHandler = null;
+const _FACE_REVIEW_PAGE_SIZE = 100;
+
 // Running render token — incremented on every _renderPeopleGrid call so
 // stale async chunks abort when a newer render starts (e.g. typing in
 // the search box while the previous chunk render is still in flight).
@@ -237,6 +248,8 @@ function _bindOnce() {
     $('#ai-person-delete-btn')?.addEventListener('click', _deleteSelectedPerson);
     $('#ai-split-cancel-btn')?.addEventListener('click', _exitSplitMode);
     $('#ai-split-commit-btn')?.addEventListener('click', _commitSplit);
+    $('#ai-person-review-faces-btn')?.addEventListener('click', _toggleFaceReview);
+    $('#ai-face-review-close-btn')?.addEventListener('click', _closeFaceReview);
 
     // WebSocket — only the people / scan events survive in the faces-only
     // build. ai_index_* / ai_tags_* were removed with the Search + Tags
@@ -1682,6 +1695,9 @@ function _personTile(p) {
 
 async function _showPersonPhotos() {
     if (!_selectedPerson) return;
+    // A fresh person was selected — collapse any open face-review panel from
+    // the previously selected person so it doesn't show stale faces.
+    if (_faceReviewActive) _closeFaceReview();
     const photosPanel = $('#ai-people-photos');
     if (photosPanel) photosPanel.classList.remove('hidden');
     const nameEl = $('#ai-people-photos-name');
@@ -1809,6 +1825,352 @@ function _photoTile(row) {
             </div>
         </button>
     `;
+}
+
+// ---- Face review (additive) -----------------------------------------------
+//
+// Opt-in detail view, toggled via the "Review faces" button on a selected
+// cluster. Shows one tile PER DETECTED FACE (cropped to its bbox, from
+// GET /api/ai/faces/:id/crop) instead of one tile per source photo, so an
+// operator can visually confirm/reject every face the algorithm attributed
+// to this cluster — including multiple faces from the same group photo,
+// which the default photo grid collapses to a single tile.
+//
+// This never replaces or mutates the existing photo-grid flow: closing the
+// panel (or never opening it) leaves `_showPersonPhotos()` / `_photoTile()`
+// completely untouched.
+
+function _qualityBadgeLabel(score) {
+    const q = Number(score) || 0;
+    if (q <= 0) return '';
+    return q >= 0.7 ? 'HQ' : q >= 0.4 ? 'MQ' : 'LQ';
+}
+
+function _toggleFaceReview() {
+    if (_faceReviewActive) {
+        _closeFaceReview();
+    } else {
+        _openFaceReview();
+    }
+}
+
+function _openFaceReview() {
+    if (!_selectedPerson) return;
+    if (_splitModeActive) _exitSplitMode();
+    _faceReviewActive = true;
+
+    const btn = $('#ai-person-review-faces-btn');
+    if (btn) btn.classList.add('ring-2', 'ring-tg-blue/50', 'bg-tg-blue/10');
+
+    $('#ai-people-photos-grid')?.classList.add('hidden');
+    $('#ai-split-hint')?.classList.add('hidden');
+    const panel = $('#ai-face-review');
+    if (panel) {
+        panel.classList.remove('hidden');
+        panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }
+
+    _faceReviewOffset = 0;
+    _loadFaceReview({ append: false });
+}
+
+function _closeFaceReview() {
+    _faceReviewActive = false;
+    const btn = $('#ai-person-review-faces-btn');
+    if (btn) btn.classList.remove('ring-2', 'ring-tg-blue/50', 'bg-tg-blue/10');
+    $('#ai-face-review')?.classList.add('hidden');
+    $('#ai-people-photos-grid')?.classList.remove('hidden');
+}
+
+async function _loadFaceReview({ append = false } = {}) {
+    if (!_selectedPerson) return;
+    const grid = $('#ai-face-review-grid');
+    const countEl = $('#ai-face-review-count');
+    if (!grid) return;
+    const token = ++_faceReviewToken;
+
+    if (!append) {
+        grid.innerHTML = `<div class="col-span-full text-center text-xs text-tg-textSecondary py-8">${escapeHtml(i18nT('common.loading', 'Loading…'))}</div>`;
+        if (countEl) countEl.textContent = '';
+    }
+
+    try {
+        const r = await api.get(
+            `/api/ai/people/${_selectedPerson}/faces?limit=${_FACE_REVIEW_PAGE_SIZE}&offset=${_faceReviewOffset}`,
+        );
+        if (token !== _faceReviewToken) return; // superseded by a newer load
+        if (!r?.success) throw new Error(r?.error || 'load failed');
+        const faces = r.faces || [];
+        _faceReviewTotal = Number(r.total) || 0;
+
+        if (!append && !faces.length) {
+            grid.innerHTML = `<div class="col-span-full text-center text-xs text-tg-textSecondary py-8">${escapeHtml(i18nT('maintenance.ai.no_faces', 'No faces in this cluster.'))}</div>`;
+            if (countEl) countEl.textContent = '';
+            return;
+        }
+
+        if (!append) grid.innerHTML = '';
+        grid.insertAdjacentHTML('beforeend', faces.map(_faceReviewTile).join(''));
+        _faceReviewOffset += faces.length;
+
+        if (countEl) {
+            countEl.textContent = i18nTf(
+                'maintenance.ai.face_review_count',
+                { n: _faceReviewTotal },
+                `${_faceReviewTotal.toLocaleString()} detected faces`,
+            );
+        }
+
+        _wireFaceReviewGrid();
+        _renderFaceReviewLoadMore();
+    } catch (e) {
+        if (token !== _faceReviewToken) return;
+        grid.innerHTML = `<div class="col-span-full text-center text-xs text-red-300 py-8">${escapeHtml(e.message)}</div>`;
+    }
+}
+
+function _renderFaceReviewLoadMore() {
+    const grid = $('#ai-face-review-grid');
+    const panel = $('#ai-face-review');
+    if (!grid || !panel) return;
+    const existing = panel.querySelector('.ai-face-review-load-more-btn');
+    if (existing) existing.remove();
+    if (_faceReviewOffset >= _faceReviewTotal) return;
+
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className =
+        'ai-face-review-load-more-btn w-full py-2.5 mx-1.5 mb-1.5 rounded-xl text-xs font-medium text-tg-textSecondary border border-tg-border/30 hover:border-tg-blue/50 hover:text-tg-blue hover:bg-tg-blue/5 transition-all';
+    btn.textContent = i18nTf(
+        'maintenance.ai.face_review_load_more',
+        { n: (_faceReviewTotal - _faceReviewOffset).toLocaleString() },
+        `Show more (${(_faceReviewTotal - _faceReviewOffset).toLocaleString()} remaining)`,
+    );
+    btn.addEventListener('click', () => _loadFaceReview({ append: true }));
+    grid.after(btn);
+}
+
+function _faceReviewTile(row) {
+    const faceId = row.face_id;
+    const dlId = row.download_id;
+    const name = escapeHtml(row.file_name || `#${dlId}`);
+    const qLabel = _qualityBadgeLabel(row.quality_score);
+    const qBadge = qLabel
+        ? `<span class="absolute top-1 left-1 h-[15px] px-1.5 rounded-full bg-black/70 text-white text-[8px] font-medium flex items-center justify-center leading-none backdrop-blur-sm">${qLabel}</span>`
+        : '';
+
+    const meta = encodeURIComponent(
+        JSON.stringify({
+            id: dlId,
+            file_name: row.file_name || '',
+            file_type: row.file_type || '',
+            file_path: String(row.file_path || '').replace(/\\/g, '/'),
+            file_size: Number(row.file_size) || 0,
+            group_id: row.group_id || null,
+            group_name: row.group_name || '',
+            pinned: !!row.pinned,
+        }),
+    );
+
+    return `
+        <div class="ai-face-review-tile group relative rounded-xl overflow-hidden shadow-sm hover:shadow-lg transition-all duration-200 bg-tg-bg/40" data-face-id="${faceId}" data-dl-id="${dlId}" data-meta="${meta}">
+            <button type="button" class="ai-face-review-open block w-full cursor-pointer" title="${escapeHtml(i18nT('maintenance.ai.face_review_open_source', 'Open source photo'))} — ${name}">
+                <img src="/api/ai/faces/${faceId}/crop?w=160" alt="${name}" loading="lazy"
+                    class="aspect-square w-full object-cover transition-transform duration-300 group-hover:scale-105">
+            </button>
+            ${qBadge}
+            <div class="absolute inset-0 bg-gradient-to-t from-black/60 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-200 pointer-events-none flex items-end p-1.5">
+                <span class="text-white text-[10px] leading-tight line-clamp-1 font-medium drop-shadow">${name}</span>
+            </div>
+            <!-- Hover actions — kept visually distinct from the click-to-open image
+                 so operators don't accidentally reassign while browsing. -->
+            <div class="absolute top-1 right-1 flex flex-col gap-1 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity duration-200">
+                <button type="button" class="ai-face-review-reassign w-5 h-5 rounded-full bg-black/70 hover:bg-tg-blue flex items-center justify-center shadow"
+                    title="${escapeHtml(i18nT('maintenance.ai.face_review_reassign', 'Move to another person…'))}">
+                    <i class="ri-arrow-left-right-line text-white text-[10px]"></i>
+                </button>
+                <button type="button" class="ai-face-review-unassign w-5 h-5 rounded-full bg-black/70 hover:bg-red-500 flex items-center justify-center shadow"
+                    title="${escapeHtml(i18nT('maintenance.ai.face_review_not_match', 'Not this person — unassign'))}">
+                    <i class="ri-close-line text-white text-[10px]"></i>
+                </button>
+            </div>
+        </div>
+    `;
+}
+
+function _wireFaceReviewGrid() {
+    const grid = $('#ai-face-review-grid');
+    if (!grid) return;
+    if (_faceReviewGridClickHandler) grid.removeEventListener('click', _faceReviewGridClickHandler);
+
+    _faceReviewGridClickHandler = (e) => {
+        const reassignBtn = e.target.closest('.ai-face-review-reassign');
+        const unassignBtn = e.target.closest('.ai-face-review-unassign');
+        const openBtn = e.target.closest('.ai-face-review-open');
+        const tile = e.target.closest('.ai-face-review-tile');
+        if (!tile) return;
+        const faceId = Number(tile.dataset.faceId);
+
+        if (reassignBtn) {
+            e.preventDefault();
+            e.stopPropagation();
+            _reassignFaceFromReview(faceId, tile);
+            return;
+        }
+        if (unassignBtn) {
+            e.preventDefault();
+            e.stopPropagation();
+            _unassignFaceFromReview(faceId, tile);
+            return;
+        }
+        if (openBtn) {
+            const allTiles = Array.from(grid.querySelectorAll('.ai-face-review-tile'));
+            const viewerFiles = allTiles.map(_personPhotoToViewerFile).filter(Boolean);
+            const idx = allTiles.indexOf(tile);
+            if (idx >= 0 && viewerFiles[idx]) {
+                // Tag the target file so the viewer's face overlay can visually
+                // emphasize the specific face this tile represented.
+                viewerFiles[idx].highlightFaceId = faceId;
+            }
+            if (viewerFiles.length) openMediaViewerForReview(viewerFiles, Math.max(0, idx));
+        }
+    };
+    grid.addEventListener('click', _faceReviewGridClickHandler);
+}
+
+// Reuses the exact same visual person-picker as _mergeSelectedPerson, but
+// targets a single face via the existing POST /api/ai/faces/:id/reassign
+// endpoint instead of merging whole clusters.
+async function _reassignFaceFromReview(faceId, tileEl) {
+    if (!faceId) return;
+    const candidates = _peopleCache.filter((p) => p.id !== _selectedPerson && p.id !== -1);
+    if (!candidates.length) {
+        showToast(
+            i18nT('maintenance.ai.merge_no_other', 'No other clusters to merge with.'),
+            'info',
+        );
+        return;
+    }
+
+    const makeCard = (p) => {
+        const name = escapeHtml(p.label || `Person #${p.id}`);
+        const faceUrl = p.id > 0 ? `/api/ai/person/${p.id}/face?w=64` : '';
+        const imgHtml = faceUrl
+            ? `<img src="${faceUrl}" class="w-full h-full object-cover" loading="lazy" onerror="this.onerror=null;this.parentElement.innerHTML='<i class=\\'ri-user-line text-base text-tg-textSecondary/40\\'></i>'">`
+            : `<i class="ri-user-line text-base text-tg-textSecondary/40"></i>`;
+        return `<button type="button" data-pid="${p.id}"
+            class="ai-face-reassign-card flex items-center gap-3 w-full text-left px-3 py-2.5 rounded-xl hover:bg-tg-blue/10 active:bg-tg-blue/20 transition-colors">
+            <div class="w-10 h-10 rounded-full overflow-hidden ring-1 ring-tg-border/30 flex-shrink-0 bg-tg-bg/40 flex items-center justify-center">
+                ${imgHtml}
+            </div>
+            <div class="flex-1 min-w-0">
+                <div class="text-sm font-medium text-tg-text truncate">${name}</div>
+                <div class="text-[11px] text-tg-textSecondary">${p.face_count} ${escapeHtml(i18nT('maintenance.ai.faces_short', 'faces'))}</div>
+            </div>
+            <i class="ri-arrow-right-s-line text-tg-textSecondary/50 flex-shrink-0"></i>
+        </button>`;
+    };
+
+    const pickerContent = `
+        <div class="px-1 mb-3">
+            <input type="search" id="ai-face-reassign-search" placeholder="${escapeHtml(i18nT('common.search', 'Search…'))}"
+                class="tg-input w-full text-sm" autocomplete="off">
+        </div>
+        <div id="ai-face-reassign-list" class="flex flex-col gap-0.5 max-h-64 overflow-y-auto"></div>
+        <p id="ai-face-reassign-empty" class="hidden text-center text-xs text-tg-textSecondary py-4">${escapeHtml(i18nT('common.no_results', 'No matches'))}</p>`;
+
+    const targetId = await new Promise((resolve) => {
+        const entry = openSheet({
+            title: i18nT('maintenance.ai.face_review_reassign', 'Move to another person…'),
+            content: pickerContent,
+            size: 'md',
+            onClose: () => resolve(null),
+        });
+
+        const listEl = entry.body.querySelector('#ai-face-reassign-list');
+        const emptyEl = entry.body.querySelector('#ai-face-reassign-empty');
+        const searchEl = entry.body.querySelector('#ai-face-reassign-search');
+
+        const renderList = (list) => {
+            if (!listEl) return;
+            listEl.innerHTML = list.slice(0, 80).map(makeCard).join('');
+            const empty = list.length === 0;
+            if (emptyEl) emptyEl.classList.toggle('hidden', !empty);
+            listEl.querySelectorAll('.ai-face-reassign-card').forEach((cbtn) => {
+                cbtn.addEventListener('click', () => {
+                    entry.close();
+                    resolve(Number(cbtn.dataset.pid));
+                });
+            });
+        };
+
+        renderList(candidates);
+
+        if (searchEl) {
+            searchEl.addEventListener('input', (e) => {
+                const q = String(e.target.value || '')
+                    .toLowerCase()
+                    .trim();
+                renderList(
+                    q
+                        ? candidates.filter((p) =>
+                              (p.label || `Person #${p.id}`).toLowerCase().includes(q),
+                          )
+                        : candidates,
+                );
+            });
+            setTimeout(() => searchEl.focus(), 60);
+        }
+    });
+
+    if (!targetId) return;
+
+    try {
+        const res = await api.post(`/api/ai/faces/${faceId}/reassign`, { personId: targetId });
+        if (!res.success) throw new Error(res.error || 'reassign failed');
+        showToast(i18nT('maintenance.ai.face_review_reassigned', 'Face moved'), 'success');
+        _removeFaceReviewTile(tileEl);
+        _loadPeople();
+        await refreshStatus();
+    } catch (e) {
+        showToast(e.message, 'error');
+    }
+}
+
+// Quick "not a match" action — unassigns the face (person_id = null) via
+// the same reassign endpoint. No new mutation API needed: unassigning is
+// just a reassign to `null`, already supported server-side.
+async function _unassignFaceFromReview(faceId, tileEl) {
+    if (!faceId) return;
+    try {
+        const res = await api.post(`/api/ai/faces/${faceId}/reassign`, { personId: null });
+        if (!res.success) throw new Error(res.error || 'unassign failed');
+        showToast(i18nT('maintenance.ai.face_review_unassigned', 'Face unassigned'), 'success');
+        _removeFaceReviewTile(tileEl);
+        _loadPeople();
+        await refreshStatus();
+    } catch (e) {
+        showToast(e.message, 'error');
+    }
+}
+
+function _removeFaceReviewTile(tileEl) {
+    tileEl?.remove();
+    _faceReviewTotal = Math.max(0, _faceReviewTotal - 1);
+    _faceReviewOffset = Math.max(0, _faceReviewOffset - 1);
+    const countEl = $('#ai-face-review-count');
+    if (countEl) {
+        countEl.textContent = i18nTf(
+            'maintenance.ai.face_review_count',
+            { n: _faceReviewTotal },
+            `${_faceReviewTotal.toLocaleString()} detected faces`,
+        );
+    }
+    _renderFaceReviewLoadMore();
+    const grid = $('#ai-face-review-grid');
+    if (grid && !grid.querySelector('.ai-face-review-tile')) {
+        grid.innerHTML = `<div class="col-span-full text-center text-xs text-tg-textSecondary py-8">${escapeHtml(i18nT('maintenance.ai.no_faces', 'No faces in this cluster.'))}</div>`;
+    }
 }
 
 async function _renameSelectedPerson() {
@@ -1956,6 +2318,9 @@ async function _mergeSelectedPerson() {
 
 function _splitSelectedPerson() {
     if (!_selectedPerson) return;
+    // Split mode operates on the photo grid — collapse face review first
+    // so the operator isn't looking at one grid while selecting in another.
+    if (_faceReviewActive) _closeFaceReview();
     _enterSplitMode();
 }
 

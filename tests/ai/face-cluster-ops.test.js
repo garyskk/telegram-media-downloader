@@ -308,6 +308,71 @@ describe('matchClusterToPersistedLabel', () => {
     });
 });
 
+describe('listFacesForPerson', () => {
+    it('returns one row per face, not collapsed per download (unlike listPhotosForPerson)', () => {
+        const did = downloadId();
+        const pid = api.insertPerson({ label: 'Group', centroidBlob: f32Blob([1, 0]), faceCount: 2 });
+        api.insertFace({
+            downloadId: did,
+            x: 0,
+            y: 0,
+            w: 50,
+            h: 50,
+            embeddingBlob: f32Blob([1, 0]),
+            personId: pid,
+            qualityScore: 0.9,
+        });
+        api.insertFace({
+            downloadId: did,
+            x: 60,
+            y: 0,
+            w: 50,
+            h: 50,
+            embeddingBlob: f32Blob([1, 0.02]),
+            personId: pid,
+            qualityScore: 0.3,
+        });
+
+        // Two faces from the SAME download — listPhotosForPerson collapses
+        // this to 1 row, listFacesForPerson must return both.
+        const photos = api.listPhotosForPerson(pid, {});
+        expect(photos.files.length).toBe(1);
+        expect(photos.total).toBe(1);
+
+        const faces = api.listFacesForPerson(pid, {});
+        expect(faces.faces.length).toBe(2);
+        expect(faces.total).toBe(2);
+        for (const row of faces.faces) {
+            expect(row.download_id).toBe(did);
+            expect(Number.isFinite(row.face_id)).toBe(true);
+            expect(row.file_name).toBe('f1.jpg');
+        }
+    });
+
+    it('clamps limit to [1, 200] and offset to >= 0', () => {
+        const did = downloadId();
+        const pid = api.insertPerson({ centroidBlob: f32Blob([1, 0]), faceCount: 1 });
+        api.insertFace({
+            downloadId: did,
+            x: 0,
+            y: 0,
+            w: 50,
+            h: 50,
+            embeddingBlob: f32Blob([1, 0]),
+            personId: pid,
+        });
+        expect(() => api.listFacesForPerson(pid, { limit: 9999, offset: -5 })).not.toThrow();
+        const r = api.listFacesForPerson(pid, { limit: 9999, offset: -5 });
+        expect(r.faces.length).toBe(1);
+    });
+
+    it('returns empty result for a person with no faces', () => {
+        const r = api.listFacesForPerson(999999, {});
+        expect(r.faces).toEqual([]);
+        expect(r.total).toBe(0);
+    });
+});
+
 describe('setFaceQualityScore', () => {
     it('persists quality_score on an existing face row', () => {
         const did = downloadId();

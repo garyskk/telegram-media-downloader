@@ -3647,6 +3647,13 @@
                                     </div>
                                 </div>
                                 <div class="flex items-center gap-1 flex-shrink-0">
+                                    <button id="ai-person-review-faces-btn"
+                                        class="tg-btn-secondary text-[11px] h-8 px-2 inline-flex items-center gap-1.5"
+                                        data-i18n-title="maintenance.ai.review_faces_btn_title"
+                                        title="Show every detected face in this cluster, cropped, so you can verify each match">
+                                        <i class="ri-focus-3-line"></i>
+                                        <span class="hidden sm:inline" data-i18n="maintenance.ai.people.actions.review_faces">Review faces</span>
+                                    </button>
                                     <button id="ai-person-merge-btn"
                                         class="tg-btn-secondary text-[11px] h-8 px-2 inline-flex items-center gap-1.5"
                                         title="Merge into another cluster">
@@ -3683,6 +3690,24 @@
                                         <i class="ri-scissors-cut-line mr-1"></i><span data-i18n="maintenance.ai.people.actions.split">Split…</span>
                                     </button>
                                 </div>
+                            </div>
+
+                            <!-- Face-level review grid — additive, opt-in via "Review faces".
+                                 Shows one tile PER DETECTED FACE (cropped to the bbox), sourced
+                                 from every photo/video the cluster appears in, so the operator
+                                 can confirm or reject each individual match. Closing it returns
+                                 to the existing per-photo grid above, unchanged. -->
+                            <div id="ai-face-review" class="hidden border-t border-tg-border/20">
+                                <div class="flex items-center justify-between gap-2 px-3 py-2 bg-tg-blue/5 border-b border-tg-blue/10">
+                                    <p id="ai-face-review-count" class="text-[11px] text-tg-textSecondary"></p>
+                                    <button id="ai-face-review-close-btn" type="button"
+                                        class="tg-btn-secondary text-[11px] h-7 px-2 inline-flex items-center gap-1"
+                                        title="Close face review">
+                                        <i class="ri-close-line"></i>
+                                        <span class="hidden sm:inline" data-i18n="common.close">Close</span>
+                                    </button>
+                                </div>
+                                <div id="ai-face-review-grid" class="grid grid-cols-3 sm:grid-cols-5 md:grid-cols-6 lg:grid-cols-8 gap-1 p-1.5"></div>
                             </div>
                         </div>
 
