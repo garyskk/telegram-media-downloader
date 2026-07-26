@@ -2145,12 +2145,15 @@ class VideoPlayer {
 
     _controlsVisible() {
         return (
-            this.controls.style.opacity !== '0' && !this.controls.classList.contains('opacity-0')
+            this.controls.style.opacity !== '0' &&
+            !this.controls.classList.contains('opacity-0') &&
+            !this.controls.classList.contains('controls-collapsed')
         );
     }
 
     _showControls(force = false) {
         this.controls.style.opacity = '1';
+        this.controls.classList.remove('controls-collapsed');
         this.container.style.cursor = '';
         if (!force && SUPPORTS_HOVER && !this.video.paused) {
             this._scheduleHide();
@@ -2177,6 +2180,10 @@ class VideoPlayer {
             // Don't hide while the speed menu is open.
             if (!this.speedMenu.classList.contains('hidden')) return;
             this.controls.style.opacity = '0';
+            // Collapse the docked band so the picture expands into the
+            // freed space (overlay-free chrome when visible; immersive
+            // when hidden).
+            this.controls.classList.add('controls-collapsed');
             this.container.style.cursor = 'none';
         }, delay);
     }

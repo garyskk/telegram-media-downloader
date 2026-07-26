@@ -282,20 +282,31 @@ html.theme-light .bottom-nav-item {
     color: #65737e;
 }
 
-/* Video player controls — the player chrome still needs a dark
-   gradient over the video (so white controls remain legible
-   against arbitrary footage), but the speed-menu pop-over uses a
+/* Video player controls — docked below the picture (not overlaid),
+   so a solid dark band is enough. Speed-menu pop-over uses a
    hard-coded `bg-[#212121]/95` which can stay dark in either
-   theme — that's a deliberate floating-overlay-on-video idiom.
-   No override needed there. */
+   theme. */
 html.theme-light .video-controls {
-    /* keep dark gradient — readability over video */
-    background-image: linear-gradient(
-        to top,
-        rgba(0, 0, 0, 0.92),
-        rgba(0, 0, 0, 0.5) 60%,
-        transparent
-    ) !important;
+    background-color: rgba(0, 0, 0, 0.92) !important;
+    background-image: none !important;
+}
+/* Auto-hide: pull the docked band out of the flex column so
+   #video-stage (flex-1) expands into the freed height. max-height
+   alone left a flex item still reserving content size. */
+.video-controls.controls-collapsed {
+    position: absolute !important;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: 0 !important;
+    max-height: 0 !important;
+    min-height: 0 !important;
+    overflow: hidden !important;
+    opacity: 0 !important;
+    pointer-events: none;
+    border: 0 !important;
+    padding: 0 !important;
+    margin: 0 !important;
 }
 .video-controls button,
 .video-controls span,
