@@ -4389,56 +4389,63 @@
                 </div>
             </div>
 
-            <!-- Custom Video Player Container -->
+            <!-- Custom Video Player Container.
+                 Column layout: video stage (flex-1) above a docked controls
+                 band so the seekbar never overlays the picture. -->
             <div id="video-container"
-                class="relative w-full h-full flex items-center justify-center bg-black hidden">
-                <!-- The hit-target for tap-to-toggle play/pause + tap-to-show-controls.
-                     Sits BEHIND the controls overlay so clicks on buttons / sliders
-                     never bubble to it. -->
-                <div id="video-tap-layer" class="absolute inset-0 z-10"></div>
+                class="relative w-full h-full flex flex-col bg-black hidden">
+                <!-- Picture + overlays. Takes remaining height above the
+                     controls band; object-contain letterboxes inside. -->
+                <div id="video-stage"
+                    class="relative flex-1 min-h-0 w-full flex items-center justify-center">
+                    <!-- The hit-target for tap-to-toggle play/pause + tap-to-show-controls.
+                         Sits BEHIND the controls so clicks on buttons / sliders
+                         never bubble to it. Scoped to the stage only. -->
+                    <div id="video-tap-layer" class="absolute inset-0 z-10"></div>
 
-                <video id="modal-video" class="max-w-full max-h-full object-contain w-full h-full relative z-0" playsinline></video>
+                    <video id="modal-video" class="max-w-full max-h-full object-contain w-full h-full relative z-0" playsinline></video>
 
-                <!-- Double-tap seek overlays (YouTube-style visual feedback). -->
-                <div id="video-seek-back-overlay"
-                    class="absolute left-0 top-0 w-1/2 h-full flex items-center justify-center z-[15] pointer-events-none opacity-0 transition-opacity duration-200">
-                    <div class="flex flex-col items-center gap-1 text-white">
-                        <i class="ri-rewind-mini-line text-4xl"></i>
-                        <span id="video-seek-back-label" class="text-sm font-medium">5s</span>
+                    <!-- Double-tap seek overlays (YouTube-style visual feedback). -->
+                    <div id="video-seek-back-overlay"
+                        class="absolute left-0 top-0 w-1/2 h-full flex items-center justify-center z-[15] pointer-events-none opacity-0 transition-opacity duration-200">
+                        <div class="flex flex-col items-center gap-1 text-white">
+                            <i class="ri-rewind-mini-line text-4xl"></i>
+                            <span id="video-seek-back-label" class="text-sm font-medium">5s</span>
+                        </div>
+                    </div>
+                    <div id="video-seek-fwd-overlay"
+                        class="absolute right-0 top-0 w-1/2 h-full flex items-center justify-center z-[15] pointer-events-none opacity-0 transition-opacity duration-200">
+                        <div class="flex flex-col items-center gap-1 text-white">
+                            <i class="ri-speed-mini-line text-4xl"></i>
+                            <span id="video-seek-fwd-label" class="text-sm font-medium">5s</span>
+                        </div>
+                    </div>
+
+                    <!-- Center play button — only visible while the video is paused. -->
+                    <button id="video-center-play"
+                        class="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-20 h-20 rounded-full bg-black/60 hover:bg-black/80 flex items-center justify-center text-white z-20 transition-opacity duration-200 hidden"
+                        data-i18n-aria-label="viewer.video.play" aria-label="Play">
+                        <i class="ri-play-fill text-5xl ml-1"></i>
+                    </button>
+
+                    <!-- Buffering spinner — centered, shown while readyState < HAVE_FUTURE_DATA. -->
+                    <div id="video-spinner"
+                        class="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-20 pointer-events-none hidden">
+                        <div class="w-12 h-12 border-4 border-white/20 border-t-white rounded-full animate-spin"></div>
+                    </div>
+
+                    <!-- Error overlay. -->
+                    <div id="video-error"
+                        class="absolute inset-0 z-30 hidden flex-col items-center justify-center gap-4 bg-black/80 text-white">
+                        <i class="ri-error-warning-line text-5xl text-red-400"></i>
+                        <p id="video-error-msg" class="text-sm text-white/80 max-w-xs text-center px-4"></p>
+                        <button id="video-retry-btn"
+                            class="px-4 py-2 bg-tg-blue hover:bg-tg-darkBlue rounded-lg text-sm text-white font-medium"
+                            data-i18n="viewer.video.retry">Retry</button>
                     </div>
                 </div>
-                <div id="video-seek-fwd-overlay"
-                    class="absolute right-0 top-0 w-1/2 h-full flex items-center justify-center z-[15] pointer-events-none opacity-0 transition-opacity duration-200">
-                    <div class="flex flex-col items-center gap-1 text-white">
-                        <i class="ri-speed-mini-line text-4xl"></i>
-                        <span id="video-seek-fwd-label" class="text-sm font-medium">5s</span>
-                    </div>
-                </div>
 
-                <!-- Center play button — only visible while the video is paused. -->
-                <button id="video-center-play"
-                    class="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-20 h-20 rounded-full bg-black/60 hover:bg-black/80 flex items-center justify-center text-white z-20 transition-opacity duration-200 hidden"
-                    data-i18n-aria-label="viewer.video.play" aria-label="Play">
-                    <i class="ri-play-fill text-5xl ml-1"></i>
-                </button>
-
-                <!-- Buffering spinner — centered, shown while readyState < HAVE_FUTURE_DATA. -->
-                <div id="video-spinner"
-                    class="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-20 pointer-events-none hidden">
-                    <div class="w-12 h-12 border-4 border-white/20 border-t-white rounded-full animate-spin"></div>
-                </div>
-
-                <!-- Error overlay. -->
-                <div id="video-error"
-                    class="absolute inset-0 z-30 hidden flex-col items-center justify-center gap-4 bg-black/80 text-white">
-                    <i class="ri-error-warning-line text-5xl text-red-400"></i>
-                    <p id="video-error-msg" class="text-sm text-white/80 max-w-xs text-center px-4"></p>
-                    <button id="video-retry-btn"
-                        class="px-4 py-2 bg-tg-blue hover:bg-tg-darkBlue rounded-lg text-sm text-white font-medium"
-                        data-i18n="viewer.video.retry">Retry</button>
-                </div>
-
-                <!-- Speed menu — opens above the speed button. -->
+                <!-- Speed menu — opens above the speed button (docked controls). -->
                 <div id="video-speed-menu"
                     class="absolute bottom-14 right-2 bg-[#212121]/95 backdrop-blur text-white rounded-lg overflow-hidden hidden z-50 shadow-xl w-32 py-1">
                     <button class="speed-opt flex items-center justify-between px-3 py-1.5 hover:bg-white/10 text-sm w-full" data-speed="0.25"><span>0.25x</span></button>
@@ -4451,17 +4458,18 @@
                     <button class="speed-opt flex items-center justify-between px-3 py-1.5 hover:bg-white/10 text-sm w-full" data-speed="2"><span>2x</span></button>
                 </div>
 
-                <!-- Bottom controls bar. Visibility class `controls-visible` is
-                     toggled by the player JS so we can reliably override the
-                     hover-only behaviour on touch devices. -->
+                <!-- Docked controls band below the picture. Auto-hide
+                     collapses this band (`.controls-collapsed`) so the
+                     video can reclaim the space; when visible the
+                     seekbar never covers the picture. -->
                 <div id="video-controls"
-                    class="video-controls absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/85 via-black/40 to-transparent transition-opacity duration-200 z-40">
+                    class="video-controls relative shrink-0 w-full bg-black/90 transition-opacity duration-200 z-40">
                     <!-- Seek bar with hover preview. Outer hit-zone is
                          24 px tall so a finger always finds it (matches iOS
                          HIG / Material a11y target). The visual track lives
                          centred inside; bar grows on hover/active for the
                          "premium" YouTube/Netflix scrub feel. -->
-                    <div class="px-3 pt-6 relative">
+                    <div class="px-3 pt-2 relative">
                         <div id="video-progress-hitzone"
                             class="relative w-full h-6 cursor-pointer group/progress touch-none select-none flex items-center"
                             tabindex="0"
