@@ -165,6 +165,7 @@ import {
     getAiCounts,
     listPeople,
     listPhotosForPerson,
+    listFacesForPerson,
     renamePerson,
     deletePerson,
     resetAllAiData,
@@ -8513,8 +8514,14 @@ app.get('/api/ai/person/:id/face', async (req, res) => {
     }
 });
 
-// Face crop for an individual face (used in the per-person photo gallery).
-// Crops the face bbox from the source image with the same 40% padding.
+// Face crop for an individual face (used in the per-person photo gallery
+// and the "Review faces" panel). Crops the face bbox from the source image
+// with the same 40% padding as the person-avatar endpoint above — reuses
+// the same `_cropFace()` helper instead of duplicating the crop math, and
+// the same `_extractVideoFrame()` fallback for video-sourced faces (sharp
+// can't decode a video container directly; without this, any face whose
+// download is a video 404s with "Input file contains unsupported image
+// format").
 app.get('/api/ai/faces/:id/crop', async (req, res) => {
     try {
         const faceId = Number(req.params.id);
@@ -8524,7 +8531,7 @@ app.get('/api/ai/faces/:id/crop', async (req, res) => {
 
         const row = aiGetDb()
             .prepare(
-                `SELECT f.x, f.y, f.w, f.h, d.file_path
+                `SELECT f.x, f.y, f.w, f.h, d.file_path, d.file_type
                    FROM faces f
                    JOIN downloads d ON d.id = f.download_id
                   WHERE f.id = ?
@@ -8539,23 +8546,20 @@ app.get('/api/ai/faces/:id/crop', async (req, res) => {
                 .status(resolved.reason === 'missing' ? 404 : 403)
                 .json({ error: resolved.reason });
 
-        const pad = 0.4;
-        const meta = await sharp(resolved.real, { failOn: 'none' }).metadata();
-        const imgW = meta.width || 9999;
-        const imgH = meta.height || 9999;
-
-        const left = Math.max(0, Math.round(row.x - row.w * pad));
-        const top = Math.max(0, Math.round(row.y - row.h * pad));
-        const right = Math.min(imgW, Math.round(row.x + row.w + row.w * pad));
-        const bottom = Math.min(imgH, Math.round(row.y + row.h + row.h * pad));
-        const width = Math.max(1, right - left);
-        const height = Math.max(1, bottom - top);
-
-        const buf = await sharp(resolved.real, { failOn: 'none' })
-            .extract({ left, top, width, height })
-            .resize(size, size, { fit: 'cover', position: 'centre' })
-            .jpeg({ quality: 82, progressive: true })
-            .toBuffer();
+        let buf;
+        if (row.file_type === 'video') {
+            const frameBuf = await _extractVideoFrame(resolved.real);
+            try {
+                buf = await _cropFace(frameBuf, row, size);
+            } catch {
+                buf = await sharp(frameBuf, { failOn: 'none' })
+                    .resize(size, size, { fit: 'cover', position: 'attention' })
+                    .jpeg({ quality: 82, progressive: true })
+                    .toBuffer();
+            }
+        } else {
+            buf = await _cropFace(resolved.real, row, size);
+        }
 
         res.set('content-type', 'image/jpeg');
         res.set('cache-control', 'public, max-age=604800, immutable');
@@ -8579,6 +8583,25 @@ app.get('/api/ai/people/:id/photos', async (req, res) => {
         const limit = Math.max(1, Math.min(200, Number(req.query?.limit) || 50));
         const offset = Math.max(0, Number(req.query?.offset) || 0);
         const result = listPhotosForPerson(id, { limit, offset });
+        res.json({ success: true, personId: id, ...result });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// Additive companion to /photos — one row PER FACE (no ROW_NUMBER collapse
+// per download), so the "review faces" grid can show every face the model
+// attributed to this cluster, including several from the same group photo.
+// Does not change /photos or its callers.
+app.get('/api/ai/people/:id/faces', async (req, res) => {
+    try {
+        const id = Number(req.params.id);
+        if (!Number.isFinite(id) || id <= 0) {
+            return res.status(400).json({ error: 'invalid person id' });
+        }
+        const limit = Math.max(1, Math.min(200, Number(req.query?.limit) || 50));
+        const offset = Math.max(0, Number(req.query?.offset) || 0);
+        const result = listFacesForPerson(id, { limit, offset });
         res.json({ success: true, personId: id, ...result });
     } catch (e) {
         res.status(500).json({ error: e.message });

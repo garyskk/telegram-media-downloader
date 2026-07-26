@@ -2856,6 +2856,40 @@ export function listPhotosForPerson(personId, { limit = 50, offset = 0 } = {}) {
     return { files: rows, total };
 }
 
+// Additive companion to listPhotosForPerson() — one row PER FACE instead of
+// one row per source download. Used by the "review faces" grid so an
+// operator can see exactly what the model detected for each appearance,
+// including group photos where several people-cluster faces share one
+// download. Does not touch/replace listPhotosForPerson(); both coexist.
+export function listFacesForPerson(personId, { limit = 50, offset = 0 } = {}) {
+    const lim = Math.max(1, Math.min(200, Number(limit) || 50));
+    const off = Math.max(0, Number(offset) || 0);
+    const db = getDb();
+    const rows = db
+        .prepare(`
+        SELECT f.id AS face_id, f.download_id, f.x, f.y, f.w, f.h, f.quality_score,
+               d.file_name, d.file_type, d.file_path, d.file_size,
+               d.group_id, d.group_name, d.message_id, d.pinned, d.created_at
+          FROM faces f
+          JOIN downloads d ON d.id = f.download_id
+         WHERE f.person_id = ?
+           AND (d.user_deleted IS NULL OR d.user_deleted = 0)
+         ORDER BY d.created_at DESC, f.id DESC
+         LIMIT ? OFFSET ?
+    `)
+        .all(Number(personId), lim, off);
+    const total = db
+        .prepare(`
+            SELECT COUNT(*) AS n
+              FROM faces f
+              JOIN downloads d ON d.id = f.download_id
+             WHERE f.person_id = ?
+               AND (d.user_deleted IS NULL OR d.user_deleted = 0)
+        `)
+        .get(Number(personId)).n;
+    return { faces: rows, total };
+}
+
 // ---- Image tags -----------------------------------------------------------
 
 export function setImageTags(downloadId, tags) {
