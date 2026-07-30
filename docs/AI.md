@@ -240,6 +240,13 @@ should read the nested path.
 | `downloadRedirectCap` | `TGDL_FACES_DOWNLOAD_REDIRECT_CAP` | `5` | Max HTTP redirects when fetching the binary |
 | `downloadMirrors` | `TGDL_FACES_DOWNLOAD_MIRRORS` | `[]` | Alternative tarball URLs / base URLs |
 | `federate` | `TGDL_FACES_FEDERATE` | `false` | Cross-peer face centroid propagation |
+| — | `TGDL_FACES_VIDEO_WINDOW_SEC` | `0.4` | *Sidecar only* — best-frame window size for the `cv2` sampler; no Node equivalent (see [Video face scanning](#video-face-scanning)) |
+| `videoFloorIntervalSec` | `TGDL_FACES_VIDEO_FLOOR_INTERVAL_SEC` | `3.0` | Max gap between samples when nothing triggers motion — backstop only, not the recall mechanism |
+| — | `TGDL_FACES_VIDEO_MOTION_THRESHOLD` | `6.0` | *Sidecar only* — luma-diff (0–255) motion sensitivity; the Node fallback uses ffmpeg's own `scene` score instead (different scale, no shared knob) |
+| `videoMaxFrames` | `TGDL_FACES_VIDEO_MAX_FRAMES` | `20000` | Pure runaway-safety ceiling — **not** a density control, should never bind on a real video |
+| — | `TGDL_FACES_VIDEO_SINGLETON_MIN_SCORE` | `0.75` | *Sidecar only* — detection-score floor for a face seen in exactly 1 sampled frame |
+| — | `TGDL_FACES_VIDEO_SINGLETON_MIN_QUALITY` | `0.55` | *Sidecar only* — quality-score floor for a face seen in exactly 1 sampled frame |
+| — | `TGDL_FACES_VIDEO_CONFIRMED_MIN_QUALITY` | `0.30` | *Sidecar only* — universal quality floor for a face confirmed across ≥2 sampled frames |
 
 Env-var precedence is strict: any `TGDL_FACES_*` value wins over the
 matching kv-config value, which wins over the legacy flat alias, which
@@ -295,27 +302,58 @@ When `advanced.ai.faces.scanVideos` is `true`, the scan runner includes
 `file_type = 'video'` rows in the phase A total alongside photos.
 Videos are processed one at a time after the photo batch finishes.
 
-For each video the sidecar's `POST /detect/video` endpoint extracts
-evenly-spaced frames via `cv2.VideoCapture` (no temp files written to
-disk). Frame count adapts to video duration — short clips get at least
-one frame, long videos are capped at `max_frames` (default 120, roughly
-1 frame/min for a 2-hour file). Detection runs on every extracted frame;
-a deduplication pass then collapses faces with cosine similarity above
-0.50 so only one best-score instance per identity is kept.
+**Sampling is duration-independent** — the same fixed cadence applies to
+a 10-second clip and a 4-hour recording; there are no duration bands and
+no per-video sampling budget. The sidecar's `POST /detect/video` endpoint
+walks the video with a single sequential `cv2.VideoCapture` decode (no
+seeking — `cv2.CAP_PROP_POS_FRAMES` seeking is unreliable on long-GOP
+H.264/HEVC) and streams sampled frames through detection one at a time,
+so memory stays bounded regardless of video length:
+
+- Every `videoWindowSec` (default 0.4s) the sharpest frame in that window
+  becomes a candidate. It's *kept* once it differs enough from the last
+  kept sample (motion) or `videoFloorIntervalSec` (default 3.0s) has
+  elapsed with no motion at all (a static-scene backstop).
+- `videoMaxFrames` (default 20000) is a pure runaway-safety ceiling, not
+  a density knob — it should essentially never bind for a real video.
+- Detections across frames are merged into per-identity **tracks**: a
+  track confirmed by ≥2 sampled frames is kept only if it also clears a
+  quality floor (catches the detector consistently misfiring on the same
+  non-face texture, which repetition alone wouldn't catch); a track seen
+  in only 1 frame needs a stricter score+quality bar. Confirmed tracks
+  keep up to 3 pose-diverse representative faces instead of collapsing
+  to a single embedding.
+
+This is a deliberate accuracy-over-speed trade: a 2-hour video can
+legitimately take thousands of detection calls instead of the old ~120.
 
 #### Video b64 fallback (external sidecar)
 
 When the sidecar runs externally without shared filesystem access, the
 `/detect/video` path mode returns 403. The Node client automatically
-falls back to:
+falls back to a local ffmpeg-based pipeline that mirrors the sidecar's
+approach:
 
-1. Extract frames locally with ffmpeg (same evenly-spaced logic).
-2. Send frames in batches of 20 to `POST /detect/batch-b64`.
-3. Deduplicate faces client-side (same cosine-sim ≥ 0.50 rule).
+1. One continuous ffmpeg process (no per-frame spawn, no `-ss` seeking)
+   using a single `select` filter that combines the duration-independent
+   floor with ffmpeg's own scene-change score as the motion trigger.
+2. Frames are parsed off ffmpeg's `stdout` incrementally and dispatched
+   to `POST /detect/batch-b64` in small windows (8 frames), discarding
+   each window's raw bytes right after — memory doesn't scale with video
+   length here either. Falls back to sequential `/detect` calls if
+   `batch-b64` isn't available (older sidecar).
+3. The same track-confirmation + best-N dedup logic as the sidecar path
+   (ported to JS, kept behaviorally in sync) runs over the results.
 
 The fallback activates transparently — no configuration needed. Once
 `_pathRejectedLogged` is set (by any 403 from photos or video), all
 subsequent video calls skip the path-mode attempt entirely.
+
+The Node fallback's `select` filter has no equivalent to `videoWindowSec`
+(no windowing concept) and uses ffmpeg's own differently-scaled `scene`
+score instead of `videoMotionThreshold`'s 0–255 luma-diff — those two
+knobs are sidecar-only (see the table above). `videoFloorIntervalSec` and
+`videoMaxFrames` apply to both paths.
 
 Embeddings from video frames land in the same `faces` table and use the
 same 512-dim ArcFace space as photo-sourced faces. Phase B DBSCAN

@@ -57,6 +57,9 @@ from .insight import (
     _resolve_models_dir,
 )
 from .io import (
+    DEFAULT_FLOOR_INTERVAL_SEC,
+    DEFAULT_MOTION_THRESHOLD,
+    DEFAULT_WINDOW_SEC,
     Base64DecodeError,
     ImageDecodeError,
     PathNotAllowedError,
@@ -199,19 +202,38 @@ class BatchDetectResponse(BaseModel):
     total_faces: int
 
 
+def _default_max_frames() -> int:
+    """Read ``TGDL_FACES_VIDEO_MAX_FRAMES`` (§5) for the request-body
+    default — falls back to 20000 (the doc's safety-ceiling default) if
+    unset/invalid. Only affects requests that omit ``max_frames``
+    entirely; an explicit request value always wins."""
+    raw = os.environ.get("TGDL_FACES_VIDEO_MAX_FRAMES", "").strip()
+    if raw:
+        try:
+            v = int(raw)
+            if v >= 1:
+                return v
+        except ValueError:
+            pass
+    return 20000
+
+
 class VideoDetectRequest(BaseModel):
     """Body for ``POST /detect/video``.
 
     ``path`` must resolve under TGDL_FACES_ALLOW_ROOTS (same rule as
-    ``/detect/batch``). ``max_frames`` caps how many evenly-spaced frames
-    are sampled — the default 120 covers a 2-hour video at 1 frame/min.
+    ``/detect/batch``). ``max_frames`` is a pure runaway-safety ceiling
+    (docs/requirements.md §4.1/§6) — not a density control — defaulting
+    to 20000 (env-overridable via ``TGDL_FACES_VIDEO_MAX_FRAMES``); it
+    should essentially never bind for a real-world video given the
+    streaming pipeline in `_do_detect_video_sync`.
     """
 
     path: str = Field(..., description="Absolute path to a video file on disk.")
     min_score: float | None = Field(default=None, ge=0.0, le=1.0)
     min_box_px: int | None = Field(default=None, ge=1)
     ar_range: tuple[float, float] | None = Field(default=None)
-    max_frames: int = Field(default=120, ge=1, le=500)
+    max_frames: int = Field(default_factory=_default_max_frames, ge=1, le=200_000)
 
     @model_validator(mode="after")
     def _validate_ar_range(self) -> "VideoDetectRequest":
@@ -918,6 +940,33 @@ _TRACK_MAX_REPRESENTATIVES = 3
 _TRACK_POSE_DEDUP_THRESHOLD = 0.85
 
 
+def _resolve_video_sampling_params() -> tuple[float, float, float]:
+    """Read the §4.1/§5 sampling knobs from env.
+
+    Returns ``(window_sec, floor_interval_sec, motion_threshold)``. Node's
+    ffmpeg-fallback continuous `select` filter has no equivalent windowing
+    concept and uses ffmpeg's own (differently-scaled) `scene` score
+    instead of a luma-diff threshold, so only ``floor_interval_sec`` has a
+    matching `videoFloorIntervalSec` knob on the Node side (§4.5) — see
+    ``src/core/ai/faces-client.js`` and docs/requirements.md §5.
+    """
+
+    def _float_env(name: str, default: float) -> float:
+        raw = os.environ.get(name, "").strip()
+        if not raw:
+            return default
+        try:
+            return float(raw)
+        except ValueError:
+            return default
+
+    return (
+        _float_env("TGDL_FACES_VIDEO_WINDOW_SEC", DEFAULT_WINDOW_SEC),
+        _float_env("TGDL_FACES_VIDEO_FLOOR_INTERVAL_SEC", DEFAULT_FLOOR_INTERVAL_SEC),
+        _float_env("TGDL_FACES_VIDEO_MOTION_THRESHOLD", DEFAULT_MOTION_THRESHOLD),
+    )
+
+
 def _resolve_video_track_thresholds() -> tuple[float, float, float]:
     """Read the §4.4/§5 track-confirmation thresholds from env.
 
@@ -1063,9 +1112,19 @@ def _do_detect_video_sync(body: VideoDetectRequest) -> JSONResponse:
         # streamed: at most `max_workers` decoded frames are ever held in
         # memory at once, regardless of video length (§4.2, §8 memory-bound
         # acceptance criterion) — no `list(...)` materialisation.
+        window_sec, floor_interval_sec, motion_threshold = _resolve_video_sampling_params()
         # `iter(...)` tolerates callers/mocks that return a plain list
         # instead of a real generator (e.g. `test_video_no_frames_extracted`).
-        gen = iter(extract_video_frames(body.path, _allow_roots(), max_frames=body.max_frames))
+        gen = iter(
+            extract_video_frames(
+                body.path,
+                _allow_roots(),
+                max_frames=body.max_frames,
+                window_sec=window_sec,
+                floor_interval_sec=floor_interval_sec,
+                motion_threshold=motion_threshold,
+            )
+        )
         first_frame = next(gen)
     except PathNotAllowedError:
         return _error(

@@ -1,7 +1,18 @@
 # Requirements: Video Face-Detection Redesign
 
-Status: **Draft — pending approval to start Phase 1**
+Status: **Implemented — Phases 1-4 complete**
 Owner surface: `faces-service/` (Python sidecar), `src/core/ai/faces-client.js` (Node ffmpeg fallback), `docs/AI.md`
+
+**Implementation note (Phase 3/4):** `videoWindowSec` and
+`videoMotionThreshold` ended up **sidecar-only**. The Node fallback's final
+`select` filter design (§4.5) uses ffmpeg's `prev_selected_t` variable in a
+single expression — `isnan(prev_selected_t)+gte(t-prev_selected_t,floor)+gt(scene,threshold)`
+— which has no windowing step to tune, and ffmpeg's built-in `scene` score
+is a different (0..1, histogram-based) metric than the Python sampler's
+0-255 luma-diff, so the two thresholds aren't numerically interchangeable.
+Only `videoFloorIntervalSec` and `videoMaxFrames` ended up wired through
+`faces-config.js` on the Node side; see the Config + env var reference in
+`docs/AI.md` for the authoritative sidecar-only vs. shared knob list.
 
 ## 1. Problem statement
 
@@ -271,6 +282,8 @@ All existing knobs (`min_score`, `min_box_px`, `ar_range`) are unchanged.
 - No behavior change to `/detect`, `/detect/batch` (photo paths).
 
 ## 7. Phased implementation plan (test-and-approve each before next)
+
+All four phases below are complete and merged.
 
 1. **Phase 1 — Streaming sampler.** Rewrite `extract_video_frames` in
    `faces-service/tgdl_faces/io.py` as a generator per §4.1/§4.2 (fixed

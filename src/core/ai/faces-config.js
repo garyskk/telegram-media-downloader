@@ -51,6 +51,8 @@ const NUMBER_KEYS = new Set([
     'healthMonitorIntervalMs',
     'healthFailuresBeforeRelaunch',
     'downloadRedirectCap',
+    'videoFloorIntervalSec',
+    'videoMaxFrames',
 ]);
 
 const BOOL_KEYS = new Set(['autoDownload', 'federate', 'qualityWeightedCentroid']);
@@ -99,6 +101,17 @@ const ENV_MAP = Object.freeze({
     downloadMirrors: 'TGDL_FACES_DOWNLOAD_MIRRORS',
     federate: 'TGDL_FACES_FEDERATE',
     qualityWeightedCentroid: 'TGDL_FACES_QUALITY_WEIGHTED_CENTROID',
+    // §5 video knobs — shared env-var names with the Python sidecar so an
+    // operator can tune both processes with the same value. Only the two
+    // knobs that have a real Node-side equivalent are wired here:
+    // `videoWindowSec` (windowed best-frame selection) and
+    // `videoMotionThreshold` (0-255 luma-diff scale) have no equivalent in
+    // the Node ffmpeg fallback's single continuous `select` filter, which
+    // has no windowing concept and uses ffmpeg's own differently-scaled
+    // `scene` score instead — see docs/requirements.md §4.5/§5 and
+    // `faces-client.js`'s `_extractVideoFrames`.
+    videoFloorIntervalSec: 'TGDL_FACES_VIDEO_FLOOR_INTERVAL_SEC',
+    videoMaxFrames: 'TGDL_FACES_VIDEO_MAX_FRAMES',
 });
 
 /**

@@ -254,7 +254,8 @@ describe('detectFacesInVideo', () => {
         await client.detectFacesInVideo('/tmp/video.mp4', {});
         expect(capturedUrl).toBe('http://host:8011/detect/video');
         expect(capturedBody.path).toBe('/tmp/video.mp4');
-        expect(capturedBody.max_frames).toBe(120);
+        // Pure safety-ceiling default (§4.1/§5) — not a density control.
+        expect(capturedBody.max_frames).toBe(20000);
         expect(Number.isFinite(capturedBody.min_score)).toBe(true);
         expect(Number.isFinite(capturedBody.min_box_px)).toBe(true);
         expect(Array.isArray(capturedBody.ar_range)).toBe(true);
@@ -342,7 +343,7 @@ describe('detectFacesInVideo', () => {
         expect(capturedBody.max_frames).toBe(60);
     });
 
-    it('clamps max_frames to 500 max', async () => {
+    it('clamps max_frames to 200000 max', async () => {
         client.setSidecarUrl('http://host:8011');
         let capturedBody = null;
         vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, init) => {
@@ -353,7 +354,87 @@ describe('detectFacesInVideo', () => {
                 json: async () => ({ faces: [], image_w: 0, image_h: 0 }),
             };
         });
-        await client.detectFacesInVideo('/tmp/video.mp4', { faces: { videoMaxFrames: 9999 } });
-        expect(capturedBody.max_frames).toBe(500);
+        await client.detectFacesInVideo('/tmp/video.mp4', { faces: { videoMaxFrames: 999_999 } });
+        expect(capturedBody.max_frames).toBe(200_000);
+    });
+
+    it('resolves videoMaxFrames via TGDL_FACES_VIDEO_MAX_FRAMES env override', async () => {
+        client.setSidecarUrl('http://host:8011');
+        process.env.TGDL_FACES_VIDEO_MAX_FRAMES = '333';
+        let capturedBody = null;
+        vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, init) => {
+            capturedBody = JSON.parse(init.body);
+            return {
+                ok: true,
+                status: 200,
+                json: async () => ({ faces: [], image_w: 0, image_h: 0 }),
+            };
+        });
+        await client.detectFacesInVideo('/tmp/video.mp4', {});
+        expect(capturedBody.max_frames).toBe(333);
+    });
+});
+
+// Regression coverage for the undici default headers/body timeout (300s,
+// hardcoded, independent of our own AbortController timeout) silently
+// killing long-running requests with a generic "fetch failed" — see the
+// comment above `_dispatcherFor`'s definition in faces-client.js. Every
+// fetch whose own intended timeout can exceed 300s must pass a `dispatcher`
+// with matching headers/body timeouts, or undici's ceiling wins first.
+describe('_dispatcherFor — undici timeout ceiling fix', () => {
+    it('caches one Agent per distinct timeout value', () => {
+        const a = client._dispatcherFor(60_000);
+        const b = client._dispatcherFor(60_000);
+        const c = client._dispatcherFor(120_000);
+        expect(a).toBe(b);
+        expect(a).not.toBe(c);
+    });
+
+    it('/detect/video passes a dispatcher matching the 2h video timeout floor', async () => {
+        client.setSidecarUrl('http://host:8011');
+        let capturedInit = null;
+        vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, init) => {
+            capturedInit = init;
+            return {
+                ok: true,
+                status: 200,
+                json: async () => ({ faces: [], image_w: 0, image_h: 0 }),
+            };
+        });
+        await client.detectFacesInVideo('/tmp/video.mp4', {});
+        expect(capturedInit.dispatcher).toBeTruthy();
+        expect(capturedInit.dispatcher).toBe(client._dispatcherFor(2 * 60 * 60 * 1000));
+    });
+
+    it('/detect/batch passes a dispatcher scaled with file count', async () => {
+        client.setSidecarUrl('http://host:8011');
+        let capturedInit = null;
+        vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, init) => {
+            capturedInit = init;
+            return {
+                ok: true,
+                status: 200,
+                json: async () => ({ results: [] }),
+            };
+        });
+        // _requestTimeoutMs defaults to 60000 (unset by _resetForTests in beforeEach).
+        await client.detectFacesBatch(['/tmp/a.jpg', '/tmp/b.jpg'], {});
+        // batchTimeoutMs = max(2 * 60000, 120000) = 120000
+        expect(capturedInit.dispatcher).toBe(client._dispatcherFor(120_000));
+    });
+
+    it('/detect (single image, via _postWithRetry) passes a dispatcher matching requestTimeoutMs', async () => {
+        client.setSidecarUrl('http://host:8011');
+        let capturedInit = null;
+        vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, init) => {
+            capturedInit = init;
+            return {
+                ok: true,
+                status: 200,
+                json: async () => ({ faces: [] }),
+            };
+        });
+        await client.detectFaces('/tmp/a.jpg', {});
+        expect(capturedInit.dispatcher).toBe(client._dispatcherFor(60_000));
     });
 });

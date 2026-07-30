@@ -176,8 +176,9 @@ services:
   # and tagged `:latest` (CPU), `:cuda-latest`, `:openvino-latest`.
   # Watchtower picks them up via the label below.
   tgdl-faces:
-    image: ghcr.io/botnick/tgdl-faces:latest
-    pull_policy: always
+    # image: ghcr.io/botnick/tgdl-faces:latest
+    build: ./faces-service
+    # pull_policy: always
     container_name: tgdl-faces
     restart: unless-stopped
     profiles: ["faces"]
@@ -233,6 +234,7 @@ services:
         # tighter envelopes (Pi 4 4GB, small Synology).
         limits:
           memory: ${TGDL_FACES_MEM_LIMIT:-2g}
+          cpus: ${TGDL_FACES_CPU_LIMIT:-6}
         reservations:
           memory: 512m
     logging:

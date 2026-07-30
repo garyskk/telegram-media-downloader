@@ -78,6 +78,112 @@ def _diverse_variant(idx: int, variant: int, dim: int = 512) -> list[float]:
 # ---------------------------------------------------------------------------
 
 
+class TestVideoConfigResolution:
+    """Phase 4 (docs/requirements.md §5) — env-var wiring for the sampling
+    and track-confirmation knobs. Each ``TGDL_FACES_VIDEO_*`` var must
+    override its hardcoded default, and fall back cleanly when unset or
+    garbage."""
+
+    def setup_method(self):
+        self._env_keys = [
+            "TGDL_FACES_VIDEO_WINDOW_SEC",
+            "TGDL_FACES_VIDEO_FLOOR_INTERVAL_SEC",
+            "TGDL_FACES_VIDEO_MOTION_THRESHOLD",
+            "TGDL_FACES_VIDEO_MAX_FRAMES",
+            "TGDL_FACES_VIDEO_SINGLETON_MIN_SCORE",
+            "TGDL_FACES_VIDEO_SINGLETON_MIN_QUALITY",
+            "TGDL_FACES_VIDEO_CONFIRMED_MIN_QUALITY",
+        ]
+        for k in self._env_keys:
+            os.environ.pop(k, None)
+
+    def teardown_method(self):
+        for k in self._env_keys:
+            os.environ.pop(k, None)
+
+    def test_sampling_params_default_when_unset(self):
+        from tgdl_faces.app import _resolve_video_sampling_params
+        from tgdl_faces.io import (
+            DEFAULT_FLOOR_INTERVAL_SEC,
+            DEFAULT_MOTION_THRESHOLD,
+            DEFAULT_WINDOW_SEC,
+        )
+
+        window_sec, floor_interval_sec, motion_threshold = _resolve_video_sampling_params()
+        assert window_sec == DEFAULT_WINDOW_SEC
+        assert floor_interval_sec == DEFAULT_FLOOR_INTERVAL_SEC
+        assert motion_threshold == DEFAULT_MOTION_THRESHOLD
+
+    def test_sampling_params_env_override(self):
+        from tgdl_faces.app import _resolve_video_sampling_params
+
+        os.environ["TGDL_FACES_VIDEO_WINDOW_SEC"] = "0.8"
+        os.environ["TGDL_FACES_VIDEO_FLOOR_INTERVAL_SEC"] = "5.0"
+        os.environ["TGDL_FACES_VIDEO_MOTION_THRESHOLD"] = "10.0"
+        window_sec, floor_interval_sec, motion_threshold = _resolve_video_sampling_params()
+        assert window_sec == 0.8
+        assert floor_interval_sec == 5.0
+        assert motion_threshold == 10.0
+
+    def test_sampling_params_garbage_env_falls_back_to_default(self):
+        from tgdl_faces.app import _resolve_video_sampling_params
+        from tgdl_faces.io import DEFAULT_WINDOW_SEC
+
+        os.environ["TGDL_FACES_VIDEO_WINDOW_SEC"] = "not-a-number"
+        window_sec, _, _ = _resolve_video_sampling_params()
+        assert window_sec == DEFAULT_WINDOW_SEC
+
+    def test_track_thresholds_default_when_unset(self):
+        from tgdl_faces.app import _resolve_video_track_thresholds
+
+        score, quality, confirmed = _resolve_video_track_thresholds()
+        assert score == 0.75
+        assert quality == 0.55
+        assert confirmed == 0.30
+
+    def test_track_thresholds_env_override(self):
+        from tgdl_faces.app import _resolve_video_track_thresholds
+
+        os.environ["TGDL_FACES_VIDEO_SINGLETON_MIN_SCORE"] = "0.8"
+        os.environ["TGDL_FACES_VIDEO_SINGLETON_MIN_QUALITY"] = "0.6"
+        os.environ["TGDL_FACES_VIDEO_CONFIRMED_MIN_QUALITY"] = "0.4"
+        score, quality, confirmed = _resolve_video_track_thresholds()
+        assert score == 0.8
+        assert quality == 0.6
+        assert confirmed == 0.4
+
+    def test_default_max_frames_is_20000_when_unset(self):
+        from tgdl_faces.app import _default_max_frames
+
+        assert _default_max_frames() == 20000
+
+    def test_default_max_frames_env_override(self):
+        from tgdl_faces.app import _default_max_frames
+
+        os.environ["TGDL_FACES_VIDEO_MAX_FRAMES"] = "5000"
+        assert _default_max_frames() == 5000
+
+    def test_default_max_frames_garbage_env_falls_back(self):
+        from tgdl_faces.app import _default_max_frames
+
+        os.environ["TGDL_FACES_VIDEO_MAX_FRAMES"] = "not-a-number"
+        assert _default_max_frames() == 20000
+
+    def test_video_request_max_frames_uses_env_default_when_omitted(self):
+        from tgdl_faces.app import VideoDetectRequest
+
+        os.environ["TGDL_FACES_VIDEO_MAX_FRAMES"] = "777"
+        req = VideoDetectRequest(path="/tmp/x.mp4")
+        assert req.max_frames == 777
+
+    def test_video_request_explicit_max_frames_wins_over_env(self):
+        from tgdl_faces.app import VideoDetectRequest
+
+        os.environ["TGDL_FACES_VIDEO_MAX_FRAMES"] = "777"
+        req = VideoDetectRequest(path="/tmp/x.mp4", max_frames=42)
+        assert req.max_frames == 42
+
+
 class TestBuildFaceTracks:
     """`_build_face_tracks(frames_faces)` per docs/requirements.md §4.4.
 
@@ -487,12 +593,31 @@ def test_video_max_frames_zero_returns_422(client, temp_root: Path) -> None:
     assert resp.status_code in (400, 422)
 
 
-def test_video_max_frames_501_returns_422(client, temp_root: Path) -> None:
+def test_video_max_frames_over_ceiling_returns_422(client, temp_root: Path) -> None:
+    """`max_frames` is a pure safety ceiling (§4.1/§6, default 20000) — the
+    real cap moved from the old density-control 500 up to 200000, but the
+    field is still bounded so a client can't request an unbounded decode."""
     resp = client.post(
         "/detect/video",
-        json={"path": str(temp_root / "x.mp4"), "max_frames": 501},
+        json={"path": str(temp_root / "x.mp4"), "max_frames": 200_001},
     )
     assert resp.status_code in (400, 422)
+
+
+def test_video_max_frames_20000_is_valid(client, temp_root: Path) -> None:
+    """20000 — the new §5 safety-ceiling default — must itself be an
+    accepted value, not just values below it."""
+    from tgdl_faces import insight
+    from tgdl_faces import app as app_mod
+
+    with patch.object(insight, "_APP", MagicMock()), patch.object(
+        insight, "_APP_ERROR", None
+    ), patch.object(app_mod, "extract_video_frames", lambda *a, **kw: []):
+        resp = client.post(
+            "/detect/video",
+            json={"path": str(temp_root / "x.mp4"), "max_frames": 20000},
+        )
+    assert resp.status_code == 200
 
 
 def test_video_model_not_ready_returns_503(monkeypatch, client, temp_root: Path) -> None:
