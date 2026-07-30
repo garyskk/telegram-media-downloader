@@ -25,6 +25,7 @@ import binascii
 import logging
 import os
 from pathlib import Path
+from typing import Iterator
 
 import cv2
 import numpy as np
@@ -202,16 +203,111 @@ def load_image_from_path(path: str, allow_roots: list[str]) -> np.ndarray:
     return _apply_exif_orientation(img, raw)
 
 
+# Fixed sampling constants (see docs/requirements.md §4.1) — deliberately
+# NOT scaled by video duration. A 10-second clip and a 4-hour video are
+# walked with identical logic; only the *number* of windows differs.
+#
+#   DEFAULT_WINDOW_SEC         is the real recall-latency driver: motion is
+#                              re-checked every window against the last kept
+#                              sample, so this is how fast a brief on-screen
+#                              appearance gets noticed.
+#   DEFAULT_FLOOR_INTERVAL_SEC is only a backstop for stretches where
+#                              nothing ever triggers motion (a genuinely
+#                              static scene) — looser than window_sec is
+#                              fine since it isn't the recall mechanism.
+#   DEFAULT_MOTION_THRESHOLD   is the sensitivity dial: how much luma
+#                              change (0-255 scale, on a downscaled
+#                              signature) counts as "the picture changed".
+DEFAULT_WINDOW_SEC = 0.4
+DEFAULT_FLOOR_INTERVAL_SEC = 3.0
+DEFAULT_MOTION_THRESHOLD = 6.0
+
+_ACTIVITY_SIZE = (160, 90)  # (width, height) of the downscaled luma signature — the
+# actual full-resolution frame is still used for detection; this only feeds the
+# cheap motion/sharpness signal that decides *which* frames to keep. Kept larger
+# than a typical motion-detector proxy would use so a small/distant face entering
+# frame still perturbs enough cells to register — still trivially cheap next to
+# the ArcFace/RetinaFace inference cost that dominates this pipeline regardless.
+
+
+def _activity_signature(frame: np.ndarray, size: tuple[int, int] = _ACTIVITY_SIZE) -> np.ndarray:
+    """Cheap per-frame signature for motion/scene-change comparison.
+
+    Pure-NumPy nearest-neighbour downsample + luma grayscale. Deliberately
+    avoids a second cv2 call per frame (the caller already paid for one
+    decode) — a coarse ~48x27 signal is plenty to tell "the picture
+    changed" apart from "identical scene" without pixel-perfect comparison,
+    and staying in NumPy keeps this testable independent of cv2's own
+    resize/color-convert behaviour.
+    """
+    h, w = frame.shape[:2]
+    tw, th = size
+    xs = np.clip((np.arange(tw) * w) // max(1, tw), 0, w - 1)
+    ys = np.clip((np.arange(th) * h) // max(1, th), 0, h - 1)
+    small = frame[ys][:, xs]  # th x tw x 3, BGR (cv2 decode order)
+    b = small[..., 0].astype(np.float32)
+    g = small[..., 1].astype(np.float32)
+    r = small[..., 2].astype(np.float32)
+    return b * 0.114 + g * 0.587 + r * 0.299
+
+
+def _activity_diff(a: np.ndarray, b: np.ndarray) -> float:
+    """Mean absolute difference between two activity signatures (0..255 scale)."""
+    return float(np.abs(a - b).mean())
+
+
+def _sharpness(sig: np.ndarray) -> float:
+    """Cheap sharpness proxy: variance of the signature's local gradient.
+
+    Computed on the already-downscaled activity signature so picking the
+    least motion-blurred frame within a sampling window costs nothing
+    beyond the diff signature every frame already needs.
+    """
+    if sig.shape[0] < 2 or sig.shape[1] < 2:
+        return 0.0
+    gx = np.diff(sig, axis=1)
+    gy = np.diff(sig, axis=0)
+    return float(gx.var() + gy.var())
+
+
 def extract_video_frames(
     path: str,
     allow_roots: list[str],
     max_frames: int = 120,
-) -> list[np.ndarray]:
-    """Extract evenly-spaced frames from a video using cv2.VideoCapture.
+    *,
+    window_sec: float = DEFAULT_WINDOW_SEC,
+    floor_interval_sec: float = DEFAULT_FLOOR_INTERVAL_SEC,
+    motion_threshold: float = DEFAULT_MOTION_THRESHOLD,
+) -> Iterator[np.ndarray]:
+    """Yield content-adaptive frames from a video via one sequential decode.
 
-    Frames are returned as in-memory BGR ndarrays — no temp files written.
-    Sample count adapts to video duration so short clips get at least one
-    frame and very long videos stay under ``max_frames``.
+    Replaces the previous evenly-spaced-by-duration-band sampler. Uniform
+    time sampling misses any face whose on-screen appearance is shorter
+    than the sampling interval, and ``cv2``'s ``CAP_PROP_POS_FRAMES`` seek
+    is unreliable on long-GOP H.264/HEVC (it lands on the nearest keyframe,
+    not the requested index). This walks the video exactly once, start to
+    end — no seeking — and decides on the fly which frames are worth
+    keeping, using **fixed** constants that do not scale with video
+    duration (see docs/requirements.md §4.1):
+
+    - The video is split into ``window_sec`` windows. Within each window,
+      the least motion-blurred frame (cheapest-possible sharpness proxy on
+      a downscaled luma signature) is that window's candidate.
+    - A candidate is *kept* when it differs from the previously kept
+      sample by more than ``motion_threshold`` — the picture actually
+      changed — checked at every window boundary, which is what lets a
+      brief appearance get caught regardless of video length.
+    - A candidate is also kept if ``floor_interval_sec`` has elapsed since
+      the last kept sample, even with zero detected motion — a backstop
+      for genuinely static scenes, not the primary recall mechanism.
+    - ``max_frames`` is a hard ceiling — a runaway-safety net, not a
+      duration-based budget. It should rarely bind for real videos.
+
+    Frames are yielded as in-memory BGR ndarrays in temporal order — no
+    temp files written to disk, no seeking. This is a generator so a
+    caller that detects-and-discards each frame as it arrives (the
+    streaming pipeline in docs/requirements.md §4.2) never holds more than
+    a handful of decoded frames in memory regardless of video length.
 
     Raises
     ------
@@ -241,38 +337,50 @@ def extract_video_frames(
         if total_frames <= 0:
             # Some containers don't report frame count — grab one frame.
             ret, frame = cap.read()
-            return [frame] if (ret and frame is not None) else []
-
-        duration = total_frames / fps
-
-        # Adaptive sample count: more frames for short clips, fewer for long.
-        if duration < 30:
-            n_samples = min(3, total_frames)
-        elif duration < 300:       # < 5 min
-            n_samples = min(30, max_frames)
-        elif duration < 1800:      # < 30 min
-            n_samples = min(60, max_frames)
-        else:
-            n_samples = max_frames
-
-        n_samples = max(1, min(n_samples, total_frames))
-
-        if n_samples == 1:
-            indices = [total_frames // 2]
-        else:
-            step = (total_frames - 1) / (n_samples - 1)
-            indices = [
-                min(int(round(i * step)), total_frames - 1)
-                for i in range(n_samples)
-            ]
-
-        frames: list[np.ndarray] = []
-        for idx in indices:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, float(idx))
-            ret, frame = cap.read()
             if ret and frame is not None:
-                frames.append(frame)
-        return frames
+                yield frame
+            return
+
+        window_frames = max(1, round(fps * window_sec))
+        floor_frames = max(window_frames, round(fps * floor_interval_sec))
+
+        prev_sig: np.ndarray | None = None
+        last_kept_idx = -floor_frames
+        kept = 0
+
+        best_sharp = -1.0
+        best_frame: np.ndarray | None = None
+        best_sig: np.ndarray | None = None
+        best_idx = 0
+        window_start = 0
+
+        for idx in range(total_frames):
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                break
+            sig = _activity_signature(frame)
+            sharp = _sharpness(sig)
+            if sharp > best_sharp:
+                best_sharp, best_frame, best_sig, best_idx = sharp, frame, sig, idx
+
+            at_window_end = (idx - window_start + 1) >= window_frames
+            at_video_end = idx == total_frames - 1
+            if best_frame is not None and (at_window_end or at_video_end):
+                motion = (
+                    _activity_diff(prev_sig, best_sig)
+                    if prev_sig is not None
+                    else float("inf")
+                )
+                hit_floor = (best_idx - last_kept_idx) >= floor_frames
+                if prev_sig is None or motion >= motion_threshold or hit_floor:
+                    yield best_frame
+                    prev_sig = best_sig
+                    last_kept_idx = best_idx
+                    kept += 1
+                    if kept >= max_frames:
+                        return
+                best_sharp, best_frame, best_sig = -1.0, None, None
+                window_start = idx + 1
     finally:
         cap.release()
 

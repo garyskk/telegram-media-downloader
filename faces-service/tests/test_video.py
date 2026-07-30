@@ -1,7 +1,8 @@
 """Tests for video face detection infrastructure.
 
 Covers:
-* ``_dedupe_video_faces`` — identity deduplication across frames.
+* ``_build_face_tracks`` — temporal-confirmation identity tracking + best-N
+  dedup across frames (docs/requirements.md §4.4).
 * ``extract_video_frames`` — cv2-based frame sampler (cv2 fully mocked).
 * ``POST /detect/video`` — FastAPI endpoint validation + soft-error paths.
 
@@ -13,6 +14,8 @@ from __future__ import annotations
 
 import os
 import tempfile
+import threading
+import time
 from pathlib import Path
 from typing import Iterator
 from unittest.mock import MagicMock, patch
@@ -26,7 +29,7 @@ import pytest
 # ---------------------------------------------------------------------------
 
 
-def _face(score: float = 0.8, emb: list[float] | None = None) -> dict:
+def _face(score: float = 0.8, quality: float = 0.6, emb: list[float] | None = None) -> dict:
     if emb is None:
         emb = [1.0] + [0.0] * 511
     return {
@@ -35,6 +38,7 @@ def _face(score: float = 0.8, emb: list[float] | None = None) -> dict:
         "w": 60,
         "h": 60,
         "score": score,
+        "quality_score": quality,
         "embedding": list(emb),
         "landmarks": [],
     }
@@ -55,62 +59,129 @@ def _near(idx: int, noise: float = 0.436, dim: int = 512) -> list[float]:
     return v
 
 
+def _diverse_variant(idx: int, variant: int, dim: int = 512) -> list[float]:
+    """Return a unit vector sharing a dominant component at *idx* (so it
+    still matches the same identity/track) but with a distinct secondary
+    component per *variant* — pairwise similarity between variants stays
+    well under the 0.85 near-duplicate-pose threshold, while similarity to
+    the shared dominant direction stays above the 0.50 track-match bar.
+    """
+    v = [0.0] * dim
+    v[idx] = 0.85
+    v[(idx + 1 + variant) % dim] = 0.53
+    norm = (v[idx] ** 2 + v[(idx + 1 + variant) % dim] ** 2) ** 0.5
+    return [x / norm for x in v]
+
+
 # ---------------------------------------------------------------------------
-# Tests: _dedupe_video_faces
+# Tests: _build_face_tracks
 # ---------------------------------------------------------------------------
 
 
-class TestDedupeVideoFaces:
+class TestBuildFaceTracks:
+    """`_build_face_tracks(frames_faces)` per docs/requirements.md §4.4.
+
+    ``frames_faces`` is ``list[list[dict]]`` — one list of detections per
+    *sampled frame*, in temporal order (not a flat list) — this is what
+    lets the tracker count "how many distinct frames corroborated this
+    identity" rather than just "how many detections total".
+    """
+
     def setup_method(self):
-        from tgdl_faces.app import _dedupe_video_faces
-        self._fn = _dedupe_video_faces
+        from tgdl_faces.app import _build_face_tracks
+        self._fn = _build_face_tracks
 
     def test_empty_input_returns_empty(self):
         assert self._fn([]) == []
 
-    def test_single_face_returns_that_face(self):
-        f = _face(score=0.9)
-        result = self._fn([f])
+    def test_empty_frames_return_empty(self):
+        assert self._fn([[], [], []]) == []
+
+    def test_single_hit_high_confidence_kept(self):
+        f = _face(score=0.9, quality=0.9)
+        result = self._fn([[f]])
         assert result == [f]
 
-    def test_same_person_dedupes_to_one_result(self):
-        low = _face(score=0.6, emb=_unit(0))
-        high = _face(score=0.95, emb=_near(0))
-        result = self._fn([low, high])
+    def test_single_hit_below_score_bar_dropped(self):
+        f = _face(score=0.6, quality=0.9)  # below the 0.75 singleton score bar
+        assert self._fn([[f]]) == []
+
+    def test_single_hit_below_quality_bar_dropped(self):
+        f = _face(score=0.9, quality=0.4)  # below the 0.55 singleton quality bar
+        assert self._fn([[f]]) == []
+
+    def test_single_hit_at_exact_bars_kept(self):
+        f = _face(score=0.75, quality=0.55)
+        assert self._fn([[f]]) == [f]
+
+    def test_two_hits_same_person_confirmed_and_deduped_to_best(self):
+        """Mirrors the old greedy-dedup behaviour for near-identical poses:
+        confirmed by 2 hits, but the poses are too similar to count as
+        diverse, so only the highest-scoring one survives."""
+        low = _face(score=0.6, quality=0.5, emb=_unit(0))
+        high = _face(score=0.95, quality=0.5, emb=_near(0))
+        result = self._fn([[low], [high]])
         assert len(result) == 1
         assert result[0]["score"] == 0.95
 
-    def test_same_person_keeps_higher_score_regardless_of_order(self):
-        high = _face(score=0.95, emb=_unit(0))
-        low = _face(score=0.6, emb=_near(0))
-        result = self._fn([high, low])
+    def test_two_hits_confirmed_regardless_of_frame_order(self):
+        high = _face(score=0.95, quality=0.5, emb=_unit(0))
+        low = _face(score=0.6, quality=0.5, emb=_near(0))
+        result = self._fn([[high], [low]])
         assert len(result) == 1
         assert result[0]["score"] == 0.95
 
-    def test_different_people_keeps_both(self):
-        a = _face(score=0.8, emb=_unit(0))
-        b = _face(score=0.8, emb=_unit(1))
-        result = self._fn([a, b])
+    def test_confirmed_track_below_universal_quality_floor_dropped(self):
+        """The core false-positive-class fix: a systematic misfire (same
+        non-face region detected consistently) shouldn't survive just
+        because it repeats — every face in the track fails the 0.30 floor."""
+        a = _face(score=0.9, quality=0.1, emb=_unit(5))
+        b = _face(score=0.9, quality=0.1, emb=_near(5))
+        assert self._fn([[a], [b]]) == []
+
+    def test_confirmed_track_meeting_quality_floor_kept(self):
+        a = _face(score=0.9, quality=0.35, emb=_unit(6))
+        b = _face(score=0.9, quality=0.35, emb=_near(6))
+        result = self._fn([[a], [b]])
+        assert len(result) == 1
+
+    def test_different_people_across_frames_kept_separately(self):
+        frame1 = [_face(score=0.8, quality=0.6, emb=_unit(0)), _face(score=0.8, quality=0.6, emb=_unit(1))]
+        frame2 = [_face(score=0.8, quality=0.6, emb=_near(0)), _face(score=0.8, quality=0.6, emb=_near(1))]
+        result = self._fn([frame1, frame2])
+        # Each identity confirmed by 2 hits, but near-duplicate poses within
+        # each identity collapse to 1 representative -> 2 identities total.
         assert len(result) == 2
 
-    def test_three_unique_people_returns_three(self):
-        faces = [
-            _face(score=0.8, emb=_unit(0)),
-            _face(score=0.8, emb=_unit(1)),
-            _face(score=0.8, emb=_unit(2)),
-            _face(score=0.9, emb=_near(0)),
-            _face(score=0.7, emb=_near(1)),
+    def test_three_unique_identities_plus_one_unconfirmed_low_conf_dropped(self):
+        frames = [
+            [_face(score=0.8, quality=0.6, emb=_unit(0)), _face(score=0.8, quality=0.6, emb=_unit(1))],
+            [_face(score=0.9, quality=0.6, emb=_near(0)), _face(score=0.7, quality=0.6, emb=_near(1))],
+            [_face(score=0.8, quality=0.6, emb=_unit(2))],  # single-hit but confident -> kept
+            [_face(score=0.5, quality=0.3, emb=_unit(9))],  # single-hit, weak -> dropped
         ]
-        result = self._fn(faces)
+        result = self._fn(frames)
         assert len(result) == 3
 
-    def test_below_threshold_not_deduped(self):
-        a = _face(score=0.8, emb=_unit(0))
-        b = _face(score=0.8, emb=_unit(1))
-        result = self._fn([a, b])
-        assert len(result) == 2
-        scores = {r["score"] for r in result}
-        assert scores == {0.8}
+    def test_keeps_up_to_three_diverse_representatives(self):
+        faces = [
+            _face(score=0.9 - 0.05 * k, quality=0.7, emb=_diverse_variant(0, k))
+            for k in range(5)
+        ]
+        result = self._fn([[f] for f in faces])
+        assert len(result) <= 3
+        assert len(result) >= 2  # confirmed by 5 hits, diverse poses -> more than 1 kept
+        scores = sorted((r["score"] for r in result), reverse=True)
+        assert scores == sorted(scores, reverse=True)
+
+    def test_near_duplicate_poses_collapse_to_fewer_representatives(self):
+        """Same identity, 5 hits, but every pose is a near-duplicate of the
+        top scorer — diversity gate should keep far fewer than 5."""
+        top = _face(score=0.95, quality=0.7, emb=_unit(3))
+        dupes = [_face(score=0.7, quality=0.7, emb=_near(3)) for _ in range(4)]
+        result = self._fn([[top]] + [[d] for d in dupes])
+        assert len(result) == 1
+        assert result[0]["score"] == 0.95
 
 
 # ---------------------------------------------------------------------------
@@ -119,19 +190,36 @@ class TestDedupeVideoFaces:
 
 
 class TestExtractVideoFrames:
-    def _make_frame(self) -> np.ndarray:
-        return np.zeros((480, 640, 3), dtype=np.uint8)
+    """Covers the fixed-cadence, duration-independent sampler.
+
+    `extract_video_frames` is a **generator** — see docs/requirements.md
+    §4.1/§4.2. Calling it just builds the generator object without running
+    any code (including the allow-list / cv2-open checks), so every test
+    that expects an error or a result has to force iteration via
+    ``list(...)`` inside the assertion context.
+    """
+
+    def _make_frame(self, size=(480, 640)) -> np.ndarray:
+        return np.zeros((*size, 3), dtype=np.uint8)
+
+    def _mock_cv2(self, mock_cap) -> MagicMock:
+        mock_cv2 = MagicMock()
+        mock_cv2.VideoCapture.return_value = mock_cap
+        mock_cv2.CAP_PROP_FPS = 5
+        mock_cv2.CAP_PROP_FRAME_COUNT = 7
+        mock_cv2.CAP_PROP_POS_FRAMES = 8
+        return mock_cv2
 
     def test_empty_allow_roots_raises_path_not_allowed(self):
         from tgdl_faces.io import PathNotAllowedError, extract_video_frames
         with pytest.raises(PathNotAllowedError):
-            extract_video_frames("/some/path/video.mp4", allow_roots=[])
+            list(extract_video_frames("/some/path/video.mp4", allow_roots=[]))
 
     def test_path_outside_allow_roots_raises_path_not_allowed(self, tmp_path):
         from tgdl_faces.io import PathNotAllowedError, extract_video_frames
         outside = str(tmp_path / "video.mp4")
         with pytest.raises(PathNotAllowedError):
-            extract_video_frames(outside, allow_roots=["/not/this/dir"])
+            list(extract_video_frames(outside, allow_roots=["/not/this/dir"]))
 
     def test_cv2_cannot_open_raises_file_not_found(self, tmp_path):
         from tgdl_faces.io import extract_video_frames
@@ -141,15 +229,11 @@ class TestExtractVideoFrames:
 
         mock_cap = MagicMock()
         mock_cap.isOpened.return_value = False
-
-        mock_cv2 = MagicMock()
-        mock_cv2.VideoCapture.return_value = mock_cap
-        mock_cv2.CAP_PROP_FPS = 5
-        mock_cv2.CAP_PROP_FRAME_COUNT = 7
+        mock_cv2 = self._mock_cv2(mock_cap)
 
         with patch("tgdl_faces.io.cv2", mock_cv2):
             with pytest.raises(FileNotFoundError):
-                extract_video_frames(target, allow_roots=[str(tmp_path)])
+                list(extract_video_frames(target, allow_roots=[str(tmp_path)]))
 
     def test_zero_total_frames_reads_one_frame_and_returns_it(self, tmp_path):
         from tgdl_faces.io import extract_video_frames
@@ -161,156 +245,14 @@ class TestExtractVideoFrames:
         mock_cap = MagicMock()
         mock_cap.isOpened.return_value = True
         mock_cap.read.return_value = (True, frame)
-
-        mock_cv2 = MagicMock()
-        mock_cv2.VideoCapture.return_value = mock_cap
-        mock_cv2.CAP_PROP_FPS = 5
-        mock_cv2.CAP_PROP_FRAME_COUNT = 7
         mock_cap.get.side_effect = lambda prop: 0
+        mock_cv2 = self._mock_cv2(mock_cap)
 
         with patch("tgdl_faces.io.cv2", mock_cv2):
-            result = extract_video_frames(target, allow_roots=[str(tmp_path)])
+            result = list(extract_video_frames(target, allow_roots=[str(tmp_path)]))
 
         assert len(result) == 1
         assert result[0] is frame
-
-    def test_short_clip_under_30s_n_samples_le_3(self, tmp_path):
-        from tgdl_faces.io import extract_video_frames
-
-        target = str(tmp_path / "video.mp4")
-        Path(target).touch()
-        frame = self._make_frame()
-
-        # 5s at 30fps = 150 frames
-        fps = 30.0
-        total_frames = 150
-
-        mock_cap = MagicMock()
-        mock_cap.isOpened.return_value = True
-        mock_cap.read.return_value = (True, frame)
-        mock_cap.get.side_effect = lambda prop: fps if prop == 5 else float(total_frames)
-
-        mock_cv2 = MagicMock()
-        mock_cv2.VideoCapture.return_value = mock_cap
-        mock_cv2.CAP_PROP_FPS = 5
-        mock_cv2.CAP_PROP_FRAME_COUNT = 7
-
-        with patch("tgdl_faces.io.cv2", mock_cv2):
-            result = extract_video_frames(target, allow_roots=[str(tmp_path)])
-
-        assert len(result) <= 3
-
-    def test_medium_clip_30s_to_5min_n_samples_le_30(self, tmp_path):
-        from tgdl_faces.io import extract_video_frames
-
-        target = str(tmp_path / "video.mp4")
-        Path(target).touch()
-        frame = self._make_frame()
-
-        # 3min at 30fps = 5400 frames
-        fps = 30.0
-        total_frames = 5400
-
-        mock_cap = MagicMock()
-        mock_cap.isOpened.return_value = True
-        mock_cap.read.return_value = (True, frame)
-        mock_cap.get.side_effect = lambda prop: fps if prop == 5 else float(total_frames)
-
-        mock_cv2 = MagicMock()
-        mock_cv2.VideoCapture.return_value = mock_cap
-        mock_cv2.CAP_PROP_FPS = 5
-        mock_cv2.CAP_PROP_FRAME_COUNT = 7
-
-        with patch("tgdl_faces.io.cv2", mock_cv2):
-            result = extract_video_frames(target, allow_roots=[str(tmp_path)])
-
-        assert len(result) > 3
-        assert len(result) <= 30
-
-    def test_long_clip_5min_to_30min_n_samples_le_60(self, tmp_path):
-        from tgdl_faces.io import extract_video_frames
-
-        target = str(tmp_path / "video.mp4")
-        Path(target).touch()
-        frame = self._make_frame()
-
-        # 15min at 30fps = 27000 frames
-        fps = 30.0
-        total_frames = 27000
-
-        mock_cap = MagicMock()
-        mock_cap.isOpened.return_value = True
-        mock_cap.read.return_value = (True, frame)
-        mock_cap.get.side_effect = lambda prop: fps if prop == 5 else float(total_frames)
-
-        mock_cv2 = MagicMock()
-        mock_cv2.VideoCapture.return_value = mock_cap
-        mock_cv2.CAP_PROP_FPS = 5
-        mock_cv2.CAP_PROP_FRAME_COUNT = 7
-
-        with patch("tgdl_faces.io.cv2", mock_cv2):
-            result = extract_video_frames(target, allow_roots=[str(tmp_path)])
-
-        assert len(result) <= 60
-
-    def test_very_long_clip_over_30min_n_samples_le_max_frames(self, tmp_path):
-        from tgdl_faces.io import extract_video_frames
-
-        target = str(tmp_path / "video.mp4")
-        Path(target).touch()
-        frame = self._make_frame()
-
-        # 1hr at 30fps = 108000 frames
-        fps = 30.0
-        total_frames = 108000
-
-        mock_cap = MagicMock()
-        mock_cap.isOpened.return_value = True
-        mock_cap.read.return_value = (True, frame)
-        mock_cap.get.side_effect = lambda prop: fps if prop == 5 else float(total_frames)
-
-        mock_cv2 = MagicMock()
-        mock_cv2.VideoCapture.return_value = mock_cap
-        mock_cv2.CAP_PROP_FPS = 5
-        mock_cv2.CAP_PROP_FRAME_COUNT = 7
-
-        with patch("tgdl_faces.io.cv2", mock_cv2):
-            result = extract_video_frames(target, allow_roots=[str(tmp_path)], max_frames=120)
-
-        assert len(result) <= 120
-
-    def test_indices_within_bounds(self, tmp_path):
-        from tgdl_faces.io import extract_video_frames
-
-        target = str(tmp_path / "video.mp4")
-        Path(target).touch()
-        frame = self._make_frame()
-
-        fps = 30.0
-        total_frames = 5400
-        seen_indices = []
-
-        def cap_set(prop, value):
-            if prop == 8:
-                seen_indices.append(value)
-
-        mock_cap = MagicMock()
-        mock_cap.isOpened.return_value = True
-        mock_cap.read.return_value = (True, frame)
-        mock_cap.get.side_effect = lambda prop: fps if prop == 5 else float(total_frames)
-        mock_cap.set.side_effect = cap_set
-
-        mock_cv2 = MagicMock()
-        mock_cv2.VideoCapture.return_value = mock_cap
-        mock_cv2.CAP_PROP_FPS = 5
-        mock_cv2.CAP_PROP_FRAME_COUNT = 7
-        mock_cv2.CAP_PROP_POS_FRAMES = 8
-
-        with patch("tgdl_faces.io.cv2", mock_cv2):
-            extract_video_frames(target, allow_roots=[str(tmp_path)])
-
-        for idx in seen_indices:
-            assert 0 <= idx <= total_frames - 1
 
     def test_cap_release_called_even_when_empty_frames(self, tmp_path):
         from tgdl_faces.io import extract_video_frames
@@ -325,17 +267,164 @@ class TestExtractVideoFrames:
         mock_cap.isOpened.return_value = True
         mock_cap.read.return_value = (False, None)
         mock_cap.get.side_effect = lambda prop: fps if prop == 5 else float(total_frames)
-
-        mock_cv2 = MagicMock()
-        mock_cv2.VideoCapture.return_value = mock_cap
-        mock_cv2.CAP_PROP_FPS = 5
-        mock_cv2.CAP_PROP_FRAME_COUNT = 7
+        mock_cv2 = self._mock_cv2(mock_cap)
 
         with patch("tgdl_faces.io.cv2", mock_cv2):
-            result = extract_video_frames(target, allow_roots=[str(tmp_path)])
+            result = list(extract_video_frames(target, allow_roots=[str(tmp_path)]))
 
         mock_cap.release.assert_called_once()
         assert result == []
+
+    def test_never_seeks(self, tmp_path):
+        """Proves the seek-drift bug is fixed: no `cap.set(...)` calls at all —
+        one sequential decode, start to end, no `CAP_PROP_POS_FRAMES`."""
+        from tgdl_faces.io import extract_video_frames
+
+        target = str(tmp_path / "video.mp4")
+        Path(target).touch()
+        frame = self._make_frame()
+
+        fps = 30.0
+        total_frames = 900  # 30s
+
+        mock_cap = MagicMock()
+        mock_cap.isOpened.return_value = True
+        mock_cap.read.return_value = (True, frame)
+        mock_cap.get.side_effect = lambda prop: fps if prop == 5 else float(total_frames)
+        mock_cv2 = self._mock_cv2(mock_cap)
+
+        with patch("tgdl_faces.io.cv2", mock_cv2):
+            list(extract_video_frames(target, allow_roots=[str(tmp_path)]))
+
+        mock_cap.set.assert_not_called()
+
+    def _static_video(self, tmp_path, total_frames: int, fps: float = 30.0):
+        """A mocked video where every decoded frame is identical (zero
+        motion) — isolates the floor-checkpoint behaviour from motion."""
+        from tgdl_faces.io import extract_video_frames
+
+        target = str(tmp_path / "video.mp4")
+        Path(target).touch()
+        frame = self._make_frame((64, 64))
+
+        mock_cap = MagicMock()
+        mock_cap.isOpened.return_value = True
+        mock_cap.read.return_value = (True, frame)
+        mock_cap.get.side_effect = lambda prop: fps if prop == 5 else float(total_frames)
+        mock_cv2 = self._mock_cv2(mock_cap)
+
+        with patch("tgdl_faces.io.cv2", mock_cv2):
+            return list(extract_video_frames(target, allow_roots=[str(tmp_path)], max_frames=100000))
+
+    def test_static_video_short_and_long_have_matching_sample_rate(self, tmp_path):
+        """Duration-independence: a short and a long zero-motion video must
+        get the *same per-second floor rate* — no duration bands, no
+        special-casing by video length (docs/requirements.md §4.1/§8)."""
+        short = self._static_video(tmp_path, total_frames=300, fps=30.0)  # 10s
+        long = self._static_video(tmp_path, total_frames=3000, fps=30.0)  # 100s
+
+        rate_short = len(short) / (300 / 30.0)
+        rate_long = len(long) / (3000 / 30.0)
+
+        # Both rates should approximate 1 / floor_interval_sec (default 3.0s
+        # -> ~0.33/s); loose tolerance absorbs first-sample/rounding effects
+        # at window boundaries, not a duration-band difference.
+        assert abs(rate_short - rate_long) < 0.15, (
+            f"sample rate should be duration-independent: "
+            f"short={rate_short:.3f}/s long={rate_long:.3f}/s"
+        )
+        # Sanity: neither collapses to the old hardcoded bands (3 / 30 / 60).
+        assert 2 <= len(short) <= 8
+        assert 20 <= len(long) <= 45
+
+    def test_zero_motion_video_respects_floor_interval(self, tmp_path):
+        """A fully static 10s video samples roughly once per
+        `floor_interval_sec` (default 3.0s), not once per minute like the
+        old evenly-spaced sampler would for a video this short-but-long-ish."""
+        result = self._static_video(tmp_path, total_frames=300, fps=30.0)  # 10s
+        assert 2 <= len(result) <= 6
+
+    def test_brief_content_change_is_captured(self, tmp_path):
+        """A short-lived, visually distinct block of frames (simulating a
+        person briefly on screen) between two floor checkpoints is caught
+        by motion detection, not skipped — the core bug this rewrite fixes."""
+        from tgdl_faces.io import extract_video_frames
+
+        target = str(tmp_path / "video.mp4")
+        Path(target).touch()
+
+        fps = 30.0
+        total_frames = 300  # 10s
+        blank = np.zeros((64, 64, 3), dtype=np.uint8)
+        gradient_row = np.linspace(0, 255, 64, dtype=np.uint8)
+        gradient = np.tile(gradient_row, (64, 1))
+        gradient_frame = np.stack([gradient, gradient, gradient], axis=-1).astype(np.uint8)
+
+        frames_seq = [blank.copy() for _ in range(total_frames)]
+        for i in range(40, 46):  # ~0.2s block — shorter than window_sec
+            frames_seq[i] = gradient_frame
+
+        state = {"i": 0}
+
+        def _read(*_a, **_kw):
+            i = state["i"]
+            state["i"] += 1
+            if i >= len(frames_seq):
+                return (False, None)
+            return (True, frames_seq[i])
+
+        mock_cap = MagicMock()
+        mock_cap.isOpened.return_value = True
+        mock_cap.read.side_effect = _read
+        mock_cap.get.side_effect = lambda prop: fps if prop == 5 else float(total_frames)
+        mock_cv2 = self._mock_cv2(mock_cap)
+
+        with patch("tgdl_faces.io.cv2", mock_cv2):
+            result = list(extract_video_frames(target, allow_roots=[str(tmp_path)]))
+
+        assert any(int(f[0, 0, 0]) == int(gradient_frame[0, 0, 0]) for f in result), (
+            "the brief gradient block should have been sampled via motion "
+            "detection despite falling between floor checkpoints"
+        )
+
+    def test_max_frames_ceiling_stops_sampling(self, tmp_path):
+        """`max_frames` is a hard ceiling — with constant high motion (every
+        frame different) it must still cap total samples, proving it's a
+        safety net independent of the (now-fixed, non-duration-scaled)
+        sampling cadence."""
+        from tgdl_faces.io import extract_video_frames
+
+        target = str(tmp_path / "video.mp4")
+        Path(target).touch()
+
+        fps = 30.0
+        total_frames = 300
+        state = {"i": 0}
+
+        def _read(*_a, **_kw):
+            i = state["i"]
+            state["i"] += 1
+            if i >= total_frames:
+                return (False, None)
+            # Distinct, textured content every frame -> motion fires on
+            # (almost) every window boundary.
+            val = (i * 37) % 256
+            row = np.linspace(0, val, 64, dtype=np.uint8)
+            plane = np.tile(row, (64, 1))
+            return (True, np.stack([plane, plane, plane], axis=-1).astype(np.uint8))
+
+        mock_cap = MagicMock()
+        mock_cap.isOpened.return_value = True
+        mock_cap.read.side_effect = _read
+        mock_cap.get.side_effect = lambda prop: fps if prop == 5 else float(total_frames)
+        mock_cv2 = self._mock_cv2(mock_cap)
+
+        with patch("tgdl_faces.io.cv2", mock_cv2):
+            result = list(
+                extract_video_frames(target, allow_roots=[str(tmp_path)], max_frames=5)
+            )
+
+        assert len(result) == 5
 
 
 # ---------------------------------------------------------------------------
@@ -468,3 +557,87 @@ def test_video_no_frames_extracted_returns_200_with_error(
     body = resp.json()
     assert body["error"] == "no_frames"
     assert body["faces"] == []
+
+
+def test_video_happy_path_streams_frames_into_confirmed_track(
+    monkeypatch, client, temp_root: Path
+) -> None:
+    """End-to-end: `extract_video_frames` generator -> per-frame detection
+    -> `_build_face_tracks` -> response. Also asserts quality scoring is
+    no longer force-skipped for video (Phase 2 §4.4 requirement)."""
+    from tgdl_faces import insight
+    from tgdl_faces import app as app_mod
+
+    monkeypatch.setattr(insight, "_APP", MagicMock())
+    monkeypatch.setattr(insight, "_APP_ERROR", None)
+    monkeypatch.setattr(app_mod, "gpu_available", lambda: False)
+
+    frame = np.zeros((20, 30, 3), dtype=np.uint8)
+
+    def _frame_gen(*_a, **_kw):
+        yield frame
+        yield frame
+
+    monkeypatch.setattr(app_mod, "extract_video_frames", _frame_gen)
+
+    seen_kwargs: list[dict] = []
+    template = _face(score=0.9, quality=0.6, emb=_unit(0))
+
+    def _fake_detect(_img, **kwargs):
+        seen_kwargs.append(kwargs)
+        return [dict(template)]
+
+    monkeypatch.setattr(app_mod, "detect_and_embed", _fake_detect)
+
+    resp = client.post("/detect/video", json={"path": str(temp_root / "ok.mp4")})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["image_w"] == 30
+    assert body["image_h"] == 20
+    assert len(body["faces"]) == 1
+    assert body["faces"][0]["score"] == 0.9
+    assert len(seen_kwargs) == 2
+    assert all("_skip_quality_score" not in kw for kw in seen_kwargs)
+
+
+def test_video_streaming_bounds_in_flight_frames_to_max_workers(
+    monkeypatch, client, temp_root: Path
+) -> None:
+    """Regression test for the §4.2/§8 memory-bound requirement: even for a
+    very long simulated video, at most `max_workers` decoded frames are
+    ever concurrently "in flight" (submitted-but-not-yet-detected) — proves
+    the streaming rewrite decouples peak memory from total sample count."""
+    from tgdl_faces import insight
+    from tgdl_faces import app as app_mod
+
+    monkeypatch.setattr(insight, "_APP", MagicMock())
+    monkeypatch.setattr(insight, "_APP_ERROR", None)
+    monkeypatch.setattr(app_mod, "gpu_available", lambda: True)
+    monkeypatch.setattr(app_mod, "_resolve_max_concurrency", lambda: 4)
+
+    total_frames = 2000
+
+    def _frame_gen(*_a, **_kw):
+        for _ in range(total_frames):
+            yield np.zeros((8, 8, 3), dtype=np.uint8)
+
+    monkeypatch.setattr(app_mod, "extract_video_frames", _frame_gen)
+
+    in_flight = {"current": 0, "peak": 0}
+    lock = threading.Lock()
+
+    def _slow_detect(_frame, **_kwargs):
+        with lock:
+            in_flight["current"] += 1
+            in_flight["peak"] = max(in_flight["peak"], in_flight["current"])
+        time.sleep(0.001)
+        with lock:
+            in_flight["current"] -= 1
+        return []
+
+    monkeypatch.setattr(app_mod, "detect_and_embed", _slow_detect)
+
+    resp = client.post("/detect/video", json={"path": str(temp_root / "long.mp4")})
+    assert resp.status_code == 200
+    assert resp.json()["faces"] == []
+    assert in_flight["peak"] <= 4
