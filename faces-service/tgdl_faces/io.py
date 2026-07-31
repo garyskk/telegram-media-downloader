@@ -25,7 +25,7 @@ import binascii
 import logging
 import os
 from pathlib import Path
-from typing import Iterator
+from typing import Callable, Iterator
 
 import cv2
 import numpy as np
@@ -278,6 +278,7 @@ def extract_video_frames(
     window_sec: float = DEFAULT_WINDOW_SEC,
     floor_interval_sec: float = DEFAULT_FLOOR_INTERVAL_SEC,
     motion_threshold: float = DEFAULT_MOTION_THRESHOLD,
+    progress_cb: Callable[[int, int], None] | None = None,
 ) -> Iterator[np.ndarray]:
     """Yield content-adaptive frames from a video via one sequential decode.
 
@@ -308,6 +309,14 @@ def extract_video_frames(
     caller that detects-and-discards each frame as it arrives (the
     streaming pipeline in docs/requirements.md §4.2) never holds more than
     a handful of decoded frames in memory regardless of video length.
+
+    ``progress_cb``, when given, is called as ``progress_cb(idx, total_frames)``
+    once per decoded frame (``idx`` is the 0-based position in the raw
+    stream, not the count of *kept* samples) so a caller can report
+    "how far through the video are we" — see ``video_progress.py`` and
+    ``GET /detect/video/status/{job_id}`` — without needing to know
+    ``total_frames`` ahead of time. Not called on the ``total_frames <= 0``
+    fallback branch below, since there's nothing meaningful to report.
 
     Raises
     ------
@@ -358,6 +367,8 @@ def extract_video_frames(
             ret, frame = cap.read()
             if not ret or frame is None:
                 break
+            if progress_cb is not None:
+                progress_cb(idx, total_frames)
             sig = _activity_signature(frame)
             sharp = _sharpness(sig)
             if sharp > best_sharp:

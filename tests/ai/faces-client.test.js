@@ -375,6 +375,267 @@ describe('detectFacesInVideo', () => {
     });
 });
 
+// Video scan progress reporting — a `job_id` in the POST body lets the
+// sidecar's GET /detect/video/status/{job_id} be polled while the main
+// request is in flight (see docs/AI.md). Polling is opt-in: it only
+// happens when the caller passes an `onVideoProgress` callback.
+describe('detectFacesInVideo — job_id progress polling', () => {
+    afterEach(() => {
+        vi.useRealTimers();
+    });
+
+    function _mockFetchWithStatusPolling() {
+        let resolveMain;
+        const mainPromise = new Promise((resolve) => {
+            resolveMain = resolve;
+        });
+        let statusCallCount = 0;
+        const statusCalls = [];
+        vi.spyOn(globalThis, 'fetch').mockImplementation(async (url) => {
+            if (String(url).includes('/detect/video/status/')) {
+                statusCallCount++;
+                statusCalls.push(String(url));
+                return {
+                    ok: true,
+                    status: 200,
+                    json: async () => ({
+                        job_id: 'fake-job',
+                        frames_decoded: statusCallCount * 10,
+                        total_frames: 100,
+                        pct: statusCallCount * 10,
+                        elapsed_sec: statusCallCount,
+                    }),
+                };
+            }
+            return mainPromise;
+        });
+        return {
+            resolveMain: (body) =>
+                resolveMain({ ok: true, status: 200, json: async () => body }),
+            statusCalls,
+            getStatusCallCount: () => statusCallCount,
+        };
+    }
+
+    it('omits job_id and never polls when onVideoProgress is not provided', async () => {
+        client.setSidecarUrl('http://host:8011');
+        let capturedBody = null;
+        vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, init) => {
+            capturedBody = JSON.parse(init.body);
+            return {
+                ok: true,
+                status: 200,
+                json: async () => ({ faces: [], image_w: 0, image_h: 0 }),
+            };
+        });
+        await client.detectFacesInVideo('/tmp/video.mp4', {});
+        expect(capturedBody.job_id).toBeUndefined();
+        expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+    });
+
+    it('includes a job_id in the POST body when onVideoProgress is provided', async () => {
+        client.setSidecarUrl('http://host:8011');
+        let capturedBody = null;
+        vi.spyOn(globalThis, 'fetch').mockImplementation(async (url, init) => {
+            if (String(url).endsWith('/detect/video')) capturedBody = JSON.parse(init.body);
+            return {
+                ok: true,
+                status: 200,
+                json: async () => ({ faces: [], image_w: 0, image_h: 0 }),
+            };
+        });
+        await client.detectFacesInVideo('/tmp/video.mp4', {}, null, null, () => {});
+        expect(typeof capturedBody.job_id).toBe('string');
+        expect(capturedBody.job_id.length).toBeGreaterThan(0);
+    });
+
+    it('polls the status endpoint every videoProgressPollMs and forwards parsed fields', async () => {
+        client.setSidecarUrl('http://host:8011');
+        vi.useFakeTimers();
+        const { resolveMain, getStatusCallCount } = _mockFetchWithStatusPolling();
+
+        const progressCalls = [];
+        const resultPromise = client.detectFacesInVideo(
+            '/tmp/video.mp4',
+            {},
+            null,
+            null,
+            (p) => progressCalls.push(p),
+        );
+
+        await vi.advanceTimersByTimeAsync(5000);
+        await vi.advanceTimersByTimeAsync(5000);
+
+        expect(getStatusCallCount()).toBe(2);
+        expect(progressCalls).toHaveLength(2);
+        expect(progressCalls[0]).toMatchObject({
+            path: '/tmp/video.mp4',
+            frames_decoded: 10,
+            total_frames: 100,
+            pct: 10,
+        });
+        expect(progressCalls[1].frames_decoded).toBe(20);
+
+        resolveMain({ faces: [], image_w: 0, image_h: 0 });
+        await resultPromise;
+    });
+
+    it('stops polling once the main request settles', async () => {
+        client.setSidecarUrl('http://host:8011');
+        vi.useFakeTimers();
+        const { resolveMain, getStatusCallCount } = _mockFetchWithStatusPolling();
+
+        const progressCalls = [];
+        const resultPromise = client.detectFacesInVideo(
+            '/tmp/video.mp4',
+            {},
+            null,
+            null,
+            (p) => progressCalls.push(p),
+        );
+
+        await vi.advanceTimersByTimeAsync(5000);
+        expect(getStatusCallCount()).toBe(1);
+
+        resolveMain({ faces: [], image_w: 0, image_h: 0 });
+        await resultPromise;
+
+        const countAfterSettle = getStatusCallCount();
+        await vi.advanceTimersByTimeAsync(30000);
+        expect(getStatusCallCount()).toBe(countAfterSettle);
+    });
+
+    it('a poll failure is swallowed and never affects the returned faces', async () => {
+        client.setSidecarUrl('http://host:8011');
+        vi.useFakeTimers();
+
+        let resolveMain;
+        const mainPromise = new Promise((resolve) => {
+            resolveMain = resolve;
+        });
+        vi.spyOn(globalThis, 'fetch').mockImplementation(async (url) => {
+            if (String(url).includes('/detect/video/status/')) {
+                throw new Error('ECONNRESET');
+            }
+            return mainPromise;
+        });
+
+        const progressCalls = [];
+        const resultPromise = client.detectFacesInVideo(
+            '/tmp/video.mp4',
+            {},
+            null,
+            null,
+            (p) => progressCalls.push(p),
+        );
+
+        await vi.advanceTimersByTimeAsync(5000);
+        expect(progressCalls).toHaveLength(0);
+
+        resolveMain({ ok: true, status: 200, json: async () => ({ faces: [], image_w: 0, image_h: 0 }) });
+        const out = await resultPromise;
+        expect(out).toEqual([]);
+    });
+
+    it('a 404 status response (job already gone) is swallowed, not surfaced', async () => {
+        client.setSidecarUrl('http://host:8011');
+        vi.useFakeTimers();
+
+        let resolveMain;
+        const mainPromise = new Promise((resolve) => {
+            resolveMain = resolve;
+        });
+        vi.spyOn(globalThis, 'fetch').mockImplementation(async (url) => {
+            if (String(url).includes('/detect/video/status/')) {
+                return { ok: false, status: 404, json: async () => ({ error: 'not_found' }) };
+            }
+            return mainPromise;
+        });
+
+        const progressCalls = [];
+        const resultPromise = client.detectFacesInVideo(
+            '/tmp/video.mp4',
+            {},
+            null,
+            null,
+            (p) => progressCalls.push(p),
+        );
+
+        await vi.advanceTimersByTimeAsync(5000);
+        expect(progressCalls).toHaveLength(0);
+
+        resolveMain({ ok: true, status: 200, json: async () => ({ faces: [], image_w: 0, image_h: 0 }) });
+        await resultPromise;
+    });
+
+    it('resolves a custom videoProgressPollMs from cfg', async () => {
+        client.setSidecarUrl('http://host:8011');
+        vi.useFakeTimers();
+        const { resolveMain, getStatusCallCount } = _mockFetchWithStatusPolling();
+
+        const resultPromise = client.detectFacesInVideo(
+            '/tmp/video.mp4',
+            { faces: { videoProgressPollMs: 2000 } },
+            null,
+            null,
+            () => {},
+        );
+
+        await vi.advanceTimersByTimeAsync(2000);
+        expect(getStatusCallCount()).toBe(1);
+        await vi.advanceTimersByTimeAsync(2000);
+        expect(getStatusCallCount()).toBe(2);
+
+        resolveMain({ faces: [], image_w: 0, image_h: 0 });
+        await resultPromise;
+    });
+
+    it('resolves videoProgressPollMs via TGDL_FACES_VIDEO_PROGRESS_POLL_MS env override', async () => {
+        client.setSidecarUrl('http://host:8011');
+        process.env.TGDL_FACES_VIDEO_PROGRESS_POLL_MS = '3000';
+        vi.useFakeTimers();
+        const { resolveMain, getStatusCallCount } = _mockFetchWithStatusPolling();
+
+        const resultPromise = client.detectFacesInVideo(
+            '/tmp/video.mp4',
+            {},
+            null,
+            null,
+            () => {},
+        );
+
+        await vi.advanceTimersByTimeAsync(2999);
+        expect(getStatusCallCount()).toBe(0);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(getStatusCallCount()).toBe(1);
+
+        resolveMain({ faces: [], image_w: 0, image_h: 0 });
+        await resultPromise;
+    });
+
+    it('clamps a too-small videoProgressPollMs to a 1000ms floor', async () => {
+        client.setSidecarUrl('http://host:8011');
+        vi.useFakeTimers();
+        const { resolveMain, getStatusCallCount } = _mockFetchWithStatusPolling();
+
+        const resultPromise = client.detectFacesInVideo(
+            '/tmp/video.mp4',
+            { faces: { videoProgressPollMs: 10 } },
+            null,
+            null,
+            () => {},
+        );
+
+        await vi.advanceTimersByTimeAsync(999);
+        expect(getStatusCallCount()).toBe(0);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(getStatusCallCount()).toBe(1);
+
+        resolveMain({ faces: [], image_w: 0, image_h: 0 });
+        await resultPromise;
+    });
+});
+
 // Regression coverage for the undici default headers/body timeout (300s,
 // hardcoded, independent of our own AbortController timeout) silently
 // killing long-running requests with a generic "fetch failed" — see the

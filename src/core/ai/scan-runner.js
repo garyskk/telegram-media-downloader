@@ -86,6 +86,11 @@ function _emptyState() {
         faceCount: 0, // total face embeddings found in phase A
         peopleCount: 0, // clusters produced by phase B
         noiseFaces: 0, // faces not assigned to any cluster
+        // Decode-position progress for whichever video is currently mid-flight
+        // (video scan progress reporting) — null between videos, during the
+        // photo phase, and whenever the sidecar doesn't report a job_id
+        // (older sidecar version, or onVideoProgress polling never started).
+        currentVideo: null,
         abort: null,
     };
 }
@@ -418,7 +423,19 @@ export function startFacesScan(cfg, onProgress, onDone, onLog) {
                         let detected = null;
                         const _tv0 = Date.now();
                         try {
-                            detected = await detectFacesInVideo(abs, cfg, log, signal);
+                            detected = await detectFacesInVideo(abs, cfg, log, signal, (p) => {
+                                state.currentVideo = {
+                                    name: path.basename(abs),
+                                    pct: Number.isFinite(p?.pct) ? p.pct : null,
+                                    framesDecoded: Number.isFinite(p?.frames_decoded)
+                                        ? p.frames_decoded
+                                        : null,
+                                    totalFrames: Number.isFinite(p?.total_frames)
+                                        ? p.total_frames
+                                        : null,
+                                };
+                                bump();
+                            });
                         } catch (e) {
                             log('warn', `detectFacesInVideo threw for ${abs}: ${e?.message || e}`);
                         }
@@ -452,6 +469,10 @@ export function startFacesScan(cfg, onProgress, onDone, onLog) {
                         }
                         setAiIndexedAt(row.id);
                         state.scanned += 1;
+                        // Clear so this video's stale progress doesn't linger
+                        // once it's done — the next iteration's callback (or
+                        // nothing, once the phase ends) sets it again.
+                        state.currentVideo = null;
                         bump();
                         await new Promise((r) => setImmediate(r));
                     }

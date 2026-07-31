@@ -33,6 +33,31 @@ describe('_shortProgress', () => {
         expect(_shortProgress({})).toBe('');
         expect(_shortProgress({ stage: 'starting' })).toBe('starting');
     });
+
+    it('appends currentVideo decode progress (video scan progress reporting)', () => {
+        expect(
+            _shortProgress({
+                scanned: 101,
+                total: 592,
+                currentVideo: { name: 'clip.mp4', pct: 42, framesDecoded: 3412, totalFrames: 8120 },
+            }),
+        ).toBe('101/592 video: clip.mp4 42% (3412/8120 frames)');
+    });
+
+    it('omits pct/frames when they are not finite yet (job just registered)', () => {
+        expect(
+            _shortProgress({
+                scanned: 101,
+                total: 592,
+                currentVideo: { name: 'clip.mp4', pct: null, framesDecoded: null, totalFrames: null },
+            }),
+        ).toBe('101/592 video: clip.mp4');
+    });
+
+    it('ignores currentVideo without a name (cleared / malformed payload)', () => {
+        expect(_shortProgress({ scanned: 101, total: 592, currentVideo: {} })).toBe('101/592');
+        expect(_shortProgress({ scanned: 101, total: 592, currentVideo: null })).toBe('101/592');
+    });
 });
 
 describe('createJobTracker', () => {

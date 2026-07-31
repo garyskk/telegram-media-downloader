@@ -19,6 +19,36 @@ import { openMediaViewerForReview } from './viewer.js';
 
 const $ = (sel) => document.querySelector(sel);
 
+/**
+ * Builds the `#ai-progress-status` text during the video phase — shared by
+ * the WS live-update handler (`_onScanProgress`) and the periodic
+ * full-state render, so both surfaces render the exact same string for
+ * `state.currentVideo` (video scan progress reporting; see
+ * `scan-runner.js`). Falls back to the plain "Scanning…" text when
+ * `currentVideo` is absent — the photo phase, between videos, or a
+ * sidecar too old to report decode progress.
+ */
+function _formatScanStatusText(currentVideo) {
+    if (!currentVideo || typeof currentVideo !== 'object') {
+        return i18nT('maintenance.ai.scanning', 'Scanning…');
+    }
+    const name = currentVideo.name || '';
+    const pct = Number.isFinite(currentVideo.pct) ? currentVideo.pct : null;
+    const decoded = Number.isFinite(currentVideo.framesDecoded) ? currentVideo.framesDecoded : null;
+    const total = Number.isFinite(currentVideo.totalFrames) ? currentVideo.totalFrames : null;
+    if (pct != null && decoded != null && total != null) {
+        return i18nTf(
+            'maintenance.ai.scanning_video',
+            { name, pct, decoded: decoded.toLocaleString(), total: total.toLocaleString() },
+            `Video: ${name} — ${pct}% decoded (${decoded.toLocaleString()}/${total.toLocaleString()} frames)`,
+        );
+    }
+    // Sidecar hasn't reported decode-position fields yet (first tick) or is
+    // too old to know about job_id at all — still name the file so the
+    // operator doesn't wonder if the scan is stuck.
+    return i18nTf('maintenance.ai.scanning_video_unknown', { name }, `Video: ${name}`);
+}
+
 const _CHIP_STYLES = {
     'tg-blue': ['border-tg-blue', 'bg-tg-blue/10', 'text-tg-blue'],
     'amber-500': ['border-amber-500', 'bg-amber-500/10', 'text-amber-500'],
@@ -499,7 +529,7 @@ function _renderStatus(status) {
             pctEl.textContent = total
                 ? `${scanned.toLocaleString()} / ${total.toLocaleString()} (${pct}%)`
                 : `${scanned.toLocaleString()} processed`;
-        if (statusEl) statusEl.textContent = i18nT('maintenance.ai.scanning', 'Scanning…');
+        if (statusEl) statusEl.textContent = _formatScanStatusText(facesScan.currentVideo);
     }
 
     // KPI tiles. peopleCount is the canonical "how many clusters"
@@ -1339,7 +1369,7 @@ function _onScanProgress(feature, msg) {
             : '';
     }
     if (progressStatus && running) {
-        progressStatus.textContent = i18nT('maintenance.ai.scanning', 'Scanning…');
+        progressStatus.textContent = _formatScanStatusText(msg.currentVideo);
     }
     // Phase tag — shows "Phase 1: detection" during A; hidden when idle.
     if (phaseTag) {

@@ -247,6 +247,7 @@ should read the nested path.
 | — | `TGDL_FACES_VIDEO_SINGLETON_MIN_SCORE` | `0.75` | *Sidecar only* — detection-score floor for a face seen in exactly 1 sampled frame |
 | — | `TGDL_FACES_VIDEO_SINGLETON_MIN_QUALITY` | `0.55` | *Sidecar only* — quality-score floor for a face seen in exactly 1 sampled frame |
 | — | `TGDL_FACES_VIDEO_CONFIRMED_MIN_QUALITY` | `0.30` | *Sidecar only* — universal quality floor for a face confirmed across ≥2 sampled frames |
+| `videoProgressPollMs` | `TGDL_FACES_VIDEO_PROGRESS_POLL_MS` | `5000` | *Node only* — how often `detectFacesInVideo` polls `GET /detect/video/status/{job_id}` while a video request is in flight (see [Video scan progress reporting](#video-scan-progress-reporting)) |
 
 Env-var precedence is strict: any `TGDL_FACES_*` value wins over the
 matching kv-config value, which wins over the legacy flat alias, which
@@ -362,6 +363,44 @@ in the same People group automatically.
 
 Off by default; toggle via the AI maintenance page or set
 `advanced.ai.faces.scanVideos = true` in the config.
+
+#### Video scan progress reporting
+
+`POST /detect/video` is a single blocking request that can legitimately
+take many minutes on a long or dense video — without this, the
+maintenance dashboard's progress bar looks frozen for the entire
+duration of that one video (it only advances once per video, not once
+per frame). To fix that:
+
+1. When `detectFacesInVideo` is called with an `onVideoProgress`
+   callback (scan-runner.js always supplies one), the Node client
+   generates a `job_id` and includes it in the `POST /detect/video`
+   body.
+2. The sidecar reports its decode position into an in-memory registry
+   (`tgdl_faces/video_progress.py`) as `extract_video_frames` walks the
+   video — one report per decoded frame, keyed by `job_id`. The registry
+   entry is removed once the request finishes (success, soft-error, or
+   exception), via a `try`/`finally` around the whole detect body.
+3. While the main request is in flight, the Node client polls
+   `GET /detect/video/status/{job_id}` every `videoProgressPollMs`
+   (default 5000 ms) and forwards the parsed `{frames_decoded,
+   total_frames, pct, elapsed_sec}` payload to `onVideoProgress`.
+4. `scan-runner.js` stores this on `state.currentVideo` (cleared back to
+   `null` once that video finishes) and broadcasts it with the rest of
+   the scan progress; the maintenance page renders it as e.g.
+   `Video: clip.mp4 — 42% decoded (3,412/8,120 frames)` in place of the
+   generic "Scanning…" text.
+
+The reported percentage is decode position (`frames_decoded /
+total_frames`), not a "faces found so far" count — the streaming
+pipeline's bounded sliding window means decode and detection run in
+near-lockstep, so decode-% is an accurate proxy for "how far through the
+video are we" without needing a second counter. Polling is best-effort
+telemetry: a poll failure, a `404` (job already finished, or the sidecar
+predates `job_id` support), or omitting `onVideoProgress` entirely never
+affects the returned faces — it just means no mid-flight progress is
+shown. Not wired for the Node b64 fallback path (`_detectVideoB64Fallback`)
+since it doesn't currently know `total_frames` up front.
 
 ### CPU throttle
 

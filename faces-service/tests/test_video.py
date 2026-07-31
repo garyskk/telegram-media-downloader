@@ -532,6 +532,122 @@ class TestExtractVideoFrames:
 
         assert len(result) == 5
 
+    def test_progress_cb_called_once_per_decoded_frame(self, tmp_path):
+        """`progress_cb(idx, total_frames)` fires on every raw decode
+        iteration — independent of the sampling cadence (kept-frame count)
+        — so a caller can report decode position for a long video."""
+        from tgdl_faces.io import extract_video_frames
+
+        target = str(tmp_path / "video.mp4")
+        Path(target).touch()
+
+        fps = 30.0
+        total_frames = 10
+        frame = self._make_frame()
+
+        mock_cap = MagicMock()
+        mock_cap.isOpened.return_value = True
+        mock_cap.read.return_value = (True, frame)
+        mock_cap.get.side_effect = lambda prop: fps if prop == 5 else float(total_frames)
+        mock_cv2 = self._mock_cv2(mock_cap)
+
+        calls = []
+        with patch("tgdl_faces.io.cv2", mock_cv2):
+            list(
+                extract_video_frames(
+                    target,
+                    allow_roots=[str(tmp_path)],
+                    progress_cb=lambda idx, total: calls.append((idx, total)),
+                )
+            )
+
+        assert calls == [(i, total_frames) for i in range(total_frames)]
+
+    def test_progress_cb_not_called_when_read_stops_early(self, tmp_path):
+        from tgdl_faces.io import extract_video_frames
+
+        target = str(tmp_path / "video.mp4")
+        Path(target).touch()
+
+        fps = 30.0
+        total_frames = 10
+        frame = self._make_frame()
+
+        state = {"i": 0}
+
+        def _read(*_a, **_kw):
+            i = state["i"]
+            state["i"] += 1
+            if i >= 3:
+                return (False, None)
+            return (True, frame)
+
+        mock_cap = MagicMock()
+        mock_cap.isOpened.return_value = True
+        mock_cap.read.side_effect = _read
+        mock_cap.get.side_effect = lambda prop: fps if prop == 5 else float(total_frames)
+        mock_cv2 = self._mock_cv2(mock_cap)
+
+        calls = []
+        with patch("tgdl_faces.io.cv2", mock_cv2):
+            list(
+                extract_video_frames(
+                    target,
+                    allow_roots=[str(tmp_path)],
+                    progress_cb=lambda idx, total: calls.append((idx, total)),
+                )
+            )
+
+        assert calls == [(0, total_frames), (1, total_frames), (2, total_frames)]
+
+    def test_progress_cb_not_called_on_zero_total_frames_fallback(self, tmp_path):
+        from tgdl_faces.io import extract_video_frames
+
+        target = str(tmp_path / "video.mp4")
+        Path(target).touch()
+        frame = self._make_frame()
+
+        mock_cap = MagicMock()
+        mock_cap.isOpened.return_value = True
+        mock_cap.read.return_value = (True, frame)
+        mock_cap.get.side_effect = lambda prop: 0
+        mock_cv2 = self._mock_cv2(mock_cap)
+
+        calls = []
+        with patch("tgdl_faces.io.cv2", mock_cv2):
+            list(
+                extract_video_frames(
+                    target,
+                    allow_roots=[str(tmp_path)],
+                    progress_cb=lambda idx, total: calls.append((idx, total)),
+                )
+            )
+
+        assert calls == []
+
+    def test_progress_cb_none_is_the_default_and_safe(self, tmp_path):
+        """No `progress_cb` given -> behaves exactly as before (no crash,
+        no behavior change to yielded frames)."""
+        from tgdl_faces.io import extract_video_frames
+
+        target = str(tmp_path / "video.mp4")
+        Path(target).touch()
+        frame = self._make_frame()
+
+        fps = 30.0
+        total_frames = 5
+
+        mock_cap = MagicMock()
+        mock_cap.isOpened.return_value = True
+        mock_cap.read.return_value = (True, frame)
+        mock_cap.get.side_effect = lambda prop: fps if prop == 5 else float(total_frames)
+        mock_cv2 = self._mock_cv2(mock_cap)
+
+        with patch("tgdl_faces.io.cv2", mock_cv2):
+            result = list(extract_video_frames(target, allow_roots=[str(tmp_path)]))
+
+        assert len(result) >= 1
+
 
 # ---------------------------------------------------------------------------
 # Fixtures for endpoint tests (mirror test_app.py patterns)
@@ -766,3 +882,132 @@ def test_video_streaming_bounds_in_flight_frames_to_max_workers(
     assert resp.status_code == 200
     assert resp.json()["faces"] == []
     assert in_flight["peak"] <= 4
+
+
+# ---------------------------------------------------------------------------
+# Tests: job_id progress -> GET /detect/video/status/{job_id}
+# ---------------------------------------------------------------------------
+
+
+def test_video_status_unknown_job_id_returns_404(client) -> None:
+    resp = client.get("/detect/video/status/does-not-exist")
+    assert resp.status_code == 404
+    assert resp.json()["code"] == "job_not_found"
+
+
+def test_video_status_reports_progress_mid_request_and_cleans_up_after(
+    monkeypatch, client, temp_root: Path
+) -> None:
+    """End-to-end: a `job_id` in the POST body makes `_do_detect_video_sync`
+    report decode position into `video_progress` as `extract_video_frames`
+    walks the video, pollable via GET /detect/video/status/{job_id} — and
+    the entry is gone once the request completes (success path)."""
+    from tgdl_faces import insight
+    from tgdl_faces import app as app_mod
+
+    monkeypatch.setattr(insight, "_APP", MagicMock())
+    monkeypatch.setattr(insight, "_APP_ERROR", None)
+    monkeypatch.setattr(app_mod, "gpu_available", lambda: False)
+    monkeypatch.setattr(app_mod, "detect_and_embed", lambda *_a, **_kw: [])
+
+    frame = np.zeros((20, 30, 3), dtype=np.uint8)
+    reached_midpoint = threading.Event()
+    release = threading.Event()
+
+    def _frame_gen(*_a, progress_cb=None, **_kw):
+        if progress_cb:
+            progress_cb(0, 4)
+        yield frame
+        if progress_cb:
+            progress_cb(1, 4)
+        reached_midpoint.set()
+        assert release.wait(timeout=5), "test deadlocked waiting for release"
+        if progress_cb:
+            progress_cb(2, 4)
+        yield frame
+        if progress_cb:
+            progress_cb(3, 4)
+
+    monkeypatch.setattr(app_mod, "extract_video_frames", _frame_gen)
+
+    job_id = "job-mid-flight-test"
+    result_holder: dict = {}
+
+    def _do_request():
+        result_holder["resp"] = client.post(
+            "/detect/video",
+            json={"path": str(temp_root / "x.mp4"), "job_id": job_id},
+        )
+
+    thread = threading.Thread(target=_do_request)
+    thread.start()
+    try:
+        assert reached_midpoint.wait(timeout=5), "request never reached the midpoint"
+
+        status_resp = client.get(f"/detect/video/status/{job_id}")
+        assert status_resp.status_code == 200
+        body = status_resp.json()
+        assert body["job_id"] == job_id
+        assert body["frames_decoded"] == 2
+        assert body["total_frames"] == 4
+        assert body["pct"] == 50
+        assert body["elapsed_sec"] >= 0
+    finally:
+        release.set()
+        thread.join(timeout=5)
+
+    assert result_holder["resp"].status_code == 200
+
+    final_status = client.get(f"/detect/video/status/{job_id}")
+    assert final_status.status_code == 404
+
+
+def test_video_status_cleaned_up_after_soft_error(monkeypatch, client, temp_root: Path) -> None:
+    """job_id cleanup also fires on the file_not_found soft-error path —
+    the try/finally wraps the whole detect body, not just the happy path."""
+    from tgdl_faces import insight
+    from tgdl_faces import app as app_mod
+
+    monkeypatch.setattr(insight, "_APP", MagicMock())
+    monkeypatch.setattr(insight, "_APP_ERROR", None)
+
+    def _raise_fnf(*_a, **_kw):
+        raise FileNotFoundError("cv2 cannot open")
+
+    monkeypatch.setattr(app_mod, "extract_video_frames", _raise_fnf)
+
+    job_id = "job-soft-error-test"
+    resp = client.post(
+        "/detect/video",
+        json={"path": str(temp_root / "missing.mp4"), "job_id": job_id},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["error"] == "file_not_found"
+
+    assert client.get(f"/detect/video/status/{job_id}").status_code == 404
+
+
+def test_video_without_job_id_never_registers_progress(
+    monkeypatch, client, temp_root: Path
+) -> None:
+    """Omitting job_id (old client / no-op default) means extract_video_frames
+    is called with progress_cb=None — no registry entry is ever created."""
+    from tgdl_faces import insight
+    from tgdl_faces import app as app_mod
+
+    monkeypatch.setattr(insight, "_APP", MagicMock())
+    monkeypatch.setattr(insight, "_APP_ERROR", None)
+    monkeypatch.setattr(app_mod, "gpu_available", lambda: False)
+    monkeypatch.setattr(app_mod, "detect_and_embed", lambda *_a, **_kw: [])
+
+    seen_progress_cb = {"value": "unset"}
+
+    def _frame_gen(*_a, progress_cb=None, **_kw):
+        seen_progress_cb["value"] = progress_cb
+        yield np.zeros((4, 4, 3), dtype=np.uint8)
+
+    monkeypatch.setattr(app_mod, "extract_video_frames", _frame_gen)
+
+    resp = client.post("/detect/video", json={"path": str(temp_root / "no-job-id.mp4")})
+    assert resp.status_code == 200
+    assert seen_progress_cb["value"] is None

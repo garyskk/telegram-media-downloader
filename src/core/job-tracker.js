@@ -293,6 +293,20 @@ function _shortProgress(p) {
         parts.push(`${done ?? 0}/${p.total ?? 0}`);
     }
     if (p.stage) parts.push(p.stage);
+    // Video scan progress reporting: scan-runner.js sets `currentVideo` while
+    // a `/detect/video` request is mid-flight (see faces-client.js job_id
+    // polling). Surface it in the same 5s-throttled log line so a 2-hour
+    // video's decode position is visible in `docker compose logs` even when
+    // nobody has the dashboard open / the tab is stale.
+    const cv = p.currentVideo;
+    if (cv && typeof cv === 'object' && cv.name) {
+        const pctPart = Number.isFinite(cv.pct) ? ` ${cv.pct}%` : '';
+        const framesPart =
+            Number.isFinite(cv.framesDecoded) && Number.isFinite(cv.totalFrames)
+                ? ` (${cv.framesDecoded}/${cv.totalFrames} frames)`
+                : '';
+        parts.push(`video: ${cv.name}${pctPart}${framesPart}`);
+    }
     return parts.join(' ');
 }
 

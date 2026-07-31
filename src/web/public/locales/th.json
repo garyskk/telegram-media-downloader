@@ -974,6 +974,8 @@
     "maintenance.ai.scan_now": "Scan ตอนนี้",
     "maintenance.ai.scan_tooltip": "ตรวจหน้าทุกภาพที่ยังไม่ได้ index แล้ว re-cluster คนที่ปรากฏซ้ำ",
     "maintenance.ai.scanning": "กำลัง scan…",
+    "maintenance.ai.scanning_video": "วิดีโอ: {name} — decode แล้ว {pct}% ({decoded}/{total} เฟรม)",
+    "maintenance.ai.scanning_video_unknown": "วิดีโอ: {name}",
     "maintenance.ai.cancel": "ยกเลิก",
     "maintenance.ai.master_toggle_label": "เปิด AI subsystem",
     "maintenance.ai.master_toggle_help": "Master switch ปิดแล้วไม่มีการ scan, sidecar หยุดรับงาน, auto-index บน download ใหม่ไม่ทำงาน",

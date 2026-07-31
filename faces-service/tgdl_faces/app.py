@@ -67,6 +67,7 @@ from .io import (
     load_image_from_b64,
     load_image_from_path,
 )
+from . import video_progress
 
 
 _LOG = logging.getLogger(__name__)
@@ -234,6 +235,14 @@ class VideoDetectRequest(BaseModel):
     min_box_px: int | None = Field(default=None, ge=1)
     ar_range: tuple[float, float] | None = Field(default=None)
     max_frames: int = Field(default_factory=_default_max_frames, ge=1, le=200_000)
+    job_id: str | None = Field(
+        default=None,
+        description=(
+            "Opaque caller-supplied id used to poll decode progress via "
+            "GET /detect/video/status/{job_id} while this request is in "
+            "flight. Optional — omit for the old fire-and-forget behavior."
+        ),
+    )
 
     @model_validator(mode="after")
     def _validate_ar_range(self) -> "VideoDetectRequest":
@@ -1102,47 +1111,77 @@ def _do_detect_video_sync(body: VideoDetectRequest) -> JSONResponse:
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
         )
 
-    try:
-        # `extract_video_frames` is a generator (see docs/requirements.md
-        # §4.2/§4.4) — calling it just builds the generator object without
-        # running any code, so pulling the first frame (to validate there
-        # *is* a video and to read its dimensions) has to happen inside
-        # this try block for path/file errors raised from within the
-        # generator body to be catchable here. Everything after this is
-        # streamed: at most `max_workers` decoded frames are ever held in
-        # memory at once, regardless of video length (§4.2, §8 memory-bound
-        # acceptance criterion) — no `list(...)` materialisation.
-        window_sec, floor_interval_sec, motion_threshold = _resolve_video_sampling_params()
-        # `iter(...)` tolerates callers/mocks that return a plain list
-        # instead of a real generator (e.g. `test_video_no_frames_extracted`).
-        gen = iter(
-            extract_video_frames(
-                body.path,
-                _allow_roots(),
-                max_frames=body.max_frames,
-                window_sec=window_sec,
-                floor_interval_sec=floor_interval_sec,
-                motion_threshold=motion_threshold,
-            )
-        )
-        first_frame = next(gen)
-    except PathNotAllowedError:
-        return _error(
-            "path falls outside TGDL_FACES_ALLOW_ROOTS",
-            code="path_not_allowed",
-            status_code=status.HTTP_403_FORBIDDEN,
-        )
-    except FileNotFoundError:
-        return JSONResponse(
-            status_code=status.HTTP_200_OK,
-            content={"faces": [], "error": "file_not_found", "image_w": 0, "image_h": 0},
-        )
-    except StopIteration:
-        return JSONResponse(
-            status_code=status.HTTP_200_OK,
-            content={"faces": [], "error": "no_frames", "image_w": 0, "image_h": 0},
+    # A `job_id` lets the Node client poll GET /detect/video/status/{job_id}
+    # for decode-position progress while this (potentially very long)
+    # request is in flight (docs/requirements.md — video scan progress
+    # reporting). The `finally` below guarantees the registry entry is
+    # removed on every exit path (success, soft-error, or exception) so
+    # nothing outlives this request.
+    def _progress_cb(idx: int, total_frames: int) -> None:
+        video_progress.report(
+            body.job_id,
+            path=body.path,
+            frames_decoded=idx + 1,
+            total_frames=total_frames,
         )
 
+    try:
+        try:
+            # `extract_video_frames` is a generator (see docs/requirements.md
+            # §4.2/§4.4) — calling it just builds the generator object without
+            # running any code, so pulling the first frame (to validate there
+            # *is* a video and to read its dimensions) has to happen inside
+            # this try block for path/file errors raised from within the
+            # generator body to be catchable here. Everything after this is
+            # streamed: at most `max_workers` decoded frames are ever held in
+            # memory at once, regardless of video length (§4.2, §8 memory-bound
+            # acceptance criterion) — no `list(...)` materialisation.
+            window_sec, floor_interval_sec, motion_threshold = _resolve_video_sampling_params()
+            # `iter(...)` tolerates callers/mocks that return a plain list
+            # instead of a real generator (e.g. `test_video_no_frames_extracted`).
+            gen = iter(
+                extract_video_frames(
+                    body.path,
+                    _allow_roots(),
+                    max_frames=body.max_frames,
+                    window_sec=window_sec,
+                    floor_interval_sec=floor_interval_sec,
+                    motion_threshold=motion_threshold,
+                    progress_cb=_progress_cb if body.job_id else None,
+                )
+            )
+            first_frame = next(gen)
+        except PathNotAllowedError:
+            return _error(
+                "path falls outside TGDL_FACES_ALLOW_ROOTS",
+                code="path_not_allowed",
+                status_code=status.HTTP_403_FORBIDDEN,
+            )
+        except FileNotFoundError:
+            return JSONResponse(
+                status_code=status.HTTP_200_OK,
+                content={"faces": [], "error": "file_not_found", "image_w": 0, "image_h": 0},
+            )
+        except StopIteration:
+            return JSONResponse(
+                status_code=status.HTTP_200_OK,
+                content={"faces": [], "error": "no_frames", "image_w": 0, "image_h": 0},
+            )
+
+        return _detect_video_frames(body, gen, first_frame)
+    finally:
+        if body.job_id:
+            video_progress.finish(body.job_id)
+
+
+def _detect_video_frames(
+    body: VideoDetectRequest, gen: Any, first_frame: "np.ndarray"
+) -> JSONResponse:
+    """Runs detection over the already-opened frame generator and builds
+    the final response. Split out of `_do_detect_video_sync` purely for
+    readability — it's still covered by that function's try/finally
+    (job-progress cleanup) since the caller returns this call's result
+    from inside that try block."""
     kwargs: dict[str, Any] = {}
     if body.min_score is not None:
         kwargs["min_score"] = float(body.min_score)
@@ -1225,6 +1264,24 @@ async def detect_video(body: VideoDetectRequest) -> JSONResponse:
     lands in the same "Person" group automatically.
     """
     return await run_in_threadpool(_do_detect_video_sync, body)
+
+
+@app.get("/detect/video/status/{job_id}")
+def detect_video_status(job_id: str) -> JSONResponse:
+    """Poll decode progress for an in-flight ``POST /detect/video`` call.
+
+    Only meaningful when that call's body included a matching ``job_id``.
+    Returns ``404`` once the request has finished (or if ``job_id`` was
+    never registered) — callers should treat that as "nothing to report",
+    not as an error, since this is best-effort progress telemetry.
+    """
+    job = video_progress.get(job_id)
+    if job is None:
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND,
+            content={"error": "not_found", "code": "job_not_found"},
+        )
+    return JSONResponse(content=job)
 
 
 # ---------------------------------------------------------------------------

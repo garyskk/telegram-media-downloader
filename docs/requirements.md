@@ -14,6 +14,18 @@ Only `videoFloorIntervalSec` and `videoMaxFrames` ended up wired through
 `faces-config.js` on the Node side; see the Config + env var reference in
 `docs/AI.md` for the authoritative sidecar-only vs. shared knob list.
 
+**Follow-up (video scan progress reporting):** the duration-independent
+sampling here means a single `POST /detect/video` call can legitimately
+run for tens of minutes, during which the old design gave zero
+mid-request feedback. A follow-up added a `job_id` + `GET
+/detect/video/status/{job_id}` polling side-channel (sidecar:
+`tgdl_faces/video_progress.py`; Node: `detectFacesInVideo`'s
+`onVideoProgress` param) so the maintenance dashboard can show live
+decode-position progress for the video currently being scanned. See
+"Video scan progress reporting" in `docs/AI.md` for the full design —
+not part of the Phase 1-4 scope tracked above, but directly motivated by
+it.
+
 ## 1. Problem statement
 
 The current video face pipeline samples a fixed number of **evenly-spaced**

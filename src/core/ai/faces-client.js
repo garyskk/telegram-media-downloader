@@ -23,6 +23,7 @@
 import { promises as fs } from 'fs';
 import { Buffer } from 'buffer';
 import { spawn } from 'child_process';
+import { randomUUID } from 'crypto';
 import { Agent } from 'undici';
 
 import { resolveFacesValue } from './faces-config.js';
@@ -415,12 +416,26 @@ export async function detectFacesBatch(absPaths, cfg = {}, onLog = null, signal 
  * @param {string}    absPath absolute path to the video file
  * @param {object}    cfg     `advanced.ai` config slice
  * @param {function?} onLog   optional `({source, level, msg}) => void`
+ * @param {AbortSignal?} signal
+ * @param {function?} onVideoProgress optional `({path, frames_decoded,
+ *   total_frames, pct, elapsed_sec}) => void`, called roughly every
+ *   `videoProgressPollMs` while the request is in flight — see
+ *   docs/AI.md "video scan progress reporting". Best-effort: a poll
+ *   failure (network hiccup, sidecar too old to know `job_id`, or the
+ *   request already finished) never throws and never affects the
+ *   returned faces. Omit to skip polling entirely (zero extra requests).
  * @returns {Promise<Array | null>}
  *   `null` = sidecar error / file unresolvable
  *   `[]`   = processed but no faces found
  *   `[…]` = detected unique faces (one embedding per person per video)
  */
-export async function detectFacesInVideo(absPath, cfg = {}, onLog = null, signal = null) {
+export async function detectFacesInVideo(
+    absPath,
+    cfg = {},
+    onLog = null,
+    signal = null,
+    onVideoProgress = null,
+) {
     _bootstrapFromEnv();
     const url = getSidecarUrl();
     if (!url) {
@@ -429,6 +444,7 @@ export async function detectFacesInVideo(absPath, cfg = {}, onLog = null, signal
     }
 
     // Path mode already known to fail — skip straight to b64 fallback.
+    // (Progress polling isn't wired for the b64 fallback — see docs/AI.md.)
     if (_pathRejectedLogged) {
         return _detectVideoB64Fallback(absPath, cfg, url, onLog, signal);
     }
@@ -449,12 +465,18 @@ export async function detectFacesInVideo(absPath, cfg = {}, onLog = null, signal
         20000,
     );
 
+    // A `job_id` is only generated (and only sent to the sidecar) when the
+    // caller actually wants progress updates — an older/simpler caller that
+    // doesn't pass `onVideoProgress` gets the exact previous wire format.
+    const jobId = typeof onVideoProgress === 'function' ? randomUUID() : null;
+
     const body = {
         path: absPath,
         min_score: minScore,
         min_box_px: minBoxPx,
         ar_range: arRange,
         max_frames: Math.max(1, Math.min(200_000, maxFrames)),
+        ...(jobId ? { job_id: jobId } : {}),
     };
 
     // Video detection is much slower than a single image, and now that
@@ -466,75 +488,133 @@ export async function detectFacesInVideo(absPath, cfg = {}, onLog = null, signal
     // computed).
     const videoTimeoutMs = Math.max(_requestTimeoutMs, VIDEO_REQUEST_TIMEOUT_MS_FLOOR);
 
-    let res;
-    try {
-        const ctrl = new AbortController();
-        const timer = setTimeout(() => ctrl.abort(), videoTimeoutMs);
-        if (signal) {
-            if (signal.aborted) ctrl.abort();
-            else signal.addEventListener('abort', () => ctrl.abort(), { once: true });
-        }
-        try {
-            res = await globalThis.fetch(`${url}/detect/video`, {
-                method: 'POST',
-                headers: { 'content-type': 'application/json' },
-                body: JSON.stringify(body),
-                signal: ctrl.signal,
-                dispatcher: _dispatcherFor(videoTimeoutMs),
-            });
-        } finally {
-            clearTimeout(timer);
-        }
-    } catch (e) {
-        _log(
-            onLog,
-            'warn',
-            `detectFacesInVideo: network error for ${absPath} — ${e?.message || e}`,
+    // Poll GET /detect/video/status/{job_id} on a short interval for the
+    // whole lifetime of the main request — cleared in the `finally` below
+    // no matter which path the main request exits through.
+    let pollTimer = null;
+    if (jobId) {
+        const pollMs = Math.max(
+            1000,
+            _pickNumber(
+                [resolveFacesValue('videoProgressPollMs', facesCfg), cfg?.videoProgressPollMs],
+                5000,
+            ),
         );
-        return null;
+        const pollState = { inFlight: false };
+        pollTimer = setInterval(
+            () => _pollVideoProgress(url, jobId, absPath, onVideoProgress, pollState),
+            pollMs,
+        );
     }
 
-    if (res.status === 403) {
-        let code = null;
-        try {
-            const body = await res.clone().json();
-            code = body?.code || null;
-        } catch {}
-        if (code === 'path_not_allowed') {
-            if (!_pathRejectedLogged) {
-                _log(
-                    onLog,
-                    'info',
-                    'video path mode rejected by sidecar; switching to b64 fallback for all files',
-                );
-                _pathRejectedLogged = true;
-            }
-            return _detectVideoB64Fallback(absPath, cfg, url, onLog, signal);
-        }
-        _log(onLog, 'warn', `detectFacesInVideo: sidecar returned 403 for ${absPath}`);
-        return null;
-    }
-
-    if (!res.ok) {
-        _log(onLog, 'warn', `detectFacesInVideo: sidecar returned ${res.status} for ${absPath}`);
-        return null;
-    }
-
-    let resBody;
     try {
-        resBody = await res.json();
-    } catch (e) {
-        _log(onLog, 'warn', `detectFacesInVideo: invalid JSON from sidecar: ${e?.message || e}`);
-        return null;
-    }
+        let res;
+        try {
+            const ctrl = new AbortController();
+            const timer = setTimeout(() => ctrl.abort(), videoTimeoutMs);
+            if (signal) {
+                if (signal.aborted) ctrl.abort();
+                else signal.addEventListener('abort', () => ctrl.abort(), { once: true });
+            }
+            try {
+                res = await globalThis.fetch(`${url}/detect/video`, {
+                    method: 'POST',
+                    headers: { 'content-type': 'application/json' },
+                    body: JSON.stringify(body),
+                    signal: ctrl.signal,
+                    dispatcher: _dispatcherFor(videoTimeoutMs),
+                });
+            } finally {
+                clearTimeout(timer);
+            }
+        } catch (e) {
+            _log(
+                onLog,
+                'warn',
+                `detectFacesInVideo: network error for ${absPath} — ${e?.message || e}`,
+            );
+            return null;
+        }
 
-    if (resBody?.error) {
-        const lvl = resBody.error === 'file_not_found' ? 'warn' : 'info';
-        _log(onLog, lvl, `detectFacesInVideo ${absPath}: sidecar soft-error="${resBody.error}"`);
-        return [];
-    }
+        if (res.status === 403) {
+            let code = null;
+            try {
+                const body = await res.clone().json();
+                code = body?.code || null;
+            } catch {}
+            if (code === 'path_not_allowed') {
+                if (!_pathRejectedLogged) {
+                    _log(
+                        onLog,
+                        'info',
+                        'video path mode rejected by sidecar; switching to b64 fallback for all files',
+                    );
+                    _pathRejectedLogged = true;
+                }
+                return _detectVideoB64Fallback(absPath, cfg, url, onLog, signal);
+            }
+            _log(onLog, 'warn', `detectFacesInVideo: sidecar returned 403 for ${absPath}`);
+            return null;
+        }
 
-    return _parseFacesList(Array.isArray(resBody?.faces) ? resBody.faces : []);
+        if (!res.ok) {
+            _log(
+                onLog,
+                'warn',
+                `detectFacesInVideo: sidecar returned ${res.status} for ${absPath}`,
+            );
+            return null;
+        }
+
+        let resBody;
+        try {
+            resBody = await res.json();
+        } catch (e) {
+            _log(
+                onLog,
+                'warn',
+                `detectFacesInVideo: invalid JSON from sidecar: ${e?.message || e}`,
+            );
+            return null;
+        }
+
+        if (resBody?.error) {
+            const lvl = resBody.error === 'file_not_found' ? 'warn' : 'info';
+            _log(
+                onLog,
+                lvl,
+                `detectFacesInVideo ${absPath}: sidecar soft-error="${resBody.error}"`,
+            );
+            return [];
+        }
+
+        return _parseFacesList(Array.isArray(resBody?.faces) ? resBody.faces : []);
+    } finally {
+        if (pollTimer) clearInterval(pollTimer);
+    }
+}
+
+/**
+ * One progress-poll tick for `detectFacesInVideo`. Fire-and-forget from a
+ * `setInterval` callback (never awaited by the caller) — `pollState.inFlight`
+ * skips a tick if the previous poll is still in flight (e.g. a slow/stalled
+ * sidecar), so overlapping GETs can't pile up. Any failure — network error,
+ * non-2xx (404 once the job is done, or a sidecar too old to know `job_id`),
+ * invalid JSON — is swallowed: this is best-effort telemetry only.
+ */
+async function _pollVideoProgress(url, jobId, absPath, onVideoProgress, pollState) {
+    if (pollState.inFlight) return;
+    pollState.inFlight = true;
+    try {
+        const res = await _fetchWithTimeout(`${url}/detect/video/status/${jobId}`);
+        if (!res || !res.ok) return;
+        const p = await res.json();
+        onVideoProgress({ path: absPath, ...p });
+    } catch {
+        // best-effort telemetry — never propagate.
+    } finally {
+        pollState.inFlight = false;
+    }
 }
 
 async function _sendB64(absPath, baseBody, url, onLog) {

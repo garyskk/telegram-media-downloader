@@ -974,6 +974,8 @@
     "maintenance.ai.scan_now": "Scan now",
     "maintenance.ai.scan_tooltip": "Detect faces on every photo missing an index pass, then re-cluster recurring people.",
     "maintenance.ai.scanning": "Scanning…",
+    "maintenance.ai.scanning_video": "Video: {name} — {pct}% decoded ({decoded}/{total} frames)",
+    "maintenance.ai.scanning_video_unknown": "Video: {name}",
     "maintenance.ai.cancel": "Cancel",
     "maintenance.ai.master_toggle_label": "Run AI subsystem",
     "maintenance.ai.master_toggle_help": "Master switch. When off, no scans run, the sidecar stops accepting work, and auto-index on new downloads is skipped.",
