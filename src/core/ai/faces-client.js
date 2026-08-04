@@ -712,9 +712,14 @@ function _parseFacesList(faces) {
                 h: Number(f.h) || 0,
                 score: Number.isFinite(f.score) ? Number(f.score) : 0,
                 qualityScore: Number.isFinite(f.quality_score) ? Number(f.quality_score) : null,
+                landmarkRegularity: Number.isFinite(f.landmark_regularity)
+                    ? Number(f.landmark_regularity)
+                    : 0.5,
                 embedding: emb,
             };
             if (f.landmarks != null) out.landmarks = f.landmarks;
+            const fts = f.frame_time_sec ?? f.frameTimeSec;
+            if (Number.isFinite(fts) && fts >= 0) out.frameTimeSec = Number(fts);
             return out;
         })
         .filter(Boolean);
@@ -941,7 +946,15 @@ async function* _extractVideoFrames(absPath, onLog, opts = {}) {
 
     let proc;
     try {
-        proc = spawn(bin, args, { stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true });
+        const nice = Math.max(0, opts.nice ?? 0) | 0;
+        if (nice > 0 && process.platform !== 'win32') {
+            proc = spawn('nice', ['-n', String(Math.min(19, nice)), bin, ...args], {
+                stdio: ['ignore', 'pipe', 'ignore'],
+                windowsHide: true,
+            });
+        } else {
+            proc = spawn(bin, args, { stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true });
+        }
     } catch (e) {
         _log(onLog, 'warn', `video b64 fallback: failed to spawn ffmpeg — ${e?.message || e}`);
         return;
@@ -993,7 +1006,9 @@ const TRACK_MAX_REPRESENTATIVES = 3;
 const TRACK_POSE_DEDUP_THRESHOLD = 0.85;
 const SINGLETON_MIN_SCORE = 0.75;
 const SINGLETON_MIN_QUALITY = 0.55;
-const CONFIRMED_MIN_QUALITY = 0.3;
+const CONFIRMED_MIN_QUALITY = 0.45;
+const CONFIRMED_MIN_SCORE = 0.6;
+const MIN_LANDMARK_REGULARITY = 0.35;
 
 /**
  * Merge per-frame detections into per-identity tracks and return the
@@ -1008,13 +1023,15 @@ const CONFIRMED_MIN_QUALITY = 0.3;
  * than a raw detection count.
  *
  * - A track confirmed by >= 2 frames is kept only if at least one of its
- *   faces clears `CONFIRMED_MIN_QUALITY` (0.30) — defends against a
+ *   faces clears `CONFIRMED_MIN_QUALITY` (0.45), `CONFIRMED_MIN_SCORE`
+ *   (0.60), and `MIN_LANDMARK_REGULARITY` (0.35) — defends against a
  *   *systematic* false positive (the detector consistently misfiring on
  *   the same non-face texture) that mere repetition would otherwise wave
  *   through.
  * - A track seen in exactly 1 frame is kept only if that face clears the
  *   stricter `SINGLETON_MIN_SCORE`/`SINGLETON_MIN_QUALITY` bars (0.75 /
- *   0.55) — otherwise dropped as unconfirmed noise.
+ *   0.55) plus the landmark regularity floor — otherwise dropped as
+ *   unconfirmed noise.
  * - Confirmed tracks return up to 3 representative faces, see
  *   `_selectDiverseRepresentatives`.
  */
@@ -1052,11 +1069,29 @@ function _dedupeVideoFaces(framesFaces) {
         const faces = tr.faces;
         if (tr.hits >= 2) {
             const bestQuality = Math.max(...faces.map((f) => _qualityOf(f)));
-            if (bestQuality < CONFIRMED_MIN_QUALITY) continue;
-            kept.push(..._selectDiverseRepresentatives(faces));
+            const bestScore = Math.max(...faces.map((f) => f.score || 0));
+            const bestRegularity = Math.max(...faces.map((f) => _regularityOf(f)));
+            if (
+                bestQuality < CONFIRMED_MIN_QUALITY ||
+                bestScore < CONFIRMED_MIN_SCORE ||
+                bestRegularity < MIN_LANDMARK_REGULARITY
+            ) {
+                continue;
+            }
+            kept.push(
+                ..._selectDiverseRepresentatives(faces, TRACK_MAX_REPRESENTATIVES, {
+                    minQuality: CONFIRMED_MIN_QUALITY,
+                    minScore: CONFIRMED_MIN_SCORE,
+                    minRegularity: MIN_LANDMARK_REGULARITY,
+                }),
+            );
         } else {
             const face = faces[0];
-            if (face.score >= SINGLETON_MIN_SCORE && _qualityOf(face) >= SINGLETON_MIN_QUALITY) {
+            if (
+                face.score >= SINGLETON_MIN_SCORE &&
+                _qualityOf(face) >= SINGLETON_MIN_QUALITY &&
+                _regularityOf(face) >= MIN_LANDMARK_REGULARITY
+            ) {
                 kept.push(face);
             }
         }
@@ -1068,14 +1103,30 @@ function _qualityOf(face) {
     return Number.isFinite(face.qualityScore) ? face.qualityScore : 0;
 }
 
+function _regularityOf(face) {
+    return Number.isFinite(face.landmarkRegularity) ? face.landmarkRegularity : 0.5;
+}
+
 /**
  * Pick up to `limit` faces from one confirmed track, highest score first,
  * skipping any pose that's a near-duplicate (cosine similarity >= 0.85) of
  * an already-kept face — preserves angle/pose diversity instead of
  * collapsing the whole track down to one embedding.
+ *
+ * Only faces clearing `minQuality`, `minScore`, and `minRegularity` are
+ * eligible — weaker frames in an admitted track are dropped here.
  */
-function _selectDiverseRepresentatives(faces, limit = TRACK_MAX_REPRESENTATIVES) {
-    const ordered = [...faces].sort((a, b) => b.score - a.score);
+function _selectDiverseRepresentatives(faces, limit = TRACK_MAX_REPRESENTATIVES, floors = {}) {
+    const minQuality = floors.minQuality ?? 0;
+    const minScore = floors.minScore ?? 0;
+    const minRegularity = floors.minRegularity ?? 0;
+    const eligible = faces.filter(
+        (f) =>
+            _qualityOf(f) >= minQuality &&
+            (f.score || 0) >= minScore &&
+            _regularityOf(f) >= minRegularity,
+    );
+    const ordered = [...eligible].sort((a, b) => b.score - a.score);
     const kept = [];
     const keptEmbs = [];
     for (const face of ordered) {
@@ -1132,15 +1183,24 @@ async function _detectVideoB64Fallback(absPath, cfg, url, onLog, signal) {
         [resolveFacesValue('videoMaxFrames', facesCfg)],
         MAX_FRAMES_SAFETY_CEILING,
     );
+    const videoNice = Math.max(
+        0,
+        _pickNumber([resolveFacesValue('videoNice', facesCfg), facesCfg.videoNice], 0) | 0,
+    );
 
     _log(onLog, 'info', `video b64 fallback: streaming frames from ${absPath}`);
-    const frameGen = _extractVideoFrames(absPath, onLog, { floorIntervalSec, maxFramesCeiling });
+    const frameGen = _extractVideoFrames(absPath, onLog, {
+        floorIntervalSec,
+        maxFramesCeiling,
+        nice: videoNice,
+    });
     const framesFaces = await _streamFramesToSidecar(
         frameGen,
         { minScore, minBoxPx, arRange },
         url,
         onLog,
         signal,
+        (sampleIdx) => sampleIdx * floorIntervalSec,
     );
 
     if (!framesFaces.length) {
@@ -1165,10 +1225,26 @@ const STREAM_BATCH_SIZE = 8;
  * Returns `framesFaces`: one detection array per frame, in temporal order
  * — the shape `_dedupeVideoFaces` expects.
  */
-async function _streamFramesToSidecar(frameGen, opts, url, onLog, signal) {
+async function _streamFramesToSidecar(
+    frameGen,
+    opts,
+    url,
+    onLog,
+    signal,
+    frameTimeForSample = null,
+) {
     const framesFaces = [];
     let batch = [];
     let batchB64Available = true;
+    let sampleIdx = 0;
+
+    const tagFaces = (faces) => {
+        if (typeof frameTimeForSample !== 'function') return faces;
+        const t = frameTimeForSample(sampleIdx);
+        sampleIdx += 1;
+        if (!Number.isFinite(t) || t < 0) return faces;
+        return faces.map((f) => ({ ...f, frameTimeSec: t }));
+    };
 
     const flush = async () => {
         if (!batch.length) return;
@@ -1177,14 +1253,16 @@ async function _streamFramesToSidecar(frameGen, opts, url, onLog, signal) {
         if (batchB64Available) {
             const result = await _sendBatchB64Chunk(toSend, opts, url, onLog, signal);
             if (result !== null) {
-                framesFaces.push(...result);
+                for (const frameFaces of result) {
+                    framesFaces.push(tagFaces(frameFaces));
+                }
                 return;
             }
             batchB64Available = false;
             _log(onLog, 'info', 'batch-b64 unavailable, falling back to sequential /detect');
         }
         for (const buf of toSend) {
-            framesFaces.push(await _detectOneFrameB64(buf, opts, url, onLog));
+            framesFaces.push(tagFaces(await _detectOneFrameB64(buf, opts, url, onLog)));
         }
     };
 

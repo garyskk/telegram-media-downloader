@@ -29,7 +29,12 @@ import pytest
 # ---------------------------------------------------------------------------
 
 
-def _face(score: float = 0.8, quality: float = 0.6, emb: list[float] | None = None) -> dict:
+def _face(
+    score: float = 0.8,
+    quality: float = 0.6,
+    emb: list[float] | None = None,
+    regularity: float = 0.5,
+) -> dict:
     if emb is None:
         emb = [1.0] + [0.0] * 511
     return {
@@ -39,6 +44,7 @@ def _face(score: float = 0.8, quality: float = 0.6, emb: list[float] | None = No
         "h": 60,
         "score": score,
         "quality_score": quality,
+        "landmark_regularity": regularity,
         "embedding": list(emb),
         "landmarks": [],
     }
@@ -93,6 +99,8 @@ class TestVideoConfigResolution:
             "TGDL_FACES_VIDEO_SINGLETON_MIN_SCORE",
             "TGDL_FACES_VIDEO_SINGLETON_MIN_QUALITY",
             "TGDL_FACES_VIDEO_CONFIRMED_MIN_QUALITY",
+            "TGDL_FACES_VIDEO_CONFIRMED_MIN_SCORE",
+            "TGDL_FACES_VIDEO_MIN_LANDMARK_REGULARITY",
         ]
         for k in self._env_keys:
             os.environ.pop(k, None)
@@ -136,21 +144,27 @@ class TestVideoConfigResolution:
     def test_track_thresholds_default_when_unset(self):
         from tgdl_faces.app import _resolve_video_track_thresholds
 
-        score, quality, confirmed = _resolve_video_track_thresholds()
+        score, quality, confirmed, confirmed_score, regularity = _resolve_video_track_thresholds()
         assert score == 0.75
         assert quality == 0.55
-        assert confirmed == 0.30
+        assert confirmed == 0.45
+        assert confirmed_score == 0.60
+        assert regularity == 0.35
 
     def test_track_thresholds_env_override(self):
         from tgdl_faces.app import _resolve_video_track_thresholds
 
         os.environ["TGDL_FACES_VIDEO_SINGLETON_MIN_SCORE"] = "0.8"
         os.environ["TGDL_FACES_VIDEO_SINGLETON_MIN_QUALITY"] = "0.6"
-        os.environ["TGDL_FACES_VIDEO_CONFIRMED_MIN_QUALITY"] = "0.4"
-        score, quality, confirmed = _resolve_video_track_thresholds()
+        os.environ["TGDL_FACES_VIDEO_CONFIRMED_MIN_QUALITY"] = "0.5"
+        os.environ["TGDL_FACES_VIDEO_CONFIRMED_MIN_SCORE"] = "0.65"
+        os.environ["TGDL_FACES_VIDEO_MIN_LANDMARK_REGULARITY"] = "0.4"
+        score, quality, confirmed, confirmed_score, regularity = _resolve_video_track_thresholds()
         assert score == 0.8
         assert quality == 0.6
-        assert confirmed == 0.4
+        assert confirmed == 0.5
+        assert confirmed_score == 0.65
+        assert regularity == 0.4
 
     def test_default_max_frames_is_20000_when_unset(self):
         from tgdl_faces.app import _default_max_frames
@@ -240,16 +254,38 @@ class TestBuildFaceTracks:
     def test_confirmed_track_below_universal_quality_floor_dropped(self):
         """The core false-positive-class fix: a systematic misfire (same
         non-face region detected consistently) shouldn't survive just
-        because it repeats — every face in the track fails the 0.30 floor."""
+        because it repeats — every face in the track fails the 0.45 floor."""
         a = _face(score=0.9, quality=0.1, emb=_unit(5))
         b = _face(score=0.9, quality=0.1, emb=_near(5))
         assert self._fn([[a], [b]]) == []
 
     def test_confirmed_track_meeting_quality_floor_kept(self):
-        a = _face(score=0.9, quality=0.35, emb=_unit(6))
-        b = _face(score=0.9, quality=0.35, emb=_near(6))
+        a = _face(score=0.9, quality=0.50, emb=_unit(6))
+        b = _face(score=0.9, quality=0.50, emb=_near(6))
         result = self._fn([[a], [b]])
         assert len(result) == 1
+
+    def test_confirmed_track_below_score_floor_dropped(self):
+        a = _face(score=0.55, quality=0.6, emb=_unit(7))
+        b = _face(score=0.55, quality=0.6, emb=_near(7))
+        assert self._fn([[a], [b]]) == []
+
+    def test_confirmed_track_below_regularity_floor_dropped(self):
+        a = _face(score=0.9, quality=0.6, regularity=0.2, emb=_unit(8))
+        b = _face(score=0.9, quality=0.6, regularity=0.2, emb=_near(8))
+        assert self._fn([[a], [b]]) == []
+
+    def test_singleton_below_regularity_floor_dropped(self):
+        f = _face(score=0.9, quality=0.9, regularity=0.2)
+        assert self._fn([[f]]) == []
+
+    def test_confirmed_track_drops_sub_floor_representatives(self):
+        """Track admission uses best face; exported reps must each clear floors."""
+        good = _face(score=0.9, quality=0.6, emb=_unit(10))
+        weak = _face(score=0.9, quality=0.38, emb=_diverse_variant(10, 1))
+        result = self._fn([[good], [weak]])
+        assert len(result) == 1
+        assert result[0]["quality_score"] == 0.6
 
     def test_different_people_across_frames_kept_separately(self):
         frame1 = [_face(score=0.8, quality=0.6, emb=_unit(0)), _face(score=0.8, quality=0.6, emb=_unit(1))]
@@ -358,7 +394,10 @@ class TestExtractVideoFrames:
             result = list(extract_video_frames(target, allow_roots=[str(tmp_path)]))
 
         assert len(result) == 1
-        assert result[0] is frame
+        got_frame, frame_idx, time_sec = result[0]
+        assert got_frame is frame
+        assert frame_idx == 0
+        assert time_sec == 0.0
 
     def test_cap_release_called_even_when_empty_frames(self, tmp_path):
         from tgdl_faces.io import extract_video_frames
@@ -839,6 +878,7 @@ def test_video_happy_path_streams_frames_into_confirmed_track(
     assert body["faces"][0]["score"] == 0.9
     assert len(seen_kwargs) == 2
     assert all("_skip_quality_score" not in kw for kw in seen_kwargs)
+    assert all(kw.get("_video_mode") is True for kw in seen_kwargs)
 
 
 def test_video_streaming_bounds_in_flight_frames_to_max_workers(

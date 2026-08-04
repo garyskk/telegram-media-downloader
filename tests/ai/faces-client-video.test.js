@@ -33,7 +33,7 @@ afterEach(() => {
 // Helpers (mirrors faces-service/tests/test_video.py's _face/_unit/_near)
 // ---------------------------------------------------------------------------
 
-function _face({ score = 0.8, quality = 0.6, emb } = {}) {
+function _face({ score = 0.8, quality = 0.6, emb, regularity = 0.5 } = {}) {
     const e = emb ?? _unit(0);
     return {
         x: 10,
@@ -42,6 +42,7 @@ function _face({ score = 0.8, quality = 0.6, emb } = {}) {
         h: 60,
         score,
         qualityScore: quality,
+        landmarkRegularity: regularity,
         embedding: Float32Array.from(e),
         landmarks: [],
     };
@@ -118,16 +119,36 @@ describe('_dedupeVideoFaces (tracker port of Python _build_face_tracks)', () => 
         expect(result[0].score).toBe(0.95);
     });
 
-    it('drops a confirmed (>=2 hit) track that fails the universal quality floor (0.30)', () => {
+    it('drops a confirmed (>=2 hit) track that fails the universal quality floor (0.45)', () => {
         const a = _face({ score: 0.9, quality: 0.1, emb: _unit(5) });
         const b = _face({ score: 0.9, quality: 0.1, emb: _near(5) });
         expect(client._dedupeVideoFaces([[a], [b]])).toEqual([]);
     });
 
     it('keeps a confirmed track that meets the quality floor', () => {
-        const a = _face({ score: 0.9, quality: 0.35, emb: _unit(6) });
-        const b = _face({ score: 0.9, quality: 0.35, emb: _near(6) });
+        const a = _face({ score: 0.9, quality: 0.5, emb: _unit(6) });
+        const b = _face({ score: 0.9, quality: 0.5, emb: _near(6) });
         expect(client._dedupeVideoFaces([[a], [b]])).toHaveLength(1);
+    });
+
+    it('drops a confirmed track below the score floor (0.60)', () => {
+        const a = _face({ score: 0.55, quality: 0.6, emb: _unit(7) });
+        const b = _face({ score: 0.55, quality: 0.6, emb: _near(7) });
+        expect(client._dedupeVideoFaces([[a], [b]])).toEqual([]);
+    });
+
+    it('drops a confirmed track below the landmark regularity floor (0.35)', () => {
+        const a = _face({ score: 0.9, quality: 0.6, regularity: 0.2, emb: _unit(8) });
+        const b = _face({ score: 0.9, quality: 0.6, regularity: 0.2, emb: _near(8) });
+        expect(client._dedupeVideoFaces([[a], [b]])).toEqual([]);
+    });
+
+    it('drops sub-floor representatives from an otherwise valid track', () => {
+        const good = _face({ score: 0.9, quality: 0.6, emb: _unit(10) });
+        const weak = _face({ score: 0.9, quality: 0.38, emb: _diverseVariant(10, 1) });
+        const result = client._dedupeVideoFaces([[good], [weak]]);
+        expect(result).toHaveLength(1);
+        expect(result[0].qualityScore).toBe(0.6);
     });
 
     it('keeps different identities across frames separately', () => {

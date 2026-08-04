@@ -244,9 +244,13 @@ should read the nested path.
 | `videoFloorIntervalSec` | `TGDL_FACES_VIDEO_FLOOR_INTERVAL_SEC` | `3.0` | Max gap between samples when nothing triggers motion — backstop only, not the recall mechanism |
 | — | `TGDL_FACES_VIDEO_MOTION_THRESHOLD` | `6.0` | *Sidecar only* — luma-diff (0–255) motion sensitivity; the Node fallback uses ffmpeg's own `scene` score instead (different scale, no shared knob) |
 | `videoMaxFrames` | `TGDL_FACES_VIDEO_MAX_FRAMES` | `20000` | Pure runaway-safety ceiling — **not** a density control, should never bind on a real video |
+| `videoScanLimit` | `TGDL_FACES_VIDEO_SCAN_LIMIT` | `0` | Max unindexed videos per scan run (`0` = unlimited). Use a small value while testing detection changes |
+| `videoNice` | `TGDL_FACES_VIDEO_NICE` | `0` | Unix **nice** level for the video scan phase (`0` = normal, `10`–`15` = background-friendly). Applies to Node, ffmpeg fallback, and sidecar `/detect/video` |
 | — | `TGDL_FACES_VIDEO_SINGLETON_MIN_SCORE` | `0.75` | *Sidecar only* — detection-score floor for a face seen in exactly 1 sampled frame |
 | — | `TGDL_FACES_VIDEO_SINGLETON_MIN_QUALITY` | `0.55` | *Sidecar only* — quality-score floor for a face seen in exactly 1 sampled frame |
-| — | `TGDL_FACES_VIDEO_CONFIRMED_MIN_QUALITY` | `0.30` | *Sidecar only* — universal quality floor for a face confirmed across ≥2 sampled frames |
+| — | `TGDL_FACES_VIDEO_CONFIRMED_MIN_QUALITY` | `0.45` | *Sidecar only* — universal quality floor for a face confirmed across ≥2 sampled frames |
+| — | `TGDL_FACES_VIDEO_CONFIRMED_MIN_SCORE` | `0.60` | *Sidecar only* — detection-score floor for a track confirmed across ≥2 sampled frames |
+| — | `TGDL_FACES_VIDEO_MIN_LANDMARK_REGULARITY` | `0.35` | *Sidecar only* — landmark symmetry floor (hard gate against non-face textures) |
 | `videoProgressPollMs` | `TGDL_FACES_VIDEO_PROGRESS_POLL_MS` | `5000` | *Node only* — how often `detectFacesInVideo` polls `GET /detect/video/status/{job_id}` while a video request is in flight (see [Video scan progress reporting](#video-scan-progress-reporting)) |
 
 Env-var precedence is strict: any `TGDL_FACES_*` value wins over the
@@ -421,6 +425,29 @@ freeze the entire loop.
 
 Range is clamped to `[0, 5]`. Set via `advanced.ai.faces.cpuThrottleRatio`
 in config or `TGDL_FACES_CPU_THROTTLE_RATIO` env var.
+
+### Video CPU priority (nice)
+
+`videoNice` lowers OS scheduling priority **during the video phase only**
+(photos keep normal priority). On Linux it applies at three layers:
+
+1. **Node scan loop** — `process.setPriority()` for the duration of Phase A videos
+2. **ffmpeg fallback** — spawns `nice -n <N> ffmpeg …` when path-mode is unavailable
+3. **Sidecar** — `os.nice()` for the lifetime of each `POST /detect/video` request
+
+| Value | Effect |
+|---|---|
+| `0` (default) | Normal priority |
+| `10` | Background-friendly — good starting point for testing |
+| `15`–`19` | Very low priority — use when the host is shared / CPU-constrained |
+
+Unix only; ignored on Windows and macOS (Node nice is best-effort there).
+Set via Maintenance → AI → **Video CPU priority (nice)**, config
+`advanced.ai.faces.videoNice`, or `TGDL_FACES_VIDEO_NICE` env var (must be
+passed to **both** `telegram-downloader` and `tgdl-faces` in compose).
+
+For Docker-level weighting independent of nice, you can also lower
+`cpu_shares` on the `tgdl-faces` service (see `docker-compose.yml` comment).
 
 ### Detector model options
 

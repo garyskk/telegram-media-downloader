@@ -53,6 +53,8 @@ const NUMBER_KEYS = new Set([
     'downloadRedirectCap',
     'videoFloorIntervalSec',
     'videoMaxFrames',
+    'videoScanLimit',
+    'videoNice',
     'videoProgressPollMs',
 ]);
 
@@ -113,6 +115,8 @@ const ENV_MAP = Object.freeze({
     // `faces-client.js`'s `_extractVideoFrames`.
     videoFloorIntervalSec: 'TGDL_FACES_VIDEO_FLOOR_INTERVAL_SEC',
     videoMaxFrames: 'TGDL_FACES_VIDEO_MAX_FRAMES',
+    videoScanLimit: 'TGDL_FACES_VIDEO_SCAN_LIMIT',
+    videoNice: 'TGDL_FACES_VIDEO_NICE',
     // Node-only — how often `detectFacesInVideo` polls the sidecar's
     // GET /detect/video/status/{job_id} while a video request is in
     // flight. No Python-side equivalent: the sidecar just answers

@@ -155,24 +155,25 @@ curl -X POST http://127.0.0.1:8011/detect/batch-b64 \
 
 ```bash
 cd faces-service
-python -m venv .venv
-# Windows
-.venv\Scripts\activate
-# Unix / macOS
-source .venv/bin/activate
 
-pip install -e ".[test]"
+# Install deps into .venv (CPU variant by default)
+uv sync --group dev
+
+# GPU / DirectML / OpenVINO variants (pick one — they replace onnxruntime):
+# uv sync --group dev --extra gpu
+# uv sync --group dev --extra directml
+# uv sync --group dev --extra openvino
 
 # Auto-detect platform and install the matching onnxruntime EP
 # (DirectML on Windows, CUDA on NVIDIA Linux, OpenVINO on Intel Linux,
 # CoreML on macOS — uninstalls any conflicting wheel first).
-python -m tgdl_faces.install        # or: tgdl-faces-install
+uv run python -m tgdl_faces.install        # or: uv run tgdl-faces-install
 # Flags: --dry-run | --force {cpu,gpu,directml,openvino} | --no-uninstall
 
 # Run the sidecar on 127.0.0.1:8011
 # The model pre-loads in a background thread — /health.ready becomes true
 # a few seconds after startup.
-python -m tgdl_faces
+uv run python -m tgdl_faces
 ```
 
 In a second terminal:
@@ -205,16 +206,17 @@ curl -X POST http://127.0.0.1:8011/detect \
     -d "{\"image_b64\": \"$B64\"}"
 ```
 
-## Requirements files
+## Dependency variants
 
-| File | Use |
+| Install command | Use |
 |---|---|
-| `requirements.txt` | CPU-only (default) |
-| `requirements-cuda.txt` | NVIDIA CUDA (Linux/Windows) |
-| `requirements-directml.txt` | DirectML (Windows, any DX12 GPU) |
+| `uv sync` | CPU-only (default) |
+| `uv sync --extra gpu` | NVIDIA CUDA (Linux/Windows) |
+| `uv sync --extra directml` | DirectML (Windows, any DX12 GPU) |
+| `uv sync --extra openvino` | Intel OpenVINO |
 
 The onnxruntime variants share the `onnxruntime` module name and cannot coexist — install
-only one per environment.
+only one per environment. Exact versions are pinned in `uv.lock`.
 
 ## Docker
 

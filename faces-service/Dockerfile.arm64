@@ -38,17 +38,21 @@ RUN apt-get update \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/
+
 WORKDIR /build
 
-COPY pyproject.toml README.md ./
-COPY tgdl_faces ./tgdl_faces
+COPY pyproject.toml uv.lock README.md ./
 
 # Base onnxruntime ships CPU + OpenVINO EPs on aarch64; no CUDA available.
-RUN pip install --user --no-cache-dir .
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev --no-install-project
+
+COPY tgdl_faces ./tgdl_faces
 
 # Pre-download buffalo_l at build time so the runtime image boots offline.
 ENV TGDL_FACES_MODELS_DIR=/root/.cache/tgdl-faces/models
-RUN python -c "\
+RUN .venv/bin/python -c "\
 from insightface.app import FaceAnalysis; \
 a = FaceAnalysis(name='buffalo_l', root='/root/.cache/tgdl-faces/models', \
     providers=['CPUExecutionProvider']); \
@@ -68,13 +72,13 @@ RUN apt-get update \
         wget \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /root/.local /root/.local
+COPY --from=builder /build/.venv /app/.venv
 COPY --from=builder /root/.cache/tgdl-faces/models /root/.cache/tgdl-faces/models
 
 WORKDIR /app
 COPY tgdl_faces /app/tgdl_faces
 
-ENV PATH="/root/.local/bin:${PATH}" \
+ENV PATH="/app/.venv/bin:${PATH}" \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     TGDL_FACES_HOST=0.0.0.0 \

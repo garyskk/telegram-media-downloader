@@ -27,7 +27,7 @@ import {
     setAiIndexedAt,
     setFacePerson,
 } from '../db.js';
-import { clusterFaces, FACE_DEFAULTS } from './faces.js';
+import { clusterFaces, FACE_DEFAULTS, qualityFilter } from './faces.js';
 import { detectFacesBatch, detectFacesInVideo } from './faces-client.js';
 import { resolveFacesValue } from './faces-config.js';
 import { getDataDir } from '../paths.js';
@@ -49,6 +49,30 @@ async function _throttleSleep(elapsedMs, ratio) {
     if (!ratio || ratio <= 0) return;
     const sleepMs = Math.min(Math.round(elapsedMs * ratio), 5000);
     if (sleepMs >= 10) await new Promise((r) => setTimeout(r, sleepMs));
+}
+
+/** Lower this Node process's CPU priority during the video phase (Unix only). */
+function _applyVideoNice(niceLevel) {
+    if (!Number.isFinite(niceLevel) || niceLevel <= 0) return null;
+    if (process.platform === 'win32') return null;
+    if (typeof process.setPriority !== 'function') return null;
+    try {
+        const prev = process.getPriority();
+        const target = Math.max(-20, Math.min(19, niceLevel | 0));
+        if (target > prev) process.setPriority(target);
+        return prev;
+    } catch {
+        return null;
+    }
+}
+
+function _restoreVideoNice(prev) {
+    if (prev === null || typeof process.setPriority !== 'function') return;
+    try {
+        process.setPriority(prev);
+    } catch {
+        /* EPERM on some containers — best effort */
+    }
 }
 
 // Pick the first finite number from a list of candidates; fall back to
@@ -227,6 +251,18 @@ export function startFacesScan(cfg, onProgress, onDone, onLog) {
                 `)
                 .get(...fileTypes).n;
             const scanVideos = facesCfgIn.scanVideos === true;
+            const videoScanLimitRaw = _pickNumber(
+                [resolveFacesValue('videoScanLimit', facesCfgIn), facesCfgIn.videoScanLimit],
+                0,
+            );
+            const videoScanLimit = Math.max(0, videoScanLimitRaw | 0);
+            const videoNice = Math.max(
+                0,
+                _pickNumber(
+                    [resolveFacesValue('videoNice', facesCfgIn), facesCfgIn.videoNice],
+                    0,
+                ) | 0,
+            );
             const videoTotal = scanVideos
                 ? db
                       .prepare(
@@ -234,11 +270,13 @@ export function startFacesScan(cfg, onProgress, onDone, onLog) {
                       )
                       .get().n
                 : 0;
-            state.total = phaseATotal + videoTotal;
+            const videoToScan =
+                videoScanLimit > 0 ? Math.min(videoTotal, videoScanLimit) : videoTotal;
+            state.total = phaseATotal + videoToScan;
             bump();
             log(
                 'info',
-                `faces scan: ${phaseATotal} photos${videoTotal ? ` + ${videoTotal} videos` : ''} to scan in phase A`,
+                `faces scan: ${phaseATotal} photos${videoToScan ? ` + ${videoToScan} videos${videoScanLimit > 0 && videoTotal > videoToScan ? ` (limit ${videoScanLimit}, ${videoTotal - videoToScan} deferred)` : ''}` : videoTotal ? ` + ${videoTotal} videos` : ''} to scan in phase A`,
             );
 
             // `batchSize` precedence (same model as fileTypes above).
@@ -369,6 +407,9 @@ export function startFacesScan(cfg, onProgress, onDone, onLog) {
                                     : Number.isFinite(f.score)
                                       ? f.score
                                       : null,
+                                frameTimeSec: Number.isFinite(f.frameTimeSec)
+                                    ? f.frameTimeSec
+                                    : null,
                             });
                         }
                     }
@@ -404,12 +445,27 @@ export function startFacesScan(cfg, onProgress, onDone, onLog) {
             // Gated by cfg.faces.scanVideos — off by default, opt-in via UI toggle.
             if (!signal.aborted && scanVideos) {
                 if (videoTotal > 0) {
-                    log('info', `faces scan: starting video phase — ${videoTotal} videos`);
+                    const limitNote =
+                        videoScanLimit > 0
+                            ? ` (limit ${videoScanLimit}${videoTotal > videoScanLimit ? `, ${videoTotal - videoScanLimit} deferred` : ''})`
+                            : '';
+                    const niceNote = videoNice > 0 ? `, nice=${videoNice}` : '';
+                    log('info', `faces scan: starting video phase — ${videoToScan} videos${limitNote}${niceNote}`);
                     let _vNull = 0,
                         _vEmpty = 0,
                         _vFaces = 0,
-                        _vVids = 0;
-                    while (!signal.aborted) {
+                        _vVids = 0,
+                        _vProcessed = 0;
+                    const savedNice = _applyVideoNice(videoNice);
+                    try {
+                        while (!signal.aborted) {
+                        if (videoScanLimit > 0 && _vProcessed >= videoScanLimit) {
+                            log(
+                                'info',
+                                `faces scan: video scan limit (${videoScanLimit}) reached — ${videoTotal - _vProcessed} videos deferred to a later scan`,
+                            );
+                            break;
+                        }
                         const [row] = getUnindexedAiBatch({ fileTypes: ['video'], limit: 1 });
                         if (!row) break;
                         const abs = _resolveAbs(row.file_path);
@@ -449,6 +505,8 @@ export function startFacesScan(cfg, onProgress, onDone, onLog) {
                             _vVids++;
                         }
                         if (Array.isArray(detected) && detected.length) {
+                            const facesCfg = cfg?.faces || cfg || {};
+                            detected = qualityFilter(detected, facesCfg);
                             deleteFacesForDownload(row.id);
                             for (const f of detected) {
                                 if (!f.embedding || !f.embedding.length) continue;
@@ -464,17 +522,24 @@ export function startFacesScan(cfg, onProgress, onDone, onLog) {
                                         : Number.isFinite(f.score)
                                           ? f.score
                                           : null,
+                                    frameTimeSec: Number.isFinite(f.frameTimeSec)
+                                        ? f.frameTimeSec
+                                        : null,
                                 });
                             }
                         }
                         setAiIndexedAt(row.id);
                         state.scanned += 1;
+                        _vProcessed += 1;
                         // Clear so this video's stale progress doesn't linger
                         // once it's done — the next iteration's callback (or
                         // nothing, once the phase ends) sets it again.
                         state.currentVideo = null;
                         bump();
                         await new Promise((r) => setImmediate(r));
+                    }
+                    } finally {
+                        _restoreVideoNice(savedNice);
                     }
                     log(
                         'info',

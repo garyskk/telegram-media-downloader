@@ -24,26 +24,21 @@ $outName = "tgdl-faces-win-$arch"
 
 Write-Host "Building $outName.exe (variant=$Variant, with-model=$WithModel)" -ForegroundColor Cyan
 
-# ── Install/check PyInstaller ─────────────────────────────────────────────────
-python -m pip install --quiet pyinstaller
-
-# ── Optional: install the right onnxruntime variant ──────────────────────────
+# ── Install deps via uv ───────────────────────────────────────────────────────
+$uvArgs = @('sync', '--group', 'build')
 switch ($Variant) {
-    'cuda' {
-        python -m pip install --quiet 'onnxruntime-gpu>=1.18'
-        python -m pip uninstall -y onnxruntime 2>$null
-    }
-    'dml' {
-        python -m pip install --quiet 'onnxruntime-directml>=1.18'
-        python -m pip uninstall -y onnxruntime 2>$null
-    }
-    default {
-        python -m pip install --quiet 'onnxruntime>=1.18,<2'
-    }
+    'cuda' { $uvArgs += '--extra', 'gpu' }
+    'dml'  { $uvArgs += '--extra', 'directml' }
+}
+Push-Location $PSScriptRoot
+try {
+    uv @uvArgs
+} finally {
+    Pop-Location
 }
 
 # ── Resolve the tgdl_faces package path ──────────────────────────────────────
-$pkgPath = python -c "import tgdl_faces, os; print(os.path.dirname(tgdl_faces.__file__))"
+$pkgPath = uv run python -c "import tgdl_faces, os; print(os.path.dirname(tgdl_faces.__file__))"
 if (-not $pkgPath) {
     # Not installed — add src dir to PYTHONPATH so PyInstaller finds it
     $env:PYTHONPATH = "$PSScriptRoot;$env:PYTHONPATH"
@@ -92,8 +87,8 @@ if ($WithModel) {
 # Entry point
 $entryPoint = Join-Path $PSScriptRoot 'tgdl_faces\__main__.py'
 
-Write-Host "Running: pyinstaller $args $entryPoint" -ForegroundColor DarkGray
-python -m PyInstaller @args $entryPoint
+Write-Host "Running: uv run pyinstaller $args $entryPoint" -ForegroundColor DarkGray
+uv run pyinstaller @args $entryPoint
 
 # ── Copy to dist ──────────────────────────────────────────────────────────────
 $distExe = Join-Path $PSScriptRoot "dist\$outName.exe"

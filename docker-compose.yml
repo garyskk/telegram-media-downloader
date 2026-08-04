@@ -78,6 +78,10 @@ services:
       # stays empty and Node falls back to the bundled PyInstaller
       # binary downloaded on first use.
       - FACES_SERVICE_URL=${FACES_SERVICE_URL:-http://tgdl-faces:8011}
+      # Video face scan knobs — see docs/AI.md. Limit caps videos per run;
+      # nice lowers CPU priority during the video phase (Unix, 0 = off).
+      - TGDL_FACES_VIDEO_SCAN_LIMIT=${TGDL_FACES_VIDEO_SCAN_LIMIT:-0}
+      - TGDL_FACES_VIDEO_NICE=${TGDL_FACES_VIDEO_NICE:-0}
       # Seekbar preview sidecar URL. Leave unset to let the dashboard
       # auto-spawn the bundled Go binary on a random localhost port;
       # set when running `seekbar-service/` as a separate compose
@@ -212,6 +216,7 @@ services:
       # (downloader, OS) get breathing room. Leave at 0 (default) when a
       # GPU provider is active — GPU inference already leaves the CPU idle.
       - TGDL_FACES_THROTTLE_MS=${TGDL_FACES_THROTTLE_MS:-0}
+      - TGDL_FACES_VIDEO_NICE=${TGDL_FACES_VIDEO_NICE:-10}
       - TZ=${TZ:-UTC}
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:8011/health || exit 1"]
@@ -232,6 +237,10 @@ services:
         # resident on amd64 amid a scan burst; 2g default leaves
         # headroom. Override via TGDL_FACES_MEM_LIMIT for boxes with
         # tighter envelopes (Pi 4 4GB, small Synology).
+        #
+        # Optional: lower cgroup CPU weight vs the main app (default 1024).
+        # Uncomment when video scans starve downloads/UI even with nice:
+        #   cpu_shares: 256
         limits:
           memory: ${TGDL_FACES_MEM_LIMIT:-2g}
           cpus: ${TGDL_FACES_CPU_LIMIT:-6}
@@ -284,6 +293,7 @@ services:
       # Throttle: 0 (default) is correct for GPU — CPU is idle between
       # kernel dispatches. Only raise this if falling back to CPU.
       - TGDL_FACES_THROTTLE_MS=${TGDL_FACES_THROTTLE_MS:-0}
+      - TGDL_FACES_VIDEO_NICE=${TGDL_FACES_VIDEO_NICE:-10}
       - TZ=${TZ:-UTC}
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:8011/health || exit 1"]
@@ -346,6 +356,7 @@ services:
       - TGDL_FACES_MODELS_DIR=/root/.cache/tgdl-faces/models
       - TGDL_FACES_PROVIDERS=${TGDL_FACES_PROVIDERS:-auto}
       - TGDL_FACES_THROTTLE_MS=${TGDL_FACES_THROTTLE_MS:-0}
+      - TGDL_FACES_VIDEO_NICE=${TGDL_FACES_VIDEO_NICE:-10}
       - TZ=${TZ:-UTC}
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:8011/health || exit 1"]

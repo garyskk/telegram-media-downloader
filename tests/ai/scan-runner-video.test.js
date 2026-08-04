@@ -160,6 +160,39 @@ describe('scanVideos gate', () => {
         expect(face.x).toBe(10);
         expect(face.w).toBe(80);
     });
+
+    it('videoScanLimit: stops after N videos; remaining stay unindexed', async () => {
+        const downloadsDir = path.join(DATA_DIR, 'downloads');
+        fs.mkdirSync(downloadsDir, { recursive: true });
+        for (let i = 0; i < 3; i++) {
+            fs.writeFileSync(path.join(downloadsDir, `vid${i}.mp4`), 'fake-video');
+            insertVideoRow(`vid${i}.mp4`);
+        }
+
+        clientMock.detectFacesInVideo.mockResolvedValue([]);
+
+        scannerApi.startFacesScan(
+            { faces: { scanVideos: true, fileTypes: ['photo'], videoScanLimit: 2 } },
+            null,
+            null,
+            null,
+        );
+        await waitForScan();
+
+        expect(clientMock.detectFacesInVideo).toHaveBeenCalledTimes(2);
+        const indexed = db
+            .prepare(
+                `SELECT COUNT(*) AS n FROM downloads WHERE file_type = 'video' AND ai_indexed_at IS NOT NULL`,
+            )
+            .get().n;
+        const pending = db
+            .prepare(
+                `SELECT COUNT(*) AS n FROM downloads WHERE file_type = 'video' AND ai_indexed_at IS NULL`,
+            )
+            .get().n;
+        expect(indexed).toBe(2);
+        expect(pending).toBe(1);
+    });
 });
 
 // Video scan progress reporting — detectFacesInVideo's 5th arg

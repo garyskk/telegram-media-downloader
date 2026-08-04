@@ -3419,6 +3419,29 @@
                                 <div id="ai-scan-videos-toggle" class="tg-toggle shrink-0 mt-0.5" role="switch" aria-checked="false" tabindex="0"></div>
                             </div>
 
+                            <!-- Video scan limit — cap how many unindexed videos
+                                 Phase A processes per run (0 = unlimited).
+                                 Useful while testing tighter detection filters. -->
+                            <div class="flex items-start justify-between gap-3">
+                                <div class="min-w-0">
+                                    <label for="ai-faces-video-scan-limit" class="text-tg-text text-sm" data-i18n="maintenance.ai.video_scan_limit_label">Video scan limit</label>
+                                    <p class="text-[11px] text-tg-textSecondary mt-0.5" data-i18n="maintenance.ai.video_scan_limit_help">Max videos to process per scan run. 0 = no limit. Set a small number (e.g. 5) to test detection changes without re-scanning the whole library.</p>
+                                </div>
+                                <input id="ai-faces-video-scan-limit" type="number" min="0" max="10000" step="1" value="0"
+                                    class="tg-input w-20 text-sm text-right shrink-0 mt-0.5" inputmode="numeric">
+                            </div>
+
+                            <!-- Video CPU nice — lower scheduling priority during
+                                 the video phase so downloads/UI stay responsive. -->
+                            <div class="flex items-start justify-between gap-3">
+                                <div class="min-w-0">
+                                    <label for="ai-faces-video-nice" class="text-tg-text text-sm" data-i18n="maintenance.ai.video_nice_label">Video CPU priority (nice)</label>
+                                    <p class="text-[11px] text-tg-textSecondary mt-0.5" data-i18n="maintenance.ai.video_nice_help">Unix only. 0 = normal priority. 10–15 = background-friendly — keeps Telegram downloads and the dashboard responsive during long video scans. Also applies to the faces sidecar and ffmpeg fallback.</p>
+                                </div>
+                                <input id="ai-faces-video-nice" type="number" min="0" max="19" step="1" value="0"
+                                    class="tg-input w-20 text-sm text-right shrink-0 mt-0.5" inputmode="numeric">
+                            </div>
+
                             <!-- Detector model select. Switching the
                                  preset auto-restarts the sidecar +
                                  reminds the operator that the existing

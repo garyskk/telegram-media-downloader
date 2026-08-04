@@ -23,7 +23,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        python3.11 python3.11-dev python3-pip \
+        python3.11 python3.11-dev python3.11-venv \
         gcc g++ \
         libgl1 libglib2.0-0 \
         ca-certificates \
@@ -31,18 +31,20 @@ RUN apt-get update \
     && ln -sf python3 /usr/bin/python \
     && rm -rf /var/lib/apt/lists/*
 
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/
+
 WORKDIR /build
 
-COPY pyproject.toml README.md ./
-COPY tgdl_faces ./tgdl_faces
+COPY pyproject.toml uv.lock README.md ./
 
-# Install CPU variant first, then overlay onnxruntime-gpu which pip will
-# use to satisfy the onnxruntime requirement (they share the module name).
-RUN pip install --user --no-cache-dir ".[gpu]"
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev --no-install-project --extra gpu
+
+COPY tgdl_faces ./tgdl_faces
 
 # Pre-download buffalo_l model weights.
 ENV TGDL_FACES_MODELS_DIR=/root/.cache/tgdl-faces/models
-RUN python -c "from insightface.app import FaceAnalysis; a = FaceAnalysis(name='buffalo_l', root='/root/.cache/tgdl-faces/models', providers=['CPUExecutionProvider']); a.prepare(ctx_id=-1)"
+RUN .venv/bin/python -c "from insightface.app import FaceAnalysis; a = FaceAnalysis(name='buffalo_l', root='/root/.cache/tgdl-faces/models', providers=['CPUExecutionProvider']); a.prepare(ctx_id=-1)"
 
 # ---------------------------------------------------------------------------
 # Stage 2 — runtime
@@ -53,7 +55,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        python3.11 python3-pip \
+        python3.11 \
         libgl1 libglib2.0-0 \
         ca-certificates \
         tini \
@@ -62,13 +64,13 @@ RUN apt-get update \
     && ln -sf python3 /usr/bin/python \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /root/.local /root/.local
+COPY --from=builder /build/.venv /app/.venv
 COPY --from=builder /root/.cache/tgdl-faces/models /root/.cache/tgdl-faces/models
 
 WORKDIR /app
 COPY tgdl_faces /app/tgdl_faces
 
-ENV PATH="/root/.local/bin:${PATH}" \
+ENV PATH="/app/.venv/bin:${PATH}" \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     TGDL_FACES_HOST=0.0.0.0 \

@@ -421,6 +421,15 @@ function initSchema() {
     } catch {
         /* column already present */
     }
+    // Video-sourced faces: timestamp (seconds) of the sampled frame the
+    // bbox was detected on. Used by crop endpoints to seek ffmpeg to the
+    // correct frame instead of always using frame 0 (which produced black/
+    // wrong crops when the face appeared later in the video).
+    try {
+        db.exec('ALTER TABLE faces ADD COLUMN frame_time_sec REAL');
+    } catch {
+        /* column already present */
+    }
     try {
         db.exec('ALTER TABLE people ADD COLUMN gender TEXT');
     } catch {
@@ -2478,11 +2487,12 @@ export function insertFace({
     embeddingBlob,
     personId = null,
     qualityScore = null,
+    frameTimeSec = null,
 }) {
     return getDb()
         .prepare(`
-        INSERT INTO faces (download_id, x, y, w, h, embedding, person_id, quality_score)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO faces (download_id, x, y, w, h, embedding, person_id, quality_score, frame_time_sec)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     `)
         .run(
             Number(downloadId),
@@ -2493,6 +2503,7 @@ export function insertFace({
             embeddingBlob,
             personId == null ? null : Number(personId),
             qualityScore == null ? null : Number(qualityScore),
+            frameTimeSec == null ? null : Number(frameTimeSec),
         );
 }
 

@@ -784,6 +784,35 @@ def _l2_normalise(vec: np.ndarray) -> np.ndarray:
     return (arr / norm).astype(np.float32, copy=False)
 
 
+def _compute_landmark_regularity(
+    kps: Any,
+    w: int,
+    h: int,
+    scale: float = 1.0,
+) -> float:
+    """Eye/nose/mouth symmetry score in [0.0, 1.0].
+
+    Exported per-face so video track confirmation can apply a hard gate
+    independent of the composite ``quality_score``.
+    """
+    if kps is None:
+        return 0.5
+    try:
+        pts = np.asarray(kps, dtype=np.float32).reshape(-1, 2) / scale
+        if len(pts) >= 5:
+            eye_l, eye_r, nose = pts[0], pts[1], pts[2]
+            mouth_l, mouth_r = pts[3], pts[4]
+            eye_dy = abs(float(eye_l[1] - eye_r[1])) / max(1, h)
+            eye_cx = (float(eye_l[0]) + float(eye_r[0])) / 2
+            nose_dx = abs(float(nose[0]) - eye_cx) / max(1, w)
+            mouth_cx = (float(mouth_l[0]) + float(mouth_r[0])) / 2
+            mouth_dx = abs(mouth_cx - eye_cx) / max(1, w)
+            return max(0.0, 1.0 - (eye_dy + nose_dx + mouth_dx) * 3.0)
+        return 0.5
+    except (ValueError, TypeError):
+        return 0.5
+
+
 def _compute_quality_score(
     face: Any,
     image_bgr: np.ndarray,
@@ -792,12 +821,18 @@ def _compute_quality_score(
     w: int,
     h: int,
     scale: float = 1.0,
+    *,
+    sharpness_divisor: float = 100.0,
+    regularity: float | None = None,
 ) -> float:
     """Composite face quality score in [0.0, 1.0].
 
     Five factors, each normalised to [0, 1]:
       det_score (0.30) + face_size (0.20) + sharpness (0.20)
       + landmark_regularity (0.15) + pose_frontalness (0.15)
+
+    ``sharpness_divisor`` is lower for video frames (40 vs 100) so
+    compressed/motion-blurred crops can still reach HQ when genuinely sharp.
     """
     import cv2 as _cv2  # noqa: PLC0415
 
@@ -820,31 +855,15 @@ def _compute_quality_score(
             image_bgr[crop_y1:crop_y2, crop_x1:crop_x2], _cv2.COLOR_BGR2GRAY
         )
         lap_var = float(_cv2.Laplacian(grey, _cv2.CV_64F).var()) if grey.size else 0.0
-        sharpness = min(1.0, lap_var / 100.0)
+        div = max(1.0, float(sharpness_divisor))
+        sharpness = min(1.0, lap_var / div)
     else:
         sharpness = 0.0
 
     # 4. Landmark regularity (eye symmetry, nose/mouth centering)
-    # face.kps is in detect_img coords; scale back to original
-    kps = getattr(face, "kps", None)
-    if kps is not None:
-        try:
-            pts = np.asarray(kps, dtype=np.float32).reshape(-1, 2) / scale
-            if len(pts) >= 5:
-                eye_l, eye_r, nose = pts[0], pts[1], pts[2]
-                mouth_l, mouth_r = pts[3], pts[4]
-                eye_dy = abs(float(eye_l[1] - eye_r[1])) / max(1, h)
-                eye_cx = (float(eye_l[0]) + float(eye_r[0])) / 2
-                nose_dx = abs(float(nose[0]) - eye_cx) / max(1, w)
-                mouth_cx = (float(mouth_l[0]) + float(mouth_r[0])) / 2
-                mouth_dx = abs(mouth_cx - eye_cx) / max(1, w)
-                regularity = max(0.0, 1.0 - (eye_dy + nose_dx + mouth_dx) * 3.0)
-            else:
-                regularity = 0.5
-        except (ValueError, TypeError):
-            regularity = 0.5
-    else:
-        regularity = 0.5
+    if regularity is None:
+        kps = getattr(face, "kps", None)
+        regularity = _compute_landmark_regularity(kps, w, h, scale)
 
     # 5. Pose frontalness (insightface pose = [pitch, yaw, roll] degrees)
     pose = getattr(face, "pose", None)
@@ -877,6 +896,7 @@ def detect_and_embed(
     ar_range: tuple[float, float] = (0.5, 2.0),
     _track_stats: bool = True,
     _skip_quality_score: bool | None = None,
+    _video_mode: bool = False,
 ) -> list[dict[str, Any]]:
     """Detect every face in ``image_bgr`` and return cleaned-up records.
 
@@ -1012,8 +1032,28 @@ def detect_and_embed(
                 except (ValueError, TypeError):
                     landmarks = []
 
+            kps_for_reg = getattr(face, "kps", None)
+            if kps_for_reg is None:
+                kps_for_reg = getattr(face, "landmark_2d_106", None)
+            regularity = _compute_landmark_regularity(kps_for_reg, w, h, scale)
+
             do_quality = not (_skip_quality_score if _skip_quality_score is not None else _skip_quality())
-            quality = _compute_quality_score(face, image_bgr, x, y, w, h, scale) if do_quality else 0.0
+            sharpness_divisor = 40.0 if _video_mode else 100.0
+            quality = (
+                _compute_quality_score(
+                    face,
+                    image_bgr,
+                    x,
+                    y,
+                    w,
+                    h,
+                    scale,
+                    sharpness_divisor=sharpness_divisor,
+                    regularity=regularity,
+                )
+                if do_quality
+                else 0.0
+            )
 
             out.append(
                 {
@@ -1023,6 +1063,7 @@ def detect_and_embed(
                     "h": h,
                     "score": score,
                     "quality_score": quality,
+                    "landmark_regularity": round(regularity, 4),
                     "embedding": emb.tolist(),
                     "landmarks": landmarks,
                 }

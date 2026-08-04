@@ -179,6 +179,18 @@ function _bindOnce() {
             _onScanVideosToggle();
         }
     });
+    $('#ai-faces-video-scan-limit')?.addEventListener('change', async (e) => {
+        const raw = Number(e.target.value);
+        const limit = Number.isFinite(raw) ? Math.max(0, Math.min(10000, raw | 0)) : 0;
+        if (String(e.target.value) !== String(limit)) e.target.value = String(limit);
+        await _saveSetting('videoScanLimit', limit);
+    });
+    $('#ai-faces-video-nice')?.addEventListener('change', async (e) => {
+        const raw = Number(e.target.value);
+        const nice = Number.isFinite(raw) ? Math.max(0, Math.min(19, raw | 0)) : 0;
+        if (String(e.target.value) !== String(nice)) e.target.value = String(nice);
+        await _saveSetting('videoNice', nice);
+    });
 
     // Settings inputs — model / threshold / minPoints / provider.
     // `change` (not `input`) so dragging the slider doesn't spam saves.
@@ -422,6 +434,10 @@ async function _saveSetting(cfgKey, value, { restartSidecar = false } = {}) {
         if (alias) {
             body.advanced.ai[alias[0]] = value;
             body.advanced.ai.faces = { [alias[1]]: value };
+        } else if (cfgKey === 'videoScanLimit') {
+            body.advanced.ai.faces = { videoScanLimit: value };
+        } else if (cfgKey === 'videoNice') {
+            body.advanced.ai.faces = { videoNice: value };
         } else {
             body.advanced.ai[cfgKey] = value;
         }
@@ -609,6 +625,16 @@ function _renderStatus(status) {
         const on = cfg.faces?.scanVideos === true;
         scanVideosToggle.classList.toggle('active', on);
         scanVideosToggle.setAttribute('aria-checked', String(on));
+    }
+    const videoScanLimitInp = $('#ai-faces-video-scan-limit');
+    if (videoScanLimitInp) {
+        const cur = Number.isFinite(cfg.faces?.videoScanLimit) ? cfg.faces.videoScanLimit : 0;
+        if (Number(videoScanLimitInp.value) !== cur) videoScanLimitInp.value = String(cur);
+    }
+    const videoNiceInp = $('#ai-faces-video-nice');
+    if (videoNiceInp) {
+        const cur = Number.isFinite(cfg.faces?.videoNice) ? cfg.faces.videoNice : 0;
+        if (Number(videoNiceInp.value) !== cur) videoNiceInp.value = String(cur);
     }
 
     // Model line — id + dim + provider, served by /api/ai/status.

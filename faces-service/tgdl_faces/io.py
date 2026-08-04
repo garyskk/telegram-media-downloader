@@ -347,7 +347,7 @@ def extract_video_frames(
             # Some containers don't report frame count — grab one frame.
             ret, frame = cap.read()
             if ret and frame is not None:
-                yield frame
+                yield frame, 0, 0.0
             return
 
         window_frames = max(1, round(fps * window_sec))
@@ -384,7 +384,7 @@ def extract_video_frames(
                 )
                 hit_floor = (best_idx - last_kept_idx) >= floor_frames
                 if prev_sig is None or motion >= motion_threshold or hit_floor:
-                    yield best_frame
+                    yield best_frame, best_idx, best_idx / fps
                     prev_sig = best_sig
                     last_kept_idx = best_idx
                     kept += 1

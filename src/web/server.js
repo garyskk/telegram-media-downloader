@@ -8420,15 +8420,32 @@ app.get('/api/ai/group-by-person', async (req, res) => {
 
 // Extract a single frame from a video file as a raw image buffer using ffmpeg.
 // Used by the face crop endpoints when the source is a video file.
-async function _extractVideoFrame(videoPath) {
+async function _extractVideoFrame(videoPath, timeSec = 0) {
     const { execFile } = await import('child_process');
     const { resolveFfmpegBin } = await import('../core/thumbs.js');
     const ffmpeg = resolveFfmpegBin();
+    const ss = Math.max(0, Number(timeSec) || 0);
+    const args =
+        ss > 0
+            ? [
+                  '-ss',
+                  String(ss),
+                  '-i',
+                  videoPath,
+                  '-vframes',
+                  '1',
+                  '-f',
+                  'image2',
+                  '-vcodec',
+                  'png',
+                  'pipe:1',
+              ]
+            : ['-i', videoPath, '-vframes', '1', '-f', 'image2', '-vcodec', 'png', 'pipe:1'];
     return new Promise((resolve, reject) => {
         execFile(
             ffmpeg,
-            ['-i', videoPath, '-vframes', '1', '-f', 'image2', '-vcodec', 'png', 'pipe:1'],
-            { encoding: 'buffer', maxBuffer: 20 * 1024 * 1024, timeout: 10000 },
+            args,
+            { encoding: 'buffer', maxBuffer: 20 * 1024 * 1024, timeout: 15000 },
             (err, stdout) => {
                 if (err) return reject(err);
                 resolve(stdout);
@@ -8437,10 +8454,99 @@ async function _extractVideoFrame(videoPath) {
     });
 }
 
+async function _probeVideoDurationSec(videoPath) {
+    const { execFile } = await import('child_process');
+    const { resolveFfprobeBin } = await import('../core/thumbs.js');
+    const ffprobe = resolveFfprobeBin();
+    try {
+        const { stdout } = await new Promise((resolve, reject) => {
+            execFile(
+                ffprobe,
+                [
+                    '-v',
+                    'error',
+                    '-show_entries',
+                    'format=duration',
+                    '-of',
+                    'default=noprint_wrappers=1:nokey=1',
+                    videoPath,
+                ],
+                { encoding: 'utf8', timeout: 10000 },
+                (err, out) => (err ? reject(err) : resolve({ stdout: out })),
+            );
+        });
+        const d = Number(String(stdout || '').trim());
+        return Number.isFinite(d) && d > 0 ? d : 0;
+    } catch {
+        return 0;
+    }
+}
+
+/** Cheap sharpness proxy for a face bbox on a decoded frame (higher = better). */
+async function _faceCropSharpness(sourceBuf, row) {
+    const pad = 0.4;
+    const meta = await sharp(sourceBuf, { failOn: 'none' }).metadata();
+    const imgW = meta.width || 9999;
+    const imgH = meta.height || 9999;
+    const left = Math.max(0, Math.round(row.x - row.w * pad));
+    const top = Math.max(0, Math.round(row.y - row.h * pad));
+    const right = Math.min(imgW, Math.round(row.x + row.w + row.w * pad));
+    const bottom = Math.min(imgH, Math.round(row.y + row.h + row.h * pad));
+    const width = Math.max(1, right - left);
+    const height = Math.max(1, bottom - top);
+    const raw = await sharp(sourceBuf, { failOn: 'none' })
+        .extract({ left, top, width, height })
+        .greyscale()
+        .raw()
+        .toBuffer();
+    if (!raw.length) return 0;
+    let sum = 0;
+    for (let i = 0; i < raw.length; i++) sum += raw[i];
+    const mean = sum / raw.length;
+    let varSum = 0;
+    for (let i = 0; i < raw.length; i++) {
+        const d = raw[i] - mean;
+        varSum += d * d;
+    }
+    return varSum / raw.length;
+}
+
+// Pick the best frame for a legacy video face (no stored timestamp) by
+// trying several seek points and keeping the crop with highest variance.
+async function _extractBestVideoFrameForCrop(videoPath, row) {
+    const stored = Number(row.frame_time_sec);
+    if (Number.isFinite(stored) && stored >= 0) {
+        return _extractVideoFrame(videoPath, stored);
+    }
+    const duration = await _probeVideoDurationSec(videoPath);
+    const times =
+        duration > 0
+            ? [0, duration * 0.25, duration * 0.5, duration * 0.75, Math.max(0, duration - 0.05)]
+            : [0];
+    let bestBuf = null;
+    let bestScore = -1;
+    for (const t of times) {
+        try {
+            const frameBuf = await _extractVideoFrame(videoPath, t);
+            const score = await _faceCropSharpness(frameBuf, row);
+            if (score > bestScore) {
+                bestScore = score;
+                bestBuf = frameBuf;
+            }
+        } catch {
+            /* try next candidate */
+        }
+    }
+    if (!bestBuf) throw new Error('no video frame extracted');
+    return bestBuf;
+}
+
 // Crop a face from an image buffer (or file path) with padding.
+// `.rotate()` honours EXIF orientation so coordinates from the sidecar
+// (which already applies EXIF before detection) match the pixel space.
 async function _cropFace(source, row, size) {
     const pad = 0.4;
-    const meta = await sharp(source, { failOn: 'none' }).metadata();
+    const meta = await sharp(source, { failOn: 'none' }).rotate().metadata();
     const imgW = meta.width || 9999;
     const imgH = meta.height || 9999;
     const left = Math.max(0, Math.round(row.x - row.w * pad));
@@ -8450,6 +8556,7 @@ async function _cropFace(source, row, size) {
     const width = Math.max(1, right - left);
     const height = Math.max(1, bottom - top);
     return sharp(source, { failOn: 'none' })
+        .rotate()
         .extract({ left, top, width, height })
         .resize(size, size, { fit: 'cover', position: 'centre' })
         .jpeg({ quality: 82, progressive: true })
@@ -8468,7 +8575,7 @@ app.get('/api/ai/person/:id/face', async (req, res) => {
 
         const row = aiGetDb()
             .prepare(
-                `SELECT f.x, f.y, f.w, f.h, d.file_path, d.file_type
+                `SELECT f.x, f.y, f.w, f.h, f.frame_time_sec, d.file_path, d.file_type
                    FROM faces f
                    JOIN downloads d ON d.id = f.download_id
                   WHERE f.person_id = ?
@@ -8488,11 +8595,12 @@ app.get('/api/ai/person/:id/face', async (req, res) => {
 
         let buf;
         if (row.file_type === 'video') {
-            const frameBuf = await _extractVideoFrame(resolved.real);
+            const frameBuf = await _extractBestVideoFrameForCrop(resolved.real, row);
             try {
                 buf = await _cropFace(frameBuf, row, size);
             } catch {
                 buf = await sharp(frameBuf, { failOn: 'none' })
+                    .rotate()
                     .resize(size, size, { fit: 'cover', position: 'attention' })
                     .jpeg({ quality: 82, progressive: true })
                     .toBuffer();
@@ -8531,7 +8639,7 @@ app.get('/api/ai/faces/:id/crop', async (req, res) => {
 
         const row = aiGetDb()
             .prepare(
-                `SELECT f.x, f.y, f.w, f.h, d.file_path, d.file_type
+                `SELECT f.x, f.y, f.w, f.h, f.frame_time_sec, d.file_path, d.file_type
                    FROM faces f
                    JOIN downloads d ON d.id = f.download_id
                   WHERE f.id = ?
@@ -8548,11 +8656,12 @@ app.get('/api/ai/faces/:id/crop', async (req, res) => {
 
         let buf;
         if (row.file_type === 'video') {
-            const frameBuf = await _extractVideoFrame(resolved.real);
+            const frameBuf = await _extractBestVideoFrameForCrop(resolved.real, row);
             try {
                 buf = await _cropFace(frameBuf, row, size);
             } catch {
                 buf = await sharp(frameBuf, { failOn: 'none' })
+                    .rotate()
                     .resize(size, size, { fit: 'cover', position: 'attention' })
                     .jpeg({ quality: 82, progressive: true })
                     .toBuffer();
