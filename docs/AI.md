@@ -664,15 +664,25 @@ All endpoints are admin-only.
 | POST   | `/api/ai/scan/cancel`               | same body shape                                        |
 | GET    | `/api/ai/scan/status?feature=faces` | live state for re-mounted page                         |
 | GET    | `/api/ai/people`                    | clusters with cover face + count                       |
+| GET    | `/api/ai/people/excluded`           | durable exclusion denylist (`{ excluded, total }`)     |
 | GET    | `/api/ai/people/:id/photos`         | paginated photos in this cluster                       |
 | PATCH  | `/api/ai/people/:id`                | `{ label }` — rename                                   |
-| DELETE | `/api/ai/people/:id`                | drop cluster (faces become unassigned)                 |
+| DELETE | `/api/ai/people/:id`                | temporary drop (faces unassigned; may reappear)        |
+| POST   | `/api/ai/people/:id/exclude`        | durable exclude — skipped by Phase B recluster         |
+| DELETE | `/api/ai/people/excluded/:id`       | un-exclude (next recluster may recreate)               |
 | POST   | `/api/ai/people/:id/merge`          | `{ otherId }` — fold one cluster into another          |
 | POST   | `/api/ai/people/:id/split`          | `{ faceIds, newLabel? }` — create a new cluster        |
 | POST   | `/api/ai/faces/:id/reassign`        | `{ personId }` — move a single face to another cluster |
 | GET    | `/api/ai/faces/by-download/:id`     | face boxes for the gallery viewer overlay              |
 | POST   | `/api/ai/preload-model/:name`       | trigger background model download (proxy to sidecar)   |
 | GET    | `/api/ai/preload-model/:name/status`| check model download status                            |
+
+**Delete vs Exclude.** `DELETE /api/ai/people/:id` only drops the
+cluster row (faces become unassigned); the next Phase B recluster can
+recreate it. `POST /api/ai/people/:id/exclude` snapshots the centroid
+into `excluded_people` so Phase B skips matching clusters across
+reclusters. Full faces reindex clears the denylist (embedding space may
+change with the detector model).
 
 ## Sidecar wire format
 

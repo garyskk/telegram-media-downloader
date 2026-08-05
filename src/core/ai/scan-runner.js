@@ -24,6 +24,7 @@ import {
     insertFace,
     insertPerson,
     iterateAllFaces,
+    listExcludedCentroids,
     setAiIndexedAt,
     setFacePerson,
 } from '../db.js';
@@ -663,16 +664,47 @@ export function startFacesScan(cfg, onProgress, onDone, onLog) {
                 return best;
             };
 
+            // Excluded centroids survive clearAllPeople — load once and skip
+            // matching clusters so durable ignores stick across reclusters.
+            const excludedSnapshot = listExcludedCentroids();
+            const isExcludedCentroid = (centroid) => {
+                let bestDist = Infinity;
+                for (const s of excludedSnapshot) {
+                    if (s.centroid.length !== centroid.length) continue;
+                    let sum = 0;
+                    for (let i = 0; i < centroid.length; i++) {
+                        const d = centroid[i] - s.centroid[i];
+                        sum += d * d;
+                    }
+                    const dist = Math.sqrt(sum);
+                    if (dist < bestDist && dist <= matchEps) {
+                        bestDist = dist;
+                        return true;
+                    }
+                }
+                return false;
+            };
+
             clearAllPeople();
             let i = 0;
             let preservedCount = 0;
+            let excludedSkipped = 0;
+            let peopleInserted = 0;
             for (const c of clusters) {
+                if (isExcludedCentroid(c.centroid)) {
+                    // Leave member faces unassigned (person_id stays null).
+                    excludedSkipped += 1;
+                    i += 1;
+                    if (i % 100 === 0) await new Promise((r) => setImmediate(r));
+                    continue;
+                }
                 const carryOver = findCarryOverLabel(c.centroid);
                 const personId = insertPerson({
                     label: carryOver,
                     centroidBlob: _f32ToBlob(c.centroid),
                     faceCount: c.faceCount,
                 });
+                peopleInserted += 1;
                 if (carryOver) preservedCount += 1;
                 for (const memberIdx of c.memberIdxs) {
                     const faceId = faces[memberIdx].id;
@@ -681,11 +713,14 @@ export function startFacesScan(cfg, onProgress, onDone, onLog) {
                 i += 1;
                 if (i % 100 === 0) await new Promise((r) => setImmediate(r));
             }
-            state.peopleCount = clusters.length;
+            state.peopleCount = peopleInserted;
             state.noiseFaces = noise.length;
             log(
                 'info',
-                `faces scan: clustered ${faces.length} faces into ${clusters.length} groups (${preservedCount}/${labelSnapshot.length} labels preserved across re-cluster, eps=${matchEps.toFixed(3)})`,
+                `faces scan: clustered ${faces.length} faces into ${clusters.length} groups ` +
+                    `(${peopleInserted} people, ${excludedSkipped} excluded, ` +
+                    `${preservedCount}/${labelSnapshot.length} labels preserved across re-cluster, ` +
+                    `eps=${matchEps.toFixed(3)})`,
             );
         },
         onProgress,

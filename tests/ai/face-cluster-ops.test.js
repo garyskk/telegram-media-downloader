@@ -44,6 +44,7 @@ beforeEach(() => {
     // Reset clusters + faces between tests
     db.prepare('DELETE FROM faces').run();
     db.prepare('DELETE FROM people').run();
+    db.prepare('DELETE FROM excluded_people').run();
 });
 
 const downloadId = () => db.prepare('SELECT id FROM downloads LIMIT 1').get().id;
@@ -387,5 +388,165 @@ describe('setFaceQualityScore', () => {
         api.setFaceQualityScore(fid, 0.91);
         const row = db.prepare('SELECT quality_score FROM faces WHERE id = ?').get(fid);
         expect(row.quality_score).toBeCloseTo(0.91, 5);
+    });
+});
+
+describe('excludePerson (durable denylist)', () => {
+    it('moves centroid to excluded_people and deletes the person; faces unassigned', () => {
+        const did = downloadId();
+        const pid = api.insertPerson({
+            label: 'Stranger',
+            centroidBlob: f32Blob([1, 0, 0]),
+            faceCount: 2,
+        });
+        const fLow = api.insertFace({
+            downloadId: did,
+            x: 0,
+            y: 0,
+            w: 50,
+            h: 50,
+            embeddingBlob: f32Blob([1, 0, 0]),
+            personId: pid,
+            qualityScore: 0.2,
+        }).lastInsertRowid;
+        const fHigh = api.insertFace({
+            downloadId: did,
+            x: 0,
+            y: 0,
+            w: 50,
+            h: 50,
+            embeddingBlob: f32Blob([0.99, 0.01, 0]),
+            personId: pid,
+            qualityScore: 0.95,
+        }).lastInsertRowid;
+
+        const r = api.excludePerson(pid);
+        expect(r.ok).toBe(true);
+        expect(r.excludedId).toBeTruthy();
+        expect(r.label).toBe('Stranger');
+        expect(r.coverFaceId).toBe(fHigh);
+        expect(r.coverFaceId).not.toBe(fLow);
+
+        expect(db.prepare('SELECT id FROM people WHERE id = ?').get(pid)).toBeUndefined();
+        const facesLeft = db
+            .prepare('SELECT person_id FROM faces WHERE person_id IS NOT NULL')
+            .all();
+        expect(facesLeft).toEqual([]);
+
+        const listed = api.listExcludedPeople({});
+        expect(listed.total).toBe(1);
+        expect(listed.excluded[0].label).toBe('Stranger');
+        expect(listed.excluded[0].id).toBe(r.excludedId);
+        expect(listed.excluded[0].cover_face_id).toBe(fHigh);
+    });
+
+    it('backfills cover_face_id for legacy exclusions missing a cover', () => {
+        const did = downloadId();
+        const pid = api.insertPerson({
+            label: 'Legacy',
+            centroidBlob: f32Blob([0.2, 0.8, 0]),
+            faceCount: 1,
+        });
+        const fid = api.insertFace({
+            downloadId: did,
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 40,
+            embeddingBlob: f32Blob([0.21, 0.79, 0]),
+            personId: pid,
+            qualityScore: 0.8,
+        }).lastInsertRowid;
+        // Simulate pre-cover_face_id exclude: insert denylist row without cover.
+        db.prepare(
+            `INSERT INTO excluded_people (embedding_centroid, label, created_at, cover_face_id)
+             VALUES (?, ?, ?, NULL)`,
+        ).run(f32Blob([0.2, 0.8, 0]), 'Legacy', Date.now());
+        db.prepare('DELETE FROM people WHERE id = ?').run(pid);
+
+        const listed = api.listExcludedPeople({});
+        expect(listed.total).toBe(1);
+        expect(listed.excluded[0].cover_face_id).toBe(fid);
+    });
+
+    it('survives clearAllPeople (Phase B wipe of people table)', () => {
+        const pid = api.insertPerson({
+            label: 'Noise',
+            centroidBlob: f32Blob([0, 1, 0]),
+            faceCount: 1,
+        });
+        const r = api.excludePerson(pid);
+        expect(r.ok).toBe(true);
+
+        api.clearAllPeople();
+        expect(api.listExcludedPeople({}).total).toBe(1);
+        const match = api.matchExcludedCentroid(new Float32Array([0, 1, 0]), 0.4);
+        expect(match).toBeTruthy();
+        expect(match.id).toBe(r.excludedId);
+    });
+
+    it('matchExcludedCentroid returns null when outside eps', () => {
+        const pid = api.insertPerson({
+            label: 'Far',
+            centroidBlob: f32Blob([1, 0, 0]),
+            faceCount: 1,
+        });
+        api.excludePerson(pid);
+        expect(api.matchExcludedCentroid(new Float32Array([-1, 0, 0]), 0.4)).toBeNull();
+    });
+
+    it('deletePerson does NOT add to the exclusion denylist', () => {
+        const pid = api.insertPerson({
+            label: 'Temp',
+            centroidBlob: f32Blob([1, 0, 0]),
+            faceCount: 1,
+        });
+        expect(api.deletePerson(pid)).toBe(1);
+        expect(api.listExcludedPeople({}).total).toBe(0);
+        expect(api.matchExcludedCentroid(new Float32Array([1, 0, 0]), 0.4)).toBeNull();
+    });
+
+    it('deleteExcludedPerson restores — match no longer hits', () => {
+        const pid = api.insertPerson({
+            label: 'Back',
+            centroidBlob: f32Blob([0, 0, 1]),
+            faceCount: 1,
+        });
+        const r = api.excludePerson(pid);
+        expect(api.deleteExcludedPerson(r.excludedId)).toBe(1);
+        expect(api.listExcludedPeople({}).total).toBe(0);
+        expect(api.matchExcludedCentroid(new Float32Array([0, 0, 1]), 0.4)).toBeNull();
+    });
+
+    it('clearExcludedPeople / resetAllAiData wipe the denylist', () => {
+        const a = api.insertPerson({ centroidBlob: f32Blob([1, 0]), faceCount: 1 });
+        api.excludePerson(a);
+        expect(api.clearExcludedPeople()).toBe(1);
+        expect(api.listExcludedPeople({}).total).toBe(0);
+
+        const b = api.insertPerson({ centroidBlob: f32Blob([0, 1]), faceCount: 1 });
+        api.excludePerson(b);
+        const reset = api.resetAllAiData();
+        expect(reset.excluded).toBeGreaterThanOrEqual(1);
+        expect(api.listExcludedPeople({}).total).toBe(0);
+    });
+
+    it('returns not_found for missing person', () => {
+        expect(api.excludePerson(999999)).toEqual({ ok: false, reason: 'not_found' });
+        expect(api.excludePerson(-1).ok).toBe(false);
+    });
+
+    it('listExcludedCentroids returns Float32Array centroids for Phase B', () => {
+        const pid = api.insertPerson({
+            label: 'Vec',
+            centroidBlob: f32Blob([0.5, 0.5, 0]),
+            faceCount: 1,
+        });
+        api.excludePerson(pid);
+        const cents = api.listExcludedCentroids();
+        expect(cents).toHaveLength(1);
+        expect(cents[0].centroid).toBeInstanceOf(Float32Array);
+        expect(cents[0].centroid[0]).toBeCloseTo(0.5, 5);
+        expect(cents[0].label).toBe('Vec');
     });
 });

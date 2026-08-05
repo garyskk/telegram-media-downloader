@@ -3690,9 +3690,17 @@
                                         <i class="ri-scissors-cut-line"></i>
                                         <span class="hidden sm:inline" data-i18n="maintenance.ai.people.actions.split">Split…</span>
                                     </button>
+                                    <button id="ai-person-exclude-btn"
+                                        class="tg-btn-secondary text-[11px] h-8 px-2 inline-flex items-center gap-1.5 text-amber-300 hover:border-amber-400/40"
+                                        data-i18n-title="maintenance.ai.exclude_btn_title"
+                                        title="Exclude this identity — it will not reappear after recluster">
+                                        <i class="ri-eye-off-line"></i>
+                                        <span class="hidden sm:inline" data-i18n="maintenance.ai.people.actions.exclude">Exclude</span>
+                                    </button>
                                     <button id="ai-person-delete-btn"
                                         class="tg-btn-secondary text-[11px] w-8 h-8 p-0 inline-flex items-center justify-center text-red-300 hover:border-red-400/40"
-                                        title="Delete cluster">
+                                        data-i18n-title="maintenance.ai.delete_btn_title"
+                                        title="Delete cluster (temporary — may reappear on recluster)">
                                         <i class="ri-delete-bin-line"></i>
                                     </button>
                                 </div>
@@ -3731,6 +3739,24 @@
                                     </button>
                                 </div>
                                 <div id="ai-face-review-grid" class="grid grid-cols-3 sm:grid-cols-5 md:grid-cols-6 lg:grid-cols-8 gap-1 p-1.5"></div>
+                            </div>
+                        </div>
+
+                        <!-- Durable exclusions — sits under the selected-cluster panel -->
+                        <div id="ai-people-excluded" class="hidden mt-3 rounded-xl bg-tg-bg/30 border border-white/5 overflow-hidden">
+                            <button type="button" id="ai-people-excluded-toggle"
+                                class="w-full flex items-center justify-between gap-2 px-3 py-2.5 text-left hover:bg-white/[0.02] transition-colors"
+                                aria-expanded="false" aria-controls="ai-people-excluded-body">
+                                <span class="inline-flex items-center gap-2 min-w-0">
+                                    <i class="ri-eye-off-line text-amber-400/80 text-sm"></i>
+                                    <span class="text-xs font-medium text-tg-text" data-i18n="maintenance.ai.excluded.heading">Excluded</span>
+                                    <span id="ai-people-excluded-count" class="text-[10px] text-tg-textSecondary"></span>
+                                </span>
+                                <i class="ri-arrow-down-s-line text-tg-textSecondary text-sm transition-transform" id="ai-people-excluded-chevron"></i>
+                            </button>
+                            <div id="ai-people-excluded-body" class="hidden border-t border-white/5 px-3 py-2">
+                                <p class="text-[11px] text-tg-textSecondary/70 mb-2" data-i18n="maintenance.ai.excluded.help">These identities stay out of People across reclusters. Restore to allow them again.</p>
+                                <ul id="ai-people-excluded-list" class="space-y-1"></ul>
                             </div>
                         </div>
 

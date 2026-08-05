@@ -168,6 +168,9 @@ import {
     listFacesForPerson,
     renamePerson,
     deletePerson,
+    excludePerson,
+    listExcludedPeople,
+    deleteExcludedPerson,
     resetAllAiData,
     setFaceQualityScore,
     getDb as aiGetDb,
@@ -8170,6 +8173,7 @@ app.post('/api/ai/faces/reindex', async (_req, res) => {
         const tx = db.transaction(() => {
             db.prepare(`DELETE FROM faces`).run();
             db.prepare(`DELETE FROM people`).run();
+            db.prepare(`DELETE FROM excluded_people`).run();
             db.prepare(
                 `UPDATE downloads SET ai_indexed_at = NULL WHERE file_type IN (${placeholders})`,
             ).run(...types);
@@ -8825,6 +8829,56 @@ app.delete('/api/ai/people/:id', async (req, res) => {
         }
         const changes = deletePerson(id);
         if (!changes) return res.status(404).json({ error: 'person not found' });
+        res.json({ success: true, id });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// Durable exclude — identity stays out of People across Phase B reclusters.
+// Distinct from DELETE above (temporary unassign). Must be registered with
+// the static `/excluded` paths before any ambiguous :id-only catch-alls.
+app.post('/api/ai/people/:id/exclude', async (req, res) => {
+    try {
+        const id = Number(req.params.id);
+        if (!Number.isFinite(id) || id <= 0) {
+            return res.status(400).json({ error: 'invalid person id' });
+        }
+        const r = excludePerson(id);
+        if (!r.ok) {
+            const status = r.reason === 'not_found' ? 404 : 400;
+            return res.status(status).json({ error: r.reason || 'exclude failed' });
+        }
+        log({
+            source: 'ai',
+            level: 'info',
+            msg: `faces/exclude: person=${r.personId} → excluded=${r.excludedId} label=${r.label || ''}`,
+        });
+        res.json({ success: true, ...r });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.get('/api/ai/people/excluded', async (req, res) => {
+    try {
+        const limit = Math.max(1, Math.min(2000, Number(req.query?.limit) || 500));
+        const offset = Math.max(0, Number(req.query?.offset) || 0);
+        const r = listExcludedPeople({ limit, offset });
+        res.json({ success: true, ...r });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.delete('/api/ai/people/excluded/:id', async (req, res) => {
+    try {
+        const id = Number(req.params.id);
+        if (!Number.isFinite(id) || id <= 0) {
+            return res.status(400).json({ error: 'invalid excluded id' });
+        }
+        const changes = deleteExcludedPerson(id);
+        if (!changes) return res.status(404).json({ error: 'excluded person not found' });
         res.json({ success: true, id });
     } catch (e) {
         res.status(500).json({ error: e.message });

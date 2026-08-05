@@ -287,11 +287,28 @@ function _bindOnce() {
     $('#ai-person-rename-btn')?.addEventListener('click', _renameSelectedPerson);
     $('#ai-person-merge-btn')?.addEventListener('click', _mergeSelectedPerson);
     $('#ai-person-split-btn')?.addEventListener('click', _splitSelectedPerson);
+    $('#ai-person-exclude-btn')?.addEventListener('click', _excludeSelectedPerson);
     $('#ai-person-delete-btn')?.addEventListener('click', _deleteSelectedPerson);
     $('#ai-split-cancel-btn')?.addEventListener('click', _exitSplitMode);
     $('#ai-split-commit-btn')?.addEventListener('click', _commitSplit);
     $('#ai-person-review-faces-btn')?.addEventListener('click', _toggleFaceReview);
     $('#ai-face-review-close-btn')?.addEventListener('click', _closeFaceReview);
+    $('#ai-people-excluded-toggle')?.addEventListener('click', () => {
+        const body = $('#ai-people-excluded-body');
+        const chevron = $('#ai-people-excluded-chevron');
+        const toggle = $('#ai-people-excluded-toggle');
+        if (!body) return;
+        const open = body.classList.toggle('hidden') === false;
+        toggle?.setAttribute('aria-expanded', open ? 'true' : 'false');
+        if (chevron) chevron.style.transform = open ? 'rotate(180deg)' : '';
+    });
+    $('#ai-people-excluded-list')?.addEventListener('click', (e) => {
+        const btn = e.target.closest('[data-restore-excluded]');
+        if (!btn) return;
+        const id = Number(btn.getAttribute('data-restore-excluded'));
+        if (!Number.isFinite(id)) return;
+        _restoreExcludedPerson(id);
+    });
 
     // WebSocket — only the people / scan events survive in the faces-only
     // build. ai_index_* / ai_tags_* were removed with the Search + Tags
@@ -1497,8 +1514,54 @@ async function _loadPeople() {
         if (!r.success) return;
         _peopleCache = Array.isArray(r.people) ? r.people : [];
         await _renderPeopleGrid();
+        await _loadExcludedPeople();
     } catch (e) {
         console.warn('ai/people:', e);
+    }
+}
+
+async function _loadExcludedPeople() {
+    const wrap = $('#ai-people-excluded');
+    const list = $('#ai-people-excluded-list');
+    const countEl = $('#ai-people-excluded-count');
+    if (!wrap || !list) return;
+    try {
+        const r = await api.get('/api/ai/people/excluded?limit=500');
+        if (!r.success) return;
+        const rows = Array.isArray(r.excluded) ? r.excluded : [];
+        if (!rows.length) {
+            wrap.classList.add('hidden');
+            list.innerHTML = '';
+            if (countEl) countEl.textContent = '';
+            return;
+        }
+        wrap.classList.remove('hidden');
+        if (countEl) countEl.textContent = `(${rows.length})`;
+        const unnamed = i18nT('maintenance.ai.excluded.unnamed', 'Excluded person');
+        const restoreLabel = i18nT('maintenance.ai.excluded.restore', 'Restore');
+        list.innerHTML = rows
+            .map((row) => {
+                const name = escapeHtml(row.label || unnamed);
+                const id = Number(row.id);
+                const faceId = Number(row.cover_face_id);
+                const faceHtml =
+                    Number.isFinite(faceId) && faceId > 0
+                        ? `<img src="/api/ai/faces/${faceId}/crop?w=64" alt="${name}" loading="lazy"
+                            class="w-full h-full object-cover"
+                            onerror="this.onerror=null;this.replaceWith(Object.assign(document.createElement('i'),{className:'ri-user-line text-sm text-tg-textSecondary/40'}))">`
+                        : `<i class="ri-user-line text-sm text-tg-textSecondary/40"></i>`;
+                return `<li class="flex items-center justify-between gap-2 py-1.5 px-1 rounded-lg hover:bg-white/[0.03]">
+                    <span class="inline-flex items-center gap-2.5 min-w-0">
+                        <span class="w-9 h-9 rounded-full overflow-hidden flex-shrink-0 bg-tg-bg/60 ring-1 ring-tg-border/30 flex items-center justify-center">${faceHtml}</span>
+                        <span class="text-xs text-tg-text truncate min-w-0">${name}</span>
+                    </span>
+                    <button type="button" data-restore-excluded="${id}"
+                        class="tg-btn-secondary text-[10px] h-6 px-2 flex-shrink-0">${escapeHtml(restoreLabel)}</button>
+                </li>`;
+            })
+            .join('');
+    } catch (e) {
+        console.warn('ai/people/excluded:', e);
     }
 }
 
@@ -2386,7 +2449,7 @@ async function _deleteSelectedPerson() {
         title: i18nT('maintenance.ai.person_delete', 'Delete'),
         message: i18nT(
             'maintenance.ai.delete_confirm',
-            'Delete this cluster? Faces will become unassigned.',
+            'Delete this cluster? Faces will become unassigned. The cluster may reappear after the next recluster.',
         ),
         destructive: true,
         confirmText: i18nT('maintenance.ai.person_delete', 'Delete'),
@@ -2400,6 +2463,48 @@ async function _deleteSelectedPerson() {
         _selectedPersonName = '';
         $('#ai-people-photos')?.classList.add('hidden');
         _loadPeople();
+    } catch (e) {
+        showToast(e.message, 'error');
+    }
+}
+
+async function _excludeSelectedPerson() {
+    if (!_selectedPerson) return;
+    const ok = await confirmSheet({
+        title: i18nT('maintenance.ai.person_exclude', 'Exclude'),
+        message: i18nT(
+            'maintenance.ai.exclude_confirm',
+            'Exclude this identity permanently? It will not reappear as a Person after recluster. Faces stay in the database unassigned.',
+        ),
+        destructive: true,
+        confirmText: i18nT('maintenance.ai.person_exclude', 'Exclude'),
+    });
+    if (!ok) return;
+    try {
+        const r = await api.post(`/api/ai/people/${_selectedPerson}/exclude`);
+        if (!r.success) throw new Error(r.error || 'exclude failed');
+        showToast(i18nT('maintenance.ai.exclude_done', 'Excluded'), 'success');
+        _selectedPerson = null;
+        _selectedPersonName = '';
+        $('#ai-people-photos')?.classList.add('hidden');
+        _loadPeople();
+    } catch (e) {
+        showToast(e.message, 'error');
+    }
+}
+
+async function _restoreExcludedPerson(excludedId) {
+    try {
+        const r = await api.delete(`/api/ai/people/excluded/${excludedId}`);
+        if (!r.success) throw new Error(r.error || 'restore failed');
+        showToast(
+            i18nT(
+                'maintenance.ai.excluded.restored',
+                'Restored — run Re-cluster to recreate',
+            ),
+            'success',
+        );
+        await _loadExcludedPeople();
     } catch (e) {
         showToast(e.message, 'error');
     }
