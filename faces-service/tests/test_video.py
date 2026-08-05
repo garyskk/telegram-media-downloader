@@ -1051,3 +1051,21 @@ def test_video_without_job_id_never_registers_progress(
     resp = client.post("/detect/video", json={"path": str(temp_root / "no-job-id.mp4")})
     assert resp.status_code == 200
     assert seen_progress_cb["value"] is None
+
+
+# ---------------------------------------------------------------------------
+# Tests: video nice resolution (request body beats env)
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_video_nice_request_beats_env(monkeypatch):
+    from tgdl_faces.app import _resolve_video_nice
+
+    monkeypatch.setenv("TGDL_FACES_VIDEO_NICE", "10")
+    assert _resolve_video_nice() == 10
+    assert _resolve_video_nice(0) == 0  # UI off must win over compose pin
+    assert _resolve_video_nice(15) == 15
+    assert _resolve_video_nice(99) == 19
+    monkeypatch.delenv("TGDL_FACES_VIDEO_NICE", raising=False)
+    assert _resolve_video_nice() == 0
+    assert _resolve_video_nice(None) == 0

@@ -464,6 +464,13 @@ export async function detectFacesInVideo(
         [resolveFacesValue('videoMaxFrames', facesCfg), cfg?.videoMaxFrames],
         20000,
     );
+    const videoNice = Math.max(
+        0,
+        Math.min(
+            19,
+            _pickNumber([resolveFacesValue('videoNice', facesCfg), facesCfg.videoNice], 0) | 0,
+        ),
+    );
 
     // A `job_id` is only generated (and only sent to the sidecar) when the
     // caller actually wants progress updates — an older/simpler caller that
@@ -476,6 +483,9 @@ export async function detectFacesInVideo(
         min_box_px: minBoxPx,
         ar_range: arRange,
         max_frames: Math.max(1, Math.min(200_000, maxFrames)),
+        // Always send so dashboard videoNice=0 can override a sidecar
+        // TGDL_FACES_VIDEO_NICE env pin (request beats env on the Python side).
+        nice: videoNice,
         ...(jobId ? { job_id: jobId } : {}),
     };
 

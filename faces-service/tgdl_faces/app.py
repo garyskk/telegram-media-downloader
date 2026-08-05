@@ -254,6 +254,16 @@ class VideoDetectRequest(BaseModel):
             "flight. Optional — omit for the old fire-and-forget behavior."
         ),
     )
+    nice: int | None = Field(
+        default=None,
+        ge=0,
+        le=19,
+        description=(
+            "Optional per-request Unix nice increment (0 = off). When set, "
+            "overrides TGDL_FACES_VIDEO_NICE so the dashboard Video CPU "
+            "priority control can drive the sidecar without a restart."
+        ),
+    )
 
     @model_validator(mode="after")
     def _validate_ar_range(self) -> "VideoDetectRequest":
@@ -1142,9 +1152,20 @@ def _build_face_tracks(frames_faces: list[list[dict]]) -> list[dict]:
     return kept
 
 
-def _resolve_video_nice() -> int:
-    """Read TGDL_FACES_VIDEO_NICE — Unix nice increment for /detect/video (0 = off)."""
+def _resolve_video_nice(override: int | None = None) -> int:
+    """Resolve Unix nice for /detect/video.
 
+    Precedence: per-request ``override`` (from the Node dashboard config)
+    > ``TGDL_FACES_VIDEO_NICE`` env > ``0`` (off). Explicit ``0`` from the
+    request must win over a compose env default, otherwise the UI cannot
+    turn nice off.
+    """
+
+    if override is not None:
+        try:
+            return max(0, min(19, int(override)))
+        except (TypeError, ValueError):
+            return 0
     raw = os.environ.get("TGDL_FACES_VIDEO_NICE", "").strip()
     if not raw:
         return 0
@@ -1170,7 +1191,7 @@ def _do_detect_video_sync(body: VideoDetectRequest) -> JSONResponse:
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
         )
 
-    nice_inc = _resolve_video_nice()
+    nice_inc = _resolve_video_nice(body.nice)
     try:
         if nice_inc > 0:
             try:

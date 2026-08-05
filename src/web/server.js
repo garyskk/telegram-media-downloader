@@ -7773,6 +7773,12 @@ app.get('/api/ai/status', async (_req, res) => {
                         facesBlock.detectorModel || cfg.facesDetectorModel || 'buffalo_l',
                     ),
                     scanVideos: facesBlock.scanVideos === true,
+                    videoScanLimit: Number.isFinite(facesBlock.videoScanLimit)
+                        ? Math.max(0, facesBlock.videoScanLimit | 0)
+                        : 0,
+                    videoNice: Number.isFinite(facesBlock.videoNice)
+                        ? Math.max(0, Math.min(19, facesBlock.videoNice | 0))
+                        : 0,
                     sidecarUrl:
                         typeof facesBlock.sidecarUrl === 'string' ? facesBlock.sidecarUrl : '',
                 },

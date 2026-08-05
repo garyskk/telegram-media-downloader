@@ -255,8 +255,11 @@ should read the nested path.
 
 Env-var precedence is strict: any `TGDL_FACES_*` value wins over the
 matching kv-config value, which wins over the legacy flat alias, which
-wins over the hardcoded default. Number arrays accept `,` or `:` as
-separators (`5000,5999` or `5000:5999` both work).
+wins over the hardcoded default. Do **not** inject UI-tunable knobs
+(`videoScanLimit`, `videoNice`, …) with compose `:-0` defaults — that
+pins unlimited/off and silently ignores Maintenance settings. Leave
+unset unless you intend a deploy-time override. Number arrays accept
+`,` or `:` as separators (`5000,5999` or `5000:5999` both work).
 
 ## How it works
 
@@ -437,6 +440,7 @@ in config or `TGDL_FACES_CPU_THROTTLE_RATIO` env var.
 1. **Node scan loop** — `process.setPriority()` for the duration of Phase A videos
 2. **ffmpeg fallback** — spawns `nice -n <N> ffmpeg …` when path-mode is unavailable
 3. **Sidecar** — `os.nice()` for the lifetime of each `POST /detect/video` request
+   (Node forwards `nice` in the JSON body; that beats `TGDL_FACES_VIDEO_NICE`)
 
 | Value | Effect |
 |---|---|
@@ -444,10 +448,11 @@ in config or `TGDL_FACES_CPU_THROTTLE_RATIO` env var.
 | `10` | Background-friendly — good starting point for testing |
 | `15`–`19` | Very low priority — use when the host is shared / CPU-constrained |
 
-Unix only; ignored on Windows and macOS (Node nice is best-effort there).
-Set via Maintenance → AI → **Video CPU priority (nice)**, config
-`advanced.ai.faces.videoNice`, or `TGDL_FACES_VIDEO_NICE` env var (must be
-passed to **both** `telegram-downloader` and `tgdl-faces` in compose).
+Unix only; ignored on Windows. Set via Maintenance → AI → **Video CPU
+priority (nice)** or config `advanced.ai.faces.videoNice`. Optional
+deploy-time pin: `TGDL_FACES_VIDEO_NICE` on **both** services — but do
+**not** inject compose `:-0`/`:-10` defaults or the UI value is ignored
+(env beats kv on Node; request body beats env on the sidecar).
 
 For Docker-level weighting independent of nice, you can also lower
 `cpu_shares` on the `tgdl-faces` service (see `docker-compose.yml` comment).

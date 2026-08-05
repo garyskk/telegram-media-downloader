@@ -260,6 +260,22 @@ describe('detectFacesInVideo', () => {
         expect(Number.isFinite(capturedBody.min_box_px)).toBe(true);
         expect(Array.isArray(capturedBody.ar_range)).toBe(true);
         expect(capturedBody.ar_range).toHaveLength(2);
+        expect(capturedBody.nice).toBe(0);
+    });
+
+    it('forwards faces.videoNice as body.nice so UI can override sidecar env', async () => {
+        client.setSidecarUrl('http://host:8011');
+        let capturedBody = null;
+        vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, init) => {
+            capturedBody = JSON.parse(init.body);
+            return {
+                ok: true,
+                status: 200,
+                json: async () => ({ faces: [], image_w: 0, image_h: 0 }),
+            };
+        });
+        await client.detectFacesInVideo('/tmp/video.mp4', { faces: { videoNice: 12 } });
+        expect(capturedBody.nice).toBe(12);
     });
 
     it('returns Float32Array embeddings on success', async () => {
