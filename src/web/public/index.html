@@ -3209,8 +3209,13 @@
                                     <div class="absolute right-0 top-full mt-1 z-30 w-56 bg-tg-panel border border-tg-border rounded-lg shadow-xl py-1" role="menu">
                                         <button id="ai-recluster-btn" type="button" class="w-full text-left px-3 py-2 text-xs text-tg-text hover:bg-tg-bg/40 inline-flex items-center gap-2"
                                                 data-i18n-title="maintenance.ai.recluster_tooltip"
-                                                title="Run DBSCAN clustering only — uses existing face detections + the current threshold to surface People. Fast (seconds, not minutes).">
+                                                title="Assign unassigned faces to existing People (or form new clusters). Keeps merges and labels.">
                                             <i class="ri-refresh-line text-tg-blue"></i><span data-i18n="maintenance.ai.recluster">Re-cluster</span>
+                                        </button>
+                                        <button id="ai-rebuild-btn" type="button" class="w-full text-left px-3 py-2 text-xs text-tg-text hover:bg-tg-bg/40 inline-flex items-center gap-2"
+                                                data-i18n-title="maintenance.ai.rebuild_tooltip"
+                                                title="Wipe all People and re-run DBSCAN on every face. Use after changing ε. Merges are NOT preserved.">
+                                            <i class="ri-shake-hands-line text-amber-300"></i><span data-i18n="maintenance.ai.rebuild">Rebuild all clusters</span>
                                         </button>
                                         <button id="ai-quality-backfill-btn" type="button" class="hidden w-full text-left px-3 py-2 text-xs text-tg-text hover:bg-tg-bg/40 inline-flex items-center gap-2"
                                                 title="Compute quality scores for older faces that were scanned before quality ranking was added.">
@@ -3455,7 +3460,7 @@
                                     <option value="buffalo_m">buffalo_m — faster, smaller ResNet50</option>
                                     <option value="buffalo_s">buffalo_s — fastest, ResNet34</option>
                                 </select>
-                                <p id="ai-faces-model-status" class="text-[10px] text-tg-textSecondary mt-1" data-i18n="maintenance.ai.faces.model_help">Switching the model restarts the sidecar. Re-cluster recommended after switching.</p>
+                                <p id="ai-faces-model-status" class="text-[10px] text-tg-textSecondary mt-1" data-i18n="maintenance.ai.faces.model_help">Switching the model restarts the sidecar. Rebuild all clusters (or Reindex) after switching — embedding spaces differ.</p>
                             </div>
 
                             <!-- Sensitivity presets — one-click way to
@@ -3561,7 +3566,7 @@
                         <!-- Epsilon over-merge warning (hidden by default) -->
                         <div id="ai-epsilon-warning" class="hidden mb-3 flex items-start gap-2 px-3 py-2.5 rounded-xl bg-amber-500/10 border border-amber-400/20 text-amber-300 text-xs">
                             <i class="ri-alert-line shrink-0 mt-px"></i>
-                            <span data-i18n="maintenance.ai.epsilon_warning">One cluster contains an unusually large share of all faces — the DBSCAN ε threshold may be too high, causing different people to merge. Try lowering ε and running Re-cluster.</span>
+                            <span data-i18n="maintenance.ai.epsilon_warning">One cluster contains an unusually large share of all faces — the DBSCAN ε threshold may be too high, causing different people to merge. Try lowering ε and running Rebuild all clusters.</span>
                         </div>
 
                         <!-- Search + filter row -->

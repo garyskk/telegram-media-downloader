@@ -674,3 +674,236 @@ describe('setPersonCoverFace (pinned People avatar)', () => {
         expect(api.listExcludedPeople({}).excluded[0].cover_face_id).toBe(fLow);
     });
 });
+
+describe('incremental Phase B (preserve merges)', () => {
+    let scanRunner;
+
+    beforeAll(async () => {
+        scanRunner = await import('../../src/core/ai/scan-runner.js');
+    });
+
+    it('mergeFacePerson recomputes target centroid from all faces', () => {
+        const did = downloadId();
+        const a = api.insertPerson({
+            label: 'A',
+            centroidBlob: f32Blob([1, 0, 0]),
+            faceCount: 1,
+        });
+        const b = api.insertPerson({
+            label: 'B',
+            centroidBlob: f32Blob([0, 1, 0]),
+            faceCount: 1,
+        });
+        api.insertFace({
+            downloadId: did,
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 40,
+            embeddingBlob: f32Blob([1, 0, 0]),
+            personId: a,
+        });
+        api.insertFace({
+            downloadId: did,
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 40,
+            embeddingBlob: f32Blob([0, 1, 0]),
+            personId: b,
+        });
+        const r = api.mergeFacePerson(a, b);
+        expect(r.moved).toBe(1);
+        expect(r.deleted).toBe(1);
+        const cents = api.listPeopleCentroids();
+        expect(cents).toHaveLength(1);
+        expect(cents[0].id).toBe(a);
+        expect(cents[0].faceCount).toBe(2);
+        // Mean of [1,0,0] and [0,1,0]
+        expect(cents[0].centroid[0]).toBeCloseTo(0.5, 5);
+        expect(cents[0].centroid[1]).toBeCloseTo(0.5, 5);
+    });
+
+    it('incremental Phase B leaves a merged person intact and attaches nearby unassigned faces', async () => {
+        const did = downloadId();
+        const a = api.insertPerson({
+            label: 'Merged',
+            centroidBlob: f32Blob([1, 0, 0]),
+            faceCount: 1,
+        });
+        const b = api.insertPerson({
+            label: 'Other',
+            centroidBlob: f32Blob([0.95, 0.05, 0]),
+            faceCount: 1,
+        });
+        api.insertFace({
+            downloadId: did,
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 40,
+            embeddingBlob: f32Blob([1, 0, 0]),
+            personId: a,
+        });
+        api.insertFace({
+            downloadId: did,
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 40,
+            embeddingBlob: f32Blob([0.95, 0.05, 0]),
+            personId: b,
+        });
+        api.mergeFacePerson(a, b);
+        expect(api.countPeople()).toBe(1);
+
+        // Nearby unassigned face should attach; far face forms new cluster.
+        api.insertFace({
+            downloadId: did,
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 40,
+            embeddingBlob: f32Blob([0.98, 0.02, 0]),
+            personId: null,
+        });
+        const far1 = api.insertFace({
+            downloadId: did,
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 40,
+            embeddingBlob: f32Blob([0, 0, 1]),
+            personId: null,
+        }).lastInsertRowid;
+        const far2 = api.insertFace({
+            downloadId: did,
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 40,
+            embeddingBlob: f32Blob([0.01, 0, 0.99]),
+            personId: null,
+        }).lastInsertRowid;
+
+        const state = {
+            phase: 'A',
+            faceCount: 0,
+            peopleCount: 0,
+            noiseFaces: 0,
+        };
+        const cfg = { faces: { epsilon: 0.5, minPoints: 2, labelMatchEps: 0.4 } };
+        await scanRunner._test.runIncrementalPhaseB({
+            state,
+            signal: { aborted: false },
+            log: () => {},
+            cfg,
+            bcast: () => {},
+        });
+
+        expect(api.countPeople()).toBeGreaterThanOrEqual(2); // merged + new far cluster
+        const people = api.listPeople({});
+        const merged = people.people.find((p) => p.label === 'Merged');
+        expect(merged).toBeTruthy();
+        expect(Number(merged.face_count)).toBeGreaterThanOrEqual(3); // 2 merged + nearby
+
+        const farPerson = db.prepare('SELECT person_id FROM faces WHERE id = ?').get(far1);
+        const farPerson2 = db.prepare('SELECT person_id FROM faces WHERE id = ?').get(far2);
+        expect(farPerson.person_id).toBeTruthy();
+        expect(farPerson.person_id).toBe(farPerson2.person_id);
+        expect(farPerson.person_id).not.toBe(merged.id);
+    });
+
+    it('incremental Phase B is a no-op when every face is already assigned', async () => {
+        const did = downloadId();
+        const pid = api.insertPerson({
+            label: 'Solo',
+            centroidBlob: f32Blob([1, 0]),
+            faceCount: 1,
+        });
+        api.insertFace({
+            downloadId: did,
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 40,
+            embeddingBlob: f32Blob([1, 0]),
+            personId: pid,
+        });
+        const before = api.countPeople();
+        await scanRunner._test.runIncrementalPhaseB({
+            state: { phase: 'A', faceCount: 0, peopleCount: 0, noiseFaces: 0 },
+            signal: { aborted: false },
+            log: () => {},
+            cfg: { faces: { epsilon: 0.5, minPoints: 2 } },
+            bcast: () => {},
+        });
+        expect(api.countPeople()).toBe(before);
+        expect(api.listPeople({}).people[0].id).toBe(pid);
+    });
+
+    it('excluded centroid blocks attaching / new people for nearby unassigned faces', async () => {
+        const did = downloadId();
+        const pid = api.insertPerson({
+            label: 'Keep',
+            centroidBlob: f32Blob([1, 0, 0]),
+            faceCount: 1,
+        });
+        api.insertFace({
+            downloadId: did,
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 40,
+            embeddingBlob: f32Blob([1, 0, 0]),
+            personId: pid,
+        });
+        // Exclude a far identity, then insert unassigned faces near that exclusion.
+        const ex = api.insertPerson({
+            label: 'Nope',
+            centroidBlob: f32Blob([0, 0, 1]),
+            faceCount: 1,
+        });
+        api.insertFace({
+            downloadId: did,
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 40,
+            embeddingBlob: f32Blob([0, 0, 1]),
+            personId: ex,
+        });
+        api.excludePerson(ex);
+
+        const u1 = api.insertFace({
+            downloadId: did,
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 40,
+            embeddingBlob: f32Blob([0.01, 0, 0.99]),
+            personId: null,
+        }).lastInsertRowid;
+        const u2 = api.insertFace({
+            downloadId: did,
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 40,
+            embeddingBlob: f32Blob([0, 0.01, 0.98]),
+            personId: null,
+        }).lastInsertRowid;
+
+        await scanRunner._test.runIncrementalPhaseB({
+            state: { phase: 'A', faceCount: 0, peopleCount: 0, noiseFaces: 0 },
+            signal: { aborted: false },
+            log: () => {},
+            cfg: { faces: { epsilon: 0.5, minPoints: 2, labelMatchEps: 0.4 } },
+            bcast: () => {},
+        });
+
+        expect(db.prepare('SELECT person_id FROM faces WHERE id = ?').get(u1).person_id).toBeNull();
+        expect(db.prepare('SELECT person_id FROM faces WHERE id = ?').get(u2).person_id).toBeNull();
+        expect(api.listPeople({}).people.some((p) => p.label === 'Keep')).toBe(true);
+    });
+});

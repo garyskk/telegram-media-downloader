@@ -2572,6 +2572,87 @@ export function* iterateAllFaces({ chunkSize = 1000 } = {}) {
     }
 }
 
+/** Faces not yet assigned to a person — input for incremental Phase B. */
+export function* iterateUnassignedFaces({ chunkSize = 1000 } = {}) {
+    const db = getDb();
+    const stmt = db.prepare(
+        `SELECT id, download_id, x, y, w, h, embedding, person_id, gender, quality_score FROM faces
+          WHERE person_id IS NULL
+          ORDER BY id LIMIT ? OFFSET ?`,
+    );
+    for (let offset = 0; ; offset += chunkSize) {
+        const chunk = stmt.all(chunkSize, offset);
+        if (!chunk.length) return;
+        for (const row of chunk) yield row;
+        if (chunk.length < chunkSize) return;
+    }
+}
+
+/**
+ * Existing people centroids for incremental matching.
+ * @returns {Array<{ id: number, label: string|null, centroid: Float32Array, faceCount: number }>}
+ */
+export function listPeopleCentroids() {
+    const out = [];
+    const stmt = getDb().prepare(
+        'SELECT id, label, embedding_centroid, face_count FROM people',
+    );
+    for (const r of stmt.iterate()) {
+        if (!r.embedding_centroid) continue;
+        const dim = r.embedding_centroid.byteLength / 4;
+        if (!Number.isFinite(dim) || dim < 1) continue;
+        const c = new Float32Array(dim);
+        const view = new Float32Array(
+            r.embedding_centroid.buffer,
+            r.embedding_centroid.byteOffset,
+            dim,
+        );
+        c.set(view);
+        out.push({
+            id: r.id,
+            label: r.label ?? null,
+            centroid: c,
+            faceCount: Number(r.face_count) || 0,
+        });
+    }
+    return out;
+}
+
+/**
+ * Recompute embedding_centroid + face_count from live face rows.
+ * @returns {{ ok: boolean, faceCount: number }}
+ */
+export function recomputePersonCentroid(personId) {
+    const pid = Number(personId);
+    if (!Number.isFinite(pid) || pid <= 0) return { ok: false, faceCount: 0 };
+    const db = getDb();
+    const rows = db
+        .prepare('SELECT embedding FROM faces WHERE person_id = ?')
+        .all(pid);
+    if (!rows.length) {
+        db.prepare(
+            'UPDATE people SET face_count = 0, updated_at = ? WHERE id = ?',
+        ).run(Date.now(), pid);
+        return { ok: true, faceCount: 0 };
+    }
+    const dim = rows[0].embedding.byteLength / 4;
+    const acc = new Float32Array(dim);
+    for (const r of rows) {
+        const view = new Float32Array(r.embedding.buffer, r.embedding.byteOffset, dim);
+        for (let i = 0; i < dim; i++) acc[i] += view[i];
+    }
+    for (let i = 0; i < dim; i++) acc[i] /= rows.length;
+    const centroidBlob = Buffer.from(acc.buffer);
+    db.prepare(
+        `UPDATE people SET embedding_centroid = ?, face_count = ?, updated_at = ? WHERE id = ?`,
+    ).run(centroidBlob, rows.length, Date.now(), pid);
+    return { ok: true, faceCount: rows.length };
+}
+
+export function countPeople() {
+    return getDb().prepare('SELECT COUNT(*) AS n FROM people').get().n;
+}
+
 /**
  * Update only the `quality_score` column on an existing face row. Used
  * by the v2.16 quality filter so the UI can show "low confidence"
@@ -2602,13 +2683,10 @@ export function mergeFacePerson(targetId, otherId) {
         const moved = db
             .prepare('UPDATE faces SET person_id = ? WHERE person_id = ?')
             .run(t, o).changes;
-        const newCount = db.prepare('SELECT COUNT(*) AS n FROM faces WHERE person_id = ?').get(t).n;
-        db.prepare('UPDATE people SET face_count = ?, updated_at = ? WHERE id = ?').run(
-            newCount,
-            Date.now(),
-            t,
-        );
         const deleted = db.prepare('DELETE FROM people WHERE id = ?').run(o).changes;
+        // Refresh centroid from all faces so incremental Phase B matches
+        // the merged identity, not the pre-merge target-only centroid.
+        recomputePersonCentroid(t);
         return { moved, deleted };
     });
     return tx();

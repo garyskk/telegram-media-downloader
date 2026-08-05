@@ -8107,10 +8107,10 @@ app.post('/api/ai/faces/install-deps', async (req, res) => {
 // re-detecting. Lets the operator tweak ε / minPoints and see the new
 // People grid in seconds (vs minutes for a full re-scan). Implemented
 // by triggering the standard faces scan-runner; Phase A is a no-op when
-// every photo carries `ai_indexed_at IS NOT NULL`, so for fully-indexed
-// libraries this lands in Phase B immediately. For partially-indexed
-// libraries (a scan was cancelled mid-way), Phase A picks up where it
-// left off — same as clicking "Scan now".
+// Incremental Phase B only (skipPhaseA). Does not detect faces on
+// unscanned media — use "Scan now" for that. For fully-indexed libraries
+// this is equivalent to the old recluster; for partial libraries it will
+// not pick up where a cancelled scan left off.
 app.post('/api/ai/faces/recluster', async (_req, res) => {
     try {
         const cfg = _aiCfg();
@@ -8120,6 +8120,8 @@ app.post('/api/ai/faces/recluster', async (_req, res) => {
                 message: 'A face scan is already in progress.',
             });
         }
+        // Incremental Phase B only — no detection of unscanned media.
+        const runCfg = { ...cfg, facesClusterMode: 'incremental', skipPhaseA: true };
         const tracker = _aiTrackerFor('faces');
         const claim = tracker.tryStart(({ onProgress, signal }) => {
             return new Promise((resolve, reject) => {
@@ -8131,7 +8133,7 @@ app.post('/api/ai/faces/recluster', async (_req, res) => {
                     });
                 }
                 aiStartFacesScan(
-                    cfg,
+                    runCfg,
                     (p) => {
                         try {
                             onProgress(p);
@@ -8148,7 +8150,54 @@ app.post('/api/ai/faces/recluster', async (_req, res) => {
         if (!claim.started) {
             return res.status(409).json({ error: 'Tracker busy', code: claim.code });
         }
-        res.json({ success: true, started: true });
+        res.json({ success: true, started: true, mode: 'incremental' });
+    } catch (e) {
+        res.status(500).json({ error: e?.message || String(e) });
+    }
+});
+
+// Full rebuild — clearAllPeople + DBSCAN over every face (old recluster
+// behavior). Use after changing ε when a global reshuffle is wanted.
+// Merges are NOT preserved. Labels / covers / exclusions still carry over.
+app.post('/api/ai/faces/rebuild', async (_req, res) => {
+    try {
+        const cfg = _aiCfg();
+        if (aiIsScanRunning('faces')) {
+            return res.status(409).json({
+                error: 'scan_running',
+                message: 'A face scan is already in progress.',
+            });
+        }
+        const runCfg = { ...cfg, facesClusterMode: 'full' };
+        const tracker = _aiTrackerFor('faces');
+        const claim = tracker.tryStart(({ onProgress, signal }) => {
+            return new Promise((resolve, reject) => {
+                if (signal?.addEventListener) {
+                    signal.addEventListener('abort', () => {
+                        try {
+                            aiCancelScan('faces');
+                        } catch {}
+                    });
+                }
+                aiStartFacesScan(
+                    runCfg,
+                    (p) => {
+                        try {
+                            onProgress(p);
+                        } catch {}
+                    },
+                    (p) => {
+                        if (p?.error) reject(new Error(p.error));
+                        else resolve(p || {});
+                    },
+                    (entry) => log(entry),
+                );
+            });
+        });
+        if (!claim.started) {
+            return res.status(409).json({ error: 'Tracker busy', code: claim.code });
+        }
+        res.json({ success: true, started: true, mode: 'full' });
     } catch (e) {
         res.status(500).json({ error: e?.message || String(e) });
     }

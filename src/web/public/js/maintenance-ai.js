@@ -145,6 +145,7 @@ function _bindOnce() {
     $('#ai-cancel-btn')?.addEventListener('click', () => _cancelScan('faces'));
     $('#ai-reindex-btn')?.addEventListener('click', _reindexFromScratch);
     $('#ai-recluster-btn')?.addEventListener('click', _recluster);
+    $('#ai-rebuild-btn')?.addEventListener('click', _rebuildAllClusters);
     $('#ai-restart-sidecar-btn')?.addEventListener('click', _restartSidecar);
     $('#ai-detect-test-btn')?.addEventListener('click', _runDetectTest);
 
@@ -1074,10 +1075,18 @@ async function _applyPreset(name) {
         const r = await api.post('/api/config', body);
         if (!r.success) throw new Error(r.error || 'save failed');
         showToast(
-            i18nT('maintenance.ai.preset_applied', `Preset "${name}" applied — re-clustering…`),
+            i18nT(
+                'maintenance.ai.preset_applied',
+                `Preset "${name}" applied — rebuilding clusters…`,
+            ),
             'success',
         );
-        await _recluster();
+        // ε changes need a full rebuild; incremental recluster won't reshape
+        // existing people.
+        const rb = await api.post('/api/ai/faces/rebuild', {});
+        if (!rb.success) throw new Error(rb.error || 'rebuild failed');
+        await refreshStatus();
+        await _loadPeople();
     } catch (e) {
         showToast(
             `${i18nT('common.save_failed', 'Save failed')}: ${e?.data?.error || e?.message || 'unknown'}`,
@@ -1214,15 +1223,12 @@ async function _restartSidecar() {
 }
 
 async function _recluster() {
-    // Phase B only — keeps the existing face embeddings, just re-runs
-    // DBSCAN with the current ε / minPoints. The /api/ai/faces/recluster
-    // endpoint pipelines into the same scan-runner Phase B as a full
-    // scan, but skips Phase A so it lands in seconds instead of minutes.
+    // Incremental Phase B — attach unassigned faces; keep merges/labels.
     try {
         const r = await api.post('/api/ai/faces/recluster', {});
         if (!r.success) throw new Error(r.error || 'recluster failed');
         showToast(
-            i18nT('maintenance.ai.recluster_kicked', 'Re-clustering existing faces…'),
+            i18nT('maintenance.ai.recluster_kicked', 'Assigning unassigned faces…'),
             'success',
         );
         await refreshStatus();
@@ -1231,6 +1237,36 @@ async function _recluster() {
         const msg = e?.data?.error || e?.message || 'unknown';
         showToast(
             `${i18nT('maintenance.ai.recluster_failed', 'Re-cluster failed')}: ${msg}`,
+            'error',
+        );
+    }
+}
+
+async function _rebuildAllClusters() {
+    const ok = await confirmSheet({
+        title: i18nT('maintenance.ai.rebuild_confirm_title', 'Rebuild all clusters?'),
+        body: i18nT(
+            'maintenance.ai.rebuild_confirm_body',
+            'This wipes every Person cluster and re-runs DBSCAN on all face embeddings. Manual merges will be lost. Labels and exclusions are preserved when centroids still match. Use after changing ε.',
+        ),
+        confirmLabel: i18nT('maintenance.ai.rebuild_confirm_action', 'Rebuild'),
+        cancelLabel: i18nT('common.cancel', 'Cancel'),
+        danger: true,
+    });
+    if (!ok) return;
+    try {
+        const r = await api.post('/api/ai/faces/rebuild', {});
+        if (!r.success) throw new Error(r.error || 'rebuild failed');
+        showToast(
+            i18nT('maintenance.ai.rebuild_kicked', 'Rebuilding all clusters…'),
+            'success',
+        );
+        await refreshStatus();
+        await _loadPeople();
+    } catch (e) {
+        const msg = e?.data?.error || e?.message || 'unknown';
+        showToast(
+            `${i18nT('maintenance.ai.rebuild_failed', 'Rebuild failed')}: ${msg}`,
             'error',
         );
     }
@@ -2782,7 +2818,7 @@ async function _refreshDoctor() {
 }
 
 function _setActionButtonsEnabled(enabled) {
-    const ids = ['ai-scan-btn', 'ai-reindex-btn', 'ai-recluster-btn'];
+    const ids = ['ai-scan-btn', 'ai-reindex-btn', 'ai-recluster-btn', 'ai-rebuild-btn'];
     for (const id of ids) {
         const btn = $(`#${id}`) || document.getElementById(id);
         if (!btn) continue;

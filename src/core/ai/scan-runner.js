@@ -18,14 +18,18 @@ import path from 'path';
 
 import {
     clearAllPeople,
+    countPeople,
     deleteFacesForDownload,
     getDb,
     getUnindexedAiBatch,
     insertFace,
     insertPerson,
     iterateAllFaces,
+    iterateUnassignedFaces,
     listExcludedCentroids,
+    listPeopleCentroids,
     listPinnedCoverFaceIds,
+    recomputePersonCentroid,
     restorePinnedCoverFaces,
     setAiIndexedAt,
     setFacePerson,
@@ -93,6 +97,269 @@ function _blobToF32(blob) {
     const view = new Float32Array(blob.buffer, blob.byteOffset, dim);
     out.set(view);
     return out;
+}
+
+function _euclid(a, b) {
+    if (!a || !b || a.length !== b.length) return Infinity;
+    let sum = 0;
+    for (let i = 0; i < a.length; i++) {
+        const d = a[i] - b[i];
+        sum += d * d;
+    }
+    return Math.sqrt(sum);
+}
+
+function _resolveClusterEps(cfg) {
+    const facesCfg = cfg?.faces || {};
+    const eps = _pickNumber(
+        [resolveFacesValue('epsilon', facesCfg), facesCfg.epsilon, cfg.facesEpsilon],
+        FACE_DEFAULTS.facesEpsilon,
+    );
+    const minPts = _pickNumber(
+        [resolveFacesValue('minPoints', facesCfg), facesCfg.minPoints, cfg.facesMinPoints],
+        FACE_DEFAULTS.facesMinPoints,
+    );
+    const matchEpsEnv = resolveFacesValue('labelMatchEps', facesCfg);
+    const matchEps = _pickNumber(
+        [facesCfg.labelMatchEps, cfg.facesLabelMatchEps, matchEpsEnv],
+        Math.max(0.2, Math.min(0.6, eps * 0.9)),
+    );
+    return { eps, minPts, matchEps };
+}
+
+function _isNearExcluded(centroid, excludedSnapshot, matchEps) {
+    for (const s of excludedSnapshot) {
+        if (_euclid(centroid, s.centroid) <= matchEps) return true;
+    }
+    return false;
+}
+
+/**
+ * Incremental Phase B — keep existing people / merges; only assign faces
+ * with person_id IS NULL.
+ */
+async function _runIncrementalPhaseB({ state, signal, log, cfg, bcast }) {
+    if (signal.aborted) return;
+    log('info', 'faces scan: starting incremental clustering pass');
+    const { eps, minPts, matchEps } = _resolveClusterEps(cfg);
+
+    const unassigned = [];
+    for (const r of iterateUnassignedFaces()) {
+        unassigned.push({
+            id: r.id,
+            embedding: _blobToF32(r.embedding),
+        });
+    }
+
+    state.phase = 'B';
+    state.faceCount = unassigned.length;
+    bcast(true);
+
+    if (!unassigned.length) {
+        state.peopleCount = countPeople();
+        state.noiseFaces = 0;
+        log('info', 'faces scan: incremental Phase B — no unassigned faces; people unchanged');
+        return;
+    }
+
+    const people = listPeopleCentroids();
+    const excludedSnapshot = listExcludedCentroids();
+    const touched = new Set();
+    const leftover = [];
+    let attached = 0;
+
+    for (const face of unassigned) {
+        if (signal.aborted) return;
+        let bestPerson = null;
+        let bestDist = Infinity;
+        for (const p of people) {
+            const dist = _euclid(face.embedding, p.centroid);
+            if (dist < bestDist && dist <= eps) {
+                bestDist = dist;
+                bestPerson = p;
+            }
+        }
+        let nearExcluded = false;
+        let bestExcl = Infinity;
+        for (const s of excludedSnapshot) {
+            const dist = _euclid(face.embedding, s.centroid);
+            if (dist < bestExcl) bestExcl = dist;
+            if (dist <= matchEps) nearExcluded = true;
+        }
+        if (bestPerson && nearExcluded && bestExcl <= bestDist) {
+            continue;
+        }
+        if (bestPerson) {
+            setFacePerson(face.id, bestPerson.id);
+            touched.add(bestPerson.id);
+            const n = (bestPerson.faceCount || 0) + 1;
+            const c = bestPerson.centroid;
+            for (let i = 0; i < c.length; i++) {
+                c[i] = (c[i] * (n - 1) + face.embedding[i]) / n;
+            }
+            bestPerson.faceCount = n;
+            attached += 1;
+        } else if (nearExcluded) {
+            continue;
+        } else {
+            leftover.push(face);
+        }
+    }
+
+    for (const pid of touched) {
+        recomputePersonCentroid(pid);
+    }
+
+    let peopleInserted = 0;
+    let excludedSkipped = 0;
+    let noiseCount = 0;
+
+    if (leftover.length) {
+        log(
+            'info',
+            `faces scan: incremental — attached ${attached} to existing people; ` +
+                `DBSCAN on ${leftover.length} leftover (eps=${eps}, minPts=${minPts})`,
+        );
+        const { clusters, noise } = clusterFaces(leftover, { eps, minPts });
+        noiseCount = noise.length;
+        await new Promise((r) => setImmediate(r));
+        let i = 0;
+        for (const c of clusters) {
+            if (_isNearExcluded(c.centroid, excludedSnapshot, matchEps)) {
+                excludedSkipped += 1;
+                i += 1;
+                if (i % 100 === 0) await new Promise((r) => setImmediate(r));
+                continue;
+            }
+            const personId = insertPerson({
+                label: null,
+                centroidBlob: _f32ToBlob(c.centroid),
+                faceCount: c.faceCount,
+            });
+            peopleInserted += 1;
+            for (const memberIdx of c.memberIdxs) {
+                setFacePerson(leftover[memberIdx].id, personId);
+            }
+            i += 1;
+            if (i % 100 === 0) await new Promise((r) => setImmediate(r));
+        }
+    } else {
+        log(
+            'info',
+            `faces scan: incremental — attached ${attached} to existing people; no leftovers`,
+        );
+    }
+
+    state.peopleCount = countPeople();
+    state.noiseFaces = noiseCount;
+    log(
+        'info',
+        `faces scan: incremental Phase B done — attached=${attached}, ` +
+            `newPeople=${peopleInserted}, excludedNew=${excludedSkipped}, ` +
+            `noise=${noiseCount}, peopleTotal=${state.peopleCount}, eps=${eps}`,
+    );
+}
+
+/**
+ * Full rebuild Phase B — clearAllPeople + DBSCAN over every face.
+ * Used by Rebuild all clusters (ε reshuffle). Preserves labels/covers/exclusions.
+ */
+async function _runFullRebuildPhaseB({ state, signal, log, cfg, bcast, db }) {
+    if (signal.aborted) return;
+    log('info', 'faces scan: starting full rebuild clustering pass');
+    const faces = [];
+    for (const r of iterateAllFaces()) {
+        faces.push({
+            id: r.id,
+            embedding: _blobToF32(r.embedding),
+            qualityScore: Number.isFinite(r.quality_score) ? r.quality_score : null,
+        });
+    }
+    if (!faces.length) {
+        log('info', 'faces scan: no faces detected — clustering skipped');
+        return;
+    }
+    state.phase = 'B';
+    state.faceCount = faces.length;
+    bcast(true);
+    if (faces.length > 50000) {
+        log(
+            'warn',
+            `faces scan: ${faces.length} faces is a large input for DBSCAN — clustering may take a while`,
+        );
+    }
+    const { eps, minPts, matchEps } = _resolveClusterEps(cfg);
+    log(
+        'info',
+        `faces scan: full rebuild clustering ${faces.length} faces (eps=${eps}, minPts=${minPts})`,
+    );
+    const { clusters, noise } = clusterFaces(faces, { eps, minPts });
+    await new Promise((r) => setImmediate(r));
+
+    const labelSnapshot = (() => {
+        const out = [];
+        const stmt = db.prepare(
+            'SELECT label, embedding_centroid FROM people WHERE label IS NOT NULL',
+        );
+        for (const r of stmt.iterate()) {
+            if (!r.embedding_centroid) continue;
+            out.push({ label: r.label, centroid: _blobToF32(r.embedding_centroid) });
+        }
+        return out;
+    })();
+    const findCarryOverLabel = (centroid) => {
+        let best = null;
+        let bestDist = Infinity;
+        for (const s of labelSnapshot) {
+            const dist = _euclid(centroid, s.centroid);
+            if (dist < bestDist && dist <= matchEps) {
+                bestDist = dist;
+                best = s.label;
+            }
+        }
+        return best;
+    };
+
+    const excludedSnapshot = listExcludedCentroids();
+    const coverFaceSnapshot = listPinnedCoverFaceIds();
+
+    clearAllPeople();
+    let i = 0;
+    let preservedCount = 0;
+    let excludedSkipped = 0;
+    let peopleInserted = 0;
+    for (const c of clusters) {
+        if (_isNearExcluded(c.centroid, excludedSnapshot, matchEps)) {
+            excludedSkipped += 1;
+            i += 1;
+            if (i % 100 === 0) await new Promise((r) => setImmediate(r));
+            continue;
+        }
+        const carryOver = findCarryOverLabel(c.centroid);
+        const personId = insertPerson({
+            label: carryOver,
+            centroidBlob: _f32ToBlob(c.centroid),
+            faceCount: c.faceCount,
+        });
+        peopleInserted += 1;
+        if (carryOver) preservedCount += 1;
+        for (const memberIdx of c.memberIdxs) {
+            setFacePerson(faces[memberIdx].id, personId);
+        }
+        i += 1;
+        if (i % 100 === 0) await new Promise((r) => setImmediate(r));
+    }
+    const coversRestored = restorePinnedCoverFaces(coverFaceSnapshot);
+    state.peopleCount = peopleInserted;
+    state.noiseFaces = noise.length;
+    log(
+        'info',
+        `faces scan: full rebuild clustered ${faces.length} faces into ${clusters.length} groups ` +
+            `(${peopleInserted} people, ${excludedSkipped} excluded, ` +
+            `${preservedCount}/${labelSnapshot.length} labels preserved, ` +
+            `${coversRestored}/${coverFaceSnapshot.length} covers restored, ` +
+            `eps=${matchEps.toFixed(3)})`,
+    );
 }
 
 // Per-feature state. Only `faces` survives; the slot map is kept for
@@ -241,6 +508,25 @@ export function startFacesScan(cfg, onProgress, onDone, onLog) {
                     ? envFileTypes
                     : ['photo'];
             const db = getDb();
+            const clusterMode =
+                String(cfg?.facesClusterMode || facesCfgIn.clusterMode || 'incremental')
+                    .toLowerCase() === 'full'
+                    ? 'full'
+                    : 'incremental';
+            const skipPhaseA = cfg?.skipPhaseA === true || facesCfgIn.skipPhaseA === true;
+
+            // Full rebuild: wipe+DBSCAN only (no detection). Used by
+            // Rebuild all clusters when the operator changes ε.
+            if (clusterMode === 'full') {
+                await _runFullRebuildPhaseB({ state, signal, log, cfg, bcast, db });
+                return;
+            }
+
+            // Re-cluster button: Phase B only — do not pick up unscanned media.
+            if (skipPhaseA) {
+                await _runIncrementalPhaseB({ state, signal, log, cfg, bcast });
+                return;
+            }
 
             // Phase A — detect faces on every photo we haven't visited yet.
             // Visited = "ai_indexed_at IS NOT NULL"; even photos that yield
@@ -552,185 +838,9 @@ export function startFacesScan(cfg, onProgress, onDone, onLog) {
                 }
             }
 
-            // Phase B — DBSCAN over every face embedding. Always re-runs
-            // (clusters drift as new faces land).
-            if (signal.aborted) return;
-            log('info', 'faces scan: starting clustering pass');
-            const faces = [];
-            // Collect faces first so we know faceCount before clustering.
-            for (const r of iterateAllFaces()) {
-                faces.push({
-                    id: r.id,
-                    embedding: _blobToF32(r.embedding),
-                    qualityScore: Number.isFinite(r.quality_score) ? r.quality_score : null,
-                });
-            }
-            if (!faces.length) {
-                log('info', 'faces scan: no faces detected — clustering skipped');
-                return;
-            }
-            // Signal phase transition so the frontend can swap to Phase B UI.
-            state.phase = 'B';
-            state.faceCount = faces.length;
-            bcast(true);
-            if (faces.length > 50000) {
-                log(
-                    'warn',
-                    `faces scan: ${faces.length} faces is a large input for DBSCAN — clustering may take a while`,
-                );
-            }
-            const facesCfgForCluster = cfg?.faces || {};
-            const epsForCluster = _pickNumber(
-                [
-                    resolveFacesValue('epsilon', facesCfgForCluster),
-                    facesCfgForCluster.epsilon,
-                    cfg.facesEpsilon,
-                ],
-                FACE_DEFAULTS.facesEpsilon,
-            );
-            const minPointsForCluster = _pickNumber(
-                [
-                    resolveFacesValue('minPoints', facesCfgForCluster),
-                    facesCfgForCluster.minPoints,
-                    cfg.facesMinPoints,
-                ],
-                FACE_DEFAULTS.facesMinPoints,
-            );
-            log(
-                'info',
-                `faces scan: clustering ${faces.length} faces (eps=${epsForCluster}, minPts=${minPointsForCluster})`,
-            );
-            const { clusters, noise } = clusterFaces(faces, {
-                eps: epsForCluster,
-                minPts: minPointsForCluster,
-            });
-            await new Promise((r) => setImmediate(r));
-
-            // Snapshot every labelled centroid BEFORE wiping people. The
-            // match runs against the snapshot (in-memory) because by the
-            // time we hit the DB, clearAllPeople has already nuked
-            // everything. Renames now survive re-runs as long as the new
-            // cluster's centroid is within `matchEps` of the old labelled
-            // cluster's centroid.
-            //
-            // Precedence for the match radius:
-            //   1. `cfg.faces.labelMatchEps`            (new nested path)
-            //   2. `cfg.facesLabelMatchEps`             (legacy flat key)
-            //   3. `TGDL_FACES_LABEL_MATCH_EPS` env     (deployment override)
-            //   4. derived from `epsilon * 0.9`         (the default)
-            const facesCfg = cfg?.faces || {};
-            const epsilonResolved = _pickNumber(
-                [resolveFacesValue('epsilon', facesCfg), facesCfg.epsilon, cfg.facesEpsilon],
-                FACE_DEFAULTS.facesEpsilon,
-            );
-            const matchEpsEnv = resolveFacesValue('labelMatchEps', facesCfg);
-            const matchEps = _pickNumber(
-                [facesCfg.labelMatchEps, cfg.facesLabelMatchEps, matchEpsEnv],
-                Math.max(0.2, Math.min(0.6, epsilonResolved * 0.9)),
-            );
-            const labelSnapshot = (() => {
-                const out = [];
-                const stmt = db.prepare(
-                    'SELECT label, embedding_centroid FROM people WHERE label IS NOT NULL',
-                );
-                for (const r of stmt.iterate()) {
-                    if (!r.embedding_centroid) continue;
-                    const dim = r.embedding_centroid.byteLength / 4;
-                    const c = new Float32Array(dim);
-                    const view = new Float32Array(
-                        r.embedding_centroid.buffer,
-                        r.embedding_centroid.byteOffset,
-                        dim,
-                    );
-                    c.set(view);
-                    out.push({ label: r.label, centroid: c });
-                }
-                return out;
-            })();
-            const findCarryOverLabel = (centroid) => {
-                let best = null;
-                let bestDist = Infinity;
-                for (const s of labelSnapshot) {
-                    if (s.centroid.length !== centroid.length) continue;
-                    let sum = 0;
-                    for (let i = 0; i < centroid.length; i++) {
-                        const d = centroid[i] - s.centroid[i];
-                        sum += d * d;
-                    }
-                    const dist = Math.sqrt(sum);
-                    if (dist < bestDist && dist <= matchEps) {
-                        bestDist = dist;
-                        best = s.label;
-                    }
-                }
-                return best;
-            };
-
-            // Excluded centroids survive clearAllPeople — load once and skip
-            // matching clusters so durable ignores stick across reclusters.
-            const excludedSnapshot = listExcludedCentroids();
-            const isExcludedCentroid = (centroid) => {
-                let bestDist = Infinity;
-                for (const s of excludedSnapshot) {
-                    if (s.centroid.length !== centroid.length) continue;
-                    let sum = 0;
-                    for (let i = 0; i < centroid.length; i++) {
-                        const d = centroid[i] - s.centroid[i];
-                        sum += d * d;
-                    }
-                    const dist = Math.sqrt(sum);
-                    if (dist < bestDist && dist <= matchEps) {
-                        bestDist = dist;
-                        return true;
-                    }
-                }
-                return false;
-            };
-
-            // Pinned People avatars: face rows survive Phase B; snapshot the
-            // face ids before wipe and re-apply onto whichever new person
-            // owns each face after reassignment.
-            const coverFaceSnapshot = listPinnedCoverFaceIds();
-
-            clearAllPeople();
-            let i = 0;
-            let preservedCount = 0;
-            let excludedSkipped = 0;
-            let peopleInserted = 0;
-            for (const c of clusters) {
-                if (isExcludedCentroid(c.centroid)) {
-                    // Leave member faces unassigned (person_id stays null).
-                    excludedSkipped += 1;
-                    i += 1;
-                    if (i % 100 === 0) await new Promise((r) => setImmediate(r));
-                    continue;
-                }
-                const carryOver = findCarryOverLabel(c.centroid);
-                const personId = insertPerson({
-                    label: carryOver,
-                    centroidBlob: _f32ToBlob(c.centroid),
-                    faceCount: c.faceCount,
-                });
-                peopleInserted += 1;
-                if (carryOver) preservedCount += 1;
-                for (const memberIdx of c.memberIdxs) {
-                    const faceId = faces[memberIdx].id;
-                    setFacePerson(faceId, personId);
-                }
-                i += 1;
-                if (i % 100 === 0) await new Promise((r) => setImmediate(r));
-            }
-            const coversRestored = restorePinnedCoverFaces(coverFaceSnapshot);
-            state.peopleCount = peopleInserted;
-            state.noiseFaces = noise.length;
-            log(
-                'info',
-                `faces scan: clustered ${faces.length} faces into ${clusters.length} groups ` +
-                    `(${peopleInserted} people, ${excludedSkipped} excluded, ` +
-                    `${preservedCount}/${labelSnapshot.length} labels preserved across re-cluster, ` +
-                    `${coversRestored}/${coverFaceSnapshot.length} covers restored, ` +
-                    `eps=${matchEps.toFixed(3)})`,
-            );
+            // Phase B — incremental: keep existing people/merges; assign
+            // only unassigned faces (match existing centroids or DBSCAN leftovers).
+            await _runIncrementalPhaseB({ state, signal, log, cfg, bcast });
         },
         onProgress,
         onDone,
@@ -742,3 +852,9 @@ export function startFacesScan(cfg, onProgress, onDone, onLog) {
 export function _resetForTests() {
     _scans.faces = _emptyState();
 }
+
+/** @internal test hooks */
+export const _test = {
+    runIncrementalPhaseB: _runIncrementalPhaseB,
+    runFullRebuildPhaseB: _runFullRebuildPhaseB,
+};

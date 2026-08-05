@@ -268,30 +268,33 @@ separators (`5000,5999` or `5000:5999` both work).
    regardless of detected face count, so a re-scan doesn't re-decode
    photos that yielded zero faces.
 
-2. **Phase B** — DBSCAN over every face embedding. Cluster ids are
-   rebuilt from scratch on each run; `eps` defaults to 0.5 (matches
-   buffalo_l's "definitely the same person" guidance for L2-normalised
-   embeddings); `minPts` defaults to 3 so a one-shot stranger stays
-   unassigned instead of getting forced into a cluster.
+2. **Phase B (incremental, default)** — only faces with
+   `person_id IS NULL` are considered. Each is attached to the nearest
+   existing person centroid within `epsilon` (unless nearer an excluded
+   identity), otherwise leftovers are DBSCAN'd into **new** people.
+   Existing people, merges, splits, labels, and covers are left alone.
+   End-of-scan Phase B and **Re-cluster** use this path.
 
-3. **Label preservation across re-cluster** — before wiping the `people`
-   table, every labelled centroid is snapshotted in memory. After the
-   new DBSCAN finishes, each cluster's centroid is matched against the
-   snapshot within `labelMatchEps` (default: `epsilon * 0.9` clamped to
-   `[0.2, 0.6]`) and the label carries over. Renames survive re-runs
-   even though cluster ids reset.
+3. **Rebuild all clusters (destructive)** — the old wipe+DBSCAN path:
+   `clearAllPeople()`, DBSCAN over every face, recreate people. Labels /
+   covers / exclusions carry over via centroid match. Use after changing
+   `epsilon` when a global reshuffle is wanted. **Merges are not
+   preserved.** Exposed as **Rebuild all clusters** in the UI /
+   `POST /api/ai/faces/rebuild`.
 
 ### Cluster operations
 
 The maintenance page surfaces:
 
-- **Rename** — set a label on a cluster. Survives re-cluster via the
-  centroid-match path above.
-- **Merge** — fold one cluster into another. Both label histories and
-  every linked face come along.
+- **Rename** — set a label on a cluster. Survives both Re-cluster and
+  Rebuild (via centroid match on Rebuild).
+- **Merge** — fold one cluster into another. Survives **Re-cluster**
+  (incremental). Lost on **Rebuild all** / Reindex. Target centroid is
+  recomputed from all faces after merge.
 - **Split** — pick faces from a cluster, create a new cluster, link
   those faces to it. The original keeps the rest.
 - **Reassign** — move one face between clusters.
+- **Exclude** — durable denylist so an identity does not reappear.
 
 ### Auto-pregeneration on new downloads
 
@@ -660,9 +663,11 @@ All endpoints are admin-only.
 | Method | Path                                | Notes                                                  |
 | ------ | ----------------------------------- | ------------------------------------------------------ |
 | GET    | `/api/ai/status`                    | feature flags, scan state, face count                  |
-| POST   | `/api/ai/scan/start`                | `{ feature: 'faces' }`                                 |
+| POST   | `/api/ai/scan/start`                | `{ feature: 'faces' }` — Phase A + incremental Phase B |
 | POST   | `/api/ai/scan/cancel`               | same body shape                                        |
 | GET    | `/api/ai/scan/status?feature=faces` | live state for re-mounted page                         |
+| POST   | `/api/ai/faces/recluster`           | incremental Phase B only (skip detection; keeps merges) |
+| POST   | `/api/ai/faces/rebuild`             | full wipe+DBSCAN reshape (merges lost)                 |
 | GET    | `/api/ai/people`                    | clusters with cover face + count                       |
 | GET    | `/api/ai/people/excluded`           | durable exclusion denylist (`{ excluded, total }`)     |
 | GET    | `/api/ai/people/:id/photos`         | paginated photos in this cluster                       |
@@ -679,11 +684,15 @@ All endpoints are admin-only.
 | GET    | `/api/ai/preload-model/:name/status`| check model download status                            |
 
 **Delete vs Exclude.** `DELETE /api/ai/people/:id` only drops the
-cluster row (faces become unassigned); the next Phase B recluster can
-recreate it. `POST /api/ai/people/:id/exclude` snapshots the centroid
-into `excluded_people` so Phase B skips matching clusters across
-reclusters. Full faces reindex clears the denylist (embedding space may
-change with the detector model).
+cluster row (faces become unassigned); the next **incremental** Phase B
+may recreate a cluster from those faces. `POST /api/ai/people/:id/exclude`
+snapshots the centroid into `excluded_people` so matching faces stay
+unassigned / do not form a Person. Full faces reindex clears the denylist
+(embedding space may change with the detector model).
+
+**Re-cluster vs Rebuild.** Re-cluster assigns only unassigned faces and
+preserves merges. Rebuild all clusters wipes People and re-DBSCANs
+everything (use after changing ε).
 
 ## Sidecar wire format
 
