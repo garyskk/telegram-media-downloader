@@ -187,6 +187,7 @@ Opt-in face detection + clustering, backed by the Python sidecar in `faces-servi
 | `GET`    | `/api/ai/people/excluded`           | Durable exclusion denylist (`{excluded:[{id,label,created_at,cover_face_id}], total}`). Cover crop via `/api/ai/faces/:cover_face_id/crop`. Survives recluster; cleared on full faces reindex. |
 | `GET`    | `/api/ai/people/:id/photos`         | Paginated photos in this cluster. |
 | `PATCH`  | `/api/ai/people/:id`                | `{label}` — rename. |
+| `POST`   | `/api/ai/people/:id/cover`          | `{faceId}` — pin this face as the People avatar (must belong to the person). Survives recluster. |
 | `DELETE` | `/api/ai/people/:id`                | Drop cluster temporarily; faces become unassigned (may reappear on recluster). |
 | `POST`   | `/api/ai/people/:id/exclude`        | Durable exclude — snapshot centroid denylist + drop cluster (will not reappear on recluster). |
 | `DELETE` | `/api/ai/people/excluded/:id`       | Un-exclude; next recluster may recreate the person. |

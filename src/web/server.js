@@ -171,6 +171,7 @@ import {
     excludePerson,
     listExcludedPeople,
     deleteExcludedPerson,
+    setPersonCoverFace,
     resetAllAiData,
     setFaceQualityScore,
     getDb as aiGetDb,
@@ -8567,7 +8568,8 @@ async function _cropFace(source, row, size) {
         .toBuffer();
 }
 
-// Face crop for person avatar — best (highest-quality/largest) face for this person.
+// Face crop for person avatar — pinned cover_face_id when set and still
+// belonging to this person; otherwise best (highest-quality/largest) face.
 // Used by the People grid as the circle avatar. Sharp-crops with 40% padding so the
 // face is framed, not cut tight. For video-sourced faces, extracts a frame via ffmpeg.
 app.get('/api/ai/person/:id/face', async (req, res) => {
@@ -8582,10 +8584,13 @@ app.get('/api/ai/person/:id/face', async (req, res) => {
                 `SELECT f.x, f.y, f.w, f.h, f.frame_time_sec, d.file_path, d.file_type
                    FROM faces f
                    JOIN downloads d ON d.id = f.download_id
+                   JOIN people p ON p.id = f.person_id
                   WHERE f.person_id = ?
                     AND (d.user_deleted IS NULL OR d.user_deleted = 0)
-                  ORDER BY CASE WHEN d.file_type = 'photo' THEN 0 ELSE 1 END,
-                           COALESCE(f.quality_score, 0) DESC, f.w * f.h DESC
+                  ORDER BY
+                    CASE WHEN p.cover_face_id IS NOT NULL AND f.id = p.cover_face_id THEN 0 ELSE 1 END,
+                    CASE WHEN d.file_type = 'photo' THEN 0 ELSE 1 END,
+                    COALESCE(f.quality_score, 0) DESC, f.w * f.h DESC
                   LIMIT 1`,
             )
             .get(personId);
@@ -8733,6 +8738,33 @@ app.patch('/api/ai/people/:id', async (req, res) => {
         const changes = renamePerson(id, label || null);
         if (!changes) return res.status(404).json({ error: 'person not found' });
         res.json({ success: true, id, label });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// Pin a face as this person's People avatar thumbnail.
+app.post('/api/ai/people/:id/cover', async (req, res) => {
+    try {
+        const id = Number(req.params.id);
+        const faceId = Number(req.body?.faceId);
+        if (!Number.isFinite(id) || id <= 0) {
+            return res.status(400).json({ error: 'invalid person id' });
+        }
+        if (!Number.isFinite(faceId) || faceId <= 0) {
+            return res.status(400).json({ error: 'invalid faceId' });
+        }
+        const r = setPersonCoverFace(id, faceId);
+        if (!r.ok) {
+            const status =
+                r.reason === 'person_not_found' || r.reason === 'face_not_found'
+                    ? 404
+                    : r.reason === 'mismatch'
+                      ? 400
+                      : 400;
+            return res.status(status).json({ error: r.reason || 'cover failed' });
+        }
+        res.json({ success: true, id, coverFaceId: r.coverFaceId });
     } catch (e) {
         res.status(500).json({ error: e.message });
     }

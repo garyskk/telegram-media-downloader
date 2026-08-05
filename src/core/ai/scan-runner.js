@@ -25,6 +25,8 @@ import {
     insertPerson,
     iterateAllFaces,
     listExcludedCentroids,
+    listPinnedCoverFaceIds,
+    restorePinnedCoverFaces,
     setAiIndexedAt,
     setFacePerson,
 } from '../db.js';
@@ -685,6 +687,11 @@ export function startFacesScan(cfg, onProgress, onDone, onLog) {
                 return false;
             };
 
+            // Pinned People avatars: face rows survive Phase B; snapshot the
+            // face ids before wipe and re-apply onto whichever new person
+            // owns each face after reassignment.
+            const coverFaceSnapshot = listPinnedCoverFaceIds();
+
             clearAllPeople();
             let i = 0;
             let preservedCount = 0;
@@ -713,6 +720,7 @@ export function startFacesScan(cfg, onProgress, onDone, onLog) {
                 i += 1;
                 if (i % 100 === 0) await new Promise((r) => setImmediate(r));
             }
+            const coversRestored = restorePinnedCoverFaces(coverFaceSnapshot);
             state.peopleCount = peopleInserted;
             state.noiseFaces = noise.length;
             log(
@@ -720,6 +728,7 @@ export function startFacesScan(cfg, onProgress, onDone, onLog) {
                 `faces scan: clustered ${faces.length} faces into ${clusters.length} groups ` +
                     `(${peopleInserted} people, ${excludedSkipped} excluded, ` +
                     `${preservedCount}/${labelSnapshot.length} labels preserved across re-cluster, ` +
+                    `${coversRestored}/${coverFaceSnapshot.length} covers restored, ` +
                     `eps=${matchEps.toFixed(3)})`,
             );
         },

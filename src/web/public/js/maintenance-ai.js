@@ -1765,7 +1765,9 @@ function _personTile(p) {
     const faceCount = Number(p.face_count) || 0;
     const safeName = escapeHtml(name);
 
-    const faceUrl = !isUnclassified && p.id > 0 ? `/api/ai/person/${p.id}/face?w=128` : '';
+    const bust = _personAvatarBust(p);
+    const faceUrl =
+        !isUnclassified && p.id > 0 ? `/api/ai/person/${p.id}/face?w=128&v=${bust}` : '';
     const fallbackUrl = p.cover_download_id ? `/api/thumbs/${p.cover_download_id}?w=128` : '';
 
     let imgHtml;
@@ -1826,7 +1828,9 @@ async function _showPersonPhotos() {
     const detailAvatar = $('#ai-person-detail-avatar');
     if (detailAvatar) {
         if (_selectedPerson > 0) {
-            detailAvatar.innerHTML = `<img src="/api/ai/person/${_selectedPerson}/face?w=80" alt="${escapeHtml(_selectedPersonName)}" loading="lazy" class="w-full h-full object-cover" onerror="this.onerror=null;this.replaceWith(Object.assign(document.createElement('i'),{className:'ri-user-line text-lg text-tg-textSecondary/40'}))">`;
+            const cached = _peopleCache.find((p) => p.id === _selectedPerson);
+            const bust = _personAvatarBust(cached);
+            detailAvatar.innerHTML = `<img src="/api/ai/person/${_selectedPerson}/face?w=80&v=${bust}" alt="${escapeHtml(_selectedPersonName)}" loading="lazy" class="w-full h-full object-cover" onerror="this.onerror=null;this.replaceWith(Object.assign(document.createElement('i'),{className:'ri-user-line text-lg text-tg-textSecondary/40'}))">`;
         } else {
             detailAvatar.innerHTML = `<i class="ri-user-line text-lg text-tg-textSecondary/40"></i>`;
         }
@@ -2077,6 +2081,12 @@ function _faceReviewTile(row) {
     const qBadge = qLabel
         ? `<span class="absolute top-1 left-1 h-[15px] px-1.5 rounded-full bg-black/70 text-white text-[8px] font-medium flex items-center justify-center leading-none backdrop-blur-sm">${qLabel}</span>`
         : '';
+    const cached = _peopleCache.find((p) => p.id === _selectedPerson);
+    const isCover = Number(cached?.cover_face_id) === Number(faceId);
+    const coverBadge = isCover
+        ? `<span class="absolute bottom-1 left-1 h-[15px] px-1.5 rounded-full bg-tg-blue/90 text-white text-[8px] font-medium flex items-center gap-0.5 leading-none backdrop-blur-sm"><i class="ri-image-line text-[9px]"></i>${escapeHtml(i18nT('maintenance.ai.face_review_cover_badge', 'Cover'))}</span>`
+        : '';
+    const coverRing = isCover ? ' ring-2 ring-tg-blue ring-offset-1 ring-offset-tg-bg' : '';
 
     const meta = encodeURIComponent(
         JSON.stringify({
@@ -2092,18 +2102,23 @@ function _faceReviewTile(row) {
     );
 
     return `
-        <div class="ai-face-review-tile group relative rounded-xl overflow-hidden shadow-sm hover:shadow-lg transition-all duration-200 bg-tg-bg/40" data-face-id="${faceId}" data-dl-id="${dlId}" data-meta="${meta}">
+        <div class="ai-face-review-tile group relative rounded-xl overflow-hidden shadow-sm hover:shadow-lg transition-all duration-200 bg-tg-bg/40${coverRing}" data-face-id="${faceId}" data-dl-id="${dlId}" data-meta="${meta}">
             <button type="button" class="ai-face-review-open block w-full cursor-pointer" title="${escapeHtml(i18nT('maintenance.ai.face_review_open_source', 'Open source photo'))} — ${name}">
                 <img src="/api/ai/faces/${faceId}/crop?w=160" alt="${name}" loading="lazy"
                     class="aspect-square w-full object-cover transition-transform duration-300 group-hover:scale-105">
             </button>
             ${qBadge}
+            ${coverBadge}
             <div class="absolute inset-0 bg-gradient-to-t from-black/60 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-200 pointer-events-none flex items-end p-1.5">
                 <span class="text-white text-[10px] leading-tight line-clamp-1 font-medium drop-shadow">${name}</span>
             </div>
             <!-- Hover actions — kept visually distinct from the click-to-open image
                  so operators don't accidentally reassign while browsing. -->
             <div class="absolute top-1 right-1 flex flex-col gap-1 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity duration-200">
+                <button type="button" class="ai-face-review-set-cover w-5 h-5 rounded-full bg-black/70 hover:bg-tg-blue flex items-center justify-center shadow"
+                    title="${escapeHtml(i18nT('maintenance.ai.face_review_set_cover', 'Set as thumbnail'))}">
+                    <i class="ri-image-line text-white text-[10px]"></i>
+                </button>
                 <button type="button" class="ai-face-review-reassign w-5 h-5 rounded-full bg-black/70 hover:bg-tg-blue flex items-center justify-center shadow"
                     title="${escapeHtml(i18nT('maintenance.ai.face_review_reassign', 'Move to another person…'))}">
                     <i class="ri-arrow-left-right-line text-white text-[10px]"></i>
@@ -2117,12 +2132,22 @@ function _faceReviewTile(row) {
     `;
 }
 
+function _personAvatarBust(p) {
+    if (!p) return String(Date.now());
+    const cover = Number(p.cover_face_id);
+    if (Number.isFinite(cover) && cover > 0) return String(cover);
+    const updated = Number(p.updated_at);
+    if (Number.isFinite(updated) && updated > 0) return String(updated);
+    return '0';
+}
+
 function _wireFaceReviewGrid() {
     const grid = $('#ai-face-review-grid');
     if (!grid) return;
     if (_faceReviewGridClickHandler) grid.removeEventListener('click', _faceReviewGridClickHandler);
 
     _faceReviewGridClickHandler = (e) => {
+        const setCoverBtn = e.target.closest('.ai-face-review-set-cover');
         const reassignBtn = e.target.closest('.ai-face-review-reassign');
         const unassignBtn = e.target.closest('.ai-face-review-unassign');
         const openBtn = e.target.closest('.ai-face-review-open');
@@ -2130,6 +2155,12 @@ function _wireFaceReviewGrid() {
         if (!tile) return;
         const faceId = Number(tile.dataset.faceId);
 
+        if (setCoverBtn) {
+            e.preventDefault();
+            e.stopPropagation();
+            _setCoverFaceFromReview(faceId);
+            return;
+        }
         if (reassignBtn) {
             e.preventDefault();
             e.stopPropagation();
@@ -2173,7 +2204,8 @@ async function _reassignFaceFromReview(faceId, tileEl) {
 
     const makeCard = (p) => {
         const name = escapeHtml(p.label || `Person #${p.id}`);
-        const faceUrl = p.id > 0 ? `/api/ai/person/${p.id}/face?w=64` : '';
+        const faceUrl =
+            p.id > 0 ? `/api/ai/person/${p.id}/face?w=64&v=${_personAvatarBust(p)}` : '';
         const imgHtml = faceUrl
             ? `<img src="${faceUrl}" class="w-full h-full object-cover" loading="lazy" onerror="this.onerror=null;this.parentElement.innerHTML='<i class=\\'ri-user-line text-base text-tg-textSecondary/40\\'></i>'">`
             : `<i class="ri-user-line text-base text-tg-textSecondary/40"></i>`;
@@ -2273,6 +2305,39 @@ async function _unassignFaceFromReview(faceId, tileEl) {
     }
 }
 
+async function _setCoverFaceFromReview(faceId) {
+    if (!faceId || !_selectedPerson) return;
+    try {
+        const res = await api.post(`/api/ai/people/${_selectedPerson}/cover`, { faceId });
+        if (!res.success) throw new Error(res.error || 'set cover failed');
+        const coverFaceId = Number(res.coverFaceId) || faceId;
+        const cached = _peopleCache.find((p) => p.id === _selectedPerson);
+        if (cached) {
+            cached.cover_face_id = coverFaceId;
+            cached.updated_at = Date.now();
+        }
+        showToast(
+            i18nT('maintenance.ai.face_review_cover_set', 'Thumbnail updated'),
+            'success',
+        );
+        await _renderPeopleGrid();
+        // Refresh detail avatar + cover badges in the open review grid.
+        const detailAvatar = $('#ai-person-detail-avatar');
+        if (detailAvatar) {
+            const bust = _personAvatarBust(cached);
+            detailAvatar.innerHTML = `<img src="/api/ai/person/${_selectedPerson}/face?w=80&v=${bust}" alt="${escapeHtml(_selectedPersonName)}" loading="lazy" class="w-full h-full object-cover" onerror="this.onerror=null;this.replaceWith(Object.assign(document.createElement('i'),{className:'ri-user-line text-lg text-tg-textSecondary/40'}))">`;
+        }
+        if (_faceReviewActive) {
+            _faceReviewOffset = 0;
+            const grid = $('#ai-face-review-grid');
+            if (grid) grid.innerHTML = '';
+            await _loadFaceReviewPage();
+        }
+    } catch (e) {
+        showToast(e.message, 'error');
+    }
+}
+
 function _removeFaceReviewTile(tileEl) {
     tileEl?.remove();
     _faceReviewTotal = Math.max(0, _faceReviewTotal - 1);
@@ -2329,7 +2394,8 @@ async function _mergeSelectedPerson() {
     // don't cause a multi-second innerHTML freeze on open.
     const makeMergeCard = (p) => {
         const name = escapeHtml(p.label || `Person #${p.id}`);
-        const faceUrl = p.id > 0 ? `/api/ai/person/${p.id}/face?w=64` : '';
+        const faceUrl =
+            p.id > 0 ? `/api/ai/person/${p.id}/face?w=64&v=${_personAvatarBust(p)}` : '';
         const imgHtml = faceUrl
             ? `<img src="${faceUrl}" class="w-full h-full object-cover" loading="lazy" onerror="this.onerror=null;this.parentElement.innerHTML='<i class=\\'ri-user-line text-base text-tg-textSecondary/40\\'></i>'">`
             : `<i class="ri-user-line text-base text-tg-textSecondary/40"></i>`;

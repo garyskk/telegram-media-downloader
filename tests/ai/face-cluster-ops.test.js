@@ -550,3 +550,127 @@ describe('excludePerson (durable denylist)', () => {
         expect(cents[0].label).toBe('Vec');
     });
 });
+
+describe('setPersonCoverFace (pinned People avatar)', () => {
+    it('pins a face and listPeople returns it as cover_face_id over higher-quality auto-pick', () => {
+        const did = downloadId();
+        const pid = api.insertPerson({
+            label: 'Pin',
+            centroidBlob: f32Blob([1, 0, 0]),
+            faceCount: 2,
+        });
+        const fLow = api.insertFace({
+            downloadId: did,
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 40,
+            embeddingBlob: f32Blob([1, 0, 0]),
+            personId: pid,
+            qualityScore: 0.2,
+        }).lastInsertRowid;
+        const fHigh = api.insertFace({
+            downloadId: did,
+            x: 0,
+            y: 0,
+            w: 80,
+            h: 80,
+            embeddingBlob: f32Blob([0.99, 0.01, 0]),
+            personId: pid,
+            qualityScore: 0.99,
+        }).lastInsertRowid;
+
+        // Auto-pick would prefer fHigh.
+        expect(api.listPeople({}).people[0].cover_face_id).toBe(fHigh);
+
+        const r = api.setPersonCoverFace(pid, fLow);
+        expect(r).toEqual({ ok: true, coverFaceId: fLow });
+        expect(api.listPeople({}).people[0].cover_face_id).toBe(fLow);
+        expect(api.listPinnedCoverFaceIds()).toEqual([fLow]);
+    });
+
+    it('rejects face belonging to another person', () => {
+        const did = downloadId();
+        const a = api.insertPerson({ centroidBlob: f32Blob([1, 0]), faceCount: 1 });
+        const b = api.insertPerson({ centroidBlob: f32Blob([0, 1]), faceCount: 1 });
+        const fa = api.insertFace({
+            downloadId: did,
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 40,
+            embeddingBlob: f32Blob([1, 0]),
+            personId: a,
+        }).lastInsertRowid;
+        expect(api.setPersonCoverFace(b, fa)).toEqual({ ok: false, reason: 'mismatch' });
+        expect(api.setPersonCoverFace(999999, fa).reason).toBe('person_not_found');
+        expect(api.setPersonCoverFace(a, 999999).reason).toBe('face_not_found');
+    });
+
+    it('restorePinnedCoverFaces re-applies after clearAllPeople + reassign', () => {
+        const did = downloadId();
+        const pid = api.insertPerson({
+            label: 'Keep',
+            centroidBlob: f32Blob([1, 0, 0]),
+            faceCount: 1,
+        });
+        const fid = api.insertFace({
+            downloadId: did,
+            x: 0,
+            y: 0,
+            w: 50,
+            h: 50,
+            embeddingBlob: f32Blob([1, 0, 0]),
+            personId: pid,
+            qualityScore: 0.5,
+        }).lastInsertRowid;
+        api.setPersonCoverFace(pid, fid);
+        const snap = api.listPinnedCoverFaceIds();
+        expect(snap).toEqual([fid]);
+
+        api.clearAllPeople();
+        const newPid = api.insertPerson({
+            label: 'Keep',
+            centroidBlob: f32Blob([1, 0, 0]),
+            faceCount: 1,
+        });
+        api.setFacePerson(fid, newPid);
+        expect(api.restorePinnedCoverFaces(snap)).toBe(1);
+        expect(api.listPeople({}).people[0].cover_face_id).toBe(fid);
+        expect(api.listPeople({}).people[0].id).toBe(newPid);
+    });
+
+    it('excludePerson uses pinned cover when set', () => {
+        const did = downloadId();
+        const pid = api.insertPerson({
+            label: 'PinnedEx',
+            centroidBlob: f32Blob([0, 1, 0]),
+            faceCount: 2,
+        });
+        const fLow = api.insertFace({
+            downloadId: did,
+            x: 0,
+            y: 0,
+            w: 30,
+            h: 30,
+            embeddingBlob: f32Blob([0, 1, 0]),
+            personId: pid,
+            qualityScore: 0.1,
+        }).lastInsertRowid;
+        api.insertFace({
+            downloadId: did,
+            x: 0,
+            y: 0,
+            w: 90,
+            h: 90,
+            embeddingBlob: f32Blob([0.01, 0.99, 0]),
+            personId: pid,
+            qualityScore: 0.95,
+        });
+        api.setPersonCoverFace(pid, fLow);
+        const r = api.excludePerson(pid);
+        expect(r.ok).toBe(true);
+        expect(r.coverFaceId).toBe(fLow);
+        expect(api.listExcludedPeople({}).excluded[0].cover_face_id).toBe(fLow);
+    });
+});

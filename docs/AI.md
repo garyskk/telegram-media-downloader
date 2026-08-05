@@ -667,6 +667,7 @@ All endpoints are admin-only.
 | GET    | `/api/ai/people/excluded`           | durable exclusion denylist (`{ excluded, total }`)     |
 | GET    | `/api/ai/people/:id/photos`         | paginated photos in this cluster                       |
 | PATCH  | `/api/ai/people/:id`                | `{ label }` — rename                                   |
+| POST   | `/api/ai/people/:id/cover`          | `{ faceId }` — pin People avatar thumbnail             |
 | DELETE | `/api/ai/people/:id`                | temporary drop (faces unassigned; may reappear)        |
 | POST   | `/api/ai/people/:id/exclude`        | durable exclude — skipped by Phase B recluster         |
 | DELETE | `/api/ai/people/excluded/:id`       | un-exclude (next recluster may recreate)               |

@@ -435,6 +435,13 @@ function initSchema() {
     } catch {
         /* column already present */
     }
+    // Operator-pinned People avatar. When set and still belonging to this
+    // person, listPeople / person face crop use it instead of auto-pick.
+    try {
+        db.exec('ALTER TABLE people ADD COLUMN cover_face_id INTEGER');
+    } catch {
+        /* column already present */
+    }
     // v2.16 Phase 4 — peer_face_centroids. Stores the
     // average-of-cluster face vectors that paired peers push to us.
     // The label sync flow uses this to match an incoming "Bob" centroid
@@ -2761,15 +2768,98 @@ export function clearAllPeople() {
     tx();
 }
 
-export function insertPerson({ label = null, centroidBlob, faceCount = 0 }) {
+export function insertPerson({ label = null, centroidBlob, faceCount = 0, coverFaceId = null }) {
     const now = Date.now();
+    const cover =
+        coverFaceId == null || !Number.isFinite(Number(coverFaceId)) || Number(coverFaceId) <= 0
+            ? null
+            : Number(coverFaceId);
     const r = getDb()
         .prepare(`
-        INSERT INTO people (label, embedding_centroid, face_count, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO people (label, embedding_centroid, face_count, created_at, updated_at, cover_face_id)
+        VALUES (?, ?, ?, ?, ?, ?)
     `)
-        .run(label, centroidBlob, Math.max(0, Number(faceCount) || 0), now, now);
+        .run(label, centroidBlob, Math.max(0, Number(faceCount) || 0), now, now, cover);
     return r.lastInsertRowid;
+}
+
+/**
+ * Pin a face as this person's People avatar. Face must belong to the person.
+ * @returns {{ ok: true, coverFaceId: number }
+ *   | { ok: false, reason: 'invalid_id'|'person_not_found'|'face_not_found'|'mismatch' }}
+ */
+export function setPersonCoverFace(personId, faceId) {
+    const pid = Number(personId);
+    const fid = Number(faceId);
+    if (!Number.isFinite(pid) || pid <= 0 || !Number.isFinite(fid) || fid <= 0) {
+        return { ok: false, reason: 'invalid_id' };
+    }
+    const db = getDb();
+    const person = db.prepare('SELECT id FROM people WHERE id = ?').get(pid);
+    if (!person) return { ok: false, reason: 'person_not_found' };
+    const face = db.prepare('SELECT id, person_id FROM faces WHERE id = ?').get(fid);
+    if (!face) return { ok: false, reason: 'face_not_found' };
+    if (Number(face.person_id) !== pid) return { ok: false, reason: 'mismatch' };
+    db.prepare('UPDATE people SET cover_face_id = ?, updated_at = ? WHERE id = ?').run(
+        fid,
+        Date.now(),
+        pid,
+    );
+    return { ok: true, coverFaceId: fid };
+}
+
+/** Clear a pinned cover so avatar falls back to auto-pick. */
+export function clearPersonCoverFace(personId) {
+    const pid = Number(personId);
+    if (!Number.isFinite(pid) || pid <= 0) return 0;
+    return getDb()
+        .prepare('UPDATE people SET cover_face_id = NULL, updated_at = ? WHERE id = ?')
+        .run(Date.now(), pid).changes;
+}
+
+/**
+ * Snapshot pinned cover face ids before clearAllPeople (Phase B).
+ * @returns {number[]}
+ */
+export function listPinnedCoverFaceIds() {
+    const rows = getDb()
+        .prepare(
+            `SELECT cover_face_id FROM people
+              WHERE cover_face_id IS NOT NULL`,
+        )
+        .all();
+    return rows
+        .map((r) => Number(r.cover_face_id))
+        .filter((id) => Number.isFinite(id) && id > 0);
+}
+
+/**
+ * After Phase B reassigns faces, re-apply pinned covers onto the people
+ * that now own those face rows.
+ * @param {Iterable<number>} faceIds
+ * @returns {number} how many people updated
+ */
+export function restorePinnedCoverFaces(faceIds) {
+    const ids = [...new Set([...faceIds].map(Number).filter((id) => Number.isFinite(id) && id > 0))];
+    if (!ids.length) return 0;
+    const db = getDb();
+    const find = db.prepare('SELECT person_id FROM faces WHERE id = ?');
+    const upd = db.prepare(
+        'UPDATE people SET cover_face_id = ?, updated_at = ? WHERE id = ?',
+    );
+    let n = 0;
+    const now = Date.now();
+    const tx = db.transaction(() => {
+        for (const fid of ids) {
+            const row = find.get(fid);
+            const pid = row?.person_id != null ? Number(row.person_id) : null;
+            if (!pid) continue;
+            upd.run(fid, now, pid);
+            n += 1;
+        }
+    });
+    tx();
+    return n;
 }
 
 export function listPeople({ limit = 500, offset = 0 } = {}) {
@@ -2809,7 +2899,10 @@ export function listPeople({ limit = 500, offset = 0 } = {}) {
               JOIN downloads dff ON dff.id = ff.download_id
              WHERE ff.person_id = p.id
                AND (dff.user_deleted IS NULL OR dff.user_deleted = 0)
-             ORDER BY COALESCE(ff.quality_score, 0) DESC, ff.w * ff.h DESC
+             ORDER BY
+               CASE WHEN p.cover_face_id IS NOT NULL AND ff.id = p.cover_face_id THEN 0 ELSE 1 END,
+               COALESCE(ff.quality_score, 0) DESC,
+               ff.w * ff.h DESC
              LIMIT 1
           )
          WHERE (
@@ -2862,24 +2955,39 @@ export function excludePerson(id) {
     if (!Number.isFinite(pid) || pid <= 0) return { ok: false, reason: 'invalid_id' };
     const db = getDb();
     const person = db
-        .prepare('SELECT id, label, embedding_centroid FROM people WHERE id = ?')
+        .prepare('SELECT id, label, embedding_centroid, cover_face_id FROM people WHERE id = ?')
         .get(pid);
     if (!person || !person.embedding_centroid) return { ok: false, reason: 'not_found' };
-    // Same cover pick as listPeople / person avatar — highest quality, then
-    // largest bbox. Stored so the Excluded UI can show a face after the
-    // people row is gone (faces.person_id becomes NULL).
-    const cover = db
-        .prepare(
-            `SELECT f.id AS face_id
-               FROM faces f
-               JOIN downloads d ON d.id = f.download_id
-              WHERE f.person_id = ?
-                AND (d.user_deleted IS NULL OR d.user_deleted = 0)
-              ORDER BY COALESCE(f.quality_score, 0) DESC, f.w * f.h DESC
-              LIMIT 1`,
-        )
-        .get(pid);
-    const coverFaceId = cover?.face_id != null ? Number(cover.face_id) : null;
+    // Prefer operator-pinned cover when it still belongs to this person;
+    // otherwise same auto-pick as listPeople / person avatar.
+    let coverFaceId = null;
+    if (person.cover_face_id != null) {
+        const pinned = db
+            .prepare(
+                `SELECT f.id AS face_id
+                   FROM faces f
+                   JOIN downloads d ON d.id = f.download_id
+                  WHERE f.id = ?
+                    AND f.person_id = ?
+                    AND (d.user_deleted IS NULL OR d.user_deleted = 0)`,
+            )
+            .get(Number(person.cover_face_id), pid);
+        if (pinned?.face_id != null) coverFaceId = Number(pinned.face_id);
+    }
+    if (coverFaceId == null) {
+        const cover = db
+            .prepare(
+                `SELECT f.id AS face_id
+                   FROM faces f
+                   JOIN downloads d ON d.id = f.download_id
+                  WHERE f.person_id = ?
+                    AND (d.user_deleted IS NULL OR d.user_deleted = 0)
+                  ORDER BY COALESCE(f.quality_score, 0) DESC, f.w * f.h DESC
+                  LIMIT 1`,
+            )
+            .get(pid);
+        coverFaceId = cover?.face_id != null ? Number(cover.face_id) : null;
+    }
     const tx = db.transaction(() => {
         const ins = db
             .prepare(
