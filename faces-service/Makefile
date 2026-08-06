@@ -11,9 +11,9 @@
 #   make docker-arm64        Build linux/arm64 image (Dockerfile.arm64, needs buildx)
 #
 # Dev targets:
-#   make install             pip install -e . (CPU variant)
-#   make install-gpu         pip install -e .[gpu]
-#   make install-directml    pip install -e .[directml]
+#   make install             uv sync (CPU variant)
+#   make install-gpu         uv sync --extra gpu
+#   make install-directml    uv sync --extra directml
 #   make test                Run the test suite (pytest)
 #   make check               Run biome-style linting via ruff (if installed)
 
@@ -25,16 +25,16 @@
 # ── Installation ─────────────────────────────────────────────────────────────
 
 install:
-	pip install -e .
+	uv sync
 
 install-gpu:
-	pip install -e .[gpu]
+	uv sync --extra gpu
 
 install-directml:
-	pip install -e .[directml]
+	uv sync --extra directml
 
 install-openvino:
-	pip install -e .[openvino]
+	uv sync --extra openvino
 
 # ── PyInstaller binaries ──────────────────────────────────────────────────────
 
@@ -54,7 +54,7 @@ build-win-x64:
 # ── Docker images ─────────────────────────────────────────────────────────────
 
 docker-cpu:
-	docker build -f Dockerfile -t tgdl-faces:cpu .
+	./build.sh
 
 docker-cuda:
 	docker build -f Dockerfile.cuda -t tgdl-faces:cuda .
@@ -66,8 +66,8 @@ docker-arm64:
 # ── Tests ─────────────────────────────────────────────────────────────────────
 
 test:
-	pytest -v tests/
+	uv run pytest tests/
 
 check:
 	@command -v ruff >/dev/null 2>&1 && ruff check tgdl_faces/ tests/ || \
-	    echo "ruff not installed — skipping lint (pip install ruff)"
+	    echo "ruff not installed — skipping lint (uv add --group dev ruff)"

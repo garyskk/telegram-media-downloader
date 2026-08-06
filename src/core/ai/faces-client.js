@@ -23,6 +23,8 @@
 import { promises as fs } from 'fs';
 import { Buffer } from 'buffer';
 import { spawn } from 'child_process';
+import { randomUUID } from 'crypto';
+import { Agent } from 'undici';
 
 import { resolveFacesValue } from './faces-config.js';
 
@@ -35,6 +37,34 @@ const HEALTH_CACHE_TTL_MS_DEFAULT = 5000;
 const REQUEST_TIMEOUT_MS_DEFAULT = 60000;
 const MAX_RETRIES_DEFAULT = 3;
 const RETRY_BACKOFF_MS_DEFAULT = [300, 600, 1200];
+// Fixed floor for the primary sidecar video-detect request timeout — see
+// the comment at its use site in `detectFacesInVideo` for why this is a
+// fixed value rather than scaled by `max_frames`.
+const VIDEO_REQUEST_TIMEOUT_MS_FLOOR = 2 * 60 * 60 * 1000;
+
+// Node's built-in `fetch` (undici) enforces its own `headersTimeout` /
+// `bodyTimeout` — 300s each, hardcoded — independent of whatever
+// AbortController timeout we set below. A request that's still legitimately
+// in flight past 5 minutes gets killed by undici itself with a generic
+// "fetch failed" (no useful `cause`), even though our *intended* budget
+// (e.g. the 2h video-detect floor, or a scaled batch timeout) hasn't
+// elapsed. This used to never matter — every call comfortably finished
+// under 5 minutes — but duration-independent video sampling (§4.1) means
+// `/detect/video` can legitimately run for tens of minutes on a long or
+// dense video. Any fetch whose own timeout can exceed 300s MUST pass a
+// matching `dispatcher` or undici's ceiling silently wins first.
+// `undici` is a direct dependency (not just Node's bundled copy) because
+// the bundled copy's `Agent`/dispatcher classes aren't importable.
+const _dispatcherCache = new Map();
+function _dispatcherFor(timeoutMs) {
+    const ms = Math.max(1, timeoutMs | 0);
+    let agent = _dispatcherCache.get(ms);
+    if (!agent) {
+        agent = new Agent({ headersTimeout: ms, bodyTimeout: ms });
+        _dispatcherCache.set(ms, agent);
+    }
+    return agent;
+}
 
 // Mutable runtime knobs. Initialised from defaults; overridden by either:
 //   - `applyFacesCfg(resolvedCfg)` — called by faces-spawn at boot.
@@ -316,6 +346,7 @@ export async function detectFacesBatch(absPaths, cfg = {}, onLog = null, signal 
                 headers: { 'content-type': 'application/json' },
                 body: JSON.stringify(body),
                 signal: ctrl.signal,
+                dispatcher: _dispatcherFor(batchTimeoutMs),
             });
         } finally {
             clearTimeout(timer);
@@ -385,12 +416,26 @@ export async function detectFacesBatch(absPaths, cfg = {}, onLog = null, signal 
  * @param {string}    absPath absolute path to the video file
  * @param {object}    cfg     `advanced.ai` config slice
  * @param {function?} onLog   optional `({source, level, msg}) => void`
+ * @param {AbortSignal?} signal
+ * @param {function?} onVideoProgress optional `({path, frames_decoded,
+ *   total_frames, pct, elapsed_sec}) => void`, called roughly every
+ *   `videoProgressPollMs` while the request is in flight — see
+ *   docs/AI.md "video scan progress reporting". Best-effort: a poll
+ *   failure (network hiccup, sidecar too old to know `job_id`, or the
+ *   request already finished) never throws and never affects the
+ *   returned faces. Omit to skip polling entirely (zero extra requests).
  * @returns {Promise<Array | null>}
  *   `null` = sidecar error / file unresolvable
  *   `[]`   = processed but no faces found
  *   `[…]` = detected unique faces (one embedding per person per video)
  */
-export async function detectFacesInVideo(absPath, cfg = {}, onLog = null, signal = null) {
+export async function detectFacesInVideo(
+    absPath,
+    cfg = {},
+    onLog = null,
+    signal = null,
+    onVideoProgress = null,
+) {
     _bootstrapFromEnv();
     const url = getSidecarUrl();
     if (!url) {
@@ -399,6 +444,7 @@ export async function detectFacesInVideo(absPath, cfg = {}, onLog = null, signal
     }
 
     // Path mode already known to fail — skip straight to b64 fallback.
+    // (Progress polling isn't wired for the b64 fallback — see docs/AI.md.)
     if (_pathRejectedLogged) {
         return _detectVideoB64Fallback(absPath, cfg, url, onLog, signal);
     }
@@ -410,89 +456,175 @@ export async function detectFacesInVideo(absPath, cfg = {}, onLog = null, signal
         Array.isArray(facesCfg.arRange) && facesCfg.arRange.length === 2
             ? facesCfg.arRange
             : [0.5, 2.0];
-    const maxFrames = _pickNumber([facesCfg.videoMaxFrames, cfg?.videoMaxFrames], 120);
+    // `videoMaxFrames` is a pure runaway-safety ceiling (§4.1/§5/§6), not a
+    // density control or a frame-count estimate — resolved the same way as
+    // every other faces.* knob (env > config > default) instead of the old
+    // ad-hoc direct-property read.
+    const maxFrames = _pickNumber(
+        [resolveFacesValue('videoMaxFrames', facesCfg), cfg?.videoMaxFrames],
+        20000,
+    );
+    const videoNice = Math.max(
+        0,
+        Math.min(
+            19,
+            _pickNumber([resolveFacesValue('videoNice', facesCfg), facesCfg.videoNice], 0) | 0,
+        ),
+    );
+
+    // A `job_id` is only generated (and only sent to the sidecar) when the
+    // caller actually wants progress updates — an older/simpler caller that
+    // doesn't pass `onVideoProgress` gets the exact previous wire format.
+    const jobId = typeof onVideoProgress === 'function' ? randomUUID() : null;
 
     const body = {
         path: absPath,
         min_score: minScore,
         min_box_px: minBoxPx,
         ar_range: arRange,
-        max_frames: Math.max(1, Math.min(500, maxFrames)),
+        max_frames: Math.max(1, Math.min(200_000, maxFrames)),
+        // Always send so dashboard videoNice=0 can override a sidecar
+        // TGDL_FACES_VIDEO_NICE env pin (request beats env on the Python side).
+        nice: videoNice,
+        ...(jobId ? { job_id: jobId } : {}),
     };
 
-    // Video detection is much slower than a single image — scale timeout
-    // by max_frames so a 2-hour video (120 frames) doesn't time out on
-    // slow CPU-only hardware.
-    const videoTimeoutMs = Math.max(body.max_frames * _requestTimeoutMs, 300_000);
+    // Video detection is much slower than a single image, and now that
+    // `max_frames` is a safety ceiling rather than a frame-count estimate
+    // (a video can legitimately take thousands of detection calls, §3/§6)
+    // it's no longer a sane timeout multiplier — scaling by it would turn
+    // a 20000 ceiling into a multi-day timeout. Use a fixed generous
+    // ceiling instead (2h — matches what the old 120-frame default already
+    // computed).
+    const videoTimeoutMs = Math.max(_requestTimeoutMs, VIDEO_REQUEST_TIMEOUT_MS_FLOOR);
 
-    let res;
-    try {
-        const ctrl = new AbortController();
-        const timer = setTimeout(() => ctrl.abort(), videoTimeoutMs);
-        if (signal) {
-            if (signal.aborted) ctrl.abort();
-            else signal.addEventListener('abort', () => ctrl.abort(), { once: true });
-        }
-        try {
-            res = await globalThis.fetch(`${url}/detect/video`, {
-                method: 'POST',
-                headers: { 'content-type': 'application/json' },
-                body: JSON.stringify(body),
-                signal: ctrl.signal,
-            });
-        } finally {
-            clearTimeout(timer);
-        }
-    } catch (e) {
-        _log(
-            onLog,
-            'warn',
-            `detectFacesInVideo: network error for ${absPath} — ${e?.message || e}`,
+    // Poll GET /detect/video/status/{job_id} on a short interval for the
+    // whole lifetime of the main request — cleared in the `finally` below
+    // no matter which path the main request exits through.
+    let pollTimer = null;
+    if (jobId) {
+        const pollMs = Math.max(
+            1000,
+            _pickNumber(
+                [resolveFacesValue('videoProgressPollMs', facesCfg), cfg?.videoProgressPollMs],
+                5000,
+            ),
         );
-        return null;
+        const pollState = { inFlight: false };
+        pollTimer = setInterval(
+            () => _pollVideoProgress(url, jobId, absPath, onVideoProgress, pollState),
+            pollMs,
+        );
     }
 
-    if (res.status === 403) {
-        let code = null;
-        try {
-            const body = await res.clone().json();
-            code = body?.code || null;
-        } catch {}
-        if (code === 'path_not_allowed') {
-            if (!_pathRejectedLogged) {
-                _log(
-                    onLog,
-                    'info',
-                    'video path mode rejected by sidecar; switching to b64 fallback for all files',
-                );
-                _pathRejectedLogged = true;
-            }
-            return _detectVideoB64Fallback(absPath, cfg, url, onLog, signal);
-        }
-        _log(onLog, 'warn', `detectFacesInVideo: sidecar returned 403 for ${absPath}`);
-        return null;
-    }
-
-    if (!res.ok) {
-        _log(onLog, 'warn', `detectFacesInVideo: sidecar returned ${res.status} for ${absPath}`);
-        return null;
-    }
-
-    let resBody;
     try {
-        resBody = await res.json();
-    } catch (e) {
-        _log(onLog, 'warn', `detectFacesInVideo: invalid JSON from sidecar: ${e?.message || e}`);
-        return null;
-    }
+        let res;
+        try {
+            const ctrl = new AbortController();
+            const timer = setTimeout(() => ctrl.abort(), videoTimeoutMs);
+            if (signal) {
+                if (signal.aborted) ctrl.abort();
+                else signal.addEventListener('abort', () => ctrl.abort(), { once: true });
+            }
+            try {
+                res = await globalThis.fetch(`${url}/detect/video`, {
+                    method: 'POST',
+                    headers: { 'content-type': 'application/json' },
+                    body: JSON.stringify(body),
+                    signal: ctrl.signal,
+                    dispatcher: _dispatcherFor(videoTimeoutMs),
+                });
+            } finally {
+                clearTimeout(timer);
+            }
+        } catch (e) {
+            _log(
+                onLog,
+                'warn',
+                `detectFacesInVideo: network error for ${absPath} — ${e?.message || e}`,
+            );
+            return null;
+        }
 
-    if (resBody?.error) {
-        const lvl = resBody.error === 'file_not_found' ? 'warn' : 'info';
-        _log(onLog, lvl, `detectFacesInVideo ${absPath}: sidecar soft-error="${resBody.error}"`);
-        return [];
-    }
+        if (res.status === 403) {
+            let code = null;
+            try {
+                const body = await res.clone().json();
+                code = body?.code || null;
+            } catch {}
+            if (code === 'path_not_allowed') {
+                if (!_pathRejectedLogged) {
+                    _log(
+                        onLog,
+                        'info',
+                        'video path mode rejected by sidecar; switching to b64 fallback for all files',
+                    );
+                    _pathRejectedLogged = true;
+                }
+                return _detectVideoB64Fallback(absPath, cfg, url, onLog, signal);
+            }
+            _log(onLog, 'warn', `detectFacesInVideo: sidecar returned 403 for ${absPath}`);
+            return null;
+        }
 
-    return _parseFacesList(Array.isArray(resBody?.faces) ? resBody.faces : []);
+        if (!res.ok) {
+            _log(
+                onLog,
+                'warn',
+                `detectFacesInVideo: sidecar returned ${res.status} for ${absPath}`,
+            );
+            return null;
+        }
+
+        let resBody;
+        try {
+            resBody = await res.json();
+        } catch (e) {
+            _log(
+                onLog,
+                'warn',
+                `detectFacesInVideo: invalid JSON from sidecar: ${e?.message || e}`,
+            );
+            return null;
+        }
+
+        if (resBody?.error) {
+            const lvl = resBody.error === 'file_not_found' ? 'warn' : 'info';
+            _log(
+                onLog,
+                lvl,
+                `detectFacesInVideo ${absPath}: sidecar soft-error="${resBody.error}"`,
+            );
+            return [];
+        }
+
+        return _parseFacesList(Array.isArray(resBody?.faces) ? resBody.faces : []);
+    } finally {
+        if (pollTimer) clearInterval(pollTimer);
+    }
+}
+
+/**
+ * One progress-poll tick for `detectFacesInVideo`. Fire-and-forget from a
+ * `setInterval` callback (never awaited by the caller) — `pollState.inFlight`
+ * skips a tick if the previous poll is still in flight (e.g. a slow/stalled
+ * sidecar), so overlapping GETs can't pile up. Any failure — network error,
+ * non-2xx (404 once the job is done, or a sidecar too old to know `job_id`),
+ * invalid JSON — is swallowed: this is best-effort telemetry only.
+ */
+async function _pollVideoProgress(url, jobId, absPath, onVideoProgress, pollState) {
+    if (pollState.inFlight) return;
+    pollState.inFlight = true;
+    try {
+        const res = await _fetchWithTimeout(`${url}/detect/video/status/${jobId}`);
+        if (!res || !res.ok) return;
+        const p = await res.json();
+        onVideoProgress({ path: absPath, ...p });
+    } catch {
+        // best-effort telemetry — never propagate.
+    } finally {
+        pollState.inFlight = false;
+    }
 }
 
 async function _sendB64(absPath, baseBody, url, onLog) {
@@ -590,9 +722,14 @@ function _parseFacesList(faces) {
                 h: Number(f.h) || 0,
                 score: Number.isFinite(f.score) ? Number(f.score) : 0,
                 qualityScore: Number.isFinite(f.quality_score) ? Number(f.quality_score) : null,
+                landmarkRegularity: Number.isFinite(f.landmark_regularity)
+                    ? Number(f.landmark_regularity)
+                    : 0.5,
                 embedding: emb,
             };
             if (f.landmarks != null) out.landmarks = f.landmarks;
+            const fts = f.frame_time_sec ?? f.frameTimeSec;
+            if (Number.isFinite(fts) && fts >= 0) out.frameTimeSec = Number(fts);
             return out;
         })
         .filter(Boolean);
@@ -700,7 +837,11 @@ async function _fetchWithTimeout(url, init = {}) {
         }
     }, _requestTimeoutMs);
     try {
-        return await globalThis.fetch(url, { ...init, signal: ctrl.signal });
+        return await globalThis.fetch(url, {
+            ...init,
+            signal: ctrl.signal,
+            dispatcher: _dispatcherFor(_requestTimeoutMs),
+        });
     } finally {
         clearTimeout(timer);
     }
@@ -741,131 +882,271 @@ async function _resolveFfmpegForFaces() {
     return _ffmpegBin;
 }
 
+// Fixed sampling constants (docs/requirements.md §4.5 — the Node mirror of
+// the Python §4.1 sampler). Deliberately NOT scaled by video duration.
+//
+//   DEFAULT_FLOOR_INTERVAL_SEC mirrors Python's constant of the same name
+//                              (faces-service/tgdl_faces/io.py) — backstop
+//                              for stretches where nothing ever triggers
+//                              motion, not the primary recall mechanism.
+//   DEFAULT_SCENE_THRESHOLD    is ffmpeg's own normalised (0..1) `scene`
+//                              score, NOT the same scale as Python's 0-255
+//                              luma-diff `motion_threshold` — the two
+//                              detectors use different metrics, so this is
+//                              tuned independently. Most in need of
+//                              empirical tuning, like its Python cousin.
+const DEFAULT_FLOOR_INTERVAL_SEC = 3.0;
+const DEFAULT_SCENE_THRESHOLD = 0.1;
+// Pure runaway-safety ceiling (mirrors Python's TGDL_FACES_VIDEO_MAX_FRAMES
+// default) — not a density control, should never bind on a real video.
+const MAX_FRAMES_SAFETY_CEILING = 20000;
+
+const JPEG_SOI = Buffer.from([0xff, 0xd8]);
+const JPEG_EOI = Buffer.from([0xff, 0xd9]);
+
 /**
- * Extract evenly-spaced JPEG frames from a video using ffmpeg.
- * Returns an array of Buffer (raw JPEG bytes) for each frame.
- * Mirrors the Python sidecar's `extract_video_frames` logic.
+ * Stream content-adaptive JPEG frames from a video via one continuous
+ * ffmpeg process — no per-frame process spawn, no `-ss` seeking (replaces
+ * the old evenly-spaced-seek implementation; see docs/requirements.md
+ * §4.5, the Node mirror of the Python §4.1 sampler).
+ *
+ * A single `select` filter combines both triggers using ffmpeg's
+ * `prev_selected_t` variable so one filter graph does the job of the
+ * Python sampler's window/floor/motion logic:
+ *   - `isnan(prev_selected_t)`                        — always keep frame 0.
+ *   - `gte(t-prev_selected_t, floorIntervalSec)`       — duration-independent
+ *     floor: keep a frame once this much time has passed with nothing else
+ *     triggering, regardless of video length.
+ *   - `gt(scene, sceneThreshold)`                      — ffmpeg's built-in
+ *     scene-change score; the motion-triggered component.
+ *
+ * This is an async generator: it yields raw JPEG `Buffer`s in temporal
+ * order as they're parsed out of the `mjpeg`/`image2pipe` byte stream, so
+ * a caller can process-and-discard each frame as it arrives instead of
+ * buffering the whole video in memory (mirrors the Python streaming
+ * pipeline, §4.2).
  */
-async function _extractVideoFrames(absPath, maxFrames, onLog) {
+async function* _extractVideoFrames(absPath, onLog, opts = {}) {
+    const floorIntervalSec = opts.floorIntervalSec ?? DEFAULT_FLOOR_INTERVAL_SEC;
+    const sceneThreshold = opts.sceneThreshold ?? DEFAULT_SCENE_THRESHOLD;
+    const maxFramesCeiling = opts.maxFramesCeiling ?? MAX_FRAMES_SAFETY_CEILING;
     const bin = await _resolveFfmpegForFaces();
 
-    // Step 1: get video duration via ffprobe-style ffmpeg output
-    const duration = await new Promise((resolve) => {
-        const args = ['-hide_banner', '-i', absPath, '-f', 'null', '-'];
-        const proc = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
-        let stderr = '';
-        proc.stderr.on('data', (d) => {
-            stderr += d.toString();
-        });
-        proc.on('close', () => {
-            const m = stderr.match(/Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/);
-            if (m) {
-                resolve(Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]));
-            } else {
-                resolve(0);
-            }
-        });
-        proc.on('error', () => resolve(0));
-    });
+    const selectExpr =
+        `isnan(prev_selected_t)+gte(t-prev_selected_t\\,${floorIntervalSec})` +
+        `+gt(scene\\,${sceneThreshold})`;
+    const args = [
+        '-hide_banner',
+        '-loglevel',
+        'error',
+        '-i',
+        absPath,
+        '-vf',
+        `select='${selectExpr}'`,
+        '-vsync',
+        '0',
+        '-f',
+        'image2pipe',
+        '-c:v',
+        'mjpeg',
+        '-q:v',
+        '3',
+        'pipe:1',
+    ];
 
-    if (duration <= 0) {
-        _log(onLog, 'warn', `video b64 fallback: could not determine duration for ${absPath}`);
-        return [];
-    }
-
-    // Step 2: compute seek positions (evenly spaced, skip first/last 0.5s)
-    const start = Math.min(0.5, duration * 0.05);
-    const end = Math.max(duration - 0.5, duration * 0.95);
-    const span = end - start;
-    const nFrames = Math.min(maxFrames, Math.max(1, Math.floor(duration)));
-    const positions = [];
-    if (nFrames === 1) {
-        positions.push(start + span / 2);
-    } else {
-        for (let i = 0; i < nFrames; i++) {
-            positions.push(start + (span * i) / (nFrames - 1));
-        }
-    }
-
-    // Step 3: extract frames in parallel (batches of 6 to avoid fd exhaustion)
-    function _extractOne(pos) {
-        return new Promise((resolve) => {
-            const args = [
-                '-hide_banner',
-                '-loglevel',
-                'error',
-                '-ss',
-                String(pos),
-                '-i',
-                absPath,
-                '-frames:v',
-                '1',
-                '-f',
-                'image2',
-                '-c:v',
-                'mjpeg',
-                '-q:v',
-                '3',
-                'pipe:1',
-            ];
-            const proc = spawn(bin, args, {
+    let proc;
+    try {
+        const nice = Math.max(0, opts.nice ?? 0) | 0;
+        if (nice > 0 && process.platform !== 'win32') {
+            proc = spawn('nice', ['-n', String(Math.min(19, nice)), bin, ...args], {
                 stdio: ['ignore', 'pipe', 'ignore'],
                 windowsHide: true,
             });
-            const chunks = [];
-            proc.stdout.on('data', (d) => chunks.push(d));
-            proc.on('close', (code) => {
-                if (code === 0 && chunks.length) {
-                    resolve(Buffer.concat(chunks));
-                } else {
-                    resolve(null);
-                }
-            });
-            proc.on('error', () => resolve(null));
-        });
+        } else {
+            proc = spawn(bin, args, { stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true });
+        }
+    } catch (e) {
+        _log(onLog, 'warn', `video b64 fallback: failed to spawn ffmpeg — ${e?.message || e}`);
+        return;
     }
+    proc.on('error', (e) => {
+        _log(onLog, 'warn', `video b64 fallback: ffmpeg process error — ${e?.message || e}`);
+    });
 
-    const EXTRACT_PARALLEL = 6;
-    const frames = [];
-    for (let i = 0; i < positions.length; i += EXTRACT_PARALLEL) {
-        const batch = positions.slice(i, i + EXTRACT_PARALLEL);
-        const results = await Promise.all(batch.map(_extractOne));
-        for (const buf of results) {
-            if (buf) frames.push(buf);
+    let buf = Buffer.alloc(0);
+    let yielded = 0;
+    try {
+        for await (const chunk of proc.stdout) {
+            buf = buf.length ? Buffer.concat([buf, chunk]) : chunk;
+            let popped;
+            while ((popped = _popJpegFrame(buf))) {
+                buf = popped.rest;
+                yield popped.bytes;
+                if (++yielded >= maxFramesCeiling) return;
+            }
+        }
+    } catch (e) {
+        _log(onLog, 'warn', `video b64 fallback: ffmpeg stream read error — ${e?.message || e}`);
+    } finally {
+        try {
+            proc.kill('SIGKILL');
+        } catch {
+            /* process may have already exited */
         }
     }
-    return frames;
+}
+
+/** Pop one complete JPEG frame (SOI..EOI) off the front of `buf`, if any. */
+function _popJpegFrame(buf) {
+    const soi = buf.indexOf(JPEG_SOI);
+    if (soi === -1) return null;
+    const eoi = buf.indexOf(JPEG_EOI, soi + 2);
+    if (eoi === -1) return null;
+    return { bytes: buf.subarray(soi, eoi + 2), rest: buf.subarray(eoi + 2) };
+}
+
+// Track-confirmation thresholds — JS port of the Python `_build_face_tracks`
+// (faces-service/tgdl_faces/app.py) per docs/requirements.md §4.4. Keep
+// both in sync: same thresholds, same track-matching logic. Unlike
+// `videoFloorIntervalSec`/`videoMaxFrames` (wired through faces-config.js
+// in Phase 4), these have no matching Node config key by design (§5's
+// table only lists Python env vars for them) — they stay fixed constants.
+const TRACK_MATCH_THRESHOLD = 0.5; // unchanged from the old greedy dedup
+const TRACK_MAX_REPRESENTATIVES = 3;
+const TRACK_POSE_DEDUP_THRESHOLD = 0.85;
+const SINGLETON_MIN_SCORE = 0.75;
+const SINGLETON_MIN_QUALITY = 0.55;
+const CONFIRMED_MIN_QUALITY = 0.45;
+const CONFIRMED_MIN_SCORE = 0.6;
+const MIN_LANDMARK_REGULARITY = 0.35;
+
+/**
+ * Merge per-frame detections into per-identity tracks and return the
+ * faces worth keeping — JS port of the Python `_build_face_tracks`
+ * (§4.4). Replaces the old greedy `_dedupeVideoFaces` (single
+ * "keep highest score" per identity, no temporal-confirmation/quality
+ * distinction).
+ *
+ * `framesFaces` is one detection array per *sampled frame*, in temporal
+ * order (not a flat array) — this is what lets a track's hit-count
+ * reflect "how many distinct frames corroborated this identity" rather
+ * than a raw detection count.
+ *
+ * - A track confirmed by >= 2 frames is kept only if at least one of its
+ *   faces clears `CONFIRMED_MIN_QUALITY` (0.45), `CONFIRMED_MIN_SCORE`
+ *   (0.60), and `MIN_LANDMARK_REGULARITY` (0.35) — defends against a
+ *   *systematic* false positive (the detector consistently misfiring on
+ *   the same non-face texture) that mere repetition would otherwise wave
+ *   through.
+ * - A track seen in exactly 1 frame is kept only if that face clears the
+ *   stricter `SINGLETON_MIN_SCORE`/`SINGLETON_MIN_QUALITY` bars (0.75 /
+ *   0.55) plus the landmark regularity floor — otherwise dropped as
+ *   unconfirmed noise.
+ * - Confirmed tracks return up to 3 representative faces, see
+ *   `_selectDiverseRepresentatives`.
+ */
+function _dedupeVideoFaces(framesFaces) {
+    const tracks = []; // { faces: [], embSum: number[], hits: number }
+
+    for (const frameFaces of framesFaces) {
+        for (const face of frameFaces) {
+            const emb = face.embedding;
+            let bestI = -1;
+            let bestSim = -1;
+            for (let i = 0; i < tracks.length; i++) {
+                const tr = tracks[i];
+                const mean = _scaleVec(tr.embSum, 1 / Math.max(1, tr.hits));
+                const norm = Math.sqrt(_dotProduct(mean, mean));
+                const sim = norm > 1e-9 ? _dotProduct(emb, mean) / norm : -1;
+                if (sim > bestSim) {
+                    bestI = i;
+                    bestSim = sim;
+                }
+            }
+            if (bestI >= 0 && bestSim >= TRACK_MATCH_THRESHOLD) {
+                const tr = tracks[bestI];
+                tr.faces.push(face);
+                tr.embSum = _addVec(tr.embSum, emb);
+                tr.hits += 1;
+            } else {
+                tracks.push({ faces: [face], embSum: Array.from(emb), hits: 1 });
+            }
+        }
+    }
+
+    const kept = [];
+    for (const tr of tracks) {
+        const faces = tr.faces;
+        if (tr.hits >= 2) {
+            const bestQuality = Math.max(...faces.map((f) => _qualityOf(f)));
+            const bestScore = Math.max(...faces.map((f) => f.score || 0));
+            const bestRegularity = Math.max(...faces.map((f) => _regularityOf(f)));
+            if (
+                bestQuality < CONFIRMED_MIN_QUALITY ||
+                bestScore < CONFIRMED_MIN_SCORE ||
+                bestRegularity < MIN_LANDMARK_REGULARITY
+            ) {
+                continue;
+            }
+            kept.push(
+                ..._selectDiverseRepresentatives(faces, TRACK_MAX_REPRESENTATIVES, {
+                    minQuality: CONFIRMED_MIN_QUALITY,
+                    minScore: CONFIRMED_MIN_SCORE,
+                    minRegularity: MIN_LANDMARK_REGULARITY,
+                }),
+            );
+        } else {
+            const face = faces[0];
+            if (
+                face.score >= SINGLETON_MIN_SCORE &&
+                _qualityOf(face) >= SINGLETON_MIN_QUALITY &&
+                _regularityOf(face) >= MIN_LANDMARK_REGULARITY
+            ) {
+                kept.push(face);
+            }
+        }
+    }
+    return kept;
+}
+
+function _qualityOf(face) {
+    return Number.isFinite(face.qualityScore) ? face.qualityScore : 0;
+}
+
+function _regularityOf(face) {
+    return Number.isFinite(face.landmarkRegularity) ? face.landmarkRegularity : 0.5;
 }
 
 /**
- * Deduplicate faces across video frames. Keeps the highest-score face
- * per identity (cosine similarity >= 0.50 threshold on L2-normalised
- * embeddings). Mirrors Python's `_dedupe_video_faces`.
+ * Pick up to `limit` faces from one confirmed track, highest score first,
+ * skipping any pose that's a near-duplicate (cosine similarity >= 0.85) of
+ * an already-kept face — preserves angle/pose diversity instead of
+ * collapsing the whole track down to one embedding.
+ *
+ * Only faces clearing `minQuality`, `minScore`, and `minRegularity` are
+ * eligible — weaker frames in an admitted track are dropped here.
  */
-function _dedupeVideoFaces(allFaces) {
-    const THRESHOLD = 0.5;
-    const uniqueEmbs = [];
-    const uniqueFaces = [];
-    for (const face of allFaces) {
+function _selectDiverseRepresentatives(faces, limit = TRACK_MAX_REPRESENTATIVES, floors = {}) {
+    const minQuality = floors.minQuality ?? 0;
+    const minScore = floors.minScore ?? 0;
+    const minRegularity = floors.minRegularity ?? 0;
+    const eligible = faces.filter(
+        (f) =>
+            _qualityOf(f) >= minQuality &&
+            (f.score || 0) >= minScore &&
+            _regularityOf(f) >= minRegularity,
+    );
+    const ordered = [...eligible].sort((a, b) => b.score - a.score);
+    const kept = [];
+    const keptEmbs = [];
+    for (const face of ordered) {
         const emb = face.embedding;
-        let matched = false;
-        for (let i = 0; i < uniqueEmbs.length; i++) {
-            const dot = _dotProduct(emb, uniqueEmbs[i]);
-            if (dot >= THRESHOLD) {
-                if (face.score > uniqueFaces[i].score) {
-                    uniqueEmbs[i] = emb;
-                    uniqueFaces[i] = face;
-                }
-                matched = true;
-                break;
-            }
-        }
-        if (!matched) {
-            uniqueEmbs.push(emb);
-            uniqueFaces.push(face);
-        }
+        if (keptEmbs.some((k) => _dotProduct(emb, k) >= TRACK_POSE_DEDUP_THRESHOLD)) continue;
+        kept.push(face);
+        keptEmbs.push(emb);
+        if (kept.length >= limit) break;
     }
-    return uniqueFaces;
+    return kept;
 }
 
 function _dotProduct(a, b) {
@@ -875,153 +1156,208 @@ function _dotProduct(a, b) {
     return sum;
 }
 
+function _addVec(a, b) {
+    const out = new Array(a.length);
+    for (let i = 0; i < a.length; i++) out[i] = a[i] + b[i];
+    return out;
+}
+
+function _scaleVec(a, s) {
+    const out = new Array(a.length);
+    for (let i = 0; i < a.length; i++) out[i] = a[i] * s;
+    return out;
+}
+
 /**
- * Video b64 fallback: extract frames locally with ffmpeg, send as a
- * batch to the sidecar's /detect/batch-b64 endpoint (GPU-pipelined),
- * then deduplicate. Falls back to one-by-one /detect if batch-b64 is
- * unavailable (older sidecar).
+ * Video b64 fallback: stream frames locally from ffmpeg (`_extractVideoFrames`)
+ * and dispatch each small window of frames to the sidecar as it fills
+ * (`_streamFramesToSidecar`), discarding raw JPEG bytes immediately after
+ * — mirrors the Python streaming pipeline (§4.2) so memory usage here
+ * doesn't scale with video length either. Then applies the same
+ * track-confirmation dedup (`_dedupeVideoFaces`, §4.4) as the primary
+ * sidecar path.
  */
 async function _detectVideoB64Fallback(absPath, cfg, url, onLog, signal) {
     const facesCfg = cfg?.faces || cfg || {};
-    const maxFrames = _pickNumber([facesCfg.videoMaxFrames, cfg?.videoMaxFrames], 120);
-    const capped = Math.max(1, Math.min(500, maxFrames));
-
-    _log(onLog, 'info', `video b64 fallback: extracting up to ${capped} frames from ${absPath}`);
-    const frames = await _extractVideoFrames(absPath, capped, onLog);
-    if (!frames.length) {
-        _log(onLog, 'warn', `video b64 fallback: no frames extracted for ${absPath}`);
-        return [];
-    }
-    _log(
-        onLog,
-        'info',
-        `video b64 fallback: extracted ${frames.length} frames, sending to sidecar`,
-    );
-
     const minScore = _pickNumber([cfg?.minDetectionScore, facesCfg.minDetectionScore], 0.5);
     const minBoxPx = _pickNumber([cfg?.minFaceSizePx, facesCfg.minFaceSizePx], 60);
     const arRange =
         Array.isArray(facesCfg.arRange) && facesCfg.arRange.length === 2
             ? facesCfg.arRange
             : [0.5, 2.0];
+    const floorIntervalSec = _pickNumber(
+        [resolveFacesValue('videoFloorIntervalSec', facesCfg)],
+        DEFAULT_FLOOR_INTERVAL_SEC,
+    );
+    const maxFramesCeiling = _pickNumber(
+        [resolveFacesValue('videoMaxFrames', facesCfg)],
+        MAX_FRAMES_SAFETY_CEILING,
+    );
+    const videoNice = Math.max(
+        0,
+        _pickNumber([resolveFacesValue('videoNice', facesCfg), facesCfg.videoNice], 0) | 0,
+    );
 
-    // Try batch-b64 endpoint (GPU-pipelined, much faster)
-    const allFaces = await _sendBatchB64(
-        frames,
+    _log(onLog, 'info', `video b64 fallback: streaming frames from ${absPath}`);
+    const frameGen = _extractVideoFrames(absPath, onLog, {
+        floorIntervalSec,
+        maxFramesCeiling,
+        nice: videoNice,
+    });
+    const framesFaces = await _streamFramesToSidecar(
+        frameGen,
         { minScore, minBoxPx, arRange },
         url,
         onLog,
         signal,
+        (sampleIdx) => sampleIdx * floorIntervalSec,
     );
-    return _dedupeVideoFaces(allFaces);
+
+    if (!framesFaces.length) {
+        _log(onLog, 'warn', `video b64 fallback: no frames extracted for ${absPath}`);
+        return [];
+    }
+    _log(onLog, 'info', `video b64 fallback: processed ${framesFaces.length} frames`);
+    return _dedupeVideoFaces(framesFaces);
 }
 
-const BATCH_B64_CHUNK = 30;
-const BATCH_B64_PARALLEL = 3;
+const STREAM_BATCH_SIZE = 8;
 
-async function _sendBatchB64(frames, { minScore, minBoxPx, arRange }, url, onLog, signal) {
-    // Split into chunks and send multiple chunks in parallel to keep GPU saturated
-    const chunks = [];
-    for (let start = 0; start < frames.length; start += BATCH_B64_CHUNK) {
-        chunks.push(frames.slice(start, start + BATCH_B64_CHUNK));
-    }
+/**
+ * Consume `frameGen` (an async-iterable of raw JPEG `Buffer`s — normally
+ * `_extractVideoFrames`'s generator) in small windows, sending each window
+ * to `/detect/batch-b64` as soon as it fills and discarding the raw bytes
+ * right after — peak memory is tied to `STREAM_BATCH_SIZE`, not to how
+ * many frames the video yields (§4.2). Falls back to sequential `/detect`
+ * per-frame the first time `/detect/batch-b64` turns out to be unavailable
+ * (404/405/network error — older sidecar).
+ *
+ * Returns `framesFaces`: one detection array per frame, in temporal order
+ * — the shape `_dedupeVideoFaces` expects.
+ */
+async function _streamFramesToSidecar(
+    frameGen,
+    opts,
+    url,
+    onLog,
+    signal,
+    frameTimeForSample = null,
+) {
+    const framesFaces = [];
+    let batch = [];
+    let batchB64Available = true;
+    let sampleIdx = 0;
 
-    const allFaces = [];
+    const tagFaces = (faces) => {
+        if (typeof frameTimeForSample !== 'function') return faces;
+        const t = frameTimeForSample(sampleIdx);
+        sampleIdx += 1;
+        if (!Number.isFinite(t) || t < 0) return faces;
+        return faces.map((f) => ({ ...f, frameTimeSec: t }));
+    };
 
-    async function _sendChunk(chunk) {
-        if (signal?.aborted) return [];
-        const body = {
-            images: chunk.map((buf) => buf.toString('base64')),
-            min_score: minScore,
-            min_box_px: minBoxPx,
-            ar_range: arRange,
-        };
-        const timeoutMs = Math.max(chunk.length * _requestTimeoutMs, 180_000);
-        const ctrl = new AbortController();
-        const timer = setTimeout(() => ctrl.abort(), timeoutMs);
-        if (signal) {
-            if (signal.aborted) ctrl.abort();
-            else signal.addEventListener('abort', () => ctrl.abort(), { once: true });
+    const flush = async () => {
+        if (!batch.length) return;
+        const toSend = batch;
+        batch = [];
+        if (batchB64Available) {
+            const result = await _sendBatchB64Chunk(toSend, opts, url, onLog, signal);
+            if (result !== null) {
+                for (const frameFaces of result) {
+                    framesFaces.push(tagFaces(frameFaces));
+                }
+                return;
+            }
+            batchB64Available = false;
+            _log(onLog, 'info', 'batch-b64 unavailable, falling back to sequential /detect');
         }
-        let res;
-        try {
-            res = await globalThis.fetch(`${url}/detect/batch-b64`, {
-                method: 'POST',
-                headers: { 'content-type': 'application/json' },
-                body: JSON.stringify(body),
-                signal: ctrl.signal,
-            });
-        } catch {
-            return null; // signal: endpoint not available
-        } finally {
-            clearTimeout(timer);
+        for (const buf of toSend) {
+            framesFaces.push(tagFaces(await _detectOneFrameB64(buf, opts, url, onLog)));
         }
-        if (res.status === 404 || res.status === 405) return null;
-        if (!res.ok) return [];
-        let resBody;
-        try {
-            resBody = await res.json();
-        } catch {
-            return [];
-        }
-        const faces = [];
-        for (const item of resBody?.results ?? []) {
-            if (item.error) continue;
-            const parsed = _parseFacesList(Array.isArray(item.faces) ? item.faces : []);
-            faces.push(...parsed);
-        }
-        return faces;
-    }
+    };
 
-    // Try first chunk to detect if batch-b64 is available
-    const firstResult = await _sendChunk(chunks[0]);
-    if (firstResult === null) {
-        _log(onLog, 'info', 'batch-b64 unavailable, falling back to sequential detect');
-        return _sendFramesSequential(frames, { minScore, minBoxPx, arRange }, url, onLog, signal);
-    }
-    allFaces.push(...firstResult);
-
-    // Send remaining chunks in parallel (pipeline: GPU processes chunk N while
-    // network transfers chunk N+1, keeping the GPU saturated)
-    const remaining = chunks.slice(1);
-    for (let i = 0; i < remaining.length; i += BATCH_B64_PARALLEL) {
+    for await (const frameBuf of frameGen) {
         if (signal?.aborted) break;
-        const batch = remaining.slice(i, i + BATCH_B64_PARALLEL);
-        const results = await Promise.all(batch.map((c) => _sendChunk(c)));
-        for (const r of results) {
-            if (r) allFaces.push(...r);
-        }
+        batch.push(frameBuf);
+        if (batch.length >= STREAM_BATCH_SIZE) await flush();
     }
-    return allFaces;
+    if (!signal?.aborted) await flush();
+    return framesFaces;
 }
 
-async function _sendFramesSequential(frames, { minScore, minBoxPx, arRange }, url, onLog, signal) {
-    const allFaces = [];
-    for (const frameBuf of frames) {
-        if (signal?.aborted) break;
-        const b64Body = {
-            image_b64: frameBuf.toString('base64'),
-            min_score: minScore,
-            min_box_px: minBoxPx,
-            ar_range: arRange,
-        };
-        let res;
-        try {
-            res = await _postWithRetry(`${url}/detect`, b64Body, onLog);
-        } catch {
-            continue;
-        }
-        if (!res || !res.ok) continue;
-        let resBody;
-        try {
-            resBody = await res.json();
-        } catch {
-            continue;
-        }
-        const parsed = _parseFacesList(Array.isArray(resBody?.faces) ? resBody.faces : []);
-        allFaces.push(...parsed);
+/**
+ * Send one window of raw JPEG frames to `/detect/batch-b64`. Returns
+ * `null` when the endpoint itself is unavailable (404/405/network error)
+ * — the caller's signal to switch to the sequential fallback — or an
+ * array of per-frame face arrays (same length/order as `chunk`) otherwise.
+ */
+async function _sendBatchB64Chunk(chunk, { minScore, minBoxPx, arRange }, url, onLog, signal) {
+    if (signal?.aborted) return chunk.map(() => []);
+    const body = {
+        images: chunk.map((buf) => buf.toString('base64')),
+        min_score: minScore,
+        min_box_px: minBoxPx,
+        ar_range: arRange,
+    };
+    const timeoutMs = Math.max(chunk.length * _requestTimeoutMs, 60_000);
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+    if (signal) {
+        if (signal.aborted) ctrl.abort();
+        else signal.addEventListener('abort', () => ctrl.abort(), { once: true });
     }
-    return allFaces;
+    let res;
+    try {
+        res = await globalThis.fetch(`${url}/detect/batch-b64`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify(body),
+            signal: ctrl.signal,
+            dispatcher: _dispatcherFor(timeoutMs),
+        });
+    } catch (e) {
+        _log(onLog, 'warn', `batch-b64 request failed — ${e?.message || e}`);
+        return null;
+    } finally {
+        clearTimeout(timer);
+    }
+    if (res.status === 404 || res.status === 405) return null;
+    if (!res.ok) return chunk.map(() => []);
+    let resBody;
+    try {
+        resBody = await res.json();
+    } catch {
+        return chunk.map(() => []);
+    }
+    const results = Array.isArray(resBody?.results) ? resBody.results : [];
+    return chunk.map((_buf, i) => {
+        const item = results[i];
+        if (!item || item.error) return [];
+        return _parseFacesList(Array.isArray(item.faces) ? item.faces : []);
+    });
+}
+
+async function _detectOneFrameB64(frameBuf, { minScore, minBoxPx, arRange }, url, onLog) {
+    const b64Body = {
+        image_b64: frameBuf.toString('base64'),
+        min_score: minScore,
+        min_box_px: minBoxPx,
+        ar_range: arRange,
+    };
+    let res;
+    try {
+        res = await _postWithRetry(`${url}/detect`, b64Body, onLog);
+    } catch {
+        return [];
+    }
+    if (!res || !res.ok) return [];
+    let resBody;
+    try {
+        resBody = await res.json();
+    } catch {
+        return [];
+    }
+    return _parseFacesList(Array.isArray(resBody?.faces) ? resBody.faces : []);
 }
 
 /** Test-only: clear cached URL + health probe so each spec starts fresh. */
@@ -1037,6 +1373,7 @@ export function _resetForTests() {
     _envBootstrapped = false;
     _pathRejectedLogged = false;
     _ffmpegBin = null;
+    _dispatcherCache.clear();
 }
 
 /** Test-only: snapshot the resolved runtime knobs. */
@@ -1049,3 +1386,14 @@ export function _runtimeKnobs() {
         sidecarMaxConcurrency: _maxConcurrency,
     };
 }
+
+// Test-only exports for the video b64-fallback internals (§4.4/§4.5) —
+// mirrors how faces-service/tests/test_video.py unit-tests
+// `_build_face_tracks`/`extract_video_frames` directly rather than only
+// through the full HTTP flow.
+export { _extractVideoFrames, _dedupeVideoFaces, _streamFramesToSidecar };
+
+// Test-only: the undici dispatcher factory that keeps every long-running
+// fetch's headers/body timeout in sync with its AbortController timeout
+// (see the comment above `_dispatcherFor`'s definition).
+export { _dispatcherFor };

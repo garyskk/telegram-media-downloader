@@ -19,6 +19,36 @@ import { openMediaViewerForReview } from './viewer.js';
 
 const $ = (sel) => document.querySelector(sel);
 
+/**
+ * Builds the `#ai-progress-status` text during the video phase — shared by
+ * the WS live-update handler (`_onScanProgress`) and the periodic
+ * full-state render, so both surfaces render the exact same string for
+ * `state.currentVideo` (video scan progress reporting; see
+ * `scan-runner.js`). Falls back to the plain "Scanning…" text when
+ * `currentVideo` is absent — the photo phase, between videos, or a
+ * sidecar too old to report decode progress.
+ */
+function _formatScanStatusText(currentVideo) {
+    if (!currentVideo || typeof currentVideo !== 'object') {
+        return i18nT('maintenance.ai.scanning', 'Scanning…');
+    }
+    const name = currentVideo.name || '';
+    const pct = Number.isFinite(currentVideo.pct) ? currentVideo.pct : null;
+    const decoded = Number.isFinite(currentVideo.framesDecoded) ? currentVideo.framesDecoded : null;
+    const total = Number.isFinite(currentVideo.totalFrames) ? currentVideo.totalFrames : null;
+    if (pct != null && decoded != null && total != null) {
+        return i18nTf(
+            'maintenance.ai.scanning_video',
+            { name, pct, decoded: decoded.toLocaleString(), total: total.toLocaleString() },
+            `Video: ${name} — ${pct}% decoded (${decoded.toLocaleString()}/${total.toLocaleString()} frames)`,
+        );
+    }
+    // Sidecar hasn't reported decode-position fields yet (first tick) or is
+    // too old to know about job_id at all — still name the file so the
+    // operator doesn't wonder if the scan is stuck.
+    return i18nTf('maintenance.ai.scanning_video_unknown', { name }, `Video: ${name}`);
+}
+
 const _CHIP_STYLES = {
     'tg-blue': ['border-tg-blue', 'bg-tg-blue/10', 'text-tg-blue'],
     'amber-500': ['border-amber-500', 'bg-amber-500/10', 'text-amber-500'],
@@ -115,6 +145,7 @@ function _bindOnce() {
     $('#ai-cancel-btn')?.addEventListener('click', () => _cancelScan('faces'));
     $('#ai-reindex-btn')?.addEventListener('click', _reindexFromScratch);
     $('#ai-recluster-btn')?.addEventListener('click', _recluster);
+    $('#ai-rebuild-btn')?.addEventListener('click', _rebuildAllClusters);
     $('#ai-restart-sidecar-btn')?.addEventListener('click', _restartSidecar);
     $('#ai-detect-test-btn')?.addEventListener('click', _runDetectTest);
 
@@ -148,6 +179,18 @@ function _bindOnce() {
             e.preventDefault();
             _onScanVideosToggle();
         }
+    });
+    $('#ai-faces-video-scan-limit')?.addEventListener('change', async (e) => {
+        const raw = Number(e.target.value);
+        const limit = Number.isFinite(raw) ? Math.max(0, Math.min(10000, raw | 0)) : 0;
+        if (String(e.target.value) !== String(limit)) e.target.value = String(limit);
+        await _saveSetting('videoScanLimit', limit);
+    });
+    $('#ai-faces-video-nice')?.addEventListener('change', async (e) => {
+        const raw = Number(e.target.value);
+        const nice = Number.isFinite(raw) ? Math.max(0, Math.min(19, raw | 0)) : 0;
+        if (String(e.target.value) !== String(nice)) e.target.value = String(nice);
+        await _saveSetting('videoNice', nice);
     });
 
     // Settings inputs — model / threshold / minPoints / provider.
@@ -245,11 +288,28 @@ function _bindOnce() {
     $('#ai-person-rename-btn')?.addEventListener('click', _renameSelectedPerson);
     $('#ai-person-merge-btn')?.addEventListener('click', _mergeSelectedPerson);
     $('#ai-person-split-btn')?.addEventListener('click', _splitSelectedPerson);
+    $('#ai-person-exclude-btn')?.addEventListener('click', _excludeSelectedPerson);
     $('#ai-person-delete-btn')?.addEventListener('click', _deleteSelectedPerson);
     $('#ai-split-cancel-btn')?.addEventListener('click', _exitSplitMode);
     $('#ai-split-commit-btn')?.addEventListener('click', _commitSplit);
     $('#ai-person-review-faces-btn')?.addEventListener('click', _toggleFaceReview);
     $('#ai-face-review-close-btn')?.addEventListener('click', _closeFaceReview);
+    $('#ai-people-excluded-toggle')?.addEventListener('click', () => {
+        const body = $('#ai-people-excluded-body');
+        const chevron = $('#ai-people-excluded-chevron');
+        const toggle = $('#ai-people-excluded-toggle');
+        if (!body) return;
+        const open = body.classList.toggle('hidden') === false;
+        toggle?.setAttribute('aria-expanded', open ? 'true' : 'false');
+        if (chevron) chevron.style.transform = open ? 'rotate(180deg)' : '';
+    });
+    $('#ai-people-excluded-list')?.addEventListener('click', (e) => {
+        const btn = e.target.closest('[data-restore-excluded]');
+        if (!btn) return;
+        const id = Number(btn.getAttribute('data-restore-excluded'));
+        if (!Number.isFinite(id)) return;
+        _restoreExcludedPerson(id);
+    });
 
     // WebSocket — only the people / scan events survive in the faces-only
     // build. ai_index_* / ai_tags_* were removed with the Search + Tags
@@ -392,6 +452,10 @@ async function _saveSetting(cfgKey, value, { restartSidecar = false } = {}) {
         if (alias) {
             body.advanced.ai[alias[0]] = value;
             body.advanced.ai.faces = { [alias[1]]: value };
+        } else if (cfgKey === 'videoScanLimit') {
+            body.advanced.ai.faces = { videoScanLimit: value };
+        } else if (cfgKey === 'videoNice') {
+            body.advanced.ai.faces = { videoNice: value };
         } else {
             body.advanced.ai[cfgKey] = value;
         }
@@ -499,7 +563,7 @@ function _renderStatus(status) {
             pctEl.textContent = total
                 ? `${scanned.toLocaleString()} / ${total.toLocaleString()} (${pct}%)`
                 : `${scanned.toLocaleString()} processed`;
-        if (statusEl) statusEl.textContent = i18nT('maintenance.ai.scanning', 'Scanning…');
+        if (statusEl) statusEl.textContent = _formatScanStatusText(facesScan.currentVideo);
     }
 
     // KPI tiles. peopleCount is the canonical "how many clusters"
@@ -579,6 +643,16 @@ function _renderStatus(status) {
         const on = cfg.faces?.scanVideos === true;
         scanVideosToggle.classList.toggle('active', on);
         scanVideosToggle.setAttribute('aria-checked', String(on));
+    }
+    const videoScanLimitInp = $('#ai-faces-video-scan-limit');
+    if (videoScanLimitInp) {
+        const cur = Number.isFinite(cfg.faces?.videoScanLimit) ? cfg.faces.videoScanLimit : 0;
+        if (Number(videoScanLimitInp.value) !== cur) videoScanLimitInp.value = String(cur);
+    }
+    const videoNiceInp = $('#ai-faces-video-nice');
+    if (videoNiceInp) {
+        const cur = Number.isFinite(cfg.faces?.videoNice) ? cfg.faces.videoNice : 0;
+        if (Number(videoNiceInp.value) !== cur) videoNiceInp.value = String(cur);
     }
 
     // Model line — id + dim + provider, served by /api/ai/status.
@@ -1001,10 +1075,18 @@ async function _applyPreset(name) {
         const r = await api.post('/api/config', body);
         if (!r.success) throw new Error(r.error || 'save failed');
         showToast(
-            i18nT('maintenance.ai.preset_applied', `Preset "${name}" applied — re-clustering…`),
+            i18nT(
+                'maintenance.ai.preset_applied',
+                `Preset "${name}" applied — rebuilding clusters…`,
+            ),
             'success',
         );
-        await _recluster();
+        // ε changes need a full rebuild; incremental recluster won't reshape
+        // existing people.
+        const rb = await api.post('/api/ai/faces/rebuild', {});
+        if (!rb.success) throw new Error(rb.error || 'rebuild failed');
+        await refreshStatus();
+        await _loadPeople();
     } catch (e) {
         showToast(
             `${i18nT('common.save_failed', 'Save failed')}: ${e?.data?.error || e?.message || 'unknown'}`,
@@ -1141,15 +1223,12 @@ async function _restartSidecar() {
 }
 
 async function _recluster() {
-    // Phase B only — keeps the existing face embeddings, just re-runs
-    // DBSCAN with the current ε / minPoints. The /api/ai/faces/recluster
-    // endpoint pipelines into the same scan-runner Phase B as a full
-    // scan, but skips Phase A so it lands in seconds instead of minutes.
+    // Incremental Phase B — attach unassigned faces; keep merges/labels.
     try {
         const r = await api.post('/api/ai/faces/recluster', {});
         if (!r.success) throw new Error(r.error || 'recluster failed');
         showToast(
-            i18nT('maintenance.ai.recluster_kicked', 'Re-clustering existing faces…'),
+            i18nT('maintenance.ai.recluster_kicked', 'Assigning unassigned faces…'),
             'success',
         );
         await refreshStatus();
@@ -1158,6 +1237,36 @@ async function _recluster() {
         const msg = e?.data?.error || e?.message || 'unknown';
         showToast(
             `${i18nT('maintenance.ai.recluster_failed', 'Re-cluster failed')}: ${msg}`,
+            'error',
+        );
+    }
+}
+
+async function _rebuildAllClusters() {
+    const ok = await confirmSheet({
+        title: i18nT('maintenance.ai.rebuild_confirm_title', 'Rebuild all clusters?'),
+        body: i18nT(
+            'maintenance.ai.rebuild_confirm_body',
+            'This wipes every Person cluster and re-runs DBSCAN on all face embeddings. Manual merges will be lost. Labels and exclusions are preserved when centroids still match. Use after changing ε.',
+        ),
+        confirmLabel: i18nT('maintenance.ai.rebuild_confirm_action', 'Rebuild'),
+        cancelLabel: i18nT('common.cancel', 'Cancel'),
+        danger: true,
+    });
+    if (!ok) return;
+    try {
+        const r = await api.post('/api/ai/faces/rebuild', {});
+        if (!r.success) throw new Error(r.error || 'rebuild failed');
+        showToast(
+            i18nT('maintenance.ai.rebuild_kicked', 'Rebuilding all clusters…'),
+            'success',
+        );
+        await refreshStatus();
+        await _loadPeople();
+    } catch (e) {
+        const msg = e?.data?.error || e?.message || 'unknown';
+        showToast(
+            `${i18nT('maintenance.ai.rebuild_failed', 'Rebuild failed')}: ${msg}`,
             'error',
         );
     }
@@ -1339,7 +1448,7 @@ function _onScanProgress(feature, msg) {
             : '';
     }
     if (progressStatus && running) {
-        progressStatus.textContent = i18nT('maintenance.ai.scanning', 'Scanning…');
+        progressStatus.textContent = _formatScanStatusText(msg.currentVideo);
     }
     // Phase tag — shows "Phase 1: detection" during A; hidden when idle.
     if (phaseTag) {
@@ -1441,8 +1550,54 @@ async function _loadPeople() {
         if (!r.success) return;
         _peopleCache = Array.isArray(r.people) ? r.people : [];
         await _renderPeopleGrid();
+        await _loadExcludedPeople();
     } catch (e) {
         console.warn('ai/people:', e);
+    }
+}
+
+async function _loadExcludedPeople() {
+    const wrap = $('#ai-people-excluded');
+    const list = $('#ai-people-excluded-list');
+    const countEl = $('#ai-people-excluded-count');
+    if (!wrap || !list) return;
+    try {
+        const r = await api.get('/api/ai/people/excluded?limit=500');
+        if (!r.success) return;
+        const rows = Array.isArray(r.excluded) ? r.excluded : [];
+        if (!rows.length) {
+            wrap.classList.add('hidden');
+            list.innerHTML = '';
+            if (countEl) countEl.textContent = '';
+            return;
+        }
+        wrap.classList.remove('hidden');
+        if (countEl) countEl.textContent = `(${rows.length})`;
+        const unnamed = i18nT('maintenance.ai.excluded.unnamed', 'Excluded person');
+        const restoreLabel = i18nT('maintenance.ai.excluded.restore', 'Restore');
+        list.innerHTML = rows
+            .map((row) => {
+                const name = escapeHtml(row.label || unnamed);
+                const id = Number(row.id);
+                const faceId = Number(row.cover_face_id);
+                const faceHtml =
+                    Number.isFinite(faceId) && faceId > 0
+                        ? `<img src="/api/ai/faces/${faceId}/crop?w=64" alt="${name}" loading="lazy"
+                            class="w-full h-full object-cover"
+                            onerror="this.onerror=null;this.replaceWith(Object.assign(document.createElement('i'),{className:'ri-user-line text-sm text-tg-textSecondary/40'}))">`
+                        : `<i class="ri-user-line text-sm text-tg-textSecondary/40"></i>`;
+                return `<li class="flex items-center justify-between gap-2 py-1.5 px-1 rounded-lg hover:bg-white/[0.03]">
+                    <span class="inline-flex items-center gap-2.5 min-w-0">
+                        <span class="w-9 h-9 rounded-full overflow-hidden flex-shrink-0 bg-tg-bg/60 ring-1 ring-tg-border/30 flex items-center justify-center">${faceHtml}</span>
+                        <span class="text-xs text-tg-text truncate min-w-0">${name}</span>
+                    </span>
+                    <button type="button" data-restore-excluded="${id}"
+                        class="tg-btn-secondary text-[10px] h-6 px-2 flex-shrink-0">${escapeHtml(restoreLabel)}</button>
+                </li>`;
+            })
+            .join('');
+    } catch (e) {
+        console.warn('ai/people/excluded:', e);
     }
 }
 
@@ -1646,7 +1801,9 @@ function _personTile(p) {
     const faceCount = Number(p.face_count) || 0;
     const safeName = escapeHtml(name);
 
-    const faceUrl = !isUnclassified && p.id > 0 ? `/api/ai/person/${p.id}/face?w=128` : '';
+    const bust = _personAvatarBust(p);
+    const faceUrl =
+        !isUnclassified && p.id > 0 ? `/api/ai/person/${p.id}/face?w=128&v=${bust}` : '';
     const fallbackUrl = p.cover_download_id ? `/api/thumbs/${p.cover_download_id}?w=128` : '';
 
     let imgHtml;
@@ -1707,7 +1864,9 @@ async function _showPersonPhotos() {
     const detailAvatar = $('#ai-person-detail-avatar');
     if (detailAvatar) {
         if (_selectedPerson > 0) {
-            detailAvatar.innerHTML = `<img src="/api/ai/person/${_selectedPerson}/face?w=80" alt="${escapeHtml(_selectedPersonName)}" loading="lazy" class="w-full h-full object-cover" onerror="this.onerror=null;this.replaceWith(Object.assign(document.createElement('i'),{className:'ri-user-line text-lg text-tg-textSecondary/40'}))">`;
+            const cached = _peopleCache.find((p) => p.id === _selectedPerson);
+            const bust = _personAvatarBust(cached);
+            detailAvatar.innerHTML = `<img src="/api/ai/person/${_selectedPerson}/face?w=80&v=${bust}" alt="${escapeHtml(_selectedPersonName)}" loading="lazy" class="w-full h-full object-cover" onerror="this.onerror=null;this.replaceWith(Object.assign(document.createElement('i'),{className:'ri-user-line text-lg text-tg-textSecondary/40'}))">`;
         } else {
             detailAvatar.innerHTML = `<i class="ri-user-line text-lg text-tg-textSecondary/40"></i>`;
         }
@@ -1958,6 +2117,12 @@ function _faceReviewTile(row) {
     const qBadge = qLabel
         ? `<span class="absolute top-1 left-1 h-[15px] px-1.5 rounded-full bg-black/70 text-white text-[8px] font-medium flex items-center justify-center leading-none backdrop-blur-sm">${qLabel}</span>`
         : '';
+    const cached = _peopleCache.find((p) => p.id === _selectedPerson);
+    const isCover = Number(cached?.cover_face_id) === Number(faceId);
+    const coverBadge = isCover
+        ? `<span class="absolute bottom-1 left-1 h-[15px] px-1.5 rounded-full bg-tg-blue/90 text-white text-[8px] font-medium flex items-center gap-0.5 leading-none backdrop-blur-sm"><i class="ri-image-line text-[9px]"></i>${escapeHtml(i18nT('maintenance.ai.face_review_cover_badge', 'Cover'))}</span>`
+        : '';
+    const coverRing = isCover ? ' ring-2 ring-tg-blue ring-offset-1 ring-offset-tg-bg' : '';
 
     const meta = encodeURIComponent(
         JSON.stringify({
@@ -1973,18 +2138,23 @@ function _faceReviewTile(row) {
     );
 
     return `
-        <div class="ai-face-review-tile group relative rounded-xl overflow-hidden shadow-sm hover:shadow-lg transition-all duration-200 bg-tg-bg/40" data-face-id="${faceId}" data-dl-id="${dlId}" data-meta="${meta}">
+        <div class="ai-face-review-tile group relative rounded-xl overflow-hidden shadow-sm hover:shadow-lg transition-all duration-200 bg-tg-bg/40${coverRing}" data-face-id="${faceId}" data-dl-id="${dlId}" data-meta="${meta}">
             <button type="button" class="ai-face-review-open block w-full cursor-pointer" title="${escapeHtml(i18nT('maintenance.ai.face_review_open_source', 'Open source photo'))} — ${name}">
                 <img src="/api/ai/faces/${faceId}/crop?w=160" alt="${name}" loading="lazy"
                     class="aspect-square w-full object-cover transition-transform duration-300 group-hover:scale-105">
             </button>
             ${qBadge}
+            ${coverBadge}
             <div class="absolute inset-0 bg-gradient-to-t from-black/60 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-200 pointer-events-none flex items-end p-1.5">
                 <span class="text-white text-[10px] leading-tight line-clamp-1 font-medium drop-shadow">${name}</span>
             </div>
             <!-- Hover actions — kept visually distinct from the click-to-open image
                  so operators don't accidentally reassign while browsing. -->
             <div class="absolute top-1 right-1 flex flex-col gap-1 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity duration-200">
+                <button type="button" class="ai-face-review-set-cover w-5 h-5 rounded-full bg-black/70 hover:bg-tg-blue flex items-center justify-center shadow"
+                    title="${escapeHtml(i18nT('maintenance.ai.face_review_set_cover', 'Set as thumbnail'))}">
+                    <i class="ri-image-line text-white text-[10px]"></i>
+                </button>
                 <button type="button" class="ai-face-review-reassign w-5 h-5 rounded-full bg-black/70 hover:bg-tg-blue flex items-center justify-center shadow"
                     title="${escapeHtml(i18nT('maintenance.ai.face_review_reassign', 'Move to another person…'))}">
                     <i class="ri-arrow-left-right-line text-white text-[10px]"></i>
@@ -1998,12 +2168,22 @@ function _faceReviewTile(row) {
     `;
 }
 
+function _personAvatarBust(p) {
+    if (!p) return String(Date.now());
+    const cover = Number(p.cover_face_id);
+    if (Number.isFinite(cover) && cover > 0) return String(cover);
+    const updated = Number(p.updated_at);
+    if (Number.isFinite(updated) && updated > 0) return String(updated);
+    return '0';
+}
+
 function _wireFaceReviewGrid() {
     const grid = $('#ai-face-review-grid');
     if (!grid) return;
     if (_faceReviewGridClickHandler) grid.removeEventListener('click', _faceReviewGridClickHandler);
 
     _faceReviewGridClickHandler = (e) => {
+        const setCoverBtn = e.target.closest('.ai-face-review-set-cover');
         const reassignBtn = e.target.closest('.ai-face-review-reassign');
         const unassignBtn = e.target.closest('.ai-face-review-unassign');
         const openBtn = e.target.closest('.ai-face-review-open');
@@ -2011,6 +2191,12 @@ function _wireFaceReviewGrid() {
         if (!tile) return;
         const faceId = Number(tile.dataset.faceId);
 
+        if (setCoverBtn) {
+            e.preventDefault();
+            e.stopPropagation();
+            _setCoverFaceFromReview(faceId);
+            return;
+        }
         if (reassignBtn) {
             e.preventDefault();
             e.stopPropagation();
@@ -2054,7 +2240,8 @@ async function _reassignFaceFromReview(faceId, tileEl) {
 
     const makeCard = (p) => {
         const name = escapeHtml(p.label || `Person #${p.id}`);
-        const faceUrl = p.id > 0 ? `/api/ai/person/${p.id}/face?w=64` : '';
+        const faceUrl =
+            p.id > 0 ? `/api/ai/person/${p.id}/face?w=64&v=${_personAvatarBust(p)}` : '';
         const imgHtml = faceUrl
             ? `<img src="${faceUrl}" class="w-full h-full object-cover" loading="lazy" onerror="this.onerror=null;this.parentElement.innerHTML='<i class=\\'ri-user-line text-base text-tg-textSecondary/40\\'></i>'">`
             : `<i class="ri-user-line text-base text-tg-textSecondary/40"></i>`;
@@ -2154,6 +2341,39 @@ async function _unassignFaceFromReview(faceId, tileEl) {
     }
 }
 
+async function _setCoverFaceFromReview(faceId) {
+    if (!faceId || !_selectedPerson) return;
+    try {
+        const res = await api.post(`/api/ai/people/${_selectedPerson}/cover`, { faceId });
+        if (!res.success) throw new Error(res.error || 'set cover failed');
+        const coverFaceId = Number(res.coverFaceId) || faceId;
+        const cached = _peopleCache.find((p) => p.id === _selectedPerson);
+        if (cached) {
+            cached.cover_face_id = coverFaceId;
+            cached.updated_at = Date.now();
+        }
+        showToast(
+            i18nT('maintenance.ai.face_review_cover_set', 'Thumbnail updated'),
+            'success',
+        );
+        await _renderPeopleGrid();
+        // Refresh detail avatar + cover badges in the open review grid.
+        const detailAvatar = $('#ai-person-detail-avatar');
+        if (detailAvatar) {
+            const bust = _personAvatarBust(cached);
+            detailAvatar.innerHTML = `<img src="/api/ai/person/${_selectedPerson}/face?w=80&v=${bust}" alt="${escapeHtml(_selectedPersonName)}" loading="lazy" class="w-full h-full object-cover" onerror="this.onerror=null;this.replaceWith(Object.assign(document.createElement('i'),{className:'ri-user-line text-lg text-tg-textSecondary/40'}))">`;
+        }
+        if (_faceReviewActive) {
+            _faceReviewOffset = 0;
+            const grid = $('#ai-face-review-grid');
+            if (grid) grid.innerHTML = '';
+            await _loadFaceReviewPage();
+        }
+    } catch (e) {
+        showToast(e.message, 'error');
+    }
+}
+
 function _removeFaceReviewTile(tileEl) {
     tileEl?.remove();
     _faceReviewTotal = Math.max(0, _faceReviewTotal - 1);
@@ -2210,7 +2430,8 @@ async function _mergeSelectedPerson() {
     // don't cause a multi-second innerHTML freeze on open.
     const makeMergeCard = (p) => {
         const name = escapeHtml(p.label || `Person #${p.id}`);
-        const faceUrl = p.id > 0 ? `/api/ai/person/${p.id}/face?w=64` : '';
+        const faceUrl =
+            p.id > 0 ? `/api/ai/person/${p.id}/face?w=64&v=${_personAvatarBust(p)}` : '';
         const imgHtml = faceUrl
             ? `<img src="${faceUrl}" class="w-full h-full object-cover" loading="lazy" onerror="this.onerror=null;this.parentElement.innerHTML='<i class=\\'ri-user-line text-base text-tg-textSecondary/40\\'></i>'">`
             : `<i class="ri-user-line text-base text-tg-textSecondary/40"></i>`;
@@ -2330,7 +2551,7 @@ async function _deleteSelectedPerson() {
         title: i18nT('maintenance.ai.person_delete', 'Delete'),
         message: i18nT(
             'maintenance.ai.delete_confirm',
-            'Delete this cluster? Faces will become unassigned.',
+            'Delete this cluster? Faces will become unassigned. The cluster may reappear after the next recluster.',
         ),
         destructive: true,
         confirmText: i18nT('maintenance.ai.person_delete', 'Delete'),
@@ -2344,6 +2565,48 @@ async function _deleteSelectedPerson() {
         _selectedPersonName = '';
         $('#ai-people-photos')?.classList.add('hidden');
         _loadPeople();
+    } catch (e) {
+        showToast(e.message, 'error');
+    }
+}
+
+async function _excludeSelectedPerson() {
+    if (!_selectedPerson) return;
+    const ok = await confirmSheet({
+        title: i18nT('maintenance.ai.person_exclude', 'Exclude'),
+        message: i18nT(
+            'maintenance.ai.exclude_confirm',
+            'Exclude this identity permanently? It will not reappear as a Person after recluster. Faces stay in the database unassigned.',
+        ),
+        destructive: true,
+        confirmText: i18nT('maintenance.ai.person_exclude', 'Exclude'),
+    });
+    if (!ok) return;
+    try {
+        const r = await api.post(`/api/ai/people/${_selectedPerson}/exclude`);
+        if (!r.success) throw new Error(r.error || 'exclude failed');
+        showToast(i18nT('maintenance.ai.exclude_done', 'Excluded'), 'success');
+        _selectedPerson = null;
+        _selectedPersonName = '';
+        $('#ai-people-photos')?.classList.add('hidden');
+        _loadPeople();
+    } catch (e) {
+        showToast(e.message, 'error');
+    }
+}
+
+async function _restoreExcludedPerson(excludedId) {
+    try {
+        const r = await api.delete(`/api/ai/people/excluded/${excludedId}`);
+        if (!r.success) throw new Error(r.error || 'restore failed');
+        showToast(
+            i18nT(
+                'maintenance.ai.excluded.restored',
+                'Restored — run Re-cluster to recreate',
+            ),
+            'success',
+        );
+        await _loadExcludedPeople();
     } catch (e) {
         showToast(e.message, 'error');
     }
@@ -2555,7 +2818,7 @@ async function _refreshDoctor() {
 }
 
 function _setActionButtonsEnabled(enabled) {
-    const ids = ['ai-scan-btn', 'ai-reindex-btn', 'ai-recluster-btn'];
+    const ids = ['ai-scan-btn', 'ai-reindex-btn', 'ai-recluster-btn', 'ai-rebuild-btn'];
     for (const id of ids) {
         const btn = $(`#${id}`) || document.getElementById(id);
         if (!btn) continue;

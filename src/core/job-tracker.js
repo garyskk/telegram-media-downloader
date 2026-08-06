@@ -282,9 +282,35 @@ export function createJobTracker({ kind, broadcast, log, eventPrefix } = {}) {
 function _shortProgress(p) {
     if (!p || typeof p !== 'object') return '';
     const parts = [];
-    if (Number.isFinite(p.processed) || Number.isFinite(p.total)) {
-        parts.push(`${p.processed ?? 0}/${p.total ?? 0}`);
+    // Callers use two different field names for "items done so far" —
+    // most (dedup.js, integrity.js, faststart.js, server.js admin actions)
+    // emit `processed`, but scan-runner.js's AI/faces scan emits `scanned`.
+    // Prefer `processed` when both are present; fall back to `scanned` so
+    // this generic formatter doesn't silently print "0/N" forever for
+    // trackers that use the other convention.
+    const done = Number.isFinite(p.processed) ? p.processed : p.scanned;
+    if (Number.isFinite(done) || Number.isFinite(p.total)) {
+        parts.push(`${done ?? 0}/${p.total ?? 0}`);
     }
     if (p.stage) parts.push(p.stage);
+    // Video scan progress reporting: scan-runner.js sets `currentVideo` while
+    // a `/detect/video` request is mid-flight (see faces-client.js job_id
+    // polling). Surface it in the same 5s-throttled log line so a 2-hour
+    // video's decode position is visible in `docker compose logs` even when
+    // nobody has the dashboard open / the tab is stale.
+    const cv = p.currentVideo;
+    if (cv && typeof cv === 'object' && cv.name) {
+        const pctPart = Number.isFinite(cv.pct) ? ` ${cv.pct}%` : '';
+        const framesPart =
+            Number.isFinite(cv.framesDecoded) && Number.isFinite(cv.totalFrames)
+                ? ` (${cv.framesDecoded}/${cv.totalFrames} frames)`
+                : '';
+        parts.push(`video: ${cv.name}${pctPart}${framesPart}`);
+    }
     return parts.join(' ');
 }
+
+// Test-only: pure formatter, no timing/state involved — exported so the
+// `processed`-vs-`scanned` field-name fallback can be unit tested directly
+// instead of only through the real 5s-throttled periodic log line.
+export { _shortProgress };

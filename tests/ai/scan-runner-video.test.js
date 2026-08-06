@@ -160,4 +160,152 @@ describe('scanVideos gate', () => {
         expect(face.x).toBe(10);
         expect(face.w).toBe(80);
     });
+
+    it('videoScanLimit: stops after N videos; remaining stay unindexed', async () => {
+        const downloadsDir = path.join(DATA_DIR, 'downloads');
+        fs.mkdirSync(downloadsDir, { recursive: true });
+        for (let i = 0; i < 3; i++) {
+            fs.writeFileSync(path.join(downloadsDir, `vid${i}.mp4`), 'fake-video');
+            insertVideoRow(`vid${i}.mp4`);
+        }
+
+        clientMock.detectFacesInVideo.mockResolvedValue([]);
+
+        scannerApi.startFacesScan(
+            { faces: { scanVideos: true, fileTypes: ['photo'], videoScanLimit: 2 } },
+            null,
+            null,
+            null,
+        );
+        await waitForScan();
+
+        expect(clientMock.detectFacesInVideo).toHaveBeenCalledTimes(2);
+        const indexed = db
+            .prepare(
+                `SELECT COUNT(*) AS n FROM downloads WHERE file_type = 'video' AND ai_indexed_at IS NOT NULL`,
+            )
+            .get().n;
+        const pending = db
+            .prepare(
+                `SELECT COUNT(*) AS n FROM downloads WHERE file_type = 'video' AND ai_indexed_at IS NULL`,
+            )
+            .get().n;
+        expect(indexed).toBe(2);
+        expect(pending).toBe(1);
+    });
+});
+
+// Video scan progress reporting — detectFacesInVideo's 5th arg
+// (onVideoProgress) is wired to state.currentVideo, broadcast via bump().
+describe('state.currentVideo (video scan progress reporting)', () => {
+    it('is set from the progress callback while a video is processing, and cleared after', async () => {
+        const downloadsDir = path.join(DATA_DIR, 'downloads');
+        fs.mkdirSync(downloadsDir, { recursive: true });
+        fs.writeFileSync(path.join(downloadsDir, 'progress.mp4'), 'fake-video');
+        insertVideoRow('progress.mp4');
+
+        let capturedDuring = null;
+        clientMock.detectFacesInVideo.mockImplementation(
+            async (_abs, _cfg, _log, _signal, onVideoProgress) => {
+                onVideoProgress({ frames_decoded: 42, total_frames: 100, pct: 42 });
+                capturedDuring = scannerApi.getScanState('faces').currentVideo;
+                return [];
+            },
+        );
+
+        scannerApi.startFacesScan(
+            { faces: { scanVideos: true, fileTypes: ['photo'] } },
+            null,
+            null,
+            null,
+        );
+        await waitForScan();
+
+        expect(capturedDuring).toEqual({
+            name: 'progress.mp4',
+            pct: 42,
+            framesDecoded: 42,
+            totalFrames: 100,
+        });
+        expect(scannerApi.getScanState('faces').currentVideo).toBeNull();
+    });
+
+    it('tolerates a progress payload missing pct/frames fields (nulls, not NaN/undefined)', async () => {
+        const downloadsDir = path.join(DATA_DIR, 'downloads');
+        fs.mkdirSync(downloadsDir, { recursive: true });
+        fs.writeFileSync(path.join(downloadsDir, 'sparse.mp4'), 'fake-video');
+        insertVideoRow('sparse.mp4');
+
+        let capturedDuring = null;
+        clientMock.detectFacesInVideo.mockImplementation(
+            async (_abs, _cfg, _log, _signal, onVideoProgress) => {
+                onVideoProgress({});
+                capturedDuring = scannerApi.getScanState('faces').currentVideo;
+                return [];
+            },
+        );
+
+        scannerApi.startFacesScan(
+            { faces: { scanVideos: true, fileTypes: ['photo'] } },
+            null,
+            null,
+            null,
+        );
+        await waitForScan();
+
+        expect(capturedDuring).toEqual({
+            name: 'sparse.mp4',
+            pct: null,
+            framesDecoded: null,
+            totalFrames: null,
+        });
+    });
+
+    it('resets to null between videos so stale progress never leaks into the next one', async () => {
+        const downloadsDir = path.join(DATA_DIR, 'downloads');
+        fs.mkdirSync(downloadsDir, { recursive: true });
+        fs.writeFileSync(path.join(downloadsDir, 'first.mp4'), 'fake-video');
+        fs.writeFileSync(path.join(downloadsDir, 'second.mp4'), 'fake-video');
+        insertVideoRow('first.mp4');
+        insertVideoRow('second.mp4');
+
+        const nullAtEntry = [];
+        clientMock.detectFacesInVideo.mockImplementation(
+            async (_abs, _cfg, _log, _signal, onVideoProgress) => {
+                nullAtEntry.push(scannerApi.getScanState('faces').currentVideo === null);
+                onVideoProgress({ frames_decoded: 1, total_frames: 10, pct: 10 });
+                return [];
+            },
+        );
+
+        scannerApi.startFacesScan(
+            { faces: { scanVideos: true, fileTypes: ['photo'] } },
+            null,
+            null,
+            null,
+        );
+        await waitForScan();
+
+        expect(nullAtEntry).toEqual([true, true]);
+        expect(scannerApi.getScanState('faces').currentVideo).toBeNull();
+    });
+
+    it('stays null throughout when detectFacesInVideo never calls the progress callback', async () => {
+        const downloadsDir = path.join(DATA_DIR, 'downloads');
+        fs.mkdirSync(downloadsDir, { recursive: true });
+        fs.writeFileSync(path.join(downloadsDir, 'no-progress.mp4'), 'fake-video');
+        insertVideoRow('no-progress.mp4');
+
+        clientMock.detectFacesInVideo.mockResolvedValue([]);
+
+        scannerApi.startFacesScan(
+            { faces: { scanVideos: true, fileTypes: ['photo'] } },
+            null,
+            null,
+            null,
+        );
+        await waitForScan();
+
+        expect(scannerApi.getScanState('faces').currentVideo).toBeNull();
+    });
 });

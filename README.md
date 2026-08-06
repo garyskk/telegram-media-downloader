@@ -291,7 +291,7 @@ Offload face detection and NSFW classification to a remote GPU server — ideal 
 
 ```bash
 # Face detection (already included in the repo)
-cd faces-service && pip install -r requirements.txt && python -m tgdl_faces
+cd faces-service && uv sync && uv run python -m tgdl_faces
 
 # NSFW classification
 cd nsfw-service && pip install -r requirements.txt && python main.py

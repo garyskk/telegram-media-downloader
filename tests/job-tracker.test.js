@@ -1,11 +1,64 @@
 import { describe, it, expect } from 'vitest';
-import { createJobTracker } from '../src/core/job-tracker.js';
+import { createJobTracker, _shortProgress } from '../src/core/job-tracker.js';
 
 function flushAsync(times = 4) {
     let p = Promise.resolve();
     for (let i = 0; i < times; i++) p = p.then(() => undefined);
     return p;
 }
+
+describe('_shortProgress', () => {
+    it('formats the common {processed,total} shape (dedup/integrity/faststart/server.js convention)', () => {
+        expect(_shortProgress({ processed: 12, total: 594 })).toBe('12/594');
+    });
+
+    it('falls back to {scanned,total} so the AI/faces scan-runner convention is not always "0/N"', () => {
+        // scan-runner.js emits { scanned, total }, never `processed` — this
+        // used to render as "0/594" forever regardless of real progress.
+        expect(_shortProgress({ scanned: 213, total: 594 })).toBe('213/594');
+    });
+
+    it('prefers `processed` over `scanned` when both are present', () => {
+        expect(_shortProgress({ processed: 5, scanned: 1, total: 10 })).toBe('5/10');
+    });
+
+    it('includes stage when present', () => {
+        expect(_shortProgress({ scanned: 3, total: 10, stage: 'video phase' })).toBe(
+            '3/10 video phase',
+        );
+    });
+
+    it('returns empty string for missing/invalid input', () => {
+        expect(_shortProgress(null)).toBe('');
+        expect(_shortProgress({})).toBe('');
+        expect(_shortProgress({ stage: 'starting' })).toBe('starting');
+    });
+
+    it('appends currentVideo decode progress (video scan progress reporting)', () => {
+        expect(
+            _shortProgress({
+                scanned: 101,
+                total: 592,
+                currentVideo: { name: 'clip.mp4', pct: 42, framesDecoded: 3412, totalFrames: 8120 },
+            }),
+        ).toBe('101/592 video: clip.mp4 42% (3412/8120 frames)');
+    });
+
+    it('omits pct/frames when they are not finite yet (job just registered)', () => {
+        expect(
+            _shortProgress({
+                scanned: 101,
+                total: 592,
+                currentVideo: { name: 'clip.mp4', pct: null, framesDecoded: null, totalFrames: null },
+            }),
+        ).toBe('101/592 video: clip.mp4');
+    });
+
+    it('ignores currentVideo without a name (cleared / malformed payload)', () => {
+        expect(_shortProgress({ scanned: 101, total: 592, currentVideo: {} })).toBe('101/592');
+        expect(_shortProgress({ scanned: 101, total: 592, currentVideo: null })).toBe('101/592');
+    });
+});
 
 describe('createJobTracker', () => {
     it('rejects construction without a kind', () => {

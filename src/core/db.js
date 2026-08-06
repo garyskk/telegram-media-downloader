@@ -421,8 +421,24 @@ function initSchema() {
     } catch {
         /* column already present */
     }
+    // Video-sourced faces: timestamp (seconds) of the sampled frame the
+    // bbox was detected on. Used by crop endpoints to seek ffmpeg to the
+    // correct frame instead of always using frame 0 (which produced black/
+    // wrong crops when the face appeared later in the video).
+    try {
+        db.exec('ALTER TABLE faces ADD COLUMN frame_time_sec REAL');
+    } catch {
+        /* column already present */
+    }
     try {
         db.exec('ALTER TABLE people ADD COLUMN gender TEXT');
+    } catch {
+        /* column already present */
+    }
+    // Operator-pinned People avatar. When set and still belonging to this
+    // person, listPeople / person face crop use it instead of auto-pick.
+    try {
+        db.exec('ALTER TABLE people ADD COLUMN cover_face_id INTEGER');
     } catch {
         /* column already present */
     }
@@ -445,6 +461,23 @@ function initSchema() {
         CREATE INDEX IF NOT EXISTS idx_peer_face_centroids_label
             ON peer_face_centroids(label) WHERE label IS NOT NULL;
     `);
+
+    // Durable face-cluster exclusion denylist. Survives clearAllPeople() /
+    // Phase B recluster so unwanted identities do not reappear as People.
+    // Cleared on full faces reindex (embedding space may change with model).
+    db.exec(`
+        CREATE TABLE IF NOT EXISTS excluded_people (
+            id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+            embedding_centroid BLOB    NOT NULL,
+            label              TEXT,
+            created_at         INTEGER NOT NULL
+        );
+    `);
+    try {
+        db.exec('ALTER TABLE excluded_people ADD COLUMN cover_face_id INTEGER');
+    } catch {
+        /* column already present */
+    }
 
     // Seekbar sprite cache (v2.17). One row per indexed video; sprite +
     // JSON metadata live on disk under data/seekbar/. Opt-in via
@@ -2432,10 +2465,11 @@ export function resetAllAiData() {
         const tags = db.prepare('DELETE FROM image_tags').run().changes;
         const faces = db.prepare('DELETE FROM faces').run().changes;
         const people = db.prepare('DELETE FROM people').run().changes;
+        const excluded = db.prepare('DELETE FROM excluded_people').run().changes;
         const requeued = db
             .prepare('UPDATE downloads SET ai_indexed_at = NULL WHERE ai_indexed_at IS NOT NULL')
             .run().changes;
-        return { embeddings, tags, faces, people, requeued };
+        return { embeddings, tags, faces, people, excluded, requeued };
     });
     return tx();
 }
@@ -2478,11 +2512,12 @@ export function insertFace({
     embeddingBlob,
     personId = null,
     qualityScore = null,
+    frameTimeSec = null,
 }) {
     return getDb()
         .prepare(`
-        INSERT INTO faces (download_id, x, y, w, h, embedding, person_id, quality_score)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO faces (download_id, x, y, w, h, embedding, person_id, quality_score, frame_time_sec)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     `)
         .run(
             Number(downloadId),
@@ -2493,6 +2528,7 @@ export function insertFace({
             embeddingBlob,
             personId == null ? null : Number(personId),
             qualityScore == null ? null : Number(qualityScore),
+            frameTimeSec == null ? null : Number(frameTimeSec),
         );
 }
 
@@ -2536,6 +2572,87 @@ export function* iterateAllFaces({ chunkSize = 1000 } = {}) {
     }
 }
 
+/** Faces not yet assigned to a person — input for incremental Phase B. */
+export function* iterateUnassignedFaces({ chunkSize = 1000 } = {}) {
+    const db = getDb();
+    const stmt = db.prepare(
+        `SELECT id, download_id, x, y, w, h, embedding, person_id, gender, quality_score FROM faces
+          WHERE person_id IS NULL
+          ORDER BY id LIMIT ? OFFSET ?`,
+    );
+    for (let offset = 0; ; offset += chunkSize) {
+        const chunk = stmt.all(chunkSize, offset);
+        if (!chunk.length) return;
+        for (const row of chunk) yield row;
+        if (chunk.length < chunkSize) return;
+    }
+}
+
+/**
+ * Existing people centroids for incremental matching.
+ * @returns {Array<{ id: number, label: string|null, centroid: Float32Array, faceCount: number }>}
+ */
+export function listPeopleCentroids() {
+    const out = [];
+    const stmt = getDb().prepare(
+        'SELECT id, label, embedding_centroid, face_count FROM people',
+    );
+    for (const r of stmt.iterate()) {
+        if (!r.embedding_centroid) continue;
+        const dim = r.embedding_centroid.byteLength / 4;
+        if (!Number.isFinite(dim) || dim < 1) continue;
+        const c = new Float32Array(dim);
+        const view = new Float32Array(
+            r.embedding_centroid.buffer,
+            r.embedding_centroid.byteOffset,
+            dim,
+        );
+        c.set(view);
+        out.push({
+            id: r.id,
+            label: r.label ?? null,
+            centroid: c,
+            faceCount: Number(r.face_count) || 0,
+        });
+    }
+    return out;
+}
+
+/**
+ * Recompute embedding_centroid + face_count from live face rows.
+ * @returns {{ ok: boolean, faceCount: number }}
+ */
+export function recomputePersonCentroid(personId) {
+    const pid = Number(personId);
+    if (!Number.isFinite(pid) || pid <= 0) return { ok: false, faceCount: 0 };
+    const db = getDb();
+    const rows = db
+        .prepare('SELECT embedding FROM faces WHERE person_id = ?')
+        .all(pid);
+    if (!rows.length) {
+        db.prepare(
+            'UPDATE people SET face_count = 0, updated_at = ? WHERE id = ?',
+        ).run(Date.now(), pid);
+        return { ok: true, faceCount: 0 };
+    }
+    const dim = rows[0].embedding.byteLength / 4;
+    const acc = new Float32Array(dim);
+    for (const r of rows) {
+        const view = new Float32Array(r.embedding.buffer, r.embedding.byteOffset, dim);
+        for (let i = 0; i < dim; i++) acc[i] += view[i];
+    }
+    for (let i = 0; i < dim; i++) acc[i] /= rows.length;
+    const centroidBlob = Buffer.from(acc.buffer);
+    db.prepare(
+        `UPDATE people SET embedding_centroid = ?, face_count = ?, updated_at = ? WHERE id = ?`,
+    ).run(centroidBlob, rows.length, Date.now(), pid);
+    return { ok: true, faceCount: rows.length };
+}
+
+export function countPeople() {
+    return getDb().prepare('SELECT COUNT(*) AS n FROM people').get().n;
+}
+
 /**
  * Update only the `quality_score` column on an existing face row. Used
  * by the v2.16 quality filter so the UI can show "low confidence"
@@ -2566,13 +2683,10 @@ export function mergeFacePerson(targetId, otherId) {
         const moved = db
             .prepare('UPDATE faces SET person_id = ? WHERE person_id = ?')
             .run(t, o).changes;
-        const newCount = db.prepare('SELECT COUNT(*) AS n FROM faces WHERE person_id = ?').get(t).n;
-        db.prepare('UPDATE people SET face_count = ?, updated_at = ? WHERE id = ?').run(
-            newCount,
-            Date.now(),
-            t,
-        );
         const deleted = db.prepare('DELETE FROM people WHERE id = ?').run(o).changes;
+        // Refresh centroid from all faces so incremental Phase B matches
+        // the merged identity, not the pre-merge target-only centroid.
+        recomputePersonCentroid(t);
         return { moved, deleted };
     });
     return tx();
@@ -2732,15 +2846,98 @@ export function clearAllPeople() {
     tx();
 }
 
-export function insertPerson({ label = null, centroidBlob, faceCount = 0 }) {
+export function insertPerson({ label = null, centroidBlob, faceCount = 0, coverFaceId = null }) {
     const now = Date.now();
+    const cover =
+        coverFaceId == null || !Number.isFinite(Number(coverFaceId)) || Number(coverFaceId) <= 0
+            ? null
+            : Number(coverFaceId);
     const r = getDb()
         .prepare(`
-        INSERT INTO people (label, embedding_centroid, face_count, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO people (label, embedding_centroid, face_count, created_at, updated_at, cover_face_id)
+        VALUES (?, ?, ?, ?, ?, ?)
     `)
-        .run(label, centroidBlob, Math.max(0, Number(faceCount) || 0), now, now);
+        .run(label, centroidBlob, Math.max(0, Number(faceCount) || 0), now, now, cover);
     return r.lastInsertRowid;
+}
+
+/**
+ * Pin a face as this person's People avatar. Face must belong to the person.
+ * @returns {{ ok: true, coverFaceId: number }
+ *   | { ok: false, reason: 'invalid_id'|'person_not_found'|'face_not_found'|'mismatch' }}
+ */
+export function setPersonCoverFace(personId, faceId) {
+    const pid = Number(personId);
+    const fid = Number(faceId);
+    if (!Number.isFinite(pid) || pid <= 0 || !Number.isFinite(fid) || fid <= 0) {
+        return { ok: false, reason: 'invalid_id' };
+    }
+    const db = getDb();
+    const person = db.prepare('SELECT id FROM people WHERE id = ?').get(pid);
+    if (!person) return { ok: false, reason: 'person_not_found' };
+    const face = db.prepare('SELECT id, person_id FROM faces WHERE id = ?').get(fid);
+    if (!face) return { ok: false, reason: 'face_not_found' };
+    if (Number(face.person_id) !== pid) return { ok: false, reason: 'mismatch' };
+    db.prepare('UPDATE people SET cover_face_id = ?, updated_at = ? WHERE id = ?').run(
+        fid,
+        Date.now(),
+        pid,
+    );
+    return { ok: true, coverFaceId: fid };
+}
+
+/** Clear a pinned cover so avatar falls back to auto-pick. */
+export function clearPersonCoverFace(personId) {
+    const pid = Number(personId);
+    if (!Number.isFinite(pid) || pid <= 0) return 0;
+    return getDb()
+        .prepare('UPDATE people SET cover_face_id = NULL, updated_at = ? WHERE id = ?')
+        .run(Date.now(), pid).changes;
+}
+
+/**
+ * Snapshot pinned cover face ids before clearAllPeople (Phase B).
+ * @returns {number[]}
+ */
+export function listPinnedCoverFaceIds() {
+    const rows = getDb()
+        .prepare(
+            `SELECT cover_face_id FROM people
+              WHERE cover_face_id IS NOT NULL`,
+        )
+        .all();
+    return rows
+        .map((r) => Number(r.cover_face_id))
+        .filter((id) => Number.isFinite(id) && id > 0);
+}
+
+/**
+ * After Phase B reassigns faces, re-apply pinned covers onto the people
+ * that now own those face rows.
+ * @param {Iterable<number>} faceIds
+ * @returns {number} how many people updated
+ */
+export function restorePinnedCoverFaces(faceIds) {
+    const ids = [...new Set([...faceIds].map(Number).filter((id) => Number.isFinite(id) && id > 0))];
+    if (!ids.length) return 0;
+    const db = getDb();
+    const find = db.prepare('SELECT person_id FROM faces WHERE id = ?');
+    const upd = db.prepare(
+        'UPDATE people SET cover_face_id = ?, updated_at = ? WHERE id = ?',
+    );
+    let n = 0;
+    const now = Date.now();
+    const tx = db.transaction(() => {
+        for (const fid of ids) {
+            const row = find.get(fid);
+            const pid = row?.person_id != null ? Number(row.person_id) : null;
+            if (!pid) continue;
+            upd.run(fid, now, pid);
+            n += 1;
+        }
+    });
+    tx();
+    return n;
 }
 
 export function listPeople({ limit = 500, offset = 0 } = {}) {
@@ -2780,7 +2977,10 @@ export function listPeople({ limit = 500, offset = 0 } = {}) {
               JOIN downloads dff ON dff.id = ff.download_id
              WHERE ff.person_id = p.id
                AND (dff.user_deleted IS NULL OR dff.user_deleted = 0)
-             ORDER BY COALESCE(ff.quality_score, 0) DESC, ff.w * ff.h DESC
+             ORDER BY
+               CASE WHEN p.cover_face_id IS NOT NULL AND ff.id = p.cover_face_id THEN 0 ELSE 1 END,
+               COALESCE(ff.quality_score, 0) DESC,
+               ff.w * ff.h DESC
              LIMIT 1
           )
          WHERE (
@@ -2814,7 +3014,233 @@ export function renamePerson(id, label) {
 export function deletePerson(id) {
     // ON DELETE SET NULL on faces.person_id keeps face rows around so a
     // re-cluster can re-assign them — we don't lose embeddings.
+    // Temporary only: the next Phase B recluster will recreate the cluster
+    // unless the operator used excludePerson() instead.
     return getDb().prepare('DELETE FROM people WHERE id = ?').run(Number(id)).changes;
+}
+
+/**
+ * Durable exclude — snapshot the person's centroid (+ optional label) and
+ * best cover face id into `excluded_people`, then drop the people row
+ * (faces become unassigned). Phase B skips clusters whose centroid matches
+ * an excluded entry within `labelMatchEps`.
+ *
+ * @returns {{ ok: true, excludedId: number, personId: number, label: string|null, coverFaceId: number|null }
+ *   | { ok: false, reason: 'not_found'|'invalid_id' }}
+ */
+export function excludePerson(id) {
+    const pid = Number(id);
+    if (!Number.isFinite(pid) || pid <= 0) return { ok: false, reason: 'invalid_id' };
+    const db = getDb();
+    const person = db
+        .prepare('SELECT id, label, embedding_centroid, cover_face_id FROM people WHERE id = ?')
+        .get(pid);
+    if (!person || !person.embedding_centroid) return { ok: false, reason: 'not_found' };
+    // Prefer operator-pinned cover when it still belongs to this person;
+    // otherwise same auto-pick as listPeople / person avatar.
+    let coverFaceId = null;
+    if (person.cover_face_id != null) {
+        const pinned = db
+            .prepare(
+                `SELECT f.id AS face_id
+                   FROM faces f
+                   JOIN downloads d ON d.id = f.download_id
+                  WHERE f.id = ?
+                    AND f.person_id = ?
+                    AND (d.user_deleted IS NULL OR d.user_deleted = 0)`,
+            )
+            .get(Number(person.cover_face_id), pid);
+        if (pinned?.face_id != null) coverFaceId = Number(pinned.face_id);
+    }
+    if (coverFaceId == null) {
+        const cover = db
+            .prepare(
+                `SELECT f.id AS face_id
+                   FROM faces f
+                   JOIN downloads d ON d.id = f.download_id
+                  WHERE f.person_id = ?
+                    AND (d.user_deleted IS NULL OR d.user_deleted = 0)
+                  ORDER BY COALESCE(f.quality_score, 0) DESC, f.w * f.h DESC
+                  LIMIT 1`,
+            )
+            .get(pid);
+        coverFaceId = cover?.face_id != null ? Number(cover.face_id) : null;
+    }
+    const tx = db.transaction(() => {
+        const ins = db
+            .prepare(
+                `INSERT INTO excluded_people (embedding_centroid, label, created_at, cover_face_id)
+                 VALUES (?, ?, ?, ?)`,
+            )
+            .run(person.embedding_centroid, person.label ?? null, Date.now(), coverFaceId);
+        db.prepare('DELETE FROM people WHERE id = ?').run(pid);
+        return {
+            ok: true,
+            excludedId: Number(ins.lastInsertRowid),
+            personId: pid,
+            label: person.label ?? null,
+            coverFaceId,
+        };
+    });
+    return tx();
+}
+
+/** List durable exclusions (no centroid blobs — UI list with cover face). */
+export function listExcludedPeople({ limit = 500, offset = 0 } = {}) {
+    const lim = Math.max(1, Math.min(2000, Number(limit) || 500));
+    const off = Math.max(0, Number(offset) || 0);
+    const db = getDb();
+    // Backfill cover_face_id for legacy exclusions created before the column
+    // existed (or when the person had no faces at exclude time).
+    _backfillExcludedCoverFaces(db);
+    const rows = db
+        .prepare(
+            `SELECT e.id, e.label, e.created_at, e.cover_face_id,
+                    CASE WHEN f.id IS NOT NULL
+                          AND (d.user_deleted IS NULL OR d.user_deleted = 0)
+                         THEN f.id ELSE NULL END AS cover_face_id_live
+               FROM excluded_people e
+               LEFT JOIN faces f ON f.id = e.cover_face_id
+               LEFT JOIN downloads d ON d.id = f.download_id
+              ORDER BY e.created_at DESC, e.id DESC
+              LIMIT ? OFFSET ?`,
+        )
+        .all(lim, off)
+        .map((r) => ({
+            id: r.id,
+            label: r.label,
+            created_at: r.created_at,
+            // Prefer live face id when the row still exists; else null so UI
+            // can fall back to a placeholder (file deleted / reindexed).
+            cover_face_id: r.cover_face_id_live != null ? Number(r.cover_face_id_live) : null,
+        }));
+    const total = db.prepare('SELECT COUNT(*) AS n FROM excluded_people').get().n;
+    return { excluded: rows, total };
+}
+
+/**
+ * For excluded rows missing a usable cover_face_id, pick the face whose
+ * embedding is closest to the stored centroid and persist it.
+ */
+function _backfillExcludedCoverFaces(db) {
+    const missing = db
+        .prepare(
+            `SELECT e.id, e.embedding_centroid
+               FROM excluded_people e
+              WHERE e.cover_face_id IS NULL
+                 OR NOT EXISTS (SELECT 1 FROM faces f WHERE f.id = e.cover_face_id)`,
+        )
+        .all();
+    if (!missing.length) return;
+
+    const faceRows = db
+        .prepare(
+            `SELECT f.id, f.embedding
+               FROM faces f
+               JOIN downloads d ON d.id = f.download_id
+              WHERE (d.user_deleted IS NULL OR d.user_deleted = 0)`,
+        )
+        .all();
+    if (!faceRows.length) return;
+
+    const faces = faceRows.map((r) => {
+        const dim = r.embedding.byteLength / 4;
+        return {
+            id: r.id,
+            emb: new Float32Array(r.embedding.buffer, r.embedding.byteOffset, dim),
+        };
+    });
+
+    const upd = db.prepare('UPDATE excluded_people SET cover_face_id = ? WHERE id = ?');
+    const tx = db.transaction(() => {
+        for (const row of missing) {
+            const dim = row.embedding_centroid.byteLength / 4;
+            const cent = new Float32Array(
+                row.embedding_centroid.buffer,
+                row.embedding_centroid.byteOffset,
+                dim,
+            );
+            let bestId = null;
+            let bestDist = Infinity;
+            for (const f of faces) {
+                if (f.emb.length !== dim) continue;
+                let sum = 0;
+                for (let i = 0; i < dim; i++) {
+                    const d = cent[i] - f.emb[i];
+                    sum += d * d;
+                }
+                const dist = Math.sqrt(sum);
+                if (dist < bestDist) {
+                    bestDist = dist;
+                    bestId = f.id;
+                }
+            }
+            if (bestId != null) upd.run(bestId, row.id);
+        }
+    });
+    tx();
+}
+
+/**
+ * Centroids for Phase B denylist matching.
+ * @returns {Array<{ id: number, label: string|null, centroid: Float32Array }>}
+ */
+export function listExcludedCentroids() {
+    const out = [];
+    const stmt = getDb().prepare(
+        'SELECT id, label, embedding_centroid FROM excluded_people',
+    );
+    for (const r of stmt.iterate()) {
+        if (!r.embedding_centroid) continue;
+        const dim = r.embedding_centroid.byteLength / 4;
+        if (!Number.isFinite(dim) || dim < 1) continue;
+        const c = new Float32Array(dim);
+        const view = new Float32Array(
+            r.embedding_centroid.buffer,
+            r.embedding_centroid.byteOffset,
+            dim,
+        );
+        c.set(view);
+        out.push({ id: r.id, label: r.label ?? null, centroid: c });
+    }
+    return out;
+}
+
+/**
+ * True when `centroid` is within `eps` of any excluded centroid.
+ * Used by Phase B and tests.
+ */
+export function matchExcludedCentroid(centroid, eps = 0.4) {
+    if (!(centroid instanceof Float32Array)) return null;
+    const dim = centroid.length;
+    let best = null;
+    let bestDist = Infinity;
+    for (const s of listExcludedCentroids()) {
+        if (s.centroid.length !== dim) continue;
+        let sum = 0;
+        for (let i = 0; i < dim; i++) {
+            const d = centroid[i] - s.centroid[i];
+            sum += d * d;
+        }
+        const dist = Math.sqrt(sum);
+        if (dist < bestDist && dist <= eps) {
+            bestDist = dist;
+            best = { id: s.id, label: s.label, distance: bestDist };
+        }
+    }
+    return best;
+}
+
+/** Remove one exclusion so the next recluster may recreate the person. */
+export function deleteExcludedPerson(id) {
+    const eid = Number(id);
+    if (!Number.isFinite(eid) || eid <= 0) return 0;
+    return getDb().prepare('DELETE FROM excluded_people WHERE id = ?').run(eid).changes;
+}
+
+/** Wipe the entire exclusion denylist (full faces reindex). */
+export function clearExcludedPeople() {
+    return getDb().prepare('DELETE FROM excluded_people').run().changes;
 }
 
 export function listPhotosForPerson(personId, { limit = 50, offset = 0 } = {}) {

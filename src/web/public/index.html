@@ -3209,8 +3209,13 @@
                                     <div class="absolute right-0 top-full mt-1 z-30 w-56 bg-tg-panel border border-tg-border rounded-lg shadow-xl py-1" role="menu">
                                         <button id="ai-recluster-btn" type="button" class="w-full text-left px-3 py-2 text-xs text-tg-text hover:bg-tg-bg/40 inline-flex items-center gap-2"
                                                 data-i18n-title="maintenance.ai.recluster_tooltip"
-                                                title="Run DBSCAN clustering only — uses existing face detections + the current threshold to surface People. Fast (seconds, not minutes).">
+                                                title="Assign unassigned faces to existing People (or form new clusters). Keeps merges and labels.">
                                             <i class="ri-refresh-line text-tg-blue"></i><span data-i18n="maintenance.ai.recluster">Re-cluster</span>
+                                        </button>
+                                        <button id="ai-rebuild-btn" type="button" class="w-full text-left px-3 py-2 text-xs text-tg-text hover:bg-tg-bg/40 inline-flex items-center gap-2"
+                                                data-i18n-title="maintenance.ai.rebuild_tooltip"
+                                                title="Wipe all People and re-run DBSCAN on every face. Use after changing ε. Merges are NOT preserved.">
+                                            <i class="ri-shake-hands-line text-amber-300"></i><span data-i18n="maintenance.ai.rebuild">Rebuild all clusters</span>
                                         </button>
                                         <button id="ai-quality-backfill-btn" type="button" class="hidden w-full text-left px-3 py-2 text-xs text-tg-text hover:bg-tg-bg/40 inline-flex items-center gap-2"
                                                 title="Compute quality scores for older faces that were scanned before quality ranking was added.">
@@ -3419,6 +3424,29 @@
                                 <div id="ai-scan-videos-toggle" class="tg-toggle shrink-0 mt-0.5" role="switch" aria-checked="false" tabindex="0"></div>
                             </div>
 
+                            <!-- Video scan limit — cap how many unindexed videos
+                                 Phase A processes per run (0 = unlimited).
+                                 Useful while testing tighter detection filters. -->
+                            <div class="flex items-start justify-between gap-3">
+                                <div class="min-w-0">
+                                    <label for="ai-faces-video-scan-limit" class="text-tg-text text-sm" data-i18n="maintenance.ai.video_scan_limit_label">Video scan limit</label>
+                                    <p class="text-[11px] text-tg-textSecondary mt-0.5" data-i18n="maintenance.ai.video_scan_limit_help">Max videos to process per scan run. 0 = no limit. Set a small number (e.g. 5) to test detection changes without re-scanning the whole library.</p>
+                                </div>
+                                <input id="ai-faces-video-scan-limit" type="number" min="0" max="10000" step="1" value="0"
+                                    class="tg-input w-20 text-sm text-right shrink-0 mt-0.5" inputmode="numeric">
+                            </div>
+
+                            <!-- Video CPU nice — lower scheduling priority during
+                                 the video phase so downloads/UI stay responsive. -->
+                            <div class="flex items-start justify-between gap-3">
+                                <div class="min-w-0">
+                                    <label for="ai-faces-video-nice" class="text-tg-text text-sm" data-i18n="maintenance.ai.video_nice_label">Video CPU priority (nice)</label>
+                                    <p class="text-[11px] text-tg-textSecondary mt-0.5" data-i18n="maintenance.ai.video_nice_help">Unix only. 0 = normal priority. 10–15 = background-friendly — keeps Telegram downloads and the dashboard responsive during long video scans. Also applies to the faces sidecar and ffmpeg fallback.</p>
+                                </div>
+                                <input id="ai-faces-video-nice" type="number" min="0" max="19" step="1" value="0"
+                                    class="tg-input w-20 text-sm text-right shrink-0 mt-0.5" inputmode="numeric">
+                            </div>
+
                             <!-- Detector model select. Switching the
                                  preset auto-restarts the sidecar +
                                  reminds the operator that the existing
@@ -3432,7 +3460,7 @@
                                     <option value="buffalo_m">buffalo_m — faster, smaller ResNet50</option>
                                     <option value="buffalo_s">buffalo_s — fastest, ResNet34</option>
                                 </select>
-                                <p id="ai-faces-model-status" class="text-[10px] text-tg-textSecondary mt-1" data-i18n="maintenance.ai.faces.model_help">Switching the model restarts the sidecar. Re-cluster recommended after switching.</p>
+                                <p id="ai-faces-model-status" class="text-[10px] text-tg-textSecondary mt-1" data-i18n="maintenance.ai.faces.model_help">Switching the model restarts the sidecar. Rebuild all clusters (or Reindex) after switching — embedding spaces differ.</p>
                             </div>
 
                             <!-- Sensitivity presets — one-click way to
@@ -3538,7 +3566,7 @@
                         <!-- Epsilon over-merge warning (hidden by default) -->
                         <div id="ai-epsilon-warning" class="hidden mb-3 flex items-start gap-2 px-3 py-2.5 rounded-xl bg-amber-500/10 border border-amber-400/20 text-amber-300 text-xs">
                             <i class="ri-alert-line shrink-0 mt-px"></i>
-                            <span data-i18n="maintenance.ai.epsilon_warning">One cluster contains an unusually large share of all faces — the DBSCAN ε threshold may be too high, causing different people to merge. Try lowering ε and running Re-cluster.</span>
+                            <span data-i18n="maintenance.ai.epsilon_warning">One cluster contains an unusually large share of all faces — the DBSCAN ε threshold may be too high, causing different people to merge. Try lowering ε and running Rebuild all clusters.</span>
                         </div>
 
                         <!-- Search + filter row -->
@@ -3667,9 +3695,17 @@
                                         <i class="ri-scissors-cut-line"></i>
                                         <span class="hidden sm:inline" data-i18n="maintenance.ai.people.actions.split">Split…</span>
                                     </button>
+                                    <button id="ai-person-exclude-btn"
+                                        class="tg-btn-secondary text-[11px] h-8 px-2 inline-flex items-center gap-1.5 text-amber-300 hover:border-amber-400/40"
+                                        data-i18n-title="maintenance.ai.exclude_btn_title"
+                                        title="Exclude this identity — it will not reappear after recluster">
+                                        <i class="ri-eye-off-line"></i>
+                                        <span class="hidden sm:inline" data-i18n="maintenance.ai.people.actions.exclude">Exclude</span>
+                                    </button>
                                     <button id="ai-person-delete-btn"
                                         class="tg-btn-secondary text-[11px] w-8 h-8 p-0 inline-flex items-center justify-center text-red-300 hover:border-red-400/40"
-                                        title="Delete cluster">
+                                        data-i18n-title="maintenance.ai.delete_btn_title"
+                                        title="Delete cluster (temporary — may reappear on recluster)">
                                         <i class="ri-delete-bin-line"></i>
                                     </button>
                                 </div>
@@ -3708,6 +3744,24 @@
                                     </button>
                                 </div>
                                 <div id="ai-face-review-grid" class="grid grid-cols-3 sm:grid-cols-5 md:grid-cols-6 lg:grid-cols-8 gap-1 p-1.5"></div>
+                            </div>
+                        </div>
+
+                        <!-- Durable exclusions — sits under the selected-cluster panel -->
+                        <div id="ai-people-excluded" class="hidden mt-3 rounded-xl bg-tg-bg/30 border border-white/5 overflow-hidden">
+                            <button type="button" id="ai-people-excluded-toggle"
+                                class="w-full flex items-center justify-between gap-2 px-3 py-2.5 text-left hover:bg-white/[0.02] transition-colors"
+                                aria-expanded="false" aria-controls="ai-people-excluded-body">
+                                <span class="inline-flex items-center gap-2 min-w-0">
+                                    <i class="ri-eye-off-line text-amber-400/80 text-sm"></i>
+                                    <span class="text-xs font-medium text-tg-text" data-i18n="maintenance.ai.excluded.heading">Excluded</span>
+                                    <span id="ai-people-excluded-count" class="text-[10px] text-tg-textSecondary"></span>
+                                </span>
+                                <i class="ri-arrow-down-s-line text-tg-textSecondary text-sm transition-transform" id="ai-people-excluded-chevron"></i>
+                            </button>
+                            <div id="ai-people-excluded-body" class="hidden border-t border-white/5 px-3 py-2">
+                                <p class="text-[11px] text-tg-textSecondary/70 mb-2" data-i18n="maintenance.ai.excluded.help">These identities stay out of People across reclusters. Restore to allow them again.</p>
+                                <ul id="ai-people-excluded-list" class="space-y-1"></ul>
                             </div>
                         </div>
 

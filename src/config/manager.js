@@ -590,6 +590,15 @@ const DEFAULT_CONFIG = {
                 // are biometric data. Alias of the legacy `federateFaces`
                 // flat key.
                 federate: false,
+
+                // ===== Video face scan (Node scan-runner) =====
+                // Off by default — opt in via Maintenance toggle. Limit /
+                // nice are also editable in the UI; do not pin them via
+                // compose env with a `:-0` default or the UI value is
+                // silently overridden (env beats kv — see faces-config.js).
+                scanVideos: false,
+                videoScanLimit: 0, // 0 = unlimited videos per scan run
+                videoNice: 0, // Unix nice bump during video phase; 0 = off
             },
         },
     },

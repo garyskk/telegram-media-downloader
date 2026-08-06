@@ -240,11 +240,26 @@ should read the nested path.
 | `downloadRedirectCap` | `TGDL_FACES_DOWNLOAD_REDIRECT_CAP` | `5` | Max HTTP redirects when fetching the binary |
 | `downloadMirrors` | `TGDL_FACES_DOWNLOAD_MIRRORS` | `[]` | Alternative tarball URLs / base URLs |
 | `federate` | `TGDL_FACES_FEDERATE` | `false` | Cross-peer face centroid propagation |
+| — | `TGDL_FACES_VIDEO_WINDOW_SEC` | `0.4` | *Sidecar only* — best-frame window size for the `cv2` sampler; no Node equivalent (see [Video face scanning](#video-face-scanning)) |
+| `videoFloorIntervalSec` | `TGDL_FACES_VIDEO_FLOOR_INTERVAL_SEC` | `3.0` | Max gap between samples when nothing triggers motion — backstop only, not the recall mechanism |
+| — | `TGDL_FACES_VIDEO_MOTION_THRESHOLD` | `6.0` | *Sidecar only* — luma-diff (0–255) motion sensitivity; the Node fallback uses ffmpeg's own `scene` score instead (different scale, no shared knob) |
+| `videoMaxFrames` | `TGDL_FACES_VIDEO_MAX_FRAMES` | `20000` | Pure runaway-safety ceiling — **not** a density control, should never bind on a real video |
+| `videoScanLimit` | `TGDL_FACES_VIDEO_SCAN_LIMIT` | `0` | Max unindexed videos per scan run (`0` = unlimited). Use a small value while testing detection changes |
+| `videoNice` | `TGDL_FACES_VIDEO_NICE` | `0` | Unix **nice** level for the video scan phase (`0` = normal, `10`–`15` = background-friendly). Applies to Node, ffmpeg fallback, and sidecar `/detect/video` |
+| — | `TGDL_FACES_VIDEO_SINGLETON_MIN_SCORE` | `0.75` | *Sidecar only* — detection-score floor for a face seen in exactly 1 sampled frame |
+| — | `TGDL_FACES_VIDEO_SINGLETON_MIN_QUALITY` | `0.55` | *Sidecar only* — quality-score floor for a face seen in exactly 1 sampled frame |
+| — | `TGDL_FACES_VIDEO_CONFIRMED_MIN_QUALITY` | `0.45` | *Sidecar only* — universal quality floor for a face confirmed across ≥2 sampled frames |
+| — | `TGDL_FACES_VIDEO_CONFIRMED_MIN_SCORE` | `0.60` | *Sidecar only* — detection-score floor for a track confirmed across ≥2 sampled frames |
+| — | `TGDL_FACES_VIDEO_MIN_LANDMARK_REGULARITY` | `0.35` | *Sidecar only* — landmark symmetry floor (hard gate against non-face textures) |
+| `videoProgressPollMs` | `TGDL_FACES_VIDEO_PROGRESS_POLL_MS` | `5000` | *Node only* — how often `detectFacesInVideo` polls `GET /detect/video/status/{job_id}` while a video request is in flight (see [Video scan progress reporting](#video-scan-progress-reporting)) |
 
 Env-var precedence is strict: any `TGDL_FACES_*` value wins over the
 matching kv-config value, which wins over the legacy flat alias, which
-wins over the hardcoded default. Number arrays accept `,` or `:` as
-separators (`5000,5999` or `5000:5999` both work).
+wins over the hardcoded default. Do **not** inject UI-tunable knobs
+(`videoScanLimit`, `videoNice`, …) with compose `:-0` defaults — that
+pins unlimited/off and silently ignores Maintenance settings. Leave
+unset unless you intend a deploy-time override. Number arrays accept
+`,` or `:` as separators (`5000,5999` or `5000:5999` both work).
 
 ## How it works
 
@@ -256,30 +271,33 @@ separators (`5000,5999` or `5000:5999` both work).
    regardless of detected face count, so a re-scan doesn't re-decode
    photos that yielded zero faces.
 
-2. **Phase B** — DBSCAN over every face embedding. Cluster ids are
-   rebuilt from scratch on each run; `eps` defaults to 0.5 (matches
-   buffalo_l's "definitely the same person" guidance for L2-normalised
-   embeddings); `minPts` defaults to 3 so a one-shot stranger stays
-   unassigned instead of getting forced into a cluster.
+2. **Phase B (incremental, default)** — only faces with
+   `person_id IS NULL` are considered. Each is attached to the nearest
+   existing person centroid within `epsilon` (unless nearer an excluded
+   identity), otherwise leftovers are DBSCAN'd into **new** people.
+   Existing people, merges, splits, labels, and covers are left alone.
+   End-of-scan Phase B and **Re-cluster** use this path.
 
-3. **Label preservation across re-cluster** — before wiping the `people`
-   table, every labelled centroid is snapshotted in memory. After the
-   new DBSCAN finishes, each cluster's centroid is matched against the
-   snapshot within `labelMatchEps` (default: `epsilon * 0.9` clamped to
-   `[0.2, 0.6]`) and the label carries over. Renames survive re-runs
-   even though cluster ids reset.
+3. **Rebuild all clusters (destructive)** — the old wipe+DBSCAN path:
+   `clearAllPeople()`, DBSCAN over every face, recreate people. Labels /
+   covers / exclusions carry over via centroid match. Use after changing
+   `epsilon` when a global reshuffle is wanted. **Merges are not
+   preserved.** Exposed as **Rebuild all clusters** in the UI /
+   `POST /api/ai/faces/rebuild`.
 
 ### Cluster operations
 
 The maintenance page surfaces:
 
-- **Rename** — set a label on a cluster. Survives re-cluster via the
-  centroid-match path above.
-- **Merge** — fold one cluster into another. Both label histories and
-  every linked face come along.
+- **Rename** — set a label on a cluster. Survives both Re-cluster and
+  Rebuild (via centroid match on Rebuild).
+- **Merge** — fold one cluster into another. Survives **Re-cluster**
+  (incremental). Lost on **Rebuild all** / Reindex. Target centroid is
+  recomputed from all faces after merge.
 - **Split** — pick faces from a cluster, create a new cluster, link
   those faces to it. The original keeps the rest.
 - **Reassign** — move one face between clusters.
+- **Exclude** — durable denylist so an identity does not reappear.
 
 ### Auto-pregeneration on new downloads
 
@@ -295,27 +313,58 @@ When `advanced.ai.faces.scanVideos` is `true`, the scan runner includes
 `file_type = 'video'` rows in the phase A total alongside photos.
 Videos are processed one at a time after the photo batch finishes.
 
-For each video the sidecar's `POST /detect/video` endpoint extracts
-evenly-spaced frames via `cv2.VideoCapture` (no temp files written to
-disk). Frame count adapts to video duration — short clips get at least
-one frame, long videos are capped at `max_frames` (default 120, roughly
-1 frame/min for a 2-hour file). Detection runs on every extracted frame;
-a deduplication pass then collapses faces with cosine similarity above
-0.50 so only one best-score instance per identity is kept.
+**Sampling is duration-independent** — the same fixed cadence applies to
+a 10-second clip and a 4-hour recording; there are no duration bands and
+no per-video sampling budget. The sidecar's `POST /detect/video` endpoint
+walks the video with a single sequential `cv2.VideoCapture` decode (no
+seeking — `cv2.CAP_PROP_POS_FRAMES` seeking is unreliable on long-GOP
+H.264/HEVC) and streams sampled frames through detection one at a time,
+so memory stays bounded regardless of video length:
+
+- Every `videoWindowSec` (default 0.4s) the sharpest frame in that window
+  becomes a candidate. It's *kept* once it differs enough from the last
+  kept sample (motion) or `videoFloorIntervalSec` (default 3.0s) has
+  elapsed with no motion at all (a static-scene backstop).
+- `videoMaxFrames` (default 20000) is a pure runaway-safety ceiling, not
+  a density knob — it should essentially never bind for a real video.
+- Detections across frames are merged into per-identity **tracks**: a
+  track confirmed by ≥2 sampled frames is kept only if it also clears a
+  quality floor (catches the detector consistently misfiring on the same
+  non-face texture, which repetition alone wouldn't catch); a track seen
+  in only 1 frame needs a stricter score+quality bar. Confirmed tracks
+  keep up to 3 pose-diverse representative faces instead of collapsing
+  to a single embedding.
+
+This is a deliberate accuracy-over-speed trade: a 2-hour video can
+legitimately take thousands of detection calls instead of the old ~120.
 
 #### Video b64 fallback (external sidecar)
 
 When the sidecar runs externally without shared filesystem access, the
 `/detect/video` path mode returns 403. The Node client automatically
-falls back to:
+falls back to a local ffmpeg-based pipeline that mirrors the sidecar's
+approach:
 
-1. Extract frames locally with ffmpeg (same evenly-spaced logic).
-2. Send frames in batches of 20 to `POST /detect/batch-b64`.
-3. Deduplicate faces client-side (same cosine-sim ≥ 0.50 rule).
+1. One continuous ffmpeg process (no per-frame spawn, no `-ss` seeking)
+   using a single `select` filter that combines the duration-independent
+   floor with ffmpeg's own scene-change score as the motion trigger.
+2. Frames are parsed off ffmpeg's `stdout` incrementally and dispatched
+   to `POST /detect/batch-b64` in small windows (8 frames), discarding
+   each window's raw bytes right after — memory doesn't scale with video
+   length here either. Falls back to sequential `/detect` calls if
+   `batch-b64` isn't available (older sidecar).
+3. The same track-confirmation + best-N dedup logic as the sidecar path
+   (ported to JS, kept behaviorally in sync) runs over the results.
 
 The fallback activates transparently — no configuration needed. Once
 `_pathRejectedLogged` is set (by any 403 from photos or video), all
 subsequent video calls skip the path-mode attempt entirely.
+
+The Node fallback's `select` filter has no equivalent to `videoWindowSec`
+(no windowing concept) and uses ffmpeg's own differently-scaled `scene`
+score instead of `videoMotionThreshold`'s 0–255 luma-diff — those two
+knobs are sidecar-only (see the table above). `videoFloorIntervalSec` and
+`videoMaxFrames` apply to both paths.
 
 Embeddings from video frames land in the same `faces` table and use the
 same 512-dim ArcFace space as photo-sourced faces. Phase B DBSCAN
@@ -324,6 +373,44 @@ in the same People group automatically.
 
 Off by default; toggle via the AI maintenance page or set
 `advanced.ai.faces.scanVideos = true` in the config.
+
+#### Video scan progress reporting
+
+`POST /detect/video` is a single blocking request that can legitimately
+take many minutes on a long or dense video — without this, the
+maintenance dashboard's progress bar looks frozen for the entire
+duration of that one video (it only advances once per video, not once
+per frame). To fix that:
+
+1. When `detectFacesInVideo` is called with an `onVideoProgress`
+   callback (scan-runner.js always supplies one), the Node client
+   generates a `job_id` and includes it in the `POST /detect/video`
+   body.
+2. The sidecar reports its decode position into an in-memory registry
+   (`tgdl_faces/video_progress.py`) as `extract_video_frames` walks the
+   video — one report per decoded frame, keyed by `job_id`. The registry
+   entry is removed once the request finishes (success, soft-error, or
+   exception), via a `try`/`finally` around the whole detect body.
+3. While the main request is in flight, the Node client polls
+   `GET /detect/video/status/{job_id}` every `videoProgressPollMs`
+   (default 5000 ms) and forwards the parsed `{frames_decoded,
+   total_frames, pct, elapsed_sec}` payload to `onVideoProgress`.
+4. `scan-runner.js` stores this on `state.currentVideo` (cleared back to
+   `null` once that video finishes) and broadcasts it with the rest of
+   the scan progress; the maintenance page renders it as e.g.
+   `Video: clip.mp4 — 42% decoded (3,412/8,120 frames)` in place of the
+   generic "Scanning…" text.
+
+The reported percentage is decode position (`frames_decoded /
+total_frames`), not a "faces found so far" count — the streaming
+pipeline's bounded sliding window means decode and detection run in
+near-lockstep, so decode-% is an accurate proxy for "how far through the
+video are we" without needing a second counter. Polling is best-effort
+telemetry: a poll failure, a `404` (job already finished, or the sidecar
+predates `job_id` support), or omitting `onVideoProgress` entirely never
+affects the returned faces — it just means no mid-flight progress is
+shown. Not wired for the Node b64 fallback path (`_detectVideoB64Fallback`)
+since it doesn't currently know `total_frames` up front.
 
 ### CPU throttle
 
@@ -344,6 +431,31 @@ freeze the entire loop.
 
 Range is clamped to `[0, 5]`. Set via `advanced.ai.faces.cpuThrottleRatio`
 in config or `TGDL_FACES_CPU_THROTTLE_RATIO` env var.
+
+### Video CPU priority (nice)
+
+`videoNice` lowers OS scheduling priority **during the video phase only**
+(photos keep normal priority). On Linux it applies at three layers:
+
+1. **Node scan loop** — `process.setPriority()` for the duration of Phase A videos
+2. **ffmpeg fallback** — spawns `nice -n <N> ffmpeg …` when path-mode is unavailable
+3. **Sidecar** — `os.nice()` for the lifetime of each `POST /detect/video` request
+   (Node forwards `nice` in the JSON body; that beats `TGDL_FACES_VIDEO_NICE`)
+
+| Value | Effect |
+|---|---|
+| `0` (default) | Normal priority |
+| `10` | Background-friendly — good starting point for testing |
+| `15`–`19` | Very low priority — use when the host is shared / CPU-constrained |
+
+Unix only; ignored on Windows. Set via Maintenance → AI → **Video CPU
+priority (nice)** or config `advanced.ai.faces.videoNice`. Optional
+deploy-time pin: `TGDL_FACES_VIDEO_NICE` on **both** services — but do
+**not** inject compose `:-0`/`:-10` defaults or the UI value is ignored
+(env beats kv on Node; request body beats env on the sidecar).
+
+For Docker-level weighting independent of nice, you can also lower
+`cpu_shares` on the `tgdl-faces` service (see `docker-compose.yml` comment).
 
 ### Detector model options
 
@@ -556,19 +668,36 @@ All endpoints are admin-only.
 | Method | Path                                | Notes                                                  |
 | ------ | ----------------------------------- | ------------------------------------------------------ |
 | GET    | `/api/ai/status`                    | feature flags, scan state, face count                  |
-| POST   | `/api/ai/scan/start`                | `{ feature: 'faces' }`                                 |
+| POST   | `/api/ai/scan/start`                | `{ feature: 'faces' }` — Phase A + incremental Phase B |
 | POST   | `/api/ai/scan/cancel`               | same body shape                                        |
 | GET    | `/api/ai/scan/status?feature=faces` | live state for re-mounted page                         |
+| POST   | `/api/ai/faces/recluster`           | incremental Phase B only (skip detection; keeps merges) |
+| POST   | `/api/ai/faces/rebuild`             | full wipe+DBSCAN reshape (merges lost)                 |
 | GET    | `/api/ai/people`                    | clusters with cover face + count                       |
+| GET    | `/api/ai/people/excluded`           | durable exclusion denylist (`{ excluded, total }`)     |
 | GET    | `/api/ai/people/:id/photos`         | paginated photos in this cluster                       |
 | PATCH  | `/api/ai/people/:id`                | `{ label }` — rename                                   |
-| DELETE | `/api/ai/people/:id`                | drop cluster (faces become unassigned)                 |
+| POST   | `/api/ai/people/:id/cover`          | `{ faceId }` — pin People avatar thumbnail             |
+| DELETE | `/api/ai/people/:id`                | temporary drop (faces unassigned; may reappear)        |
+| POST   | `/api/ai/people/:id/exclude`        | durable exclude — skipped by Phase B recluster         |
+| DELETE | `/api/ai/people/excluded/:id`       | un-exclude (next recluster may recreate)               |
 | POST   | `/api/ai/people/:id/merge`          | `{ otherId }` — fold one cluster into another          |
 | POST   | `/api/ai/people/:id/split`          | `{ faceIds, newLabel? }` — create a new cluster        |
 | POST   | `/api/ai/faces/:id/reassign`        | `{ personId }` — move a single face to another cluster |
 | GET    | `/api/ai/faces/by-download/:id`     | face boxes for the gallery viewer overlay              |
 | POST   | `/api/ai/preload-model/:name`       | trigger background model download (proxy to sidecar)   |
 | GET    | `/api/ai/preload-model/:name/status`| check model download status                            |
+
+**Delete vs Exclude.** `DELETE /api/ai/people/:id` only drops the
+cluster row (faces become unassigned); the next **incremental** Phase B
+may recreate a cluster from those faces. `POST /api/ai/people/:id/exclude`
+snapshots the centroid into `excluded_people` so matching faces stay
+unassigned / do not form a Person. Full faces reindex clears the denylist
+(embedding space may change with the detector model).
+
+**Re-cluster vs Rebuild.** Re-cluster assigns only unassigned faces and
+preserves merges. Rebuild all clusters wipes People and re-DBSCANs
+everything (use after changing ε).
 
 ## Sidecar wire format
 

@@ -168,6 +168,10 @@ import {
     listFacesForPerson,
     renamePerson,
     deletePerson,
+    excludePerson,
+    listExcludedPeople,
+    deleteExcludedPerson,
+    setPersonCoverFace,
     resetAllAiData,
     setFaceQualityScore,
     getDb as aiGetDb,
@@ -7769,6 +7773,12 @@ app.get('/api/ai/status', async (_req, res) => {
                         facesBlock.detectorModel || cfg.facesDetectorModel || 'buffalo_l',
                     ),
                     scanVideos: facesBlock.scanVideos === true,
+                    videoScanLimit: Number.isFinite(facesBlock.videoScanLimit)
+                        ? Math.max(0, facesBlock.videoScanLimit | 0)
+                        : 0,
+                    videoNice: Number.isFinite(facesBlock.videoNice)
+                        ? Math.max(0, Math.min(19, facesBlock.videoNice | 0))
+                        : 0,
                     sidecarUrl:
                         typeof facesBlock.sidecarUrl === 'string' ? facesBlock.sidecarUrl : '',
                 },
@@ -8103,10 +8113,10 @@ app.post('/api/ai/faces/install-deps', async (req, res) => {
 // re-detecting. Lets the operator tweak ε / minPoints and see the new
 // People grid in seconds (vs minutes for a full re-scan). Implemented
 // by triggering the standard faces scan-runner; Phase A is a no-op when
-// every photo carries `ai_indexed_at IS NOT NULL`, so for fully-indexed
-// libraries this lands in Phase B immediately. For partially-indexed
-// libraries (a scan was cancelled mid-way), Phase A picks up where it
-// left off — same as clicking "Scan now".
+// Incremental Phase B only (skipPhaseA). Does not detect faces on
+// unscanned media — use "Scan now" for that. For fully-indexed libraries
+// this is equivalent to the old recluster; for partial libraries it will
+// not pick up where a cancelled scan left off.
 app.post('/api/ai/faces/recluster', async (_req, res) => {
     try {
         const cfg = _aiCfg();
@@ -8116,6 +8126,8 @@ app.post('/api/ai/faces/recluster', async (_req, res) => {
                 message: 'A face scan is already in progress.',
             });
         }
+        // Incremental Phase B only — no detection of unscanned media.
+        const runCfg = { ...cfg, facesClusterMode: 'incremental', skipPhaseA: true };
         const tracker = _aiTrackerFor('faces');
         const claim = tracker.tryStart(({ onProgress, signal }) => {
             return new Promise((resolve, reject) => {
@@ -8127,7 +8139,7 @@ app.post('/api/ai/faces/recluster', async (_req, res) => {
                     });
                 }
                 aiStartFacesScan(
-                    cfg,
+                    runCfg,
                     (p) => {
                         try {
                             onProgress(p);
@@ -8144,7 +8156,54 @@ app.post('/api/ai/faces/recluster', async (_req, res) => {
         if (!claim.started) {
             return res.status(409).json({ error: 'Tracker busy', code: claim.code });
         }
-        res.json({ success: true, started: true });
+        res.json({ success: true, started: true, mode: 'incremental' });
+    } catch (e) {
+        res.status(500).json({ error: e?.message || String(e) });
+    }
+});
+
+// Full rebuild — clearAllPeople + DBSCAN over every face (old recluster
+// behavior). Use after changing ε when a global reshuffle is wanted.
+// Merges are NOT preserved. Labels / covers / exclusions still carry over.
+app.post('/api/ai/faces/rebuild', async (_req, res) => {
+    try {
+        const cfg = _aiCfg();
+        if (aiIsScanRunning('faces')) {
+            return res.status(409).json({
+                error: 'scan_running',
+                message: 'A face scan is already in progress.',
+            });
+        }
+        const runCfg = { ...cfg, facesClusterMode: 'full' };
+        const tracker = _aiTrackerFor('faces');
+        const claim = tracker.tryStart(({ onProgress, signal }) => {
+            return new Promise((resolve, reject) => {
+                if (signal?.addEventListener) {
+                    signal.addEventListener('abort', () => {
+                        try {
+                            aiCancelScan('faces');
+                        } catch {}
+                    });
+                }
+                aiStartFacesScan(
+                    runCfg,
+                    (p) => {
+                        try {
+                            onProgress(p);
+                        } catch {}
+                    },
+                    (p) => {
+                        if (p?.error) reject(new Error(p.error));
+                        else resolve(p || {});
+                    },
+                    (entry) => log(entry),
+                );
+            });
+        });
+        if (!claim.started) {
+            return res.status(409).json({ error: 'Tracker busy', code: claim.code });
+        }
+        res.json({ success: true, started: true, mode: 'full' });
     } catch (e) {
         res.status(500).json({ error: e?.message || String(e) });
     }
@@ -8170,6 +8229,7 @@ app.post('/api/ai/faces/reindex', async (_req, res) => {
         const tx = db.transaction(() => {
             db.prepare(`DELETE FROM faces`).run();
             db.prepare(`DELETE FROM people`).run();
+            db.prepare(`DELETE FROM excluded_people`).run();
             db.prepare(
                 `UPDATE downloads SET ai_indexed_at = NULL WHERE file_type IN (${placeholders})`,
             ).run(...types);
@@ -8420,15 +8480,32 @@ app.get('/api/ai/group-by-person', async (req, res) => {
 
 // Extract a single frame from a video file as a raw image buffer using ffmpeg.
 // Used by the face crop endpoints when the source is a video file.
-async function _extractVideoFrame(videoPath) {
+async function _extractVideoFrame(videoPath, timeSec = 0) {
     const { execFile } = await import('child_process');
     const { resolveFfmpegBin } = await import('../core/thumbs.js');
     const ffmpeg = resolveFfmpegBin();
+    const ss = Math.max(0, Number(timeSec) || 0);
+    const args =
+        ss > 0
+            ? [
+                  '-ss',
+                  String(ss),
+                  '-i',
+                  videoPath,
+                  '-vframes',
+                  '1',
+                  '-f',
+                  'image2',
+                  '-vcodec',
+                  'png',
+                  'pipe:1',
+              ]
+            : ['-i', videoPath, '-vframes', '1', '-f', 'image2', '-vcodec', 'png', 'pipe:1'];
     return new Promise((resolve, reject) => {
         execFile(
             ffmpeg,
-            ['-i', videoPath, '-vframes', '1', '-f', 'image2', '-vcodec', 'png', 'pipe:1'],
-            { encoding: 'buffer', maxBuffer: 20 * 1024 * 1024, timeout: 10000 },
+            args,
+            { encoding: 'buffer', maxBuffer: 20 * 1024 * 1024, timeout: 15000 },
             (err, stdout) => {
                 if (err) return reject(err);
                 resolve(stdout);
@@ -8437,10 +8514,99 @@ async function _extractVideoFrame(videoPath) {
     });
 }
 
+async function _probeVideoDurationSec(videoPath) {
+    const { execFile } = await import('child_process');
+    const { resolveFfprobeBin } = await import('../core/thumbs.js');
+    const ffprobe = resolveFfprobeBin();
+    try {
+        const { stdout } = await new Promise((resolve, reject) => {
+            execFile(
+                ffprobe,
+                [
+                    '-v',
+                    'error',
+                    '-show_entries',
+                    'format=duration',
+                    '-of',
+                    'default=noprint_wrappers=1:nokey=1',
+                    videoPath,
+                ],
+                { encoding: 'utf8', timeout: 10000 },
+                (err, out) => (err ? reject(err) : resolve({ stdout: out })),
+            );
+        });
+        const d = Number(String(stdout || '').trim());
+        return Number.isFinite(d) && d > 0 ? d : 0;
+    } catch {
+        return 0;
+    }
+}
+
+/** Cheap sharpness proxy for a face bbox on a decoded frame (higher = better). */
+async function _faceCropSharpness(sourceBuf, row) {
+    const pad = 0.4;
+    const meta = await sharp(sourceBuf, { failOn: 'none' }).metadata();
+    const imgW = meta.width || 9999;
+    const imgH = meta.height || 9999;
+    const left = Math.max(0, Math.round(row.x - row.w * pad));
+    const top = Math.max(0, Math.round(row.y - row.h * pad));
+    const right = Math.min(imgW, Math.round(row.x + row.w + row.w * pad));
+    const bottom = Math.min(imgH, Math.round(row.y + row.h + row.h * pad));
+    const width = Math.max(1, right - left);
+    const height = Math.max(1, bottom - top);
+    const raw = await sharp(sourceBuf, { failOn: 'none' })
+        .extract({ left, top, width, height })
+        .greyscale()
+        .raw()
+        .toBuffer();
+    if (!raw.length) return 0;
+    let sum = 0;
+    for (let i = 0; i < raw.length; i++) sum += raw[i];
+    const mean = sum / raw.length;
+    let varSum = 0;
+    for (let i = 0; i < raw.length; i++) {
+        const d = raw[i] - mean;
+        varSum += d * d;
+    }
+    return varSum / raw.length;
+}
+
+// Pick the best frame for a legacy video face (no stored timestamp) by
+// trying several seek points and keeping the crop with highest variance.
+async function _extractBestVideoFrameForCrop(videoPath, row) {
+    const stored = Number(row.frame_time_sec);
+    if (Number.isFinite(stored) && stored >= 0) {
+        return _extractVideoFrame(videoPath, stored);
+    }
+    const duration = await _probeVideoDurationSec(videoPath);
+    const times =
+        duration > 0
+            ? [0, duration * 0.25, duration * 0.5, duration * 0.75, Math.max(0, duration - 0.05)]
+            : [0];
+    let bestBuf = null;
+    let bestScore = -1;
+    for (const t of times) {
+        try {
+            const frameBuf = await _extractVideoFrame(videoPath, t);
+            const score = await _faceCropSharpness(frameBuf, row);
+            if (score > bestScore) {
+                bestScore = score;
+                bestBuf = frameBuf;
+            }
+        } catch {
+            /* try next candidate */
+        }
+    }
+    if (!bestBuf) throw new Error('no video frame extracted');
+    return bestBuf;
+}
+
 // Crop a face from an image buffer (or file path) with padding.
+// `.rotate()` honours EXIF orientation so coordinates from the sidecar
+// (which already applies EXIF before detection) match the pixel space.
 async function _cropFace(source, row, size) {
     const pad = 0.4;
-    const meta = await sharp(source, { failOn: 'none' }).metadata();
+    const meta = await sharp(source, { failOn: 'none' }).rotate().metadata();
     const imgW = meta.width || 9999;
     const imgH = meta.height || 9999;
     const left = Math.max(0, Math.round(row.x - row.w * pad));
@@ -8450,13 +8616,15 @@ async function _cropFace(source, row, size) {
     const width = Math.max(1, right - left);
     const height = Math.max(1, bottom - top);
     return sharp(source, { failOn: 'none' })
+        .rotate()
         .extract({ left, top, width, height })
         .resize(size, size, { fit: 'cover', position: 'centre' })
         .jpeg({ quality: 82, progressive: true })
         .toBuffer();
 }
 
-// Face crop for person avatar — best (highest-quality/largest) face for this person.
+// Face crop for person avatar — pinned cover_face_id when set and still
+// belonging to this person; otherwise best (highest-quality/largest) face.
 // Used by the People grid as the circle avatar. Sharp-crops with 40% padding so the
 // face is framed, not cut tight. For video-sourced faces, extracts a frame via ffmpeg.
 app.get('/api/ai/person/:id/face', async (req, res) => {
@@ -8468,13 +8636,16 @@ app.get('/api/ai/person/:id/face', async (req, res) => {
 
         const row = aiGetDb()
             .prepare(
-                `SELECT f.x, f.y, f.w, f.h, d.file_path, d.file_type
+                `SELECT f.x, f.y, f.w, f.h, f.frame_time_sec, d.file_path, d.file_type
                    FROM faces f
                    JOIN downloads d ON d.id = f.download_id
+                   JOIN people p ON p.id = f.person_id
                   WHERE f.person_id = ?
                     AND (d.user_deleted IS NULL OR d.user_deleted = 0)
-                  ORDER BY CASE WHEN d.file_type = 'photo' THEN 0 ELSE 1 END,
-                           COALESCE(f.quality_score, 0) DESC, f.w * f.h DESC
+                  ORDER BY
+                    CASE WHEN p.cover_face_id IS NOT NULL AND f.id = p.cover_face_id THEN 0 ELSE 1 END,
+                    CASE WHEN d.file_type = 'photo' THEN 0 ELSE 1 END,
+                    COALESCE(f.quality_score, 0) DESC, f.w * f.h DESC
                   LIMIT 1`,
             )
             .get(personId);
@@ -8488,11 +8659,12 @@ app.get('/api/ai/person/:id/face', async (req, res) => {
 
         let buf;
         if (row.file_type === 'video') {
-            const frameBuf = await _extractVideoFrame(resolved.real);
+            const frameBuf = await _extractBestVideoFrameForCrop(resolved.real, row);
             try {
                 buf = await _cropFace(frameBuf, row, size);
             } catch {
                 buf = await sharp(frameBuf, { failOn: 'none' })
+                    .rotate()
                     .resize(size, size, { fit: 'cover', position: 'attention' })
                     .jpeg({ quality: 82, progressive: true })
                     .toBuffer();
@@ -8531,7 +8703,7 @@ app.get('/api/ai/faces/:id/crop', async (req, res) => {
 
         const row = aiGetDb()
             .prepare(
-                `SELECT f.x, f.y, f.w, f.h, d.file_path, d.file_type
+                `SELECT f.x, f.y, f.w, f.h, f.frame_time_sec, d.file_path, d.file_type
                    FROM faces f
                    JOIN downloads d ON d.id = f.download_id
                   WHERE f.id = ?
@@ -8548,11 +8720,12 @@ app.get('/api/ai/faces/:id/crop', async (req, res) => {
 
         let buf;
         if (row.file_type === 'video') {
-            const frameBuf = await _extractVideoFrame(resolved.real);
+            const frameBuf = await _extractBestVideoFrameForCrop(resolved.real, row);
             try {
                 buf = await _cropFace(frameBuf, row, size);
             } catch {
                 buf = await sharp(frameBuf, { failOn: 'none' })
+                    .rotate()
                     .resize(size, size, { fit: 'cover', position: 'attention' })
                     .jpeg({ quality: 82, progressive: true })
                     .toBuffer();
@@ -8620,6 +8793,33 @@ app.patch('/api/ai/people/:id', async (req, res) => {
         const changes = renamePerson(id, label || null);
         if (!changes) return res.status(404).json({ error: 'person not found' });
         res.json({ success: true, id, label });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// Pin a face as this person's People avatar thumbnail.
+app.post('/api/ai/people/:id/cover', async (req, res) => {
+    try {
+        const id = Number(req.params.id);
+        const faceId = Number(req.body?.faceId);
+        if (!Number.isFinite(id) || id <= 0) {
+            return res.status(400).json({ error: 'invalid person id' });
+        }
+        if (!Number.isFinite(faceId) || faceId <= 0) {
+            return res.status(400).json({ error: 'invalid faceId' });
+        }
+        const r = setPersonCoverFace(id, faceId);
+        if (!r.ok) {
+            const status =
+                r.reason === 'person_not_found' || r.reason === 'face_not_found'
+                    ? 404
+                    : r.reason === 'mismatch'
+                      ? 400
+                      : 400;
+            return res.status(status).json({ error: r.reason || 'cover failed' });
+        }
+        res.json({ success: true, id, coverFaceId: r.coverFaceId });
     } catch (e) {
         res.status(500).json({ error: e.message });
     }
@@ -8716,6 +8916,56 @@ app.delete('/api/ai/people/:id', async (req, res) => {
         }
         const changes = deletePerson(id);
         if (!changes) return res.status(404).json({ error: 'person not found' });
+        res.json({ success: true, id });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// Durable exclude — identity stays out of People across Phase B reclusters.
+// Distinct from DELETE above (temporary unassign). Must be registered with
+// the static `/excluded` paths before any ambiguous :id-only catch-alls.
+app.post('/api/ai/people/:id/exclude', async (req, res) => {
+    try {
+        const id = Number(req.params.id);
+        if (!Number.isFinite(id) || id <= 0) {
+            return res.status(400).json({ error: 'invalid person id' });
+        }
+        const r = excludePerson(id);
+        if (!r.ok) {
+            const status = r.reason === 'not_found' ? 404 : 400;
+            return res.status(status).json({ error: r.reason || 'exclude failed' });
+        }
+        log({
+            source: 'ai',
+            level: 'info',
+            msg: `faces/exclude: person=${r.personId} → excluded=${r.excludedId} label=${r.label || ''}`,
+        });
+        res.json({ success: true, ...r });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.get('/api/ai/people/excluded', async (req, res) => {
+    try {
+        const limit = Math.max(1, Math.min(2000, Number(req.query?.limit) || 500));
+        const offset = Math.max(0, Number(req.query?.offset) || 0);
+        const r = listExcludedPeople({ limit, offset });
+        res.json({ success: true, ...r });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.delete('/api/ai/people/excluded/:id', async (req, res) => {
+    try {
+        const id = Number(req.params.id);
+        if (!Number.isFinite(id) || id <= 0) {
+            return res.status(400).json({ error: 'invalid excluded id' });
+        }
+        const changes = deleteExcludedPerson(id);
+        if (!changes) return res.status(404).json({ error: 'excluded person not found' });
         res.json({ success: true, id });
     } catch (e) {
         res.status(500).json({ error: e.message });

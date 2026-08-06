@@ -4,6 +4,25 @@ All notable changes to this project are documented here. The format is based on 
 
 ## [Unreleased]
 
+### Added
+- **Live progress for in-flight video face scans.** A single `POST /detect/video` call can legitimately run for tens of minutes on a long/dense video (see the duration-independent sampling redesign below), during which the maintenance dashboard previously looked frozen — the scan progress bar only advances once per *video*, not once per *frame*. The sidecar now tracks decode position per request (keyed by a `job_id` the Node client generates) and exposes it via `GET /detect/video/status/{job_id}`; `detectFacesInVideo` polls it every `videoProgressPollMs` (default 5s, `TGDL_FACES_VIDEO_PROGRESS_POLL_MS`) while the request is in flight and forwards it up through `scan-runner.js` to the dashboard, which now shows e.g. `Video: clip.mp4 — 42% decoded (3,412/8,120 frames)` instead of a static "Scanning…". The same decode position is now also folded into the existing 5s-throttled `aiPeople progress — …` console/`docker compose logs` line (e.g. `aiPeople progress — 101/592 video: clip.mp4 42% (3412/8120 frames)`), so it's visible without the dashboard open at all. Best-effort telemetry only — a poll failure, a 404, or an older sidecar without `job_id` support never affects the returned faces.
+
+### Changed
+- **Video face detection redesign** — replaced uniform evenly-spaced frame sampling (which missed faces on-screen for less time than the sampling interval) and greedy single-best-frame dedup (which discarded pose diversity and never corroborated detections) with a duration-independent, content-adaptive pipeline:
+  - The sidecar (`faces-service`) now walks every video with a single sequential `cv2.VideoCapture` decode — no more `CAP_PROP_POS_FRAMES` seeking, which was unreliable on long-GOP H.264/HEVC. A fixed-size window (`videoWindowSec`, default 0.4s) plus a motion trigger catch brief appearances; a fixed floor interval (`videoFloorIntervalSec`, default 3.0s) backstops static scenes. Sampling density no longer scales with video length — a 10s clip and a 4-hour video get identical treatment.
+  - Detection now streams: frames are detected and discarded immediately (bounded in-flight concurrency), so memory no longer scales with sample count on long videos.
+  - Detections are merged into per-identity tracks with temporal confirmation: a face seen in only one sampled frame needs a stricter score+quality bar; a face confirmed across ≥2 frames still needs to clear a quality floor (catches the detector consistently misfiring on the same non-face texture, which repetition alone wouldn't catch). Confirmed identities keep up to 3 pose-diverse representative embeddings instead of collapsing to one.
+  - Quality scoring is re-enabled for video frames and `/detect/batch-b64` (previously skipped for throughput) since the tracker needs it.
+  - The Node ffmpeg fallback (`faces-client.js`, used when the sidecar has no shared filesystem) got the equivalent treatment: one continuous ffmpeg process with a single `select` filter (duration-independent floor + ffmpeg's scene-change score) instead of one `-ss`-seeking process per frame, incremental JPEG-stream parsing, and the same track-confirmation dedup logic ported to JS.
+  - `videoMaxFrames` changes meaning from a density control (old default 120, ≈1 frame/min) to a pure runaway-safety ceiling (new default 20000) — it should essentially never bind for a real video now that sampling and memory are decoupled from duration.
+  - New tunables: `videoWindowSec` / `videoFloorIntervalSec` / `videoMotionThreshold` / `videoMaxFrames` (`TGDL_FACES_VIDEO_*` env vars); see `docs/AI.md`'s Config + env var reference.
+
+### Fixed
+- **Long video scans failing with a generic `fetch failed`.** Node's built-in `fetch` (undici) enforces its own hardcoded 300s `headersTimeout`/`bodyTimeout` independent of the app's own `AbortController`-based timeout — a `/detect/video` (or a large `/detect/batch`, or a `/detect/batch-b64` chunk) request still legitimately in flight past 5 minutes was killed by undici itself, surfacing as a network error even though the sidecar was still working. This went unnoticed before because every request finished well under 5 minutes; the duration-independent video sampling above means a long/dense video can now legitimately take much longer. Every faces-client request whose own timeout can exceed 300s now passes an explicit `undici` `Agent` dispatcher with matching timeouts. Note: a video that hit this before the fix was still marked as scanned (0 faces recorded) and won't be retried automatically — re-run "Reindex from scratch" (or manually clear `ai_indexed_at` for the affected file) after upgrading.
+
+### Service worker
+- `VERSION = 'v2246'`
+
 ## [2.24.5] — 2026-05-31
 
 Hardening follow-up to v2.24.4 — connection-leak + revoked-session fixes from an adversarial audit of the reconnect/self-heal code.

@@ -19,10 +19,11 @@ The Node client switches on ``code``; the human text is for logs.
 
 from __future__ import annotations
 
+import itertools
 import logging
 import os
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from typing import Annotated, Any
 
 import numpy as np
@@ -56,6 +57,9 @@ from .insight import (
     _resolve_models_dir,
 )
 from .io import (
+    DEFAULT_FLOOR_INTERVAL_SEC,
+    DEFAULT_MOTION_THRESHOLD,
+    DEFAULT_WINDOW_SEC,
     Base64DecodeError,
     ImageDecodeError,
     PathNotAllowedError,
@@ -63,6 +67,7 @@ from .io import (
     load_image_from_b64,
     load_image_from_path,
 )
+from . import video_progress
 
 
 _LOG = logging.getLogger(__name__)
@@ -166,6 +171,12 @@ class Face(BaseModel):
         le=1.0,
         description="Composite quality (det_score + size + sharpness + landmarks + pose)",
     )
+    landmark_regularity: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description="Hard-gate signal: eye/nose/mouth symmetry (0–1); used by video track confirmation",
+    )
     embedding: list[float] = Field(
         ...,
         description=f"L2-normalised {EMBEDDING_DIM}-dim float vector",
@@ -173,6 +184,11 @@ class Face(BaseModel):
     landmarks: list[list[float]] = Field(
         default_factory=list,
         description="5-point facial landmarks: [eye_l, eye_r, nose, mouth_l, mouth_r]",
+    )
+    frame_time_sec: float | None = Field(
+        default=None,
+        ge=0.0,
+        description="Source video timestamp (seconds) for video-sourced faces; null for photos",
     )
 
 
@@ -198,19 +214,56 @@ class BatchDetectResponse(BaseModel):
     total_faces: int
 
 
+def _default_max_frames() -> int:
+    """Read ``TGDL_FACES_VIDEO_MAX_FRAMES`` (§5) for the request-body
+    default — falls back to 20000 (the doc's safety-ceiling default) if
+    unset/invalid. Only affects requests that omit ``max_frames``
+    entirely; an explicit request value always wins."""
+    raw = os.environ.get("TGDL_FACES_VIDEO_MAX_FRAMES", "").strip()
+    if raw:
+        try:
+            v = int(raw)
+            if v >= 1:
+                return v
+        except ValueError:
+            pass
+    return 20000
+
+
 class VideoDetectRequest(BaseModel):
     """Body for ``POST /detect/video``.
 
     ``path`` must resolve under TGDL_FACES_ALLOW_ROOTS (same rule as
-    ``/detect/batch``). ``max_frames`` caps how many evenly-spaced frames
-    are sampled — the default 120 covers a 2-hour video at 1 frame/min.
+    ``/detect/batch``). ``max_frames`` is a pure runaway-safety ceiling
+    (docs/requirements.md §4.1/§6) — not a density control — defaulting
+    to 20000 (env-overridable via ``TGDL_FACES_VIDEO_MAX_FRAMES``); it
+    should essentially never bind for a real-world video given the
+    streaming pipeline in `_do_detect_video_sync`.
     """
 
     path: str = Field(..., description="Absolute path to a video file on disk.")
     min_score: float | None = Field(default=None, ge=0.0, le=1.0)
     min_box_px: int | None = Field(default=None, ge=1)
     ar_range: tuple[float, float] | None = Field(default=None)
-    max_frames: int = Field(default=120, ge=1, le=500)
+    max_frames: int = Field(default_factory=_default_max_frames, ge=1, le=200_000)
+    job_id: str | None = Field(
+        default=None,
+        description=(
+            "Opaque caller-supplied id used to poll decode progress via "
+            "GET /detect/video/status/{job_id} while this request is in "
+            "flight. Optional — omit for the old fire-and-forget behavior."
+        ),
+    )
+    nice: int | None = Field(
+        default=None,
+        ge=0,
+        le=19,
+        description=(
+            "Optional per-request Unix nice increment (0 = off). When set, "
+            "overrides TGDL_FACES_VIDEO_NICE so the dashboard Video CPU "
+            "priority control can drive the sidecar without a restart."
+        ),
+    )
 
     @model_validator(mode="after")
     def _validate_ar_range(self) -> "VideoDetectRequest":
@@ -850,8 +903,9 @@ def _do_batch_b64_sync(body: BatchB64DetectRequest) -> JSONResponse:
         kwargs["min_box_px"] = int(body.min_box_px)
     if body.ar_range is not None:
         kwargs["ar_range"] = (float(body.ar_range[0]), float(body.ar_range[1]))
-    # Skip quality for throughput — video frames don't need per-face quality scores
-    kwargs["_skip_quality_score"] = True
+    # Quality scoring re-enabled per docs/requirements.md §4.4/Phase 2 — the
+    # video track-confirmation logic needs real quality_score values to
+    # enforce the singleton/confirmed-track quality floors.
 
     max_workers = _resolve_max_concurrency()
 
@@ -911,31 +965,215 @@ async def detect_batch_b64(body: BatchB64DetectRequest) -> JSONResponse:
     return await run_in_threadpool(_do_batch_b64_sync, body)
 
 
-def _dedupe_video_faces(all_faces: list[dict]) -> list[dict]:
-    """Return one best face per unique identity across video frames.
+_TRACK_MATCH_THRESHOLD = 0.50  # unchanged from the old greedy dedup
+_TRACK_MAX_REPRESENTATIVES = 3
+_TRACK_POSE_DEDUP_THRESHOLD = 0.85
 
-    Insightface embeddings are L2-normalised so the dot product equals
-    cosine similarity. Faces above the 0.50 threshold are considered the
-    same person; the candidate with the highest detection score is kept.
-    O(N²) over unique identities — in practice N ≤ a handful per video.
+
+def _resolve_video_sampling_params() -> tuple[float, float, float]:
+    """Read the §4.1/§5 sampling knobs from env.
+
+    Returns ``(window_sec, floor_interval_sec, motion_threshold)``. Node's
+    ffmpeg-fallback continuous `select` filter has no equivalent windowing
+    concept and uses ffmpeg's own (differently-scaled) `scene` score
+    instead of a luma-diff threshold, so only ``floor_interval_sec`` has a
+    matching `videoFloorIntervalSec` knob on the Node side (§4.5) — see
+    ``src/core/ai/faces-client.js`` and docs/requirements.md §5.
     """
-    THRESHOLD = 0.50
-    unique_embs: list[np.ndarray] = []
-    unique_faces: list[dict] = []
-    for face in all_faces:
+
+    def _float_env(name: str, default: float) -> float:
+        raw = os.environ.get(name, "").strip()
+        if not raw:
+            return default
+        try:
+            return float(raw)
+        except ValueError:
+            return default
+
+    return (
+        _float_env("TGDL_FACES_VIDEO_WINDOW_SEC", DEFAULT_WINDOW_SEC),
+        _float_env("TGDL_FACES_VIDEO_FLOOR_INTERVAL_SEC", DEFAULT_FLOOR_INTERVAL_SEC),
+        _float_env("TGDL_FACES_VIDEO_MOTION_THRESHOLD", DEFAULT_MOTION_THRESHOLD),
+    )
+
+
+def _resolve_video_track_thresholds() -> tuple[float, float, float, float, float]:
+    """Read the §4.4/§5 track-confirmation thresholds from env.
+
+    Returns ``(singleton_min_score, singleton_min_quality,
+    confirmed_min_quality, confirmed_min_score, min_landmark_regularity)``.
+    Mirrored in ``src/core/ai/faces-client.js`` for the Node fallback path —
+    keep both in sync if these defaults ever change.
+    """
+
+    def _float_env(name: str, default: float) -> float:
+        raw = os.environ.get(name, "").strip()
+        if not raw:
+            return default
+        try:
+            return float(raw)
+        except ValueError:
+            return default
+
+    return (
+        _float_env("TGDL_FACES_VIDEO_SINGLETON_MIN_SCORE", 0.75),
+        _float_env("TGDL_FACES_VIDEO_SINGLETON_MIN_QUALITY", 0.55),
+        _float_env("TGDL_FACES_VIDEO_CONFIRMED_MIN_QUALITY", 0.45),
+        _float_env("TGDL_FACES_VIDEO_CONFIRMED_MIN_SCORE", 0.60),
+        _float_env("TGDL_FACES_VIDEO_MIN_LANDMARK_REGULARITY", 0.35),
+    )
+
+
+def _select_diverse_representatives(
+    faces: list[dict],
+    limit: int = _TRACK_MAX_REPRESENTATIVES,
+    *,
+    min_quality: float = 0.0,
+    min_score: float = 0.0,
+    min_regularity: float = 0.0,
+) -> list[dict]:
+    """Pick up to *limit* faces from one confirmed track, highest score
+    first, skipping any pose that's a near-duplicate (cosine similarity
+    >= 0.85) of an already-kept face — preserves angle/pose diversity
+    instead of collapsing the whole track down to one embedding.
+
+    Only faces clearing *min_quality*, *min_score*, and *min_regularity*
+    are eligible — a track may pass admission on its best face while
+    weaker frames in the same track are dropped here.
+    """
+    eligible = [
+        f
+        for f in faces
+        if float(f.get("quality_score", 0.0)) >= min_quality
+        and float(f.get("score", 0.0)) >= min_score
+        and float(f.get("landmark_regularity", 0.5)) >= min_regularity
+    ]
+    ordered = sorted(eligible, key=lambda f: f["score"], reverse=True)
+    kept: list[dict] = []
+    kept_embs: list[np.ndarray] = []
+    for face in ordered:
         emb = np.array(face["embedding"], dtype=np.float32)
-        matched = False
-        for i, u_emb in enumerate(unique_embs):
-            if float(np.dot(emb, u_emb)) >= THRESHOLD:
-                if face["score"] > unique_faces[i]["score"]:
-                    unique_embs[i] = emb
-                    unique_faces[i] = face
-                matched = True
-                break
-        if not matched:
-            unique_embs.append(emb)
-            unique_faces.append(face)
-    return unique_faces
+        if any(
+            float(np.dot(emb, k_emb)) >= _TRACK_POSE_DEDUP_THRESHOLD
+            for k_emb in kept_embs
+        ):
+            continue
+        kept.append(face)
+        kept_embs.append(emb)
+        if len(kept) >= limit:
+            break
+    return kept
+
+
+def _build_face_tracks(frames_faces: list[list[dict]]) -> list[dict]:
+    """Merge per-frame detections into per-identity tracks and return the
+    faces worth keeping, per docs/requirements.md §4.4.
+
+    Replaces the old greedy ``_dedupe_video_faces`` (single "keep highest
+    score" per identity, no temporal-confirmation/quality distinction).
+
+    ``frames_faces`` is one detection list per *sampled frame*, in temporal
+    order — this is what lets a track's hit-count reflect "how many
+    distinct frames corroborated this identity" rather than a raw
+    detection count. Faces are merged into a track via cosine similarity
+    (>= 0.50, unchanged from the old dedup threshold) against that track's
+    running mean embedding (insightface embeddings are L2-normalised, so
+    the dot product equals cosine similarity).
+
+    - A track confirmed by >= 2 frames is kept only if at least one of its
+      faces clears ``TGDL_FACES_VIDEO_CONFIRMED_MIN_QUALITY`` (default
+      0.45), ``TGDL_FACES_VIDEO_CONFIRMED_MIN_SCORE`` (default 0.60), and
+      ``TGDL_FACES_VIDEO_MIN_LANDMARK_REGULARITY`` (default 0.35) —
+      defends against a *systematic* false positive (the detector
+      consistently misfiring on the same non-face texture across the whole
+      scene) that mere repetition would otherwise wave through.
+    - A track seen in exactly 1 frame is kept only if that face clears the
+      stricter ``TGDL_FACES_VIDEO_SINGLETON_MIN_SCORE`` /
+      ``_MIN_QUALITY`` bars (0.75 / 0.55 by default) plus the landmark
+      regularity floor — otherwise dropped as unconfirmed noise.
+    - Confirmed tracks return up to 3 representative faces, see
+      :func:`_select_diverse_representatives`.
+
+    O(frames x faces-per-frame x tracks) — in practice tiny (a handful of
+    identities per video).
+    """
+    singleton_min_score, singleton_min_quality, confirmed_min_quality, confirmed_min_score, min_landmark_regularity = (
+        _resolve_video_track_thresholds()
+    )
+
+    tracks: list[dict[str, Any]] = []
+    for frame_faces in frames_faces:
+        for face in frame_faces:
+            emb = np.array(face["embedding"], dtype=np.float32)
+            best_i, best_sim = -1, -1.0
+            for i, tr in enumerate(tracks):
+                mean = tr["emb_sum"] / max(1, tr["hits"])
+                norm = float(np.linalg.norm(mean))
+                sim = float(np.dot(emb, mean) / norm) if norm > 1e-9 else -1.0
+                if sim > best_sim:
+                    best_i, best_sim = i, sim
+            if best_i >= 0 and best_sim >= _TRACK_MATCH_THRESHOLD:
+                tr = tracks[best_i]
+                tr["faces"].append(face)
+                tr["emb_sum"] = tr["emb_sum"] + emb
+                tr["hits"] += 1
+            else:
+                tracks.append({"faces": [face], "emb_sum": emb.copy(), "hits": 1})
+
+    kept: list[dict] = []
+    for tr in tracks:
+        faces = tr["faces"]
+        if tr["hits"] >= 2:
+            best_quality = max(float(f.get("quality_score", 0.0)) for f in faces)
+            best_score = max(float(f.get("score", 0.0)) for f in faces)
+            best_regularity = max(float(f.get("landmark_regularity", 0.5)) for f in faces)
+            if (
+                best_quality < confirmed_min_quality
+                or best_score < confirmed_min_score
+                or best_regularity < min_landmark_regularity
+            ):
+                continue
+            kept.extend(
+                _select_diverse_representatives(
+                    faces,
+                    min_quality=confirmed_min_quality,
+                    min_score=confirmed_min_score,
+                    min_regularity=min_landmark_regularity,
+                )
+            )
+        else:
+            face = faces[0]
+            if (
+                float(face["score"]) >= singleton_min_score
+                and float(face.get("quality_score", 0.0)) >= singleton_min_quality
+                and float(face.get("landmark_regularity", 0.5)) >= min_landmark_regularity
+            ):
+                kept.append(face)
+    return kept
+
+
+def _resolve_video_nice(override: int | None = None) -> int:
+    """Resolve Unix nice for /detect/video.
+
+    Precedence: per-request ``override`` (from the Node dashboard config)
+    > ``TGDL_FACES_VIDEO_NICE`` env > ``0`` (off). Explicit ``0`` from the
+    request must win over a compose env default, otherwise the UI cannot
+    turn nice off.
+    """
+
+    if override is not None:
+        try:
+            return max(0, min(19, int(override)))
+        except (TypeError, ValueError):
+            return 0
+    raw = os.environ.get("TGDL_FACES_VIDEO_NICE", "").strip()
+    if not raw:
+        return 0
+    try:
+        v = int(raw)
+    except ValueError:
+        return 0
+    return max(0, min(19, v))
 
 
 def _do_detect_video_sync(body: VideoDetectRequest) -> JSONResponse:
@@ -953,26 +1191,110 @@ def _do_detect_video_sync(body: VideoDetectRequest) -> JSONResponse:
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
         )
 
+    nice_inc = _resolve_video_nice(body.nice)
     try:
-        frames = extract_video_frames(body.path, _allow_roots(), max_frames=body.max_frames)
-    except PathNotAllowedError:
-        return _error(
-            "path falls outside TGDL_FACES_ALLOW_ROOTS",
-            code="path_not_allowed",
-            status_code=status.HTTP_403_FORBIDDEN,
-        )
-    except FileNotFoundError:
-        return JSONResponse(
-            status_code=status.HTTP_200_OK,
-            content={"faces": [], "error": "file_not_found", "image_w": 0, "image_h": 0},
+        if nice_inc > 0:
+            try:
+                os.nice(nice_inc)
+            except OSError:
+                nice_inc = 0
+
+        return _do_detect_video_sync_inner(body)
+    finally:
+        if nice_inc > 0:
+            try:
+                os.nice(-nice_inc)
+            except OSError:
+                pass
+
+
+def _do_detect_video_sync_inner(body: VideoDetectRequest) -> JSONResponse:
+    """Inner body for video detection — separated so nice wrap stays clean."""
+    # A `job_id` lets the Node client poll GET /detect/video/status/{job_id}
+    # for decode-position progress while this (potentially very long)
+    # request is in flight (docs/requirements.md — video scan progress
+    # reporting). The `finally` below guarantees the registry entry is
+    # removed on every exit path (success, soft-error, or exception) so
+    # nothing outlives this request.
+    def _progress_cb(idx: int, total_frames: int) -> None:
+        video_progress.report(
+            body.job_id,
+            path=body.path,
+            frames_decoded=idx + 1,
+            total_frames=total_frames,
         )
 
-    if not frames:
-        return JSONResponse(
-            status_code=status.HTTP_200_OK,
-            content={"faces": [], "error": "no_frames", "image_w": 0, "image_h": 0},
-        )
+    try:
+        try:
+            # `extract_video_frames` is a generator (see docs/requirements.md
+            # §4.2/§4.4) — calling it just builds the generator object without
+            # running any code, so pulling the first frame (to validate there
+            # *is* a video and to read its dimensions) has to happen inside
+            # this try block for path/file errors raised from within the
+            # generator body to be catchable here. Everything after this is
+            # streamed: at most `max_workers` decoded frames are ever held in
+            # memory at once, regardless of video length (§4.2, §8 memory-bound
+            # acceptance criterion) — no `list(...)` materialisation.
+            window_sec, floor_interval_sec, motion_threshold = _resolve_video_sampling_params()
+            # `iter(...)` tolerates callers/mocks that return a plain list
+            # instead of a real generator (e.g. `test_video_no_frames_extracted`).
+            gen = iter(
+                extract_video_frames(
+                    body.path,
+                    _allow_roots(),
+                    max_frames=body.max_frames,
+                    window_sec=window_sec,
+                    floor_interval_sec=floor_interval_sec,
+                    motion_threshold=motion_threshold,
+                    progress_cb=_progress_cb if body.job_id else None,
+                )
+            )
+            first_frame = next(gen)
+        except PathNotAllowedError:
+            return _error(
+                "path falls outside TGDL_FACES_ALLOW_ROOTS",
+                code="path_not_allowed",
+                status_code=status.HTTP_403_FORBIDDEN,
+            )
+        except FileNotFoundError:
+            return JSONResponse(
+                status_code=status.HTTP_200_OK,
+                content={"faces": [], "error": "file_not_found", "image_w": 0, "image_h": 0},
+            )
+        except StopIteration:
+            return JSONResponse(
+                status_code=status.HTTP_200_OK,
+                content={"faces": [], "error": "no_frames", "image_w": 0, "image_h": 0},
+            )
 
+        return _detect_video_frames(body, gen, first_frame)
+    finally:
+        if body.job_id:
+            video_progress.finish(body.job_id)
+
+
+def _normalize_video_sample(sample: Any) -> tuple["np.ndarray", int, float]:
+    """Unpack a frame sample from ``extract_video_frames``.
+
+    The generator yields ``(frame, frame_index, time_sec)`` tuples. Plain
+    ndarrays (legacy mocks in tests) are treated as frame 0 at t=0.
+    """
+    if isinstance(sample, tuple):
+        if len(sample) >= 3:
+            return sample[0], int(sample[1]), float(sample[2])
+        if len(sample) == 2:
+            return sample[0], int(sample[1]), 0.0
+    return sample, 0, 0.0
+
+
+def _detect_video_frames(
+    body: VideoDetectRequest, gen: Any, first_frame: Any
+) -> JSONResponse:
+    """Runs detection over the already-opened frame generator and builds
+    the final response. Split out of `_do_detect_video_sync` purely for
+    readability — it's still covered by that function's try/finally
+    (job-progress cleanup) since the caller returns this call's result
+    from inside that try block."""
     kwargs: dict[str, Any] = {}
     if body.min_score is not None:
         kwargs["min_score"] = float(body.min_score)
@@ -980,45 +1302,71 @@ def _do_detect_video_sync(body: VideoDetectRequest) -> JSONResponse:
         kwargs["min_box_px"] = int(body.min_box_px)
     if body.ar_range is not None:
         kwargs["ar_range"] = (float(body.ar_range[0]), float(body.ar_range[1]))
+    # Quality scoring re-enabled per §4.4 — track confirmation needs real
+    # quality_score values to enforce the singleton/confirmed-track floors.
 
-    first_frame = frames[0]
-    image_h, image_w = int(first_frame.shape[0]), int(first_frame.shape[1])
+    first_arr, _, _ = _normalize_video_sample(first_frame)
+    image_h, image_w = int(first_arr.shape[0]), int(first_arr.shape[1])
 
-    # Skip quality for video frames — throughput matters more than per-face scores
-    kwargs["_skip_quality_score"] = True
+    def _iter_samples():
+        yield _normalize_video_sample(first_frame)
+        for sample in gen:
+            yield _normalize_video_sample(sample)
 
-    # GPU mode: process frames in parallel for pipeline saturation.
-    # CPU mode: sequential with optional throttle.
-    all_faces_raw: list[dict] = []
-    if gpu_available() and len(frames) > 1:
+    def _detect_sample(item: tuple["np.ndarray", int, float]) -> tuple[int, list[dict]]:
+        frame, frame_idx, time_sec = item
+        try:
+            faces = detect_and_embed(frame, _video_mode=True, **kwargs)
+            for face in faces:
+                face["frame_time_sec"] = round(float(time_sec), 4)
+            return frame_idx, faces
+        except Exception:
+            _LOG.exception(
+                "detect_and_embed failed on frame %d (t=%.3fs) of %s",
+                frame_idx,
+                time_sec,
+                body.path,
+            )
+            return frame_idx, []
+
+    results_by_idx: dict[int, list[dict]] = {}
+    if gpu_available():
+        # Bounded sliding window: never more than `max_workers` frames
+        # in flight (decoded + awaiting detection) at once, so peak memory
+        # is tied to concurrency, not to how many frames the video yields.
         max_workers = _resolve_max_concurrency()
-
-        def _detect_frame(frame: "np.ndarray") -> list[dict]:
-            try:
-                return detect_and_embed(frame, **kwargs)
-            except Exception:
-                return []
-
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            for faces in pool.map(_detect_frame, frames):
-                all_faces_raw.extend(faces)
+            pending: set = set()
+            sample_iter = _iter_samples()
+
+            def _fill() -> None:
+                while len(pending) < max_workers:
+                    item = next(sample_iter, None)
+                    if item is None:
+                        return
+                    pending.add(pool.submit(_detect_sample, item))
+
+            _fill()
+            while pending:
+                done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                for fut in done:
+                    idx, faces = fut.result()
+                    results_by_idx[idx] = faces
+                _fill()
     else:
         throttle_sec = _resolve_throttle_ms() / 1000.0
-        for i, frame in enumerate(frames):
+        for i, item in enumerate(_iter_samples()):
             if throttle_sec > 0 and i > 0:
                 time.sleep(throttle_sec)
-            try:
-                face_dicts = detect_and_embed(frame, **kwargs)
-            except Exception:
-                _LOG.exception("detect_and_embed failed on frame %d of %s", i, body.path)
-                continue
-            all_faces_raw.extend(face_dicts)
+            idx, faces = _detect_sample(item)
+            results_by_idx[idx] = faces
 
-    unique_faces = _dedupe_video_faces(all_faces_raw)
+    frames_faces = [results_by_idx[i] for i in sorted(results_by_idx)]
+    kept_faces = _build_face_tracks(frames_faces)
     return JSONResponse(
         status_code=status.HTTP_200_OK,
         content=DetectResponse(
-            faces=[Face(**f) for f in unique_faces],
+            faces=[Face(**f) for f in kept_faces],
             image_w=image_w,
             image_h=image_h,
         ).model_dump(),
@@ -1029,10 +1377,13 @@ def _do_detect_video_sync(body: VideoDetectRequest) -> JSONResponse:
 async def detect_video(body: VideoDetectRequest) -> JSONResponse:
     """Detect & embed faces from a video file.
 
-    Extracts evenly-spaced frames via cv2.VideoCapture (no temp files),
-    runs face detection on each frame, then deduplicates faces across
-    frames so the same person appearing in multiple frames produces only
-    one embedding — the one with the highest detection score.
+    Streams content-adaptive frames via ``extract_video_frames`` (see
+    docs/requirements.md §4.1) with bounded in-flight concurrency — no
+    temp files, no full-video frame buffering — then merges detections
+    across frames into per-identity tracks via ``_build_face_tracks``
+    (§4.4): a track needs either >=2 corroborating frames (plus a quality
+    floor) or one very confident single-frame hit to be kept, and survives
+    with up to 3 diverse representative embeddings.
 
     Response shape matches ``/detect``: ``{faces, image_w, image_h}``.
     Faces stored from this endpoint cluster with photo-source faces in
@@ -1040,6 +1391,24 @@ async def detect_video(body: VideoDetectRequest) -> JSONResponse:
     lands in the same "Person" group automatically.
     """
     return await run_in_threadpool(_do_detect_video_sync, body)
+
+
+@app.get("/detect/video/status/{job_id}")
+def detect_video_status(job_id: str) -> JSONResponse:
+    """Poll decode progress for an in-flight ``POST /detect/video`` call.
+
+    Only meaningful when that call's body included a matching ``job_id``.
+    Returns ``404`` once the request has finished (or if ``job_id`` was
+    never registered) — callers should treat that as "nothing to report",
+    not as an error, since this is best-effort progress telemetry.
+    """
+    job = video_progress.get(job_id)
+    if job is None:
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND,
+            content={"error": "not_found", "code": "job_not_found"},
+        )
+    return JSONResponse(content=job)
 
 
 # ---------------------------------------------------------------------------
