@@ -214,6 +214,10 @@ services:
       # falls back to base64.
       - TGDL_FACES_ALLOW_ROOTS=/app/data/downloads
       - TGDL_FACES_MODELS_DIR=/root/.cache/tgdl-faces/models
+      # Detector pack — buffalo_m keeps the same ResNet50 recognition head
+      # as buffalo_l with a lighter SCRFD detector (faster CPU scans).
+      # Override via .env: TGDL_FACES_DETECTOR_MODEL=buffalo_l|buffalo_s|…
+      - TGDL_FACES_DETECTOR_MODEL=${TGDL_FACES_DETECTOR_MODEL:-buffalo_m}
       # Inter-image sleep on CPU-only hosts. Set to 50–200 (ms) to cap
       # sustained CPU load between images in a batch so other processes
       # (downloader, OS) get breathing room. Leave at 0 (default) when a
@@ -293,6 +297,7 @@ services:
       # Default to auto-pick: sidecar will probe CUDA first, fall back
       # to CPU if the driver/runtime isn't usable inside the container.
       - TGDL_FACES_PROVIDERS=${TGDL_FACES_PROVIDERS:-auto}
+      - TGDL_FACES_DETECTOR_MODEL=${TGDL_FACES_DETECTOR_MODEL:-buffalo_m}
       - NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES:-all}
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       # Throttle: 0 (default) is correct for GPU — CPU is idle between
@@ -362,6 +367,7 @@ services:
       - TGDL_FACES_ALLOW_ROOTS=/app/data/downloads
       - TGDL_FACES_MODELS_DIR=/root/.cache/tgdl-faces/models
       - TGDL_FACES_PROVIDERS=${TGDL_FACES_PROVIDERS:-auto}
+      - TGDL_FACES_DETECTOR_MODEL=${TGDL_FACES_DETECTOR_MODEL:-buffalo_m}
       - TGDL_FACES_THROTTLE_MS=${TGDL_FACES_THROTTLE_MS:-0}
       # Video nice: prefer Maintenance UI (Node forwards `nice` on each
       # /detect/video). Do not pin with `:-10` — that ignores UI=0.

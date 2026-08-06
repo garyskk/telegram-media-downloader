@@ -721,14 +721,18 @@ def preload_named_model(name: str) -> None:
             from insightface.app import FaceAnalysis  # noqa: PLC0415
 
             models_dir.mkdir(parents=True, exist_ok=True)
-            FaceAnalysis(
-                name=name,
-                root=str(models_dir),
-                allowed_modules=["detection", "recognition"],
-                providers=["CPUExecutionProvider"],
-            )
-            nested = target / name
-            if nested.is_dir():
+
+            def _flatten_nested() -> bool:
+                """insightface often unzips to models/<name>/<name>/*.onnx.
+
+                FaceAnalysis expects models/<name>/*.onnx. Flatten before
+                (re)trying the loader — otherwise AssertionError:
+                'detection' not in self.models.
+                """
+                nested = target / name
+                if not nested.is_dir():
+                    return False
+                _LOG.info("flattening nested model dir %s -> %s", nested, target)
                 for child in nested.iterdir():
                     dst = target / child.name
                     if not dst.exists():
@@ -737,6 +741,30 @@ def preload_named_model(name: str) -> None:
                     nested.rmdir()
                 except OSError:
                     pass
+                return True
+
+            # First FaceAnalysis call triggers the download/unzip. Nested
+            # packs (buffalo_m/s, antelopev2) fail the detection assert
+            # until flattened — catch, flatten, retry once.
+            try:
+                FaceAnalysis(
+                    name=name,
+                    root=str(models_dir),
+                    allowed_modules=["detection", "recognition"],
+                    providers=["CPUExecutionProvider"],
+                )
+            except AssertionError:
+                if not _flatten_nested():
+                    raise
+                FaceAnalysis(
+                    name=name,
+                    root=str(models_dir),
+                    allowed_modules=["detection", "recognition"],
+                    providers=["CPUExecutionProvider"],
+                )
+            else:
+                _flatten_nested()
+
             _PRELOAD_STATUS[name] = "ready"
             _LOG.info("preload %s complete", name)
         except Exception as exc:
