@@ -8853,17 +8853,33 @@ app.post('/api/ai/people/:id/merge', async (req, res) => {
 // fresh cluster from them. Used when DBSCAN over-merged two similar
 // people — operator picks the faces that look wrong, calls split,
 // gets a new cluster they can rename.
+//
+// Body: `{ faceIds?, downloadIds?, label?|newLabel? }`. When
+// `downloadIds` is supplied (photo-grid split) and `faceIds` is empty,
+// expand to every face of this person on those downloads so sibling
+// detections on the same photo are not left behind.
 app.post('/api/ai/people/:id/split', async (req, res) => {
     try {
-        const faceIds = Array.isArray(req.body?.faceIds) ? req.body.faceIds : [];
+        const personId = Number(req.params.id);
+        if (!Number.isFinite(personId) || personId <= 0) {
+            return res.status(400).json({ error: 'invalid person id' });
+        }
+        let faceIds = Array.isArray(req.body?.faceIds) ? req.body.faceIds : [];
+        const downloadIds = Array.isArray(req.body?.downloadIds) ? req.body.downloadIds : [];
+        const labelRaw = req.body?.label ?? req.body?.newLabel ?? '';
         const label =
-            String(req.body?.label || '')
+            String(labelRaw || '')
                 .trim()
                 .slice(0, 100) || null;
-        if (!faceIds.length) {
-            return res.status(400).json({ error: 'faceIds required (non-empty array)' });
+        const { splitFacePerson, listFaceIdsForPersonDownloads } = await import('../core/db.js');
+        if (!faceIds.length && downloadIds.length) {
+            faceIds = listFaceIdsForPersonDownloads(personId, downloadIds);
         }
-        const { splitFacePerson } = await import('../core/db.js');
+        if (!faceIds.length) {
+            return res.status(400).json({
+                error: 'faceIds or downloadIds required (non-empty array)',
+            });
+        }
         const r = splitFacePerson(faceIds, label);
         if (!r.personId) {
             return res.status(404).json({ error: 'no faces matched the supplied ids' });

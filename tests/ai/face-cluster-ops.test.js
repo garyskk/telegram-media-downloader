@@ -1,8 +1,9 @@
 // Phase 2 integration tests — manual cluster operations + centroid-
 // based label preservation. Locks in:
 //   - mergeFacePerson: faces flow from B → A, B is deleted, A.count updates
-//   - splitFacePerson: selected faces form a new cluster, sources rebalance
-//   - reassignFace: single-face hop between clusters
+//   - splitFacePerson: selected faces form a new cluster; source centroid refreshes
+//   - listFaceIdsForPersonDownloads: photo-grid split expands to sibling faces
+//   - reassignFace: single-face hop; both centroids refresh
 //   - matchClusterToPersistedLabel: closest labelled centroid within eps
 
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
@@ -165,6 +166,96 @@ describe('splitFacePerson', () => {
         expect(fresh.label).toBe('B');
     });
 
+    it('recomputes source centroid from remaining faces only', () => {
+        const did = downloadId();
+        // Stale centroid pretends all four faces are still in the cluster
+        // (mean of [1,0], [1,0], [0,1], [0,1] = [0.5, 0.5]).
+        const pid = api.insertPerson({
+            label: 'Mixed',
+            centroidBlob: f32Blob([0.5, 0.5]),
+            faceCount: 4,
+        });
+        api.insertFace({
+            downloadId: did,
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 40,
+            embeddingBlob: f32Blob([1, 0]),
+            personId: pid,
+        });
+        api.insertFace({
+            downloadId: did,
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 40,
+            embeddingBlob: f32Blob([1, 0]),
+            personId: pid,
+        });
+        const leave1 = api.insertFace({
+            downloadId: did,
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 40,
+            embeddingBlob: f32Blob([0, 1]),
+            personId: pid,
+        }).lastInsertRowid;
+        const leave2 = api.insertFace({
+            downloadId: did,
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 40,
+            embeddingBlob: f32Blob([0, 1]),
+            personId: pid,
+        }).lastInsertRowid;
+
+        api.splitFacePerson([leave1, leave2], 'B');
+        const cents = api.listPeopleCentroids().find((p) => p.id === pid);
+        expect(cents).toBeTruthy();
+        expect(cents.faceCount).toBe(2);
+        // Remaining faces are both [1,0] → centroid must be [1,0], not [0.5,0.5]
+        expect(cents.centroid[0]).toBeCloseTo(1, 5);
+        expect(cents.centroid[1]).toBeCloseTo(0, 5);
+    });
+
+    it('clears source cover_face_id when the cover face is moved out', () => {
+        const did = downloadId();
+        const pid = api.insertPerson({
+            label: 'A',
+            centroidBlob: f32Blob([1, 0]),
+            faceCount: 2,
+        });
+        const keep = api.insertFace({
+            downloadId: did,
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 40,
+            embeddingBlob: f32Blob([1, 0]),
+            personId: pid,
+        }).lastInsertRowid;
+        const cover = api.insertFace({
+            downloadId: did,
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 40,
+            embeddingBlob: f32Blob([0, 1]),
+            personId: pid,
+        }).lastInsertRowid;
+        api.setPersonCoverFace(pid, cover);
+        expect(db.prepare('SELECT cover_face_id FROM people WHERE id = ?').get(pid).cover_face_id).toBe(
+            cover,
+        );
+
+        api.splitFacePerson([cover], 'B');
+        expect(db.prepare('SELECT cover_face_id FROM people WHERE id = ?').get(pid).cover_face_id).toBeNull();
+        expect(db.prepare('SELECT person_id FROM faces WHERE id = ?').get(keep).person_id).toBe(pid);
+    });
+
     it('deletes the source cluster when every face moves out', () => {
         const did = downloadId();
         const pid = api.insertPerson({ centroidBlob: f32Blob([1, 0]), faceCount: 2 });
@@ -194,6 +285,129 @@ describe('splitFacePerson', () => {
     it('returns null personId for empty input', () => {
         expect(api.splitFacePerson([])).toEqual({ personId: null, moved: 0 });
         expect(api.splitFacePerson(null)).toEqual({ personId: null, moved: 0 });
+    });
+});
+
+describe('listFaceIdsForPersonDownloads', () => {
+    it('returns every face of the person on the given downloads', () => {
+        const did = downloadId();
+        const pid = api.insertPerson({
+            label: 'A',
+            centroidBlob: f32Blob([1, 0]),
+            faceCount: 3,
+        });
+        const other = api.insertPerson({
+            label: 'B',
+            centroidBlob: f32Blob([0, 1]),
+            faceCount: 1,
+        });
+        const f1 = api.insertFace({
+            downloadId: did,
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 40,
+            embeddingBlob: f32Blob([1, 0]),
+            personId: pid,
+        }).lastInsertRowid;
+        const f2 = api.insertFace({
+            downloadId: did,
+            x: 10,
+            y: 10,
+            w: 40,
+            h: 40,
+            embeddingBlob: f32Blob([0.95, 0.05]),
+            personId: pid,
+        }).lastInsertRowid;
+        api.insertFace({
+            downloadId: did,
+            x: 20,
+            y: 20,
+            w: 40,
+            h: 40,
+            embeddingBlob: f32Blob([0, 1]),
+            personId: other,
+        });
+
+        const ids = api.listFaceIdsForPersonDownloads(pid, [did]);
+        expect(ids.sort((a, b) => a - b)).toEqual([f1, f2].sort((a, b) => a - b));
+    });
+
+    it('returns empty for invalid args', () => {
+        expect(api.listFaceIdsForPersonDownloads(null, [1])).toEqual([]);
+        expect(api.listFaceIdsForPersonDownloads(1, [])).toEqual([]);
+        expect(api.listFaceIdsForPersonDownloads(1, null)).toEqual([]);
+    });
+
+    it('split via expanded download ids moves every sibling face and refreshes centroid', () => {
+        const did = downloadId();
+        // Source starts with a mixed stale centroid
+        const pid = api.insertPerson({
+            label: 'Mixed',
+            centroidBlob: f32Blob([0.5, 0.5]),
+            faceCount: 3,
+        });
+        api.insertFace({
+            downloadId: did,
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 40,
+            embeddingBlob: f32Blob([1, 0]),
+            personId: pid,
+        });
+        const sibling1 = api.insertFace({
+            downloadId: did,
+            x: 5,
+            y: 5,
+            w: 40,
+            h: 40,
+            embeddingBlob: f32Blob([0, 1]),
+            personId: pid,
+        }).lastInsertRowid;
+        const sibling2 = api.insertFace({
+            downloadId: did,
+            x: 10,
+            y: 10,
+            w: 40,
+            h: 40,
+            embeddingBlob: f32Blob([0, 1]),
+            personId: pid,
+        }).lastInsertRowid;
+
+        // Keep face on a second download so peeling `did` leaves the source alive.
+        const did2 = api.insertDownload({
+            groupId: '-100777',
+            groupName: 'Faces Fixture',
+            messageId: 2,
+            fileName: 'f2.jpg',
+            fileSize: 1000,
+            fileType: 'photo',
+            filePath: 'Faces_Fixture/images/f2.jpg',
+        }).lastInsertRowid;
+        db.prepare('UPDATE faces SET download_id = ? WHERE person_id = ? AND id NOT IN (?, ?)').run(
+            did2,
+            pid,
+            sibling1,
+            sibling2,
+        );
+
+        const faceIds = api.listFaceIdsForPersonDownloads(pid, [did]);
+        expect(faceIds.sort((a, b) => a - b)).toEqual(
+            [sibling1, sibling2].sort((a, b) => a - b),
+        );
+        const r = api.splitFacePerson(faceIds, 'Bob');
+        expect(r.moved).toBe(2);
+
+        const src = api.listPeopleCentroids().find((p) => p.id === pid);
+        expect(src.faceCount).toBe(1);
+        expect(src.centroid[0]).toBeCloseTo(1, 5);
+        expect(src.centroid[1]).toBeCloseTo(0, 5);
+
+        const bob = api.listPeopleCentroids().find((p) => p.id === r.personId);
+        expect(bob.faceCount).toBe(2);
+        expect(bob.centroid[0]).toBeCloseTo(0, 5);
+        expect(bob.centroid[1]).toBeCloseTo(1, 5);
     });
 });
 
@@ -237,6 +451,57 @@ describe('reassignFace', () => {
 
         expect(db.prepare('SELECT face_count FROM people WHERE id = ?').get(pA).face_count).toBe(1);
         expect(db.prepare('SELECT face_count FROM people WHERE id = ?').get(pB).face_count).toBe(2);
+    });
+
+    it('recomputes both centroids after a move', () => {
+        const did = downloadId();
+        const pA = api.insertPerson({
+            label: 'A',
+            centroidBlob: f32Blob([1, 0]),
+            faceCount: 2,
+        });
+        const pB = api.insertPerson({
+            label: 'B',
+            centroidBlob: f32Blob([0, 1]),
+            faceCount: 1,
+        });
+        api.insertFace({
+            downloadId: did,
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 40,
+            embeddingBlob: f32Blob([1, 0]),
+            personId: pA,
+        });
+        const moveMe = api.insertFace({
+            downloadId: did,
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 40,
+            embeddingBlob: f32Blob([0, 1]),
+            personId: pA,
+        }).lastInsertRowid;
+        api.insertFace({
+            downloadId: did,
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 40,
+            embeddingBlob: f32Blob([0, 1]),
+            personId: pB,
+        });
+
+        api.reassignFace(moveMe, pB);
+        const a = api.listPeopleCentroids().find((p) => p.id === pA);
+        const b = api.listPeopleCentroids().find((p) => p.id === pB);
+        expect(a.faceCount).toBe(1);
+        expect(a.centroid[0]).toBeCloseTo(1, 5);
+        expect(a.centroid[1]).toBeCloseTo(0, 5);
+        expect(b.faceCount).toBe(2);
+        expect(b.centroid[0]).toBeCloseTo(0, 5);
+        expect(b.centroid[1]).toBeCloseTo(1, 5);
     });
 
     it('deletes source cluster when its last face leaves', () => {

@@ -2698,6 +2698,11 @@ export function mergeFacePerson(targetId, otherId) {
  * centroid is computed from the moved faces' embeddings. Useful when
  * DBSCAN over-grouped two similar-looking people.
  *
+ * Surviving source clusters have their centroids recomputed from the
+ * remaining faces so incremental Phase B does not keep matching toward
+ * the pre-split identity. Stale cover_face_id pointing at a moved face
+ * is cleared.
+ *
  * Returns `{ personId, moved }` where personId is the new cluster's id.
  */
 export function splitFacePerson(faceIds, label = null) {
@@ -2734,19 +2739,24 @@ export function splitFacePerson(faceIds, label = null) {
         const moved = db
             .prepare(`UPDATE faces SET person_id = ? WHERE id IN (${placeholders})`)
             .run(newPersonId, ...ids).changes;
-        // Update each source cluster's face_count + drop those whose
-        // count hit zero.
+        const movedIdSet = new Set(rows.map((row) => Number(row.id)));
+        // Drop empty sources; recompute centroids on survivors so
+        // incremental attach does not prefer the pre-split identity.
         const oldPersonIds = [...new Set(rows.map((r) => r.person_id).filter((x) => x))];
         for (const pid of oldPersonIds) {
             const n = db.prepare('SELECT COUNT(*) AS n FROM faces WHERE person_id = ?').get(pid).n;
             if (n === 0) {
                 db.prepare('DELETE FROM people WHERE id = ?').run(pid);
             } else {
-                db.prepare('UPDATE people SET face_count = ?, updated_at = ? WHERE id = ?').run(
-                    n,
-                    now,
-                    pid,
-                );
+                const cover = db
+                    .prepare('SELECT cover_face_id FROM people WHERE id = ?')
+                    .get(pid)?.cover_face_id;
+                if (cover != null && movedIdSet.has(Number(cover))) {
+                    db.prepare(
+                        'UPDATE people SET cover_face_id = NULL, updated_at = ? WHERE id = ?',
+                    ).run(now, pid);
+                }
+                recomputePersonCentroid(pid);
             }
         }
         return { personId: Number(newPersonId), moved };
@@ -2755,10 +2765,36 @@ export function splitFacePerson(faceIds, label = null) {
 }
 
 /**
+ * Face ids belonging to `personId` on any of the given downloads.
+ * Used by photo-grid split so selecting a download peels every
+ * appearance of that person on that photo (not only the ROW_NUMBER
+ * representative shown on the tile).
+ *
+ * @returns {number[]}
+ */
+export function listFaceIdsForPersonDownloads(personId, downloadIds) {
+    const pid = Number(personId);
+    const ids = (Array.isArray(downloadIds) ? downloadIds : [])
+        .map((x) => Number(x))
+        .filter((x) => Number.isFinite(x) && x > 0);
+    if (!Number.isFinite(pid) || pid <= 0 || !ids.length) return [];
+    const placeholders = ids.map(() => '?').join(',');
+    return getDb()
+        .prepare(
+            `SELECT id FROM faces
+              WHERE person_id = ?
+                AND download_id IN (${placeholders})
+              ORDER BY id ASC`,
+        )
+        .all(pid, ...ids)
+        .map((r) => Number(r.id));
+}
+
+/**
  * Move a single face to a different cluster (or to no cluster if
  * `personId` is null). Updates both the source and destination
- * cluster's `face_count`. The source cluster is deleted if its count
- * hits zero.
+ * cluster's centroid + face_count. The source cluster is deleted if
+ * its count hits zero.
  */
 export function reassignFace(faceId, personId) {
     const fid = Number(faceId);
@@ -2777,11 +2813,17 @@ export function reassignFace(faceId, personId) {
             if (n === 0 && p === oldPid) {
                 db.prepare('DELETE FROM people WHERE id = ?').run(p);
             } else {
-                db.prepare('UPDATE people SET face_count = ?, updated_at = ? WHERE id = ?').run(
-                    n,
-                    now,
-                    p,
-                );
+                if (p === oldPid) {
+                    const cover = db
+                        .prepare('SELECT cover_face_id FROM people WHERE id = ?')
+                        .get(p)?.cover_face_id;
+                    if (cover != null && Number(cover) === fid) {
+                        db.prepare(
+                            'UPDATE people SET cover_face_id = NULL, updated_at = ? WHERE id = ?',
+                        ).run(now, p);
+                    }
+                }
+                recomputePersonCentroid(p);
             }
         }
         return { ok: true, oldPersonId: oldPid, newPersonId: pid };

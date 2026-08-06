@@ -2642,11 +2642,20 @@ function _enterSplitMode() {
     const grid = $('#ai-people-photos-grid');
     if (!grid) return;
     grid.classList.add('split-mode');
+    // Show the clustered face crop (not the full photo) so the operator
+    // sees which identity each tile represents before peeling it out.
+    grid.querySelectorAll('[data-dl-id]').forEach((tile) => {
+        const faceId = Number(tile.dataset.faceId);
+        const img = tile.querySelector('img');
+        if (!img || !(faceId > 0)) return;
+        if (!img.dataset.fullThumbSrc) img.dataset.fullThumbSrc = img.getAttribute('src') || '';
+        img.src = `/api/ai/faces/${faceId}/crop?w=160`;
+    });
 
     if (_photoGridClickHandler) grid.removeEventListener('click', _photoGridClickHandler);
     _photoGridClickHandler = (e) => {
         // Use data-dl-id (download ID — always populated) as the selection key.
-        // Face IDs are looked up from data-face-id at commit time.
+        // At commit the server expands to every face of this person on those downloads.
         const tile = e.target.closest('[data-dl-id]');
         if (!tile) return;
         const dlId = Number(tile.dataset.dlId);
@@ -2694,9 +2703,14 @@ function _exitSplitMode() {
     if (!grid) return;
     grid.classList.remove('split-mode');
     grid.querySelectorAll('.split-overlay').forEach((ov) => ov.classList.add('hidden'));
-    grid.querySelectorAll('[data-dl-id]').forEach((tile) =>
-        tile.classList.remove('ring-2', 'ring-tg-blue/60'),
-    );
+    grid.querySelectorAll('[data-dl-id]').forEach((tile) => {
+        tile.classList.remove('ring-2', 'ring-tg-blue/60');
+        const img = tile.querySelector('img');
+        if (img?.dataset?.fullThumbSrc) {
+            img.src = img.dataset.fullThumbSrc;
+            delete img.dataset.fullThumbSrc;
+        }
+    });
 
     // Restore the viewer click handler.
     if (_photoGridClickHandler) grid.removeEventListener('click', _photoGridClickHandler);
@@ -2714,29 +2728,10 @@ function _exitSplitMode() {
 async function _commitSplit() {
     if (!_splitSelectedDlIds.size || !_selectedPerson) return;
 
-    // Resolve face IDs from the tiles — the data-face-id attribute is written
-    // by _photoTile from the DB-returned face_id. Using download IDs for
-    // selection state (data-dl-id is always populated) and face IDs for the
-    // API call decouples selection from face_id availability.
-    const grid = $('#ai-people-photos-grid');
-    const faceIds = [];
-    if (grid) {
-        for (const dlId of _splitSelectedDlIds) {
-            const tile = grid.querySelector(`[data-dl-id="${dlId}"]`);
-            const faceId = Number(tile?.dataset?.faceId);
-            if (faceId > 0) faceIds.push(faceId);
-        }
-    }
-    if (!faceIds.length) {
-        showToast(
-            i18nT(
-                'maintenance.ai.split_no_face_ids',
-                'Selected photos have no face data — run a scan first.',
-            ),
-            'error',
-        );
-        return;
-    }
+    // Photo-grid selection is by download id. The server expands each
+    // download to every face of this person on that photo so sibling
+    // detections are not left on the source cluster.
+    const downloadIds = [..._splitSelectedDlIds];
 
     const newLabel = await promptSheet({
         title: i18nT('maintenance.ai.person_split', 'Split'),
@@ -2751,12 +2746,13 @@ async function _commitSplit() {
 
     try {
         const res = await api.post(`/api/ai/people/${_selectedPerson}/split`, {
-            faceIds,
-            newLabel: newLabel || undefined,
+            downloadIds,
+            label: newLabel || undefined,
         });
         if (!res.success) throw new Error(res.error || 'split failed');
+        const moved = Number(res.moved) || downloadIds.length;
         showToast(
-            `${i18nT('maintenance.ai.split_done', 'Split complete')} — ${faceIds.length} ${i18nT('maintenance.ai.faces_short', 'faces')}`,
+            `${i18nT('maintenance.ai.split_done', 'Split complete')} — ${moved} ${i18nT('maintenance.ai.faces_short', 'faces')}`,
             'success',
         );
         _exitSplitMode();
