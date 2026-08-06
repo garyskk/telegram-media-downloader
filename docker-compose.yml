@@ -223,6 +223,11 @@ services:
       # (downloader, OS) get breathing room. Leave at 0 (default) when a
       # GPU provider is active — GPU inference already leaves the CPU idle.
       - TGDL_FACES_THROTTLE_MS=${TGDL_FACES_THROTTLE_MS:-0}
+      # Confirmed-track floors for video face keep (seen in ≥2 sampled frames).
+      # Lowered from 0.45/0.60 to keep harder poses in group clips.
+      - TGDL_FACES_VIDEO_CONFIRMED_MIN_QUALITY=${TGDL_FACES_VIDEO_CONFIRMED_MIN_QUALITY:-0.35}
+      - TGDL_FACES_VIDEO_CONFIRMED_MIN_SCORE=${TGDL_FACES_VIDEO_CONFIRMED_MIN_SCORE:-0.50}
+      - TGDL_FACES_VIDEO_MIN_LANDMARK_REGULARITY=${TGDL_FACES_VIDEO_MIN_LANDMARK_REGULARITY:-0.15}
       # Video nice: prefer Maintenance UI (Node forwards `nice` on each
       # /detect/video). Do not pin with `:-10` — that ignores UI=0.
       # - TGDL_FACES_VIDEO_NICE=${TGDL_FACES_VIDEO_NICE}
@@ -303,6 +308,10 @@ services:
       # Throttle: 0 (default) is correct for GPU — CPU is idle between
       # kernel dispatches. Only raise this if falling back to CPU.
       - TGDL_FACES_THROTTLE_MS=${TGDL_FACES_THROTTLE_MS:-0}
+      # Confirmed-track floors for video face keep (seen in ≥2 sampled frames).
+      - TGDL_FACES_VIDEO_CONFIRMED_MIN_QUALITY=${TGDL_FACES_VIDEO_CONFIRMED_MIN_QUALITY:-0.35}
+      - TGDL_FACES_VIDEO_CONFIRMED_MIN_SCORE=${TGDL_FACES_VIDEO_CONFIRMED_MIN_SCORE:-0.50}
+      - TGDL_FACES_VIDEO_MIN_LANDMARK_REGULARITY=${TGDL_FACES_VIDEO_MIN_LANDMARK_REGULARITY:-0.15}
       # Video nice: prefer Maintenance UI (Node forwards `nice` on each
       # /detect/video). Do not pin with `:-10` — that ignores UI=0.
       # - TGDL_FACES_VIDEO_NICE=${TGDL_FACES_VIDEO_NICE}
@@ -369,6 +378,10 @@ services:
       - TGDL_FACES_PROVIDERS=${TGDL_FACES_PROVIDERS:-auto}
       - TGDL_FACES_DETECTOR_MODEL=${TGDL_FACES_DETECTOR_MODEL:-buffalo_m}
       - TGDL_FACES_THROTTLE_MS=${TGDL_FACES_THROTTLE_MS:-0}
+      # Confirmed-track floors for video face keep (seen in ≥2 sampled frames).
+      - TGDL_FACES_VIDEO_CONFIRMED_MIN_QUALITY=${TGDL_FACES_VIDEO_CONFIRMED_MIN_QUALITY:-0.35}
+      - TGDL_FACES_VIDEO_CONFIRMED_MIN_SCORE=${TGDL_FACES_VIDEO_CONFIRMED_MIN_SCORE:-0.50}
+      - TGDL_FACES_VIDEO_MIN_LANDMARK_REGULARITY=${TGDL_FACES_VIDEO_MIN_LANDMARK_REGULARITY:-0.15}
       # Video nice: prefer Maintenance UI (Node forwards `nice` on each
       # /detect/video). Do not pin with `:-10` — that ignores UI=0.
       # - TGDL_FACES_VIDEO_NICE=${TGDL_FACES_VIDEO_NICE}

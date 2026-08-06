@@ -147,9 +147,9 @@ class TestVideoConfigResolution:
         score, quality, confirmed, confirmed_score, regularity = _resolve_video_track_thresholds()
         assert score == 0.75
         assert quality == 0.55
-        assert confirmed == 0.45
-        assert confirmed_score == 0.60
-        assert regularity == 0.35
+        assert confirmed == 0.35
+        assert confirmed_score == 0.50
+        assert regularity == 0.15
 
     def test_track_thresholds_env_override(self):
         from tgdl_faces.app import _resolve_video_track_thresholds
@@ -254,35 +254,35 @@ class TestBuildFaceTracks:
     def test_confirmed_track_below_universal_quality_floor_dropped(self):
         """The core false-positive-class fix: a systematic misfire (same
         non-face region detected consistently) shouldn't survive just
-        because it repeats — every face in the track fails the 0.45 floor."""
+        because it repeats — every face in the track fails the 0.35 floor."""
         a = _face(score=0.9, quality=0.1, emb=_unit(5))
         b = _face(score=0.9, quality=0.1, emb=_near(5))
         assert self._fn([[a], [b]]) == []
 
     def test_confirmed_track_meeting_quality_floor_kept(self):
-        a = _face(score=0.9, quality=0.50, emb=_unit(6))
-        b = _face(score=0.9, quality=0.50, emb=_near(6))
+        a = _face(score=0.9, quality=0.35, emb=_unit(6))
+        b = _face(score=0.9, quality=0.35, emb=_near(6))
         result = self._fn([[a], [b]])
         assert len(result) == 1
 
     def test_confirmed_track_below_score_floor_dropped(self):
-        a = _face(score=0.55, quality=0.6, emb=_unit(7))
-        b = _face(score=0.55, quality=0.6, emb=_near(7))
+        a = _face(score=0.45, quality=0.6, emb=_unit(7))
+        b = _face(score=0.45, quality=0.6, emb=_near(7))
         assert self._fn([[a], [b]]) == []
 
     def test_confirmed_track_below_regularity_floor_dropped(self):
-        a = _face(score=0.9, quality=0.6, regularity=0.2, emb=_unit(8))
-        b = _face(score=0.9, quality=0.6, regularity=0.2, emb=_near(8))
+        a = _face(score=0.9, quality=0.6, regularity=0.05, emb=_unit(8))
+        b = _face(score=0.9, quality=0.6, regularity=0.05, emb=_near(8))
         assert self._fn([[a], [b]]) == []
 
     def test_singleton_below_regularity_floor_dropped(self):
-        f = _face(score=0.9, quality=0.9, regularity=0.2)
+        f = _face(score=0.9, quality=0.9, regularity=0.05)
         assert self._fn([[f]]) == []
 
     def test_confirmed_track_drops_sub_floor_representatives(self):
         """Track admission uses best face; exported reps must each clear floors."""
         good = _face(score=0.9, quality=0.6, emb=_unit(10))
-        weak = _face(score=0.9, quality=0.38, emb=_diverse_variant(10, 1))
+        weak = _face(score=0.9, quality=0.30, emb=_diverse_variant(10, 1))
         result = self._fn([[good], [weak]])
         assert len(result) == 1
         assert result[0]["quality_score"] == 0.6

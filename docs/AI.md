@@ -248,9 +248,9 @@ should read the nested path.
 | `videoNice` | `TGDL_FACES_VIDEO_NICE` | `0` | Unix **nice** level for the video scan phase (`0` = normal, `10`–`15` = background-friendly). Applies to Node, ffmpeg fallback, and sidecar `/detect/video` |
 | — | `TGDL_FACES_VIDEO_SINGLETON_MIN_SCORE` | `0.75` | *Sidecar only* — detection-score floor for a face seen in exactly 1 sampled frame |
 | — | `TGDL_FACES_VIDEO_SINGLETON_MIN_QUALITY` | `0.55` | *Sidecar only* — quality-score floor for a face seen in exactly 1 sampled frame |
-| — | `TGDL_FACES_VIDEO_CONFIRMED_MIN_QUALITY` | `0.45` | *Sidecar only* — universal quality floor for a face confirmed across ≥2 sampled frames |
-| — | `TGDL_FACES_VIDEO_CONFIRMED_MIN_SCORE` | `0.60` | *Sidecar only* — detection-score floor for a track confirmed across ≥2 sampled frames |
-| — | `TGDL_FACES_VIDEO_MIN_LANDMARK_REGULARITY` | `0.35` | *Sidecar only* — landmark symmetry floor (hard gate against non-face textures) |
+| — | `TGDL_FACES_VIDEO_CONFIRMED_MIN_QUALITY` | `0.35` | *Sidecar only* — universal quality floor for a face confirmed across ≥2 sampled frames |
+| — | `TGDL_FACES_VIDEO_CONFIRMED_MIN_SCORE` | `0.50` | *Sidecar only* — detection-score floor for a track confirmed across ≥2 sampled frames |
+| — | `TGDL_FACES_VIDEO_MIN_LANDMARK_REGULARITY` | `0.15` | *Sidecar only* — landmark symmetry floor (hard gate against non-face textures) |
 | `videoProgressPollMs` | `TGDL_FACES_VIDEO_PROGRESS_POLL_MS` | `5000` | *Node only* — how often `detectFacesInVideo` polls `GET /detect/video/status/{job_id}` while a video request is in flight (see [Video scan progress reporting](#video-scan-progress-reporting)) |
 
 Env-var precedence is strict: any `TGDL_FACES_*` value wins over the

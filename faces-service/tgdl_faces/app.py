@@ -1018,9 +1018,9 @@ def _resolve_video_track_thresholds() -> tuple[float, float, float, float, float
     return (
         _float_env("TGDL_FACES_VIDEO_SINGLETON_MIN_SCORE", 0.75),
         _float_env("TGDL_FACES_VIDEO_SINGLETON_MIN_QUALITY", 0.55),
-        _float_env("TGDL_FACES_VIDEO_CONFIRMED_MIN_QUALITY", 0.45),
-        _float_env("TGDL_FACES_VIDEO_CONFIRMED_MIN_SCORE", 0.60),
-        _float_env("TGDL_FACES_VIDEO_MIN_LANDMARK_REGULARITY", 0.35),
+        _float_env("TGDL_FACES_VIDEO_CONFIRMED_MIN_QUALITY", 0.35),
+        _float_env("TGDL_FACES_VIDEO_CONFIRMED_MIN_SCORE", 0.50),
+        _float_env("TGDL_FACES_VIDEO_MIN_LANDMARK_REGULARITY", 0.15),
     )
 
 
@@ -1082,8 +1082,8 @@ def _build_face_tracks(frames_faces: list[list[dict]]) -> list[dict]:
 
     - A track confirmed by >= 2 frames is kept only if at least one of its
       faces clears ``TGDL_FACES_VIDEO_CONFIRMED_MIN_QUALITY`` (default
-      0.45), ``TGDL_FACES_VIDEO_CONFIRMED_MIN_SCORE`` (default 0.60), and
-      ``TGDL_FACES_VIDEO_MIN_LANDMARK_REGULARITY`` (default 0.35) —
+      0.35), ``TGDL_FACES_VIDEO_CONFIRMED_MIN_SCORE`` (default 0.50), and
+      ``TGDL_FACES_VIDEO_MIN_LANDMARK_REGULARITY`` (default 0.15) —
       defends against a *systematic* false positive (the detector
       consistently misfiring on the same non-face texture across the whole
       scene) that mere repetition would otherwise wave through.

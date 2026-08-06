@@ -2367,7 +2367,7 @@ async function _setCoverFaceFromReview(faceId) {
             _faceReviewOffset = 0;
             const grid = $('#ai-face-review-grid');
             if (grid) grid.innerHTML = '';
-            await _loadFaceReviewPage();
+            await _loadFaceReview({ append: false });
         }
     } catch (e) {
         showToast(e.message, 'error');

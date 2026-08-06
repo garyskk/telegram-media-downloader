@@ -1016,9 +1016,9 @@ const TRACK_MAX_REPRESENTATIVES = 3;
 const TRACK_POSE_DEDUP_THRESHOLD = 0.85;
 const SINGLETON_MIN_SCORE = 0.75;
 const SINGLETON_MIN_QUALITY = 0.55;
-const CONFIRMED_MIN_QUALITY = 0.45;
-const CONFIRMED_MIN_SCORE = 0.6;
-const MIN_LANDMARK_REGULARITY = 0.35;
+const CONFIRMED_MIN_QUALITY = 0.35;
+const CONFIRMED_MIN_SCORE = 0.5;
+const MIN_LANDMARK_REGULARITY = 0.15;
 
 /**
  * Merge per-frame detections into per-identity tracks and return the
@@ -1033,8 +1033,8 @@ const MIN_LANDMARK_REGULARITY = 0.35;
  * than a raw detection count.
  *
  * - A track confirmed by >= 2 frames is kept only if at least one of its
- *   faces clears `CONFIRMED_MIN_QUALITY` (0.45), `CONFIRMED_MIN_SCORE`
- *   (0.60), and `MIN_LANDMARK_REGULARITY` (0.35) — defends against a
+ *   faces clears `CONFIRMED_MIN_QUALITY` (0.35), `CONFIRMED_MIN_SCORE`
+ *   (0.50), and `MIN_LANDMARK_REGULARITY` (0.15) — defends against a
  *   *systematic* false positive (the detector consistently misfiring on
  *   the same non-face texture) that mere repetition would otherwise wave
  *   through.

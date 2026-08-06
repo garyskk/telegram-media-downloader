@@ -208,8 +208,8 @@ cosine similarity (≥0.50 — the existing dedup threshold, unchanged)
 against each track's running mean embedding:
 
 - A track confirmed by **≥2 sampled frames** is accepted, **but still must
-  clear universal floors: `quality_score ≥ 0.45`, `det_score ≥ 0.60`, and
-  `landmark_regularity ≥ 0.35`.**
+  clear universal floors: `quality_score ≥ 0.35`, `det_score ≥ 0.50`, and
+  `landmark_regularity ≥ 0.15`.**
 - A track seen in only **1** sampled frame is accepted only if it clears
   a stricter bar (`score ≥ 0.75` AND `quality_score ≥ 0.55`) — otherwise
   dropped as unconfirmed noise.
@@ -276,9 +276,9 @@ duration — they're the same fixed values for every video:
 | `TGDL_FACES_VIDEO_MAX_FRAMES` / `videoMaxFrames` | 20000 | pure runaway-safety ceiling — not a density control, should not bind for real videos |
 | `TGDL_FACES_VIDEO_SINGLETON_MIN_SCORE` | 0.75 | unconfirmed (1-hit) single-frame acceptance bar (score) |
 | `TGDL_FACES_VIDEO_SINGLETON_MIN_QUALITY` | 0.55 | unconfirmed (1-hit) single-frame acceptance bar (quality) |
-| `TGDL_FACES_VIDEO_CONFIRMED_MIN_QUALITY` | 0.45 | universal quality floor for **confirmed** (≥2-hit) tracks — catches systematic false positives (skin/fabric/texture) that repetition alone would wave through |
-| `TGDL_FACES_VIDEO_CONFIRMED_MIN_SCORE` | 0.60 | detection-score floor for **confirmed** (≥2-hit) tracks |
-| `TGDL_FACES_VIDEO_MIN_LANDMARK_REGULARITY` | 0.35 | landmark symmetry hard gate — rejects detections whose predicted eye/nose/mouth layout is too irregular to be a real face |
+| `TGDL_FACES_VIDEO_CONFIRMED_MIN_QUALITY` | 0.35 | universal quality floor for **confirmed** (≥2-hit) tracks — catches systematic false positives (skin/fabric/texture) that repetition alone would wave through |
+| `TGDL_FACES_VIDEO_CONFIRMED_MIN_SCORE` | 0.50 | detection-score floor for **confirmed** (≥2-hit) tracks |
+| `TGDL_FACES_VIDEO_MIN_LANDMARK_REGULARITY` | 0.15 | landmark symmetry hard gate — rejects detections whose predicted eye/nose/mouth layout is too irregular to be a real face |
 
 All existing knobs (`min_score`, `min_box_px`, `ar_range`) are unchanged.
 
