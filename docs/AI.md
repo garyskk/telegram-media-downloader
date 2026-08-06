@@ -46,7 +46,7 @@ Releases). Cached forever.
 | macOS | Intel (x64) | Standalone | Auto-downloads `tgdl-faces-mac-x64.tar.gz` |
 | macOS | Apple Silicon (arm64) | Standalone | Auto-downloads `tgdl-faces-mac-arm64.tar.gz`; CoreML provider auto-picked when available |
 | Linux | x64 (bare-metal) | Standalone | Auto-downloads `tgdl-faces-linux-x64.tar.gz` |
-| Linux | arm64 (Pi 4 / NAS) | Standalone | Auto-downloads `tgdl-faces-linux-arm64.tar.gz`; set `TGDL_FACES_DET_SIZE=480` for ~3× faster scan on Pi 4 |
+| Linux | arm64 (Pi 4 / NAS) | Standalone | Auto-downloads `tgdl-faces-linux-arm64.tar.gz`; default `detSize=480` is already tuned for Pi 4 |
 | Linux | arm64 (Synology DSM) | Docker compose | `docker compose --profile faces up`; pulls `ghcr.io/botnick/tgdl-faces:latest` arm64 layer |
 | Linux | amd64 | Docker compose | Same as above, amd64 layer |
 | Offline / air-gapped | any | Standalone | Drop the binary at `data/faces-service/bin/`, set `TGDL_FACES_AUTO_DOWNLOAD=false` |
@@ -214,7 +214,7 @@ should read the nested path.
 | `minDetectionScore` | `TGDL_FACES_MIN_DETECTION_SCORE` | `0.5` | Detector score floor (0–1) |
 | `minFaceSizePx` | `TGDL_FACES_MIN_FACE_SIZE_PX` | `80` | Reject boxes smaller than this on the shorter edge |
 | `arRange` | `TGDL_FACES_AR_RANGE` | `0.5,2.0` | Aspect-ratio window for valid boxes |
-| `detSize` | `TGDL_FACES_DET_SIZE` | `640` | Sidecar input size; smaller = faster, lower recall |
+| `detSize` | `TGDL_FACES_DET_SIZE` | `480` | Sidecar input size; larger (640) = better recall on small faces, slower |
 | `embedDim` | `TGDL_FACES_EMBED_DIM` | `512` | buffalo_l native (informational only) |
 | `detectorModel` | `TGDL_FACES_DETECTOR_MODEL` | `buffalo_l` | Detector model preset (see [Detector model options](#detector-model-options) below) |
 | `scanVideos` | — | `false` | Include videos in face scan (see [Video face scanning](#video-face-scanning)) |
@@ -571,7 +571,7 @@ chain to onnxruntime. Options:
 
 Boot logs print the resolved provider chain:
 ```
-[tgdl-faces] INFO loading buffalo_l from ... (providers=['CUDAExecutionProvider','CPUExecutionProvider'] requested=auto det_size=(640, 640))
+[tgdl-faces] INFO loading buffalo_l from ... (providers=['CUDAExecutionProvider','CPUExecutionProvider'] requested=auto det_size=(480, 480))
 ```
 
 `/health` and `/info` both surface `providers_resolved` so the AI
@@ -780,8 +780,9 @@ source `ai-faces-spawn`) usually pinpoint the cause. Common ones:
 - *Port exhaustion*: bump `TGDL_FACES_PORT_RANGE` to a wider window.
 - *Long model load on slow disks*: bump
   `TGDL_FACES_FIRST_BOOT_HEALTH_TIMEOUT_MS=120000`.
-- *Memory pressure on Pi 4*: drop `TGDL_FACES_DET_SIZE=480` and set
-  `TGDL_FACES_MAX_CONCURRENCY=2` to cap inflight detect calls.
+- *Memory pressure on Pi 4*: default `detSize` is already 480; drop to
+  `TGDL_FACES_DET_SIZE=320` and set `TGDL_FACES_MAX_CONCURRENCY=2` to
+  cap inflight detect calls further.
 
 **Faces table grows but People grid stays empty** — phase B (clustering)
 hasn't run, or every face is below `minPoints`. Confirm by checking

@@ -18,7 +18,7 @@ _PROJECT = _HERE.parent
 _MODELS_DIR = _PROJECT / "data" / "faces-service" / "models"
 os.environ.setdefault("TGDL_FACES_MODELS_DIR", str(_MODELS_DIR))
 os.environ.setdefault("TGDL_FACES_LOG_LEVEL", "WARNING")
-os.environ.setdefault("TGDL_FACES_DET_SIZE", "640")
+os.environ.setdefault("TGDL_FACES_DET_SIZE", "480")
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")

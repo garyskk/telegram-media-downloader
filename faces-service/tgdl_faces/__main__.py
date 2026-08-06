@@ -43,7 +43,7 @@ Environment
     insightface model pack name. Defaults to ``buffalo_l``.
 
 ``TGDL_FACES_DET_SIZE``
-    Detector input resolution (positive int). Defaults to ``640``.
+    Detector input resolution (positive int). Defaults to ``480``.
 
 ``TGDL_FACES_THROTTLE_MS``
     Milliseconds to sleep between consecutive images inside a

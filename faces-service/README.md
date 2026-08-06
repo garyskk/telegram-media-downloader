@@ -137,7 +137,7 @@ curl -X POST http://127.0.0.1:8011/detect/batch-b64 \
 | `TGDL_FACES_ALLOW_ROOTS` | _empty_ | Comma-separated absolute paths the sidecar may read from. If empty, path-mode is rejected (403); only base64 works. |
 | `TGDL_FACES_PROVIDERS` | `auto` | onnxruntime provider hint. Shorthand aliases: `auto`, `cpu`, `cuda`, `coreml`, `directml`, `openvino`. Or a comma-separated list of full provider names: `CUDAExecutionProvider,CPUExecutionProvider`. |
 | `TGDL_FACES_DETECTOR_MODEL` | `buffalo_l` | insightface model pack name. |
-| `TGDL_FACES_DET_SIZE` | `640` | Detector input size. `480` is the Pi 4 sweet spot. |
+| `TGDL_FACES_DET_SIZE` | `480` | Detector input size. Raise to `640` for better recall on small/distant faces. |
 | `TGDL_FACES_MAX_CONCURRENCY` | `2` (CPU) / `8` (GPU) | Max parallel detection requests. Auto-scales when GPU is detected. |
 | `TGDL_FACES_SKIP_QUALITY` | _empty_ | Set to `1` to skip per-face quality score computation for higher throughput. |
 | `TGDL_FACES_LOG_LEVEL` | `INFO` | Standard Python `logging` level. |

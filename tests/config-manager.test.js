@@ -123,7 +123,7 @@ describe('config manager (kv-backed)', () => {
         expect(f).toBeTruthy();
         expect(f.backend).toBe('sidecar');
         expect(f.autoDownload).toBe(true);
-        expect(f.detSize).toBe(640);
+        expect(f.detSize).toBe(480);
         expect(f.providers).toBe('auto');
         expect(f.epsilon).toBeCloseTo(1.05, 5);
         expect(f.minPoints).toBe(2);

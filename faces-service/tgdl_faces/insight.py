@@ -38,8 +38,8 @@ Tunables (environment variables):
     matches.
 
 ``TGDL_FACES_DET_SIZE``
-    Detector input size (positive int). Default 640; 480 is the Pi 4
-    sweet spot at a small recall cost.
+    Detector input size (positive int). Default 480; raise to 640 for
+    better recall on small/distant faces at a speed cost.
 
 ``TGDL_FACES_MODEL_DIR``
     Alias for ``TGDL_FACES_MODELS_DIR`` (singular form accepted for
@@ -127,7 +127,7 @@ _CONCURRENCY_LOCK = threading.Lock()
 # the PyInstaller binary.
 DEFAULT_MODEL_NAME = "buffalo_l"
 EMBEDDING_DIM = 512
-DEFAULT_DET_SIZE = (640, 640)
+DEFAULT_DET_SIZE = (480, 480)
 
 # Public re-exports preserved for code that already imports `MODEL_NAME`
 # and `DET_SIZE` (the FastAPI layer pulls these into its response models).

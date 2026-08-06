@@ -208,7 +208,7 @@ def test_config_shape(client) -> None:
         f"Missing config keys: {required - payload.keys()}"
     )
     assert payload["model"] == "buffalo_l"
-    assert payload["det_size"] == 640
+    assert payload["det_size"] == 480
     assert isinstance(payload["max_concurrency"], int)
     assert payload["max_concurrency"] >= 1
 
@@ -222,7 +222,7 @@ def test_info_returns_model_and_dim(client) -> None:
     payload = resp.json()
     assert payload["model"] == "buffalo_l"
     assert payload["dim"] == 512
-    assert payload["det_size"] == 640
+    assert payload["det_size"] == 480
     assert isinstance(payload["providers"], list)
     assert len(payload["providers"]) >= 1
     assert "version" in payload
@@ -521,11 +521,11 @@ def test_info_includes_arch(client) -> None:
 
 
 def test_det_size_env_override(monkeypatch) -> None:
-    """`TGDL_FACES_DET_SIZE` overrides the default 640."""
+    """`TGDL_FACES_DET_SIZE` overrides the default 480."""
     from tgdl_faces import insight  # noqa: PLC0415
 
-    monkeypatch.setenv("TGDL_FACES_DET_SIZE", "480")
-    assert insight._resolve_det_size() == (480, 480)
+    monkeypatch.setenv("TGDL_FACES_DET_SIZE", "640")
+    assert insight._resolve_det_size() == (640, 640)
     # Garbage value falls back to the default.
     monkeypatch.setenv("TGDL_FACES_DET_SIZE", "not-a-number")
     assert insight._resolve_det_size() == insight.DEFAULT_DET_SIZE

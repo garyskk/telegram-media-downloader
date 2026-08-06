@@ -493,8 +493,9 @@ const DEFAULT_CONFIG = {
                 // Aspect-ratio window for valid face boxes.
                 arRange: [0.5, 2.0],
                 // Sidecar input size — bigger = better recall on small
-                // faces, slower per image. 480 is the Pi 4 sweet spot.
-                detSize: 640,
+                // faces, slower per image. 480 balances speed vs recall;
+                // raise to 640 if distant faces are being missed.
+                detSize: 480,
                 // buffalo_l native embedding dim. Informational only — the
                 // sidecar enforces this on its end.
                 embedDim: 512,

@@ -780,7 +780,7 @@ async function _tryPythonFallback({ host, port, allowRoots, modelsDir }) {
         TGDL_FACES_PROVIDERS: String(
             _resolvedCfg.providers || (process.platform === 'win32' ? 'cpu' : 'auto'),
         ),
-        TGDL_FACES_DET_SIZE: String(_resolvedCfg.detSize || 640),
+        TGDL_FACES_DET_SIZE: String(_resolvedCfg.detSize || 480),
         // Disable Python's stdout buffering so log lines surface in the
         // dashboard's log feed in real time rather than batched at exit.
         PYTHONUNBUFFERED: '1',
@@ -1485,7 +1485,7 @@ async function _spawnAndProbe(binPath) {
         TGDL_FACES_PROVIDERS: String(
             _resolvedCfg.providers || (process.platform === 'win32' ? 'cpu' : 'auto'),
         ),
-        TGDL_FACES_DET_SIZE: String(_resolvedCfg.detSize || 640),
+        TGDL_FACES_DET_SIZE: String(_resolvedCfg.detSize || 480),
     };
 
     _log('info', `spawning ${binPath} on 127.0.0.1:${port}`);
