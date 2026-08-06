@@ -760,11 +760,12 @@
                 <div class="tab-item" data-type="videos" data-i18n="viewer.tab.videos">Videos</div>
                 <div class="tab-item" data-type="documents" data-i18n="viewer.tab.documents">Files</div>
                 <div class="tab-item" data-type="audio" data-i18n="viewer.tab.audio">Audio</div>
-                <!-- Pinned: independent toggle (sits next to the type tabs but
-                     reads as a chip, since it stacks with the type filter
-                     instead of replacing it). -->
+                <!-- Pinned: independent 3-state chip (all → pinned →
+                     unpinned → all). Stacks with the type filter instead
+                     of replacing it. -->
                 <div class="tab-item tab-item--toggle" data-pinned-toggle
-                     data-i18n-title="favorites.filter_title" title="Show only pinned"
+                     data-pin-filter="all"
+                     data-i18n-title="favorites.filter_all_title" title="Show all — click for pinned only"
                      role="button" aria-pressed="false">
                     <i class="ri-pushpin-2-line mr-1" aria-hidden="true"></i><span data-i18n="favorites.filter">Pinned</span>
                 </div>

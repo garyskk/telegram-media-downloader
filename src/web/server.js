@@ -4419,10 +4419,13 @@ app.get('/api/downloads/all', async (req, res) => {
         const limit = Math.max(1, Math.min(500, parseInt(req.query.limit, 10) || 50));
         const type = req.query.type || 'all';
         const offset = (page - 1) * limit;
-        // Pinned filter chip (`?pinned=1`) and "surface pinned at top"
-        // setting (`?pinnedFirst=1`) — both opt-in, both default off so
-        // existing callers behave identically.
+        // Pinned filter chip (`?pinned=1` pinned-only, `?pinned=0`
+        // unpinned-only) and "surface pinned at top" setting
+        // (`?pinnedFirst=1`) — all opt-in, default off so existing
+        // callers behave identically. pinnedOnly wins if both set.
         const pinnedOnly = req.query.pinned === '1' || req.query.pinned === 'true';
+        const unpinnedOnly =
+            !pinnedOnly && (req.query.pinned === '0' || req.query.pinned === 'false');
         const pinnedFirst = req.query.pinnedFirst === '1' || req.query.pinnedFirst === 'true';
         // Federation scope (Layer 1, v2.12+):
         //   ?include=local  — own files only (default; backward-compatible)
@@ -4445,6 +4448,7 @@ app.get('/api/downloads/all', async (req, res) => {
             req.role !== 'guest' && req.query.peerId ? String(req.query.peerId) : null;
         const result = getAllDownloadsFederated(limit, offset, type, {
             pinnedOnly,
+            unpinnedOnly,
             pinnedFirst,
             include,
             ...(peerIdFilter ? { peerId: peerIdFilter } : {}),
@@ -4550,6 +4554,8 @@ app.get('/api/downloads/:groupId', async (req, res, next) => {
         const groupFolder = sanitizeName(configGroup?.name || dbRow?.group_name || 'unknown');
 
         const pinnedOnly = req.query.pinned === '1' || req.query.pinned === 'true';
+        const unpinnedOnly =
+            !pinnedOnly && (req.query.pinned === '0' || req.query.pinned === 'false');
         const pinnedFirst = req.query.pinnedFirst === '1' || req.query.pinnedFirst === 'true';
         // Federation scope — same contract as /api/downloads/all. Guest
         // sessions are forced back to `local` so cluster-only data stays
@@ -4563,6 +4569,7 @@ app.get('/api/downloads/:groupId', async (req, res, next) => {
             req.role !== 'guest' && req.query.peerId ? String(req.query.peerId) : null;
         const result = getDownloadsForGroupFederated(groupId, limit, offset, type, {
             pinnedOnly,
+            unpinnedOnly,
             pinnedFirst,
             include,
             ...(peerIdFilter ? { peerId: peerIdFilter } : {}),

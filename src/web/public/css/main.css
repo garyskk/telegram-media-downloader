@@ -3827,6 +3827,18 @@ body[data-page="maintenance-recovery"] {
     color: #ffffff;
     transform: rotate(-12deg);
 }
+/* Unpinned-only mode: muted pressed style so it reads distinct from
+   the blue pinned-only chip while still looking "active". */
+#media-tabs .tab-item--toggle[data-pin-filter="unpinned"][aria-pressed="true"] {
+    background: var(--tg-hover, #2b5278);
+    color: var(--tg-text, #e4ecf2);
+    border-color: var(--tg-textSecondary, #8b9baa);
+}
+#media-tabs .tab-item--toggle[data-pin-filter="unpinned"][aria-pressed="true"] i {
+    color: var(--tg-textSecondary, #8b9baa);
+    transform: none;
+    opacity: 0.85;
+}
 #media-tabs .tab-item--toggle:active {
     transform: scale(0.97);
 }

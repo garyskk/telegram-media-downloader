@@ -24,6 +24,9 @@ export const state = {
     currentPage: 'viewer',
     currentGroup: null,
     currentFilter: 'all',
+    // Gallery pin chip: 'all' | 'pinned' | 'unpinned'. Cycles on click;
+    // maps to ?pinned=1 / ?pinned=0 / (omit) on the downloads APIs.
+    pinnedFilter: 'all',
     groups: [],
     downloads: [],
     files: [],

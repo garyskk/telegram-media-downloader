@@ -1202,6 +1202,8 @@ export function getAllDownloads(limit = 50, offset = 0, type = 'all', opts = {})
     }
     if (opts.pinnedOnly) {
         clauses.push('d.pinned = 1');
+    } else if (opts.unpinnedOnly) {
+        clauses.push('d.pinned = 0');
     }
     const where = clauses.length ? ' WHERE ' + clauses.join(' AND ') : '';
     const orderBy = opts.pinnedFirst
@@ -1237,6 +1239,7 @@ export function getDownloads(groupId, limit = 50, offset = 0, type = 'all', opts
     }
 
     if (opts.pinnedOnly) query += ' AND d.pinned = 1';
+    else if (opts.unpinnedOnly) query += ' AND d.pinned = 0';
 
     query += opts.pinnedFirst
         ? ' ORDER BY d.pinned DESC, d.created_at DESC LIMIT ? OFFSET ?'
@@ -1247,13 +1250,24 @@ export function getDownloads(groupId, limit = 50, offset = 0, type = 'all', opts
         .prepare(query)
         .all(...params);
 
-    let countQuery = 'SELECT COUNT(*) as total FROM downloads d WHERE d.group_id = ? AND (d.user_deleted IS NULL OR d.user_deleted = 0)';
+    let countQuery =
+        'SELECT COUNT(*) as total FROM downloads d WHERE d.group_id = ? AND (d.user_deleted IS NULL OR d.user_deleted = 0)';
     const countParams = [groupId];
 
-    if (params.length > 3) {
-        countQuery += ' AND d.file_type = ?';
-        countParams.push(params[1]);
+    if (type !== 'all') {
+        const typeMap = {
+            images: 'photo',
+            videos: 'video',
+            documents: 'document',
+            audio: 'audio',
+        };
+        if (typeMap[type]) {
+            countQuery += ' AND d.file_type = ?';
+            countParams.push(typeMap[type]);
+        }
     }
+    if (opts.pinnedOnly) countQuery += ' AND d.pinned = 1';
+    else if (opts.unpinnedOnly) countQuery += ' AND d.pinned = 0';
 
     const total = getDb()
         .prepare(countQuery)
@@ -1403,6 +1417,7 @@ function _stripSortTs(rows) {
  * @param {string} type   'all' | 'images' | 'videos' | 'documents' | 'audio'
  * @param {object} [opts]
  * @param {boolean} [opts.pinnedOnly]
+ * @param {boolean} [opts.unpinnedOnly]
  * @param {boolean} [opts.pinnedFirst]
  * @param {'local'|'peers'|'all'} [opts.include='local']  scope toggle
  * @returns {{ files: Array, total: number }}
@@ -1434,6 +1449,9 @@ export function getAllDownloadsFederated(limit = 50, offset = 0, type = 'all', o
         // Peer side excluded entirely under pinnedOnly — peer files can't
         // be locally pinned. Drop a never-true predicate to short-circuit.
         peerWhereParts.push('0 = 1');
+    } else if (opts.unpinnedOnly) {
+        // Local unpinned only; peer rows are always pinned=0 so they stay.
+        localWhereParts.push('pinned = 0');
     }
     const localWhere = localWhereParts.length ? ' WHERE ' + localWhereParts.join(' AND ') : '';
     const peerWhere = peerWhereParts.length ? ' WHERE ' + peerWhereParts.join(' AND ') : '';
@@ -1498,6 +1516,8 @@ export function getDownloadsForGroupFederated(
     if (opts.pinnedOnly) {
         localWhereParts.push('pinned = 1');
         peerWhereParts.push('0 = 1');
+    } else if (opts.unpinnedOnly) {
+        localWhereParts.push('pinned = 0');
     }
     // Optional peerId filter — when caller wants only one peer's files for
     // the group (sidebar foreign-group click).

@@ -1756,7 +1756,7 @@ async function loadAllFiles() {
     try {
         const type =
             state.currentFilter && state.currentFilter !== 'all' ? state.currentFilter : 'all';
-        const pinQs = state.pinnedFilter ? '&pinned=1' : '';
+        const pinQs = _pinnedFilterQs();
         const pinFirstQs =
             localStorage.getItem('tgdl-pinned-first') === '1' ? '&pinnedFirst=1' : '';
         const scopeQs = _galleryScopeQs();
@@ -1812,7 +1812,7 @@ async function loadGroupFiles(groupId) {
     try {
         const type =
             state.currentFilter && state.currentFilter !== 'all' ? state.currentFilter : 'all';
-        const pinQs = state.pinnedFilter ? '&pinned=1' : '';
+        const pinQs = _pinnedFilterQs();
         const pinFirstQs =
             localStorage.getItem('tgdl-pinned-first') === '1' ? '&pinnedFirst=1' : '';
         const scopeQs = _galleryScopeQs();
@@ -3823,15 +3823,73 @@ function resetGalleryFilter() {
 }
 
 // ============ Media Tabs ============
+/** Map state.pinnedFilter → downloads API query string. */
+function _pinnedFilterQs() {
+    if (state.pinnedFilter === 'pinned') return '&pinned=1';
+    if (state.pinnedFilter === 'unpinned') return '&pinned=0';
+    return '';
+}
+
+/** Sync the pin-filter chip DOM to state.pinnedFilter. */
+function syncPinFilterChip() {
+    const tab = document.querySelector('#media-tabs .tab-item[data-pinned-toggle]');
+    if (!tab) return;
+    const mode = state.pinnedFilter === 'pinned' || state.pinnedFilter === 'unpinned'
+        ? state.pinnedFilter
+        : 'all';
+    tab.setAttribute('data-pin-filter', mode);
+    tab.setAttribute('aria-pressed', mode === 'all' ? 'false' : 'true');
+
+    const ico = tab.querySelector('i');
+    const lbl = tab.querySelector('span');
+    if (mode === 'pinned') {
+        if (ico) ico.className = 'ri-pushpin-2-fill mr-1';
+        if (lbl) {
+            lbl.setAttribute('data-i18n', 'favorites.filter');
+            lbl.textContent = i18nT('favorites.filter', 'Pinned');
+        }
+        const title = i18nT('favorites.filter_title', 'Show only pinned items');
+        tab.title = title;
+        tab.setAttribute('aria-label', title);
+    } else if (mode === 'unpinned') {
+        if (ico) ico.className = 'ri-pushpin-2-line mr-1';
+        if (lbl) {
+            lbl.setAttribute('data-i18n', 'favorites.filter_unpinned');
+            lbl.textContent = i18nT('favorites.filter_unpinned', 'Not pinned');
+        }
+        const title = i18nT(
+            'favorites.filter_unpinned_title',
+            'Show only unpinned items',
+        );
+        tab.title = title;
+        tab.setAttribute('aria-label', title);
+    } else {
+        if (ico) ico.className = 'ri-pushpin-2-line mr-1';
+        if (lbl) {
+            lbl.setAttribute('data-i18n', 'favorites.filter');
+            lbl.textContent = i18nT('favorites.filter', 'Pinned');
+        }
+        const title = i18nT(
+            'favorites.filter_all_title',
+            'Show all — click for pinned only',
+        );
+        tab.title = title;
+        tab.setAttribute('aria-label', title);
+    }
+}
+
 function setupMediaTabs() {
     document.querySelectorAll('#media-tabs .tab-item').forEach((tab) => {
         tab.addEventListener('click', () => {
             // The pinned toggle is a chip, NOT a type tab — it stacks with
             // the type filter instead of replacing it. Handle it separately.
+            // Cycle: all → pinned → unpinned → all.
             if (tab.dataset.pinnedToggle !== undefined) {
-                const next = tab.getAttribute('aria-pressed') !== 'true';
-                tab.setAttribute('aria-pressed', next ? 'true' : 'false');
+                const order = ['all', 'pinned', 'unpinned'];
+                const cur = order.includes(state.pinnedFilter) ? state.pinnedFilter : 'all';
+                const next = order[(order.indexOf(cur) + 1) % order.length];
                 state.pinnedFilter = next;
+                syncPinFilterChip();
                 state.page = 1;
                 state.hasMore = true;
                 state.files = [];
@@ -3864,6 +3922,7 @@ function setupMediaTabs() {
             }
         });
     });
+    syncPinFilterChip();
 }
 
 // ============ Utils ============

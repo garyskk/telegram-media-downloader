@@ -155,6 +155,14 @@ describe('pinned queries', () => {
         expect(result.files.every((f) => f.pinned === 1)).toBe(true);
     });
 
+    it('getAllDownloads unpinnedOnly returns only unpinned rows', () => {
+        const result = downloadsApi.getAllDownloads(50, 0, 'all', { unpinnedOnly: true });
+        expect(result.files.length).toBeGreaterThan(0);
+        expect(result.files.every((f) => f.pinned === 0)).toBe(true);
+        // The pinned row from the previous test must not appear.
+        expect(result.files.some((f) => f.id === pinnedId)).toBe(false);
+    });
+
     it('getAllDownloads pinnedFirst puts pinned rows first', () => {
         const result = downloadsApi.getAllDownloads(50, 0, 'all', { pinnedFirst: true });
         expect(result.files.length).toBeGreaterThan(1);
