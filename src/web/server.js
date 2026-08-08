@@ -7756,7 +7756,14 @@ app.get('/api/ai/status', async (_req, res) => {
                     facesBlock.scanVideos === true && !baseTypes.includes('video')
                         ? [...baseTypes, 'video']
                         : baseTypes;
-                return getAiCounts({ fileTypes });
+                return getAiCounts({
+                    fileTypes,
+                    facesEpsilon: Number.isFinite(facesBlock.epsilon)
+                        ? facesBlock.epsilon
+                        : Number.isFinite(cfg.facesEpsilon)
+                          ? cfg.facesEpsilon
+                          : 1.05,
+                });
             } catch {
                 return { totalEligible: 0, indexed: 0, withFaces: 0 };
             }

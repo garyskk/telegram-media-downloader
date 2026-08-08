@@ -796,6 +796,41 @@ describe('excludePerson (durable denylist)', () => {
         expect(api.listExcludedPeople({}).total).toBe(0);
     });
 
+    it('countUnclassifiedFaces omits faces near an excluded centroid', () => {
+        const did = downloadId();
+        const ex = api.insertPerson({
+            label: 'Nope',
+            centroidBlob: f32Blob([0, 0, 1]),
+            faceCount: 1,
+        });
+        api.insertFace({
+            downloadId: did,
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 40,
+            embeddingBlob: f32Blob([0, 0, 1]),
+            personId: ex,
+        });
+        api.excludePerson(ex);
+
+        // True noise far from the exclusion
+        api.insertFace({
+            downloadId: did,
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 40,
+            embeddingBlob: f32Blob([1, 0, 0]),
+            personId: null,
+        });
+
+        expect(api.countUnclassifiedFaces(0.5)).toBe(1);
+        expect(api.getAiCounts({ facesEpsilon: 0.5 }).noiseFaces).toBe(1);
+        api.clearExcludedPeople();
+        expect(api.countUnclassifiedFaces(0.5)).toBe(2);
+    });
+
     it('returns not_found for missing person', () => {
         expect(api.excludePerson(999999)).toEqual({ ok: false, reason: 'not_found' });
         expect(api.excludePerson(-1).ok).toBe(false);

@@ -2382,8 +2382,12 @@ export function setAiIndexedAt(downloadId, now = Date.now()) {
  * Counters for the Maintenance → AI page header. One COUNT per capability
  * + a totalEligible/indexed roll-up so the UI can paint progress bars
  * without per-feature round-trips.
+ *
+ * `facesEpsilon` — used to exclude denylisted faces from `noiseFaces`
+ * (same radius as incremental Phase B exclusion filter). Defaults to
+ * buffalo_l production ε (1.05).
  */
-export function getAiCounts({ fileTypes = ['photo'] } = {}) {
+export function getAiCounts({ fileTypes = ['photo'], facesEpsilon = 1.05 } = {}) {
     const types = Array.isArray(fileTypes) && fileTypes.length ? fileTypes : ['photo'];
     const placeholders = types.map(() => '?').join(',');
     const db = getDb();
@@ -2400,9 +2404,7 @@ export function getAiCounts({ fileTypes = ['photo'] } = {}) {
     const withTags = db.prepare(`SELECT COUNT(DISTINCT download_id) AS n FROM image_tags`).get().n;
     const peopleCount = db.prepare(`SELECT COUNT(*) AS n FROM people`).get().n;
     const totalFaces = db.prepare(`SELECT COUNT(*) AS n FROM faces`).get().n;
-    const noiseFaces = db
-        .prepare(`SELECT COUNT(*) AS n FROM faces WHERE person_id IS NULL OR person_id = -1`)
-        .get().n;
+    const noiseFaces = countUnclassifiedFaces(facesEpsilon);
     return {
         totalEligible: total,
         indexed,
@@ -2414,6 +2416,53 @@ export function getAiCounts({ fileTypes = ['photo'] } = {}) {
         totalFaces,
         noiseFaces,
     };
+}
+
+/**
+ * Faces with no person that are NOT within `eps` of an excluded centroid.
+ * Excluded identities stay `person_id IS NULL` by design; this keeps them
+ * out of the Unclassified counter so it reflects true clustering noise.
+ */
+export function countUnclassifiedFaces(eps = 1.05) {
+    const db = getDb();
+    const radius = Number.isFinite(eps) && eps > 0 ? Number(eps) : 1.05;
+    const excluded = listExcludedCentroids();
+    if (!excluded.length) {
+        return db
+            .prepare(`SELECT COUNT(*) AS n FROM faces WHERE person_id IS NULL OR person_id = -1`)
+            .get().n;
+    }
+    let n = 0;
+    const stmt = db.prepare(
+        `SELECT embedding FROM faces WHERE person_id IS NULL OR person_id = -1`,
+    );
+    for (const row of stmt.iterate()) {
+        if (!row.embedding) {
+            n += 1;
+            continue;
+        }
+        const dim = row.embedding.byteLength / 4;
+        if (!Number.isFinite(dim) || dim < 1) {
+            n += 1;
+            continue;
+        }
+        const emb = new Float32Array(row.embedding.buffer, row.embedding.byteOffset, dim);
+        let nearExcluded = false;
+        for (const s of excluded) {
+            if (s.centroid.length !== dim) continue;
+            let sum = 0;
+            for (let i = 0; i < dim; i++) {
+                const d = emb[i] - s.centroid[i];
+                sum += d * d;
+            }
+            if (Math.sqrt(sum) <= radius) {
+                nearExcluded = true;
+                break;
+            }
+        }
+        if (!nearExcluded) n += 1;
+    }
+    return n;
 }
 
 // ---- Image embeddings -----------------------------------------------------

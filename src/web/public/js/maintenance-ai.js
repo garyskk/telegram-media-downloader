@@ -584,8 +584,8 @@ function _renderStatus(status) {
             finishedAt > 0 ? new Date(finishedAt).toLocaleString() : i18nT('common.never', 'Never');
     }
     // Noise / unclassified faces count — DBSCAN marks faces that don't fit
-    // any cluster as noise points. Surfacing this helps operators decide
-    // whether to lower minPoints or accept the noise level.
+    // any cluster as noise points. Excluded identities are omitted from
+    // this counter (they stay person_id NULL by design).
     const noiseEl = $('#ai-stat-noise');
     if (noiseEl) {
         const noise = Number(counts.noiseFaces ?? counts.unclassified ?? 0);
