@@ -1171,4 +1171,168 @@ describe('incremental Phase B (preserve merges)', () => {
         expect(db.prepare('SELECT person_id FROM faces WHERE id = ?').get(u2).person_id).toBeNull();
         expect(api.listPeople({}).people.some((p) => p.label === 'Keep')).toBe(true);
     });
+
+    it('split→exclude: faces do not reattach to sibling when exclusion is farther than sibling', async () => {
+        // Geometry that used to bleed: face closer to kept sibling than to
+        // excluded centroid, but still within eps of the exclusion.
+        // Alice [1,0,0]; Bob excl [0.7,0.3,0]; face [0.92,0.08,0]
+        //   d(Alice)≈0.113  d(Bob)≈0.311  — both ≤ eps=0.5, Alice wins on distance
+        const did = downloadId();
+        const alice = api.insertPerson({
+            label: 'Alice',
+            centroidBlob: f32Blob([1, 0, 0]),
+            faceCount: 1,
+        });
+        api.insertFace({
+            downloadId: did,
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 40,
+            embeddingBlob: f32Blob([1, 0, 0]),
+            personId: alice,
+        });
+        const bob = api.insertPerson({
+            label: 'Bob',
+            centroidBlob: f32Blob([0.7, 0.3, 0]),
+            faceCount: 1,
+        });
+        const bobFace = api.insertFace({
+            downloadId: did,
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 40,
+            embeddingBlob: f32Blob([0.92, 0.08, 0]),
+            personId: bob,
+        }).lastInsertRowid;
+        api.excludePerson(bob);
+        expect(db.prepare('SELECT person_id FROM faces WHERE id = ?').get(bobFace).person_id).toBeNull();
+
+        await scanRunner._test.runIncrementalPhaseB({
+            state: { phase: 'A', faceCount: 0, peopleCount: 0, noiseFaces: 0 },
+            signal: { aborted: false },
+            log: () => {},
+            cfg: { faces: { epsilon: 0.5, minPoints: 2, labelMatchEps: 0.4 } },
+            bcast: () => {},
+        });
+
+        expect(db.prepare('SELECT person_id FROM faces WHERE id = ?').get(bobFace).person_id).toBeNull();
+        expect(Number(api.listPeople({}).people.find((p) => p.label === 'Alice').face_count)).toBe(1);
+    });
+
+    it('excluded faces outside labelMatchEps but inside eps stay unassigned (no sibling attach)', async () => {
+        // Threshold mismatch: face within attach eps of Alice, outside the
+        // tighter labelMatchEps of the excluded centroid — must still skip.
+        // Alice [1,0,0]; Bob excl [0.6,0.4,0]; face [0.9,0.1,0]
+        //   d(Alice)≈0.141 ≤ eps=0.5
+        //   d(Bob)≈0.424  > matchEps=0.4  but ≤ eps=0.5
+        const did = downloadId();
+        const alice = api.insertPerson({
+            label: 'Alice',
+            centroidBlob: f32Blob([1, 0, 0]),
+            faceCount: 1,
+        });
+        api.insertFace({
+            downloadId: did,
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 40,
+            embeddingBlob: f32Blob([1, 0, 0]),
+            personId: alice,
+        });
+        const bob = api.insertPerson({
+            label: 'Bob',
+            centroidBlob: f32Blob([0.6, 0.4, 0]),
+            faceCount: 1,
+        });
+        const bobFace = api.insertFace({
+            downloadId: did,
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 40,
+            embeddingBlob: f32Blob([0.9, 0.1, 0]),
+            personId: bob,
+        }).lastInsertRowid;
+        api.excludePerson(bob);
+
+        await scanRunner._test.runIncrementalPhaseB({
+            state: { phase: 'A', faceCount: 0, peopleCount: 0, noiseFaces: 0 },
+            signal: { aborted: false },
+            log: () => {},
+            cfg: { faces: { epsilon: 0.5, minPoints: 2, labelMatchEps: 0.4 } },
+            bcast: () => {},
+        });
+
+        expect(db.prepare('SELECT person_id FROM faces WHERE id = ?').get(bobFace).person_id).toBeNull();
+        expect(Number(api.listPeople({}).people.find((p) => p.label === 'Alice').face_count)).toBe(1);
+    });
+
+    it('near-excluded faces are filtered from leftover DBSCAN (no new person)', async () => {
+        // No kept person nearby — two faces near an exclusion must not form
+        // a new cluster via the leftover DBSCAN path.
+        const did = downloadId();
+        const far = api.insertPerson({
+            label: 'Far',
+            centroidBlob: f32Blob([1, 0, 0]),
+            faceCount: 1,
+        });
+        api.insertFace({
+            downloadId: did,
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 40,
+            embeddingBlob: f32Blob([1, 0, 0]),
+            personId: far,
+        });
+        const ex = api.insertPerson({
+            label: 'Nope',
+            centroidBlob: f32Blob([0, 0, 1]),
+            faceCount: 1,
+        });
+        api.insertFace({
+            downloadId: did,
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 40,
+            embeddingBlob: f32Blob([0, 0, 1]),
+            personId: ex,
+        });
+        api.excludePerson(ex);
+
+        const u1 = api.insertFace({
+            downloadId: did,
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 40,
+            embeddingBlob: f32Blob([0.02, 0, 0.98]),
+            personId: null,
+        }).lastInsertRowid;
+        const u2 = api.insertFace({
+            downloadId: did,
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 40,
+            embeddingBlob: f32Blob([0, 0.02, 0.98]),
+            personId: null,
+        }).lastInsertRowid;
+
+        await scanRunner._test.runIncrementalPhaseB({
+            state: { phase: 'A', faceCount: 0, peopleCount: 0, noiseFaces: 0 },
+            signal: { aborted: false },
+            log: () => {},
+            cfg: { faces: { epsilon: 0.5, minPoints: 2, labelMatchEps: 0.4 } },
+            bcast: () => {},
+        });
+
+        expect(db.prepare('SELECT person_id FROM faces WHERE id = ?').get(u1).person_id).toBeNull();
+        expect(db.prepare('SELECT person_id FROM faces WHERE id = ?').get(u2).person_id).toBeNull();
+        expect(api.countPeople()).toBe(1);
+    });
 });

@@ -272,9 +272,10 @@ unset unless you intend a deploy-time override. Number arrays accept
    photos that yielded zero faces.
 
 2. **Phase B (incremental, default)** — only faces with
-   `person_id IS NULL` are considered. Each is attached to the nearest
-   existing person centroid within `epsilon` (unless nearer an excluded
-   identity), otherwise leftovers are DBSCAN'd into **new** people.
+   `person_id IS NULL` are considered. Faces within `epsilon` of any
+   excluded centroid stay unassigned (no attach, no leftover DBSCAN).
+   Remaining faces attach to the nearest existing person within
+   `epsilon`, otherwise leftovers are DBSCAN'd into **new** people.
    Existing people, merges, splits, labels, and covers are left alone.
    End-of-scan Phase B and **Re-cluster** use this path.
 
@@ -691,9 +692,11 @@ All endpoints are admin-only.
 **Delete vs Exclude.** `DELETE /api/ai/people/:id` only drops the
 cluster row (faces become unassigned); the next **incremental** Phase B
 may recreate a cluster from those faces. `POST /api/ai/people/:id/exclude`
-snapshots the centroid into `excluded_people` so matching faces stay
-unassigned / do not form a Person. Full faces reindex clears the denylist
-(embedding space may change with the detector model).
+snapshots the centroid into `excluded_people` so faces within `epsilon`
+of that centroid stay unassigned (neither attached to an existing person
+nor formed into a new Person — including after split→exclude). Full faces
+reindex clears the denylist (embedding space may change with the detector
+model).
 
 **Re-cluster vs Rebuild.** Re-cluster assigns only unassigned faces and
 preserves merges. Rebuild all clusters wipes People and re-DBSCANs

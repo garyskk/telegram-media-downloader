@@ -137,11 +137,17 @@ function _isNearExcluded(centroid, excludedSnapshot, matchEps) {
 /**
  * Incremental Phase B — keep existing people / merges; only assign faces
  * with person_id IS NULL.
+ *
+ * Exclusion denylist (A+B): any unassigned face within `eps` of an
+ * excluded centroid is left unassigned — never attached to an existing
+ * person and never fed into leftover DBSCAN. Using `eps` (same radius as
+ * attach) rather than the tighter `labelMatchEps` prevents split→exclude
+ * faces from bleeding back into a sibling cluster.
  */
 async function _runIncrementalPhaseB({ state, signal, log, cfg, bcast }) {
     if (signal.aborted) return;
     log('info', 'faces scan: starting incremental clustering pass');
-    const { eps, minPts, matchEps } = _resolveClusterEps(cfg);
+    const { eps, minPts } = _resolveClusterEps(cfg);
 
     const unassigned = [];
     for (const r of iterateUnassignedFaces()) {
@@ -167,9 +173,15 @@ async function _runIncrementalPhaseB({ state, signal, log, cfg, bcast }) {
     const touched = new Set();
     const leftover = [];
     let attached = 0;
+    let excludedFaces = 0;
 
     for (const face of unassigned) {
         if (signal.aborted) return;
+        // Filter first: near-excluded faces stay noise (no attach, no DBSCAN).
+        if (_isNearExcluded(face.embedding, excludedSnapshot, eps)) {
+            excludedFaces += 1;
+            continue;
+        }
         let bestPerson = null;
         let bestDist = Infinity;
         for (const p of people) {
@@ -178,16 +190,6 @@ async function _runIncrementalPhaseB({ state, signal, log, cfg, bcast }) {
                 bestDist = dist;
                 bestPerson = p;
             }
-        }
-        let nearExcluded = false;
-        let bestExcl = Infinity;
-        for (const s of excludedSnapshot) {
-            const dist = _euclid(face.embedding, s.centroid);
-            if (dist < bestExcl) bestExcl = dist;
-            if (dist <= matchEps) nearExcluded = true;
-        }
-        if (bestPerson && nearExcluded && bestExcl <= bestDist) {
-            continue;
         }
         if (bestPerson) {
             setFacePerson(face.id, bestPerson.id);
@@ -199,8 +201,6 @@ async function _runIncrementalPhaseB({ state, signal, log, cfg, bcast }) {
             }
             bestPerson.faceCount = n;
             attached += 1;
-        } else if (nearExcluded) {
-            continue;
         } else {
             leftover.push(face);
         }
@@ -218,6 +218,7 @@ async function _runIncrementalPhaseB({ state, signal, log, cfg, bcast }) {
         log(
             'info',
             `faces scan: incremental — attached ${attached} to existing people; ` +
+                `skipped ${excludedFaces} near-excluded; ` +
                 `DBSCAN on ${leftover.length} leftover (eps=${eps}, minPts=${minPts})`,
         );
         const { clusters, noise } = clusterFaces(leftover, { eps, minPts });
@@ -225,7 +226,9 @@ async function _runIncrementalPhaseB({ state, signal, log, cfg, bcast }) {
         await new Promise((r) => setImmediate(r));
         let i = 0;
         for (const c of clusters) {
-            if (_isNearExcluded(c.centroid, excludedSnapshot, matchEps)) {
+            // Safety net — faces already filtered; still skip if a leftover
+            // cluster centroid drifts onto an exclusion.
+            if (_isNearExcluded(c.centroid, excludedSnapshot, eps)) {
                 excludedSkipped += 1;
                 i += 1;
                 if (i % 100 === 0) await new Promise((r) => setImmediate(r));
@@ -246,7 +249,8 @@ async function _runIncrementalPhaseB({ state, signal, log, cfg, bcast }) {
     } else {
         log(
             'info',
-            `faces scan: incremental — attached ${attached} to existing people; no leftovers`,
+            `faces scan: incremental — attached ${attached} to existing people; ` +
+                `skipped ${excludedFaces} near-excluded; no leftovers`,
         );
     }
 
@@ -255,8 +259,9 @@ async function _runIncrementalPhaseB({ state, signal, log, cfg, bcast }) {
     log(
         'info',
         `faces scan: incremental Phase B done — attached=${attached}, ` +
-            `newPeople=${peopleInserted}, excludedNew=${excludedSkipped}, ` +
-            `noise=${noiseCount}, peopleTotal=${state.peopleCount}, eps=${eps}`,
+            `excludedFaces=${excludedFaces}, newPeople=${peopleInserted}, ` +
+            `excludedNew=${excludedSkipped}, noise=${noiseCount}, ` +
+            `peopleTotal=${state.peopleCount}, eps=${eps}`,
     );
 }
 

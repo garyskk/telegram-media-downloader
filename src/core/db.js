@@ -3084,8 +3084,8 @@ export function deletePerson(id) {
 /**
  * Durable exclude — snapshot the person's centroid (+ optional label) and
  * best cover face id into `excluded_people`, then drop the people row
- * (faces become unassigned). Phase B skips clusters whose centroid matches
- * an excluded entry within `labelMatchEps`.
+ * (faces become unassigned). Incremental Phase B leaves faces within
+ * `epsilon` of an excluded centroid unassigned (no attach, no new Person).
  *
  * @returns {{ ok: true, excludedId: number, personId: number, label: string|null, coverFaceId: number|null }
  *   | { ok: false, reason: 'not_found'|'invalid_id' }}
