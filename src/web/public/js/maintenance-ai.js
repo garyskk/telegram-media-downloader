@@ -1247,7 +1247,7 @@ async function _rebuildAllClusters() {
         title: i18nT('maintenance.ai.rebuild_confirm_title', 'Rebuild all clusters?'),
         body: i18nT(
             'maintenance.ai.rebuild_confirm_body',
-            'This wipes every Person cluster and re-runs DBSCAN on all face embeddings. Manual merges will be lost. Labels and exclusions are preserved when centroids still match. Use after changing ε.',
+            'This wipes every Person cluster and the exclusion list, then re-runs DBSCAN on all face embeddings. Manual merges and exclusions will be lost. Labels are preserved when centroids still match. Use after changing ε.',
         ),
         confirmLabel: i18nT('maintenance.ai.rebuild_confirm_action', 'Rebuild'),
         cancelLabel: i18nT('common.cancel', 'Cancel'),

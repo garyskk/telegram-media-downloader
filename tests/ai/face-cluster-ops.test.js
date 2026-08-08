@@ -1428,3 +1428,80 @@ describe('incremental Phase B (preserve merges)', () => {
         expect(api.countPeople()).toBe(1);
     });
 });
+
+describe('full rebuild Phase B (clears exclusions)', () => {
+    let scanRunner;
+
+    beforeAll(async () => {
+        scanRunner = await import('../../src/core/ai/scan-runner.js');
+    });
+
+    it('clears excluded_people and recreates a person from formerly excluded faces', async () => {
+        const did = downloadId();
+        const keep = api.insertPerson({
+            label: 'Keep',
+            centroidBlob: f32Blob([1, 0, 0]),
+            faceCount: 2,
+        });
+        api.insertFace({
+            downloadId: did,
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 40,
+            embeddingBlob: f32Blob([1, 0, 0]),
+            personId: keep,
+        });
+        api.insertFace({
+            downloadId: did,
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 40,
+            embeddingBlob: f32Blob([0.99, 0.01, 0]),
+            personId: keep,
+        });
+
+        const ex = api.insertPerson({
+            label: 'Nope',
+            centroidBlob: f32Blob([0, 0, 1]),
+            faceCount: 2,
+        });
+        api.insertFace({
+            downloadId: did,
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 40,
+            embeddingBlob: f32Blob([0, 0, 1]),
+            personId: ex,
+        });
+        api.insertFace({
+            downloadId: did,
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 40,
+            embeddingBlob: f32Blob([0.01, 0, 0.99]),
+            personId: ex,
+        });
+        api.excludePerson(ex);
+        expect(api.listExcludedPeople({}).total).toBe(1);
+
+        await scanRunner._test.runFullRebuildPhaseB({
+            state: { phase: 'A', faceCount: 0, peopleCount: 0, noiseFaces: 0 },
+            signal: { aborted: false },
+            log: () => {},
+            cfg: { faces: { epsilon: 0.5, minPoints: 2, labelMatchEps: 0.4 } },
+            bcast: () => {},
+            db,
+        });
+
+        expect(api.listExcludedPeople({}).total).toBe(0);
+        expect(api.countPeople()).toBeGreaterThanOrEqual(2);
+        // Formerly excluded faces are assigned again (not left as denylist noise).
+        const unassigned = db.prepare('SELECT COUNT(*) AS n FROM faces WHERE person_id IS NULL').get()
+            .n;
+        expect(unassigned).toBe(0);
+    });
+});

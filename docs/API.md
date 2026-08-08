@@ -180,12 +180,12 @@ Opt-in face detection + clustering, backed by the Python sidecar in `faces-servi
 | `POST`   | `/api/ai/faces/restart`             | Restart the faces sidecar (after switching detector model / providers / det_size). Broadcasts `ai_faces_status`. |
 | `POST`   | `/api/ai/faces/install-deps`        | Stream `python -m tgdl_faces.install` over `ai_faces_install_progress` / `ai_faces_install_done`. Accepts `{force?:'cpu'\|'gpu'\|'directml'\|'openvino', dryRun?:bool, noUninstall?:bool}`. |
 | `POST`   | `/api/ai/faces/recluster`           | Incremental Phase B only (skip detection) — attach unassigned faces to existing People. Keeps merges/labels. |
-| `POST`   | `/api/ai/faces/rebuild`             | Destructive full DBSCAN — wipe People and reshape all clusters (ε reshuffle). Merges lost; labels/exclusions/covers carry over when centroids match. |
+| `POST`   | `/api/ai/faces/rebuild`             | Destructive full DBSCAN — wipe People + exclusion denylist and reshape all clusters (ε reshuffle). Merges/exclusions lost; labels/covers carry over when centroids match. |
 | `POST`   | `/api/ai/faces/reindex`             | Confirm-sheet gated — wipes every detection + cluster + exclusion denylist and re-scans every photo. Use after switching detector model. Broadcasts `ai_faces_reindexed`. |
 | `POST`   | `/api/ai/preload-model/:name`       | Trigger background download of a face detection model. Proxies to sidecar `POST /preload/:name`. Returns `{model, status}`. `status` ∈ `not_downloaded`, `downloading`, `ready`, `error:…`. |
 | `GET`    | `/api/ai/preload-model/:name/status`| Check model download status. Returns `{model, status}`. |
 | `GET`    | `/api/ai/people`                    | Cluster list with cover-face + face count + `video_face_count` per person. `?page=&limit=`. |
-| `GET`    | `/api/ai/people/excluded`           | Durable exclusion denylist (`{excluded:[{id,label,created_at,cover_face_id}], total}`). Cover crop via `/api/ai/faces/:cover_face_id/crop`. Survives recluster; cleared on full faces reindex. |
+| `GET`    | `/api/ai/people/excluded`           | Durable exclusion denylist (`{excluded:[{id,label,created_at,cover_face_id}], total}`). Cover crop via `/api/ai/faces/:cover_face_id/crop`. Survives recluster; cleared on Rebuild all clusters and full faces reindex. |
 | `GET`    | `/api/ai/people/:id/photos`         | Paginated photos in this cluster. |
 | `PATCH`  | `/api/ai/people/:id`                | `{label}` — rename. |
 | `POST`   | `/api/ai/people/:id/cover`          | `{faceId}` — pin this face as the People avatar (must belong to the person). Survives recluster. |

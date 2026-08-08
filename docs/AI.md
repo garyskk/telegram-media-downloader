@@ -282,11 +282,12 @@ unset unless you intend a deploy-time override. Number arrays accept
    End-of-scan Phase B and **Re-cluster** use this path.
 
 3. **Rebuild all clusters (destructive)** — the old wipe+DBSCAN path:
-   `clearAllPeople()`, DBSCAN over every face, recreate people. Labels /
-   covers / exclusions carry over via centroid match. Use after changing
-   `epsilon` when a global reshuffle is wanted. **Merges are not
-   preserved.** Exposed as **Rebuild all clusters** in the UI /
-   `POST /api/ai/faces/rebuild`.
+   `clearAllPeople()`, clear exclusion denylist, DBSCAN over every face,
+   recreate people. Labels / covers carry over via centroid match.
+   Exclusions are wiped — formerly excluded identities may reappear.
+   Use after changing `epsilon` when a global reshuffle is wanted.
+   **Merges are not preserved.** Exposed as **Rebuild all clusters** in
+   the UI / `POST /api/ai/faces/rebuild`.
 
 ### Cluster operations
 
@@ -696,14 +697,13 @@ cluster row (faces become unassigned); the next **incremental** Phase B
 may recreate a cluster from those faces. `POST /api/ai/people/:id/exclude`
 snapshots the centroid into `excluded_people` so faces within `epsilon`
 of that centroid stay unassigned (neither attached to an existing person
-nor formed into a new Person — including after split→exclude). Full faces
-reindex clears the denylist (embedding space may change with the detector
-model).
+nor formed into a new Person — including after split→exclude). **Rebuild
+all clusters** and full faces reindex clear the denylist.
 
 **Re-cluster vs Rebuild.** Re-cluster DBSCAN's only unassigned faces and
 links new clusters to existing people within `labelMatchEps` (preserves
-merges). Rebuild all clusters wipes People and re-DBSCANs everything
-(use after changing ε).
+merges). Rebuild all clusters wipes People **and the exclusion denylist**,
+then re-DBSCANs everything (use after changing ε).
 
 ## Sidecar wire format
 

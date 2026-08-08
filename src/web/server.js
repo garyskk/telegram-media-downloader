@@ -8169,9 +8169,10 @@ app.post('/api/ai/faces/recluster', async (_req, res) => {
     }
 });
 
-// Full rebuild — clearAllPeople + DBSCAN over every face (old recluster
-// behavior). Use after changing ε when a global reshuffle is wanted.
-// Merges are NOT preserved. Labels / covers / exclusions still carry over.
+// Full rebuild — clearAllPeople + clear exclusions + DBSCAN over every
+// face (old recluster behavior). Use after changing ε when a global
+// reshuffle is wanted. Merges and exclusions are NOT preserved.
+// Labels / covers still carry over via centroid match.
 app.post('/api/ai/faces/rebuild', async (_req, res) => {
     try {
         const cfg = _aiCfg();

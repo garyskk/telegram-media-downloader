@@ -18,6 +18,7 @@ import path from 'path';
 
 import {
     clearAllPeople,
+    clearExcludedPeople,
     countPeople,
     deleteFacesForDownload,
     getDb,
@@ -287,7 +288,9 @@ async function _runIncrementalPhaseB({ state, signal, log, cfg, bcast }) {
 
 /**
  * Full rebuild Phase B — clearAllPeople + DBSCAN over every face.
- * Used by Rebuild all clusters (ε reshuffle). Preserves labels/covers/exclusions.
+ * Used by Rebuild all clusters (ε reshuffle). Preserves labels/covers.
+ * Clears the exclusion denylist — rebuild is a full reshape, so excluded
+ * identities may reappear as People.
  */
 async function _runFullRebuildPhaseB({ state, signal, log, cfg, bcast, db }) {
     if (signal.aborted) return;
@@ -301,7 +304,14 @@ async function _runFullRebuildPhaseB({ state, signal, log, cfg, bcast, db }) {
         });
     }
     if (!faces.length) {
-        log('info', 'faces scan: no faces detected — clustering skipped');
+        // Still wipe exclusions so Rebuild on an empty face set matches the
+        // "full reshape" contract.
+        const clearedExclusions = clearExcludedPeople();
+        log(
+            'info',
+            `faces scan: no faces detected — clustering skipped` +
+                (clearedExclusions ? ` (cleared ${clearedExclusions} exclusions)` : ''),
+        );
         return;
     }
     state.phase = 'B';
@@ -345,21 +355,15 @@ async function _runFullRebuildPhaseB({ state, signal, log, cfg, bcast, db }) {
         return best;
     };
 
-    const excludedSnapshot = listExcludedCentroids();
     const coverFaceSnapshot = listPinnedCoverFaceIds();
+    const clearedExclusions = clearExcludedPeople();
 
     clearAllPeople();
     let i = 0;
     let preservedCount = 0;
-    let excludedSkipped = 0;
     let peopleInserted = 0;
     for (const c of clusters) {
-        if (_isNearExcluded(c.centroid, excludedSnapshot, matchEps)) {
-            excludedSkipped += 1;
-            i += 1;
-            if (i % 100 === 0) await new Promise((r) => setImmediate(r));
-            continue;
-        }
+        if (signal.aborted) return;
         const carryOver = findCarryOverLabel(c.centroid);
         const personId = insertPerson({
             label: carryOver,
@@ -380,10 +384,10 @@ async function _runFullRebuildPhaseB({ state, signal, log, cfg, bcast, db }) {
     log(
         'info',
         `faces scan: full rebuild clustered ${faces.length} faces into ${clusters.length} groups ` +
-            `(${peopleInserted} people, ${excludedSkipped} excluded, ` +
+            `(${peopleInserted} people, cleared ${clearedExclusions} exclusions, ` +
             `${preservedCount}/${labelSnapshot.length} labels preserved, ` +
             `${coversRestored}/${coverFaceSnapshot.length} covers restored, ` +
-            `eps=${matchEps.toFixed(3)})`,
+            `eps=${eps}, matchEps=${matchEps.toFixed(3)})`,
     );
 }
 
