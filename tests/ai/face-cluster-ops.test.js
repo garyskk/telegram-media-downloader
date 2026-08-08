@@ -1022,7 +1022,8 @@ describe('incremental Phase B (preserve merges)', () => {
         api.mergeFacePerson(a, b);
         expect(api.countPeople()).toBe(1);
 
-        // Nearby unassigned face should attach; far face forms new cluster.
+        // Nearby singleton (DBSCAN noise) still links via tight matchEps;
+        // far pair forms a new cluster (no existing person nearby).
         api.insertFace({
             downloadId: did,
             x: 0,
@@ -1077,6 +1078,97 @@ describe('incremental Phase B (preserve merges)', () => {
         expect(farPerson.person_id).toBeTruthy();
         expect(farPerson.person_id).toBe(farPerson2.person_id);
         expect(farPerson.person_id).not.toBe(merged.id);
+    });
+
+    it('cluster-then-link: face inside eps but outside matchEps stays unassigned', async () => {
+        // Old greedy attach used full eps and would pull this into Alice.
+        // Alice [1,0,0]; face [0.68, 0.32, 0] → d≈0.453 (≤eps=0.5, >matchEps=0.4)
+        const did = downloadId();
+        const alice = api.insertPerson({
+            label: 'Alice',
+            centroidBlob: f32Blob([1, 0, 0]),
+            faceCount: 1,
+        });
+        api.insertFace({
+            downloadId: did,
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 40,
+            embeddingBlob: f32Blob([1, 0, 0]),
+            personId: alice,
+        });
+        const fringe = api.insertFace({
+            downloadId: did,
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 40,
+            embeddingBlob: f32Blob([0.68, 0.32, 0]),
+            personId: null,
+        }).lastInsertRowid;
+
+        await scanRunner._test.runIncrementalPhaseB({
+            state: { phase: 'A', faceCount: 0, peopleCount: 0, noiseFaces: 0 },
+            signal: { aborted: false },
+            log: () => {},
+            cfg: { faces: { epsilon: 0.5, minPoints: 2, labelMatchEps: 0.4 } },
+            bcast: () => {},
+        });
+
+        expect(db.prepare('SELECT person_id FROM faces WHERE id = ?').get(fringe).person_id).toBeNull();
+        expect(Number(api.listPeople({}).people.find((p) => p.label === 'Alice').face_count)).toBe(1);
+    });
+
+    it('cluster-then-link: DBSCAN cluster links to existing person via matchEps', async () => {
+        const did = downloadId();
+        const alice = api.insertPerson({
+            label: 'Alice',
+            centroidBlob: f32Blob([1, 0, 0]),
+            faceCount: 1,
+        });
+        api.insertFace({
+            downloadId: did,
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 40,
+            embeddingBlob: f32Blob([1, 0, 0]),
+            personId: alice,
+        });
+        // Two close faces near Alice → one DBSCAN cluster whose centroid
+        // is within matchEps of Alice → all members link to Alice.
+        const f1 = api.insertFace({
+            downloadId: did,
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 40,
+            embeddingBlob: f32Blob([0.97, 0.03, 0]),
+            personId: null,
+        }).lastInsertRowid;
+        const f2 = api.insertFace({
+            downloadId: did,
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 40,
+            embeddingBlob: f32Blob([0.96, 0.04, 0]),
+            personId: null,
+        }).lastInsertRowid;
+
+        await scanRunner._test.runIncrementalPhaseB({
+            state: { phase: 'A', faceCount: 0, peopleCount: 0, noiseFaces: 0 },
+            signal: { aborted: false },
+            log: () => {},
+            cfg: { faces: { epsilon: 0.5, minPoints: 2, labelMatchEps: 0.4 } },
+            bcast: () => {},
+        });
+
+        expect(db.prepare('SELECT person_id FROM faces WHERE id = ?').get(f1).person_id).toBe(alice);
+        expect(db.prepare('SELECT person_id FROM faces WHERE id = ?').get(f2).person_id).toBe(alice);
+        expect(api.countPeople()).toBe(1);
+        expect(Number(api.listPeople({}).people[0].face_count)).toBe(3);
     });
 
     it('incremental Phase B is a no-op when every face is already assigned', async () => {

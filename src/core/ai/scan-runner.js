@@ -134,20 +134,39 @@ function _isNearExcluded(centroid, excludedSnapshot, matchEps) {
     return false;
 }
 
+/** Nearest person centroid within `radius`, or null. */
+function _bestPersonWithin(embedding, people, radius) {
+    let best = null;
+    let bestDist = Infinity;
+    for (const p of people) {
+        const dist = _euclid(embedding, p.centroid);
+        if (dist < bestDist && dist <= radius) {
+            bestDist = dist;
+            best = p;
+        }
+    }
+    return best;
+}
+
 /**
  * Incremental Phase B — keep existing people / merges; only assign faces
  * with person_id IS NULL.
  *
- * Exclusion denylist (A+B): any unassigned face within `eps` of an
- * excluded centroid is left unassigned — never attached to an existing
- * person and never fed into leftover DBSCAN. Using `eps` (same radius as
- * attach) rather than the tighter `labelMatchEps` prevents split→exclude
- * faces from bleeding back into a sibling cluster.
+ * Cluster-then-link (not per-face greedy attach):
+ *   1. Drop faces within `eps` of an excluded centroid (A+B denylist).
+ *   2. DBSCAN the rest at full `eps` / `minPts`.
+ *   3. Link each new cluster to an existing person when centroids are
+ *      within tight `matchEps`; otherwise insert a new person.
+ *   4. DBSCAN noise may still join an existing person within `matchEps`
+ *      (single new face of a known person); otherwise stays unassigned.
+ *
+ * Matching uses stable people centroids for the whole pass (no online
+ * drift); touched people are recomputed once at the end.
  */
 async function _runIncrementalPhaseB({ state, signal, log, cfg, bcast }) {
     if (signal.aborted) return;
     log('info', 'faces scan: starting incremental clustering pass');
-    const { eps, minPts } = _resolveClusterEps(cfg);
+    const { eps, minPts, matchEps } = _resolveClusterEps(cfg);
 
     const unassigned = [];
     for (const r of iterateUnassignedFaces()) {
@@ -170,70 +189,59 @@ async function _runIncrementalPhaseB({ state, signal, log, cfg, bcast }) {
 
     const people = listPeopleCentroids();
     const excludedSnapshot = listExcludedCentroids();
-    const touched = new Set();
-    const leftover = [];
-    let attached = 0;
+    const candidates = [];
     let excludedFaces = 0;
 
     for (const face of unassigned) {
-        if (signal.aborted) return;
-        // Filter first: near-excluded faces stay noise (no attach, no DBSCAN).
         if (_isNearExcluded(face.embedding, excludedSnapshot, eps)) {
             excludedFaces += 1;
             continue;
         }
-        let bestPerson = null;
-        let bestDist = Infinity;
-        for (const p of people) {
-            const dist = _euclid(face.embedding, p.centroid);
-            if (dist < bestDist && dist <= eps) {
-                bestDist = dist;
-                bestPerson = p;
-            }
-        }
-        if (bestPerson) {
-            setFacePerson(face.id, bestPerson.id);
-            touched.add(bestPerson.id);
-            const n = (bestPerson.faceCount || 0) + 1;
-            const c = bestPerson.centroid;
-            for (let i = 0; i < c.length; i++) {
-                c[i] = (c[i] * (n - 1) + face.embedding[i]) / n;
-            }
-            bestPerson.faceCount = n;
-            attached += 1;
-        } else {
-            leftover.push(face);
-        }
+        candidates.push(face);
     }
 
-    for (const pid of touched) {
-        recomputePersonCentroid(pid);
-    }
-
-    let peopleInserted = 0;
-    let excludedSkipped = 0;
-    let noiseCount = 0;
-
-    if (leftover.length) {
+    if (!candidates.length) {
+        state.peopleCount = countPeople();
+        state.noiseFaces = 0;
         log(
             'info',
-            `faces scan: incremental — attached ${attached} to existing people; ` +
-                `skipped ${excludedFaces} near-excluded; ` +
-                `DBSCAN on ${leftover.length} leftover (eps=${eps}, minPts=${minPts})`,
+            `faces scan: incremental Phase B — all ${excludedFaces} unassigned near-excluded; people unchanged`,
         );
-        const { clusters, noise } = clusterFaces(leftover, { eps, minPts });
-        noiseCount = noise.length;
-        await new Promise((r) => setImmediate(r));
-        let i = 0;
-        for (const c of clusters) {
-            // Safety net — faces already filtered; still skip if a leftover
-            // cluster centroid drifts onto an exclusion.
-            if (_isNearExcluded(c.centroid, excludedSnapshot, eps)) {
-                excludedSkipped += 1;
-                i += 1;
-                if (i % 100 === 0) await new Promise((r) => setImmediate(r));
-                continue;
+        return;
+    }
+
+    log(
+        'info',
+        `faces scan: incremental — DBSCAN ${candidates.length} candidates ` +
+            `(skipped ${excludedFaces} near-excluded; eps=${eps}, minPts=${minPts}, matchEps=${matchEps})`,
+    );
+    const { clusters, noise } = clusterFaces(candidates, { eps, minPts });
+    await new Promise((r) => setImmediate(r));
+
+    const touched = new Set();
+    let linked = 0;
+    let peopleInserted = 0;
+    let excludedSkipped = 0;
+    let noiseAttached = 0;
+    let noiseLeft = 0;
+
+    let i = 0;
+    for (const c of clusters) {
+        if (signal.aborted) return;
+        if (_isNearExcluded(c.centroid, excludedSnapshot, eps)) {
+            excludedSkipped += 1;
+            i += 1;
+            if (i % 100 === 0) await new Promise((r) => setImmediate(r));
+            continue;
+        }
+        const match = _bestPersonWithin(c.centroid, people, matchEps);
+        if (match) {
+            for (const memberIdx of c.memberIdxs) {
+                setFacePerson(candidates[memberIdx].id, match.id);
             }
+            touched.add(match.id);
+            linked += c.faceCount;
+        } else {
             const personId = insertPerson({
                 label: null,
                 centroidBlob: _f32ToBlob(c.centroid),
@@ -241,27 +249,39 @@ async function _runIncrementalPhaseB({ state, signal, log, cfg, bcast }) {
             });
             peopleInserted += 1;
             for (const memberIdx of c.memberIdxs) {
-                setFacePerson(leftover[memberIdx].id, personId);
+                setFacePerson(candidates[memberIdx].id, personId);
             }
-            i += 1;
-            if (i % 100 === 0) await new Promise((r) => setImmediate(r));
         }
-    } else {
-        log(
-            'info',
-            `faces scan: incremental — attached ${attached} to existing people; ` +
-                `skipped ${excludedFaces} near-excluded; no leftovers`,
-        );
+        i += 1;
+        if (i % 100 === 0) await new Promise((r) => setImmediate(r));
+    }
+
+    for (const idx of noise) {
+        if (signal.aborted) return;
+        const face = candidates[idx];
+        const match = _bestPersonWithin(face.embedding, people, matchEps);
+        if (match) {
+            setFacePerson(face.id, match.id);
+            touched.add(match.id);
+            noiseAttached += 1;
+        } else {
+            noiseLeft += 1;
+        }
+    }
+
+    for (const pid of touched) {
+        recomputePersonCentroid(pid);
     }
 
     state.peopleCount = countPeople();
-    state.noiseFaces = noiseCount;
+    state.noiseFaces = noiseLeft;
     log(
         'info',
-        `faces scan: incremental Phase B done — attached=${attached}, ` +
-            `excludedFaces=${excludedFaces}, newPeople=${peopleInserted}, ` +
-            `excludedNew=${excludedSkipped}, noise=${noiseCount}, ` +
-            `peopleTotal=${state.peopleCount}, eps=${eps}`,
+        `faces scan: incremental Phase B done — linked=${linked}, ` +
+            `noiseAttached=${noiseAttached}, newPeople=${peopleInserted}, ` +
+            `excludedFaces=${excludedFaces}, excludedNew=${excludedSkipped}, ` +
+            `noise=${noiseLeft}, peopleTotal=${state.peopleCount}, ` +
+            `eps=${eps}, matchEps=${matchEps}`,
     );
 }
 

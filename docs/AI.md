@@ -273,10 +273,12 @@ unset unless you intend a deploy-time override. Number arrays accept
 
 2. **Phase B (incremental, default)** — only faces with
    `person_id IS NULL` are considered. Faces within `epsilon` of any
-   excluded centroid stay unassigned (no attach, no leftover DBSCAN).
-   Remaining faces attach to the nearest existing person within
-   `epsilon`, otherwise leftovers are DBSCAN'd into **new** people.
-   Existing people, merges, splits, labels, and covers are left alone.
+   excluded centroid stay unassigned. Remaining faces are **DBSCAN'd**
+   at full `epsilon`; each new cluster is linked to an existing person
+   when centroids match within tight `labelMatchEps`, otherwise a new
+   person is created. DBSCAN noise may still join an existing person
+   within `labelMatchEps` (single new face of a known person). Existing
+   people, merges, splits, labels, and covers are left alone.
    End-of-scan Phase B and **Re-cluster** use this path.
 
 3. **Rebuild all clusters (destructive)** — the old wipe+DBSCAN path:
@@ -698,9 +700,10 @@ nor formed into a new Person — including after split→exclude). Full faces
 reindex clears the denylist (embedding space may change with the detector
 model).
 
-**Re-cluster vs Rebuild.** Re-cluster assigns only unassigned faces and
-preserves merges. Rebuild all clusters wipes People and re-DBSCANs
-everything (use after changing ε).
+**Re-cluster vs Rebuild.** Re-cluster DBSCAN's only unassigned faces and
+links new clusters to existing people within `labelMatchEps` (preserves
+merges). Rebuild all clusters wipes People and re-DBSCANs everything
+(use after changing ε).
 
 ## Sidecar wire format
 
