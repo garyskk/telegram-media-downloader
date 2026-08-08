@@ -3272,7 +3272,12 @@
                                 <div class="text-[10px] uppercase tracking-wide text-tg-textSecondary truncate" data-i18n="maintenance.ai.stat_people">People clusters</div>
                                 <div id="ai-stat-people" class="text-base sm:text-xl font-semibold text-tg-blue tabular-nums">—</div>
                             </div>
-                            <div class="bg-tg-bg/40 rounded-lg p-2 sm:p-3">
+                            <div class="bg-tg-bg/40 rounded-lg p-2 sm:p-3 cursor-pointer hover:bg-tg-bg/60 transition-colors disabled:cursor-default"
+                                id="ai-stat-noise-tile"
+                                role="button"
+                                tabindex="0"
+                                data-i18n-title="maintenance.ai.unclassified.open_title"
+                                title="Review unclassified faces">
                                 <div class="text-[10px] uppercase tracking-wide text-tg-textSecondary truncate" data-i18n="maintenance.ai.stat_noise">Unclassified faces</div>
                                 <div id="ai-stat-noise" class="text-base sm:text-xl font-semibold text-tg-textSecondary tabular-nums" title="Faces that didn't fit any cluster. Excluded identities are not counted.">—</div>
                             </div>
@@ -3634,6 +3639,46 @@
                             <p class="text-[11px] text-tg-textSecondary/60">Run a scan above to get started.</p>
                         </div>
                         <div id="ai-people-empty-help" class="hidden mt-2 text-center text-[11px] text-tg-textSecondary/70 max-w-xs mx-auto leading-relaxed"></div>
+
+                        <!-- Unclassified faces review — opened from the KPI tile -->
+                        <div id="ai-unclassified-review" class="hidden mb-3 rounded-xl border border-tg-border/30 overflow-hidden bg-tg-bg/20">
+                            <div class="flex items-center justify-between gap-2 px-3 py-2 bg-tg-blue/5 border-b border-tg-blue/10">
+                                <div class="min-w-0">
+                                    <p class="text-xs font-medium text-tg-text" data-i18n="maintenance.ai.unclassified.heading">Unclassified faces</p>
+                                    <p id="ai-unclassified-count" class="text-[11px] text-tg-textSecondary"></p>
+                                </div>
+                                <button id="ai-unclassified-close-btn" type="button"
+                                    class="tg-btn-secondary text-[11px] h-7 px-2 inline-flex items-center gap-1"
+                                    title="Close">
+                                    <i class="ri-close-line"></i>
+                                    <span class="hidden sm:inline" data-i18n="common.close">Close</span>
+                                </button>
+                            </div>
+                            <div id="ai-unclassified-suggestions" class="hidden px-3 py-2 border-b border-tg-border/20">
+                                <p class="text-[10px] uppercase tracking-wide text-tg-textSecondary mb-1.5" data-i18n="maintenance.ai.unclassified.suggestions">Suggested matches</p>
+                                <div id="ai-unclassified-suggestions-list" class="flex flex-wrap gap-1.5"></div>
+                                <p id="ai-unclassified-suggestions-empty" class="hidden text-[11px] text-tg-textSecondary/70" data-i18n="maintenance.ai.unclassified.no_match">No close match</p>
+                            </div>
+                            <div id="ai-unclassified-sel-bar" class="hidden items-center justify-between gap-2 px-3 py-2 border-b border-tg-blue/20 bg-tg-blue/5">
+                                <span id="ai-unclassified-sel-count" class="text-xs text-tg-textSecondary" data-i18n="maintenance.ai.unclassified.sel_hint">Tap faces to select</span>
+                                <div class="flex flex-wrap gap-1.5 justify-end">
+                                    <button id="ai-unclassified-sel-clear-btn" type="button" class="tg-btn-secondary text-[11px] h-7 px-2" data-i18n="common.clear">Clear</button>
+                                    <button id="ai-unclassified-sel-assign-btn" type="button" class="tg-btn-secondary text-[11px] h-7 px-2 inline-flex items-center gap-1" disabled>
+                                        <i class="ri-user-shared-line"></i>
+                                        <span data-i18n="maintenance.ai.unclassified.assign">Assign to person…</span>
+                                    </button>
+                                    <button id="ai-unclassified-sel-new-btn" type="button" class="tg-btn-secondary text-[11px] h-7 px-2 inline-flex items-center gap-1 text-emerald-300" disabled>
+                                        <i class="ri-user-add-line"></i>
+                                        <span data-i18n="maintenance.ai.unclassified.new_person">Create new person</span>
+                                    </button>
+                                    <button id="ai-unclassified-sel-remove-btn" type="button" class="tg-btn-secondary text-[11px] h-7 px-2 inline-flex items-center gap-1 text-red-300" disabled>
+                                        <i class="ri-delete-bin-line"></i>
+                                        <span data-i18n="maintenance.ai.unclassified.remove">Remove face</span>
+                                    </button>
+                                </div>
+                            </div>
+                            <div id="ai-unclassified-grid" class="grid grid-cols-3 sm:grid-cols-5 md:grid-cols-6 lg:grid-cols-8 gap-1 p-1.5"></div>
+                        </div>
 
                         <!-- Test-detection diagnostic (shown only after scan with 0 people) -->
                         <div id="ai-detect-test-form" class="hidden mt-4 text-center">

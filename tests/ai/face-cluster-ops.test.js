@@ -831,6 +831,288 @@ describe('excludePerson (durable denylist)', () => {
         expect(api.countUnclassifiedFaces(0.5)).toBe(2);
     });
 
+    it('listUnclassifiedFaces returns noise and omits near-excluded faces', () => {
+        const did = downloadId();
+        const alice = api.insertPerson({
+            label: 'Alice',
+            centroidBlob: f32Blob([1, 0, 0]),
+            faceCount: 1,
+        });
+        api.insertFace({
+            downloadId: did,
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 40,
+            embeddingBlob: f32Blob([1, 0, 0]),
+            personId: alice,
+        });
+        const ex = api.insertPerson({
+            label: 'Nope',
+            centroidBlob: f32Blob([0, 0, 1]),
+            faceCount: 1,
+        });
+        api.insertFace({
+            downloadId: did,
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 40,
+            embeddingBlob: f32Blob([0, 0, 1]),
+            personId: ex,
+        });
+        api.excludePerson(ex);
+
+        const noiseId = api.insertFace({
+            downloadId: did,
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 40,
+            embeddingBlob: f32Blob([0, 1, 0]),
+            personId: null,
+        }).lastInsertRowid;
+
+        const listed = api.listUnclassifiedFaces({ facesEpsilon: 0.5, limit: 50, offset: 0 });
+        expect(listed.total).toBe(1);
+        expect(listed.faces).toHaveLength(1);
+        expect(listed.faces[0].face_id).toBe(noiseId);
+        expect(listed.faces[0].embedding).toBeUndefined();
+    });
+
+    it('count/list unclassified omit faces on user-deleted downloads', () => {
+        const live = api.insertDownload({
+            groupId: '-100777',
+            groupName: 'Faces Fixture',
+            messageId: 9101,
+            fileName: 'live.jpg',
+            fileSize: 1000,
+            fileType: 'photo',
+            filePath: 'Faces_Fixture/images/live.jpg',
+        }).lastInsertRowid;
+        const gone = api.insertDownload({
+            groupId: '-100777',
+            groupName: 'Faces Fixture',
+            messageId: 9102,
+            fileName: 'gone.jpg',
+            fileSize: 1000,
+            fileType: 'photo',
+            filePath: 'Faces_Fixture/images/gone.jpg',
+        }).lastInsertRowid;
+
+        api.insertFace({
+            downloadId: live,
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 40,
+            embeddingBlob: f32Blob([1, 0, 0]),
+            personId: null,
+        });
+        api.insertFace({
+            downloadId: gone,
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 40,
+            embeddingBlob: f32Blob([0, 1, 0]),
+            personId: null,
+        });
+
+        expect(api.countUnclassifiedFaces(0.5)).toBe(2);
+        expect(api.listUnclassifiedFaces({ facesEpsilon: 0.5 }).total).toBe(2);
+
+        db.prepare('UPDATE downloads SET user_deleted = 1 WHERE id = ?').run(gone);
+
+        expect(api.countUnclassifiedFaces(0.5)).toBe(1);
+        const listed = api.listUnclassifiedFaces({ facesEpsilon: 0.5, limit: 50, offset: 0 });
+        expect(listed.total).toBe(1);
+        expect(listed.faces).toHaveLength(1);
+        expect(listed.faces[0].download_id).toBe(live);
+        expect(api.getAiCounts({ facesEpsilon: 0.5 }).noiseFaces).toBe(1);
+    });
+
+    it('suggestPeopleForFace returns nearest within matchEps', () => {
+        const did = downloadId();
+        const alice = api.insertPerson({
+            label: 'Alice',
+            centroidBlob: f32Blob([1, 0, 0]),
+            faceCount: 1,
+        });
+        api.insertPerson({
+            label: 'Bob',
+            centroidBlob: f32Blob([0, 1, 0]),
+            faceCount: 1,
+        });
+        const faceId = api.insertFace({
+            downloadId: did,
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 40,
+            embeddingBlob: f32Blob([0.98, 0.02, 0]),
+            personId: null,
+        }).lastInsertRowid;
+
+        const near = api.suggestPeopleForFace(faceId, { matchEps: 0.4, limit: 5 });
+        expect(near.ok).toBe(true);
+        expect(near.suggestions.length).toBeGreaterThanOrEqual(1);
+        expect(near.suggestions[0].id).toBe(alice);
+        expect(near.suggestions[0].label).toBe('Alice');
+
+        const farFace = api.insertFace({
+            downloadId: did,
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 40,
+            embeddingBlob: f32Blob([0, 0, 1]),
+            personId: null,
+        }).lastInsertRowid;
+        const none = api.suggestPeopleForFace(farFace, { matchEps: 0.4, limit: 5 });
+        expect(none.ok).toBe(true);
+        expect(none.suggestions).toEqual([]);
+    });
+
+    it('suggestPeopleForFace includes same-clip people even outside matchEps', () => {
+        const clipA = api.insertDownload({
+            groupId: '-100777',
+            groupName: 'Faces Fixture',
+            messageId: 9001,
+            fileName: 'clip.mp4',
+            fileSize: 5000,
+            fileType: 'video',
+            filePath: 'Faces_Fixture/videos/clip.mp4',
+        }).lastInsertRowid;
+        const clipB = api.insertDownload({
+            groupId: '-100777',
+            groupName: 'Faces Fixture',
+            messageId: 9002,
+            fileName: 'other.mp4',
+            fileSize: 5000,
+            fileType: 'video',
+            filePath: 'Faces_Fixture/videos/other.mp4',
+        }).lastInsertRowid
+
+        // Alice appears on the same clip; embedding is far from the query face
+        // so pure centroid match within matchEps would miss her.
+        const alice = api.insertPerson({
+            label: 'Alice',
+            centroidBlob: f32Blob([1, 0, 0]),
+            faceCount: 1,
+        });
+        api.insertFace({
+            downloadId: clipA,
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 40,
+            embeddingBlob: f32Blob([1, 0, 0]),
+            personId: alice,
+        });
+
+        // Bob is embedding-close but on a different clip — still a valid match.
+        const bob = api.insertPerson({
+            label: 'Bob',
+            centroidBlob: f32Blob([0, 1, 0]),
+            faceCount: 1,
+        });
+        api.insertFace({
+            downloadId: clipB,
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 40,
+            embeddingBlob: f32Blob([0, 1, 0]),
+            personId: bob,
+        });
+
+        // Query face is near Bob in embedding space, far from Alice centroid,
+        // but shares clipA with Alice.
+        const faceId = api.insertFace({
+            downloadId: clipA,
+            x: 10,
+            y: 10,
+            w: 40,
+            h: 40,
+            embeddingBlob: f32Blob([0.05, 0.95, 0]),
+            personId: null,
+        }).lastInsertRowid;
+
+        const r = api.suggestPeopleForFace(faceId, { matchEps: 0.25, limit: 5 });
+        expect(r.ok).toBe(true);
+        const byId = Object.fromEntries(r.suggestions.map((s) => [s.id, s]));
+        expect(byId[alice]).toBeTruthy();
+        expect(byId[alice].sameClip).toBe(true);
+        expect(byId[bob]).toBeTruthy();
+        expect(byId[bob].sameClip).toBeFalsy();
+        // Same-clip Alice ranks ahead of embedding-only Bob.
+        expect(r.suggestions[0].id).toBe(alice);
+    });
+
+    it('splitFacePerson on an unassigned face creates a person (new-person path)', () => {
+        const did = downloadId();
+        const faceId = api.insertFace({
+            downloadId: did,
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 40,
+            embeddingBlob: f32Blob([0, 1, 0]),
+            personId: null,
+        }).lastInsertRowid;
+        expect(api.listUnclassifiedFaces({ facesEpsilon: 0.5 }).total).toBe(1);
+
+        const r = api.splitFacePerson([faceId], 'Newbie');
+        expect(r.personId).toBeTruthy();
+        expect(r.moved).toBe(1);
+        expect(api.listUnclassifiedFaces({ facesEpsilon: 0.5 }).total).toBe(0);
+        expect(api.listPeople({}).people.some((p) => p.label === 'Newbie')).toBe(true);
+    });
+
+    it('deleteFace removes an unclassified face permanently', () => {
+        const did = downloadId();
+        const faceId = api.insertFace({
+            downloadId: did,
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 40,
+            embeddingBlob: f32Blob([0, 1, 0]),
+            personId: null,
+        }).lastInsertRowid;
+        expect(api.listUnclassifiedFaces({ facesEpsilon: 0.5 }).total).toBe(1);
+
+        const r = api.deleteFace(faceId);
+        expect(r.ok).toBe(true);
+        expect(r.faceId).toBe(faceId);
+        expect(r.oldPersonId).toBeNull();
+        expect(api.listUnclassifiedFaces({ facesEpsilon: 0.5 }).total).toBe(0);
+        expect(db.prepare('SELECT id FROM faces WHERE id = ?').get(faceId)).toBeUndefined();
+    });
+
+    it('deleteFace refreshes or drops the owning person', () => {
+        const did = downloadId();
+        const pid = api.insertPerson({
+            label: 'Solo',
+            centroidBlob: f32Blob([1, 0]),
+            faceCount: 1,
+        });
+        const faceId = api.insertFace({
+            downloadId: did,
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 40,
+            embeddingBlob: f32Blob([1, 0]),
+            personId: pid,
+        }).lastInsertRowid;
+        const r = api.deleteFace(faceId);
+        expect(r.ok).toBe(true);
+        expect(r.personDeleted).toBe(true);
+        expect(api.countPeople()).toBe(0);
+    });
+
     it('returns not_found for missing person', () => {
         expect(api.excludePerson(999999)).toEqual({ ok: false, reason: 'not_found' });
         expect(api.excludePerson(-1).ok).toBe(false);

@@ -166,6 +166,10 @@ import {
     listPeople,
     listPhotosForPerson,
     listFacesForPerson,
+    listUnclassifiedFaces,
+    suggestPeopleForFace,
+    splitFacePerson,
+    deleteFace,
     renamePerson,
     deletePerson,
     excludePerson,
@@ -7705,6 +7709,19 @@ function _aiCfg() {
     }
 }
 
+/** Resolve DBSCAN ε + labelMatchEps the same way Phase B does. */
+function _aiFacesEps() {
+    const cfg = _aiCfg();
+    const faces = cfg.faces && typeof cfg.faces === 'object' ? cfg.faces : {};
+    const epsRaw = faces.epsilon ?? cfg.facesEpsilon;
+    const eps = Number.isFinite(epsRaw) && epsRaw > 0 ? Number(epsRaw) : 1.05;
+    const matchRaw = faces.labelMatchEps ?? cfg.facesLabelMatchEps;
+    const matchEps = Number.isFinite(matchRaw) && matchRaw > 0
+        ? Number(matchRaw)
+        : Math.max(0.2, Math.min(0.6, eps * 0.9));
+    return { eps, matchEps, faces };
+}
+
 // ---- AI status -----------------------------------------------------------
 //
 // Faces-only build — the prior `/api/ai/status` payload exposed embed +
@@ -8709,6 +8726,66 @@ app.get('/api/ai/person/:id/face', async (req, res) => {
 // can't decode a video container directly; without this, any face whose
 // download is a video 404s with "Input file contains unsupported image
 // format").
+
+// Unclassified faces review — static path MUST be registered before
+// `/api/ai/faces/:id/*` so Express does not treat "unclassified" as an id.
+app.get('/api/ai/faces/unclassified', async (req, res) => {
+    try {
+        const { eps } = _aiFacesEps();
+        const limit = Math.max(1, Math.min(200, Number(req.query?.limit) || 50));
+        const offset = Math.max(0, Number(req.query?.offset) || 0);
+        const result = listUnclassifiedFaces({
+            limit,
+            offset,
+            facesEpsilon: eps,
+        });
+        res.json({ success: true, ...result });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.get('/api/ai/faces/:id/suggestions', async (req, res) => {
+    try {
+        const faceId = Number(req.params.id);
+        if (!Number.isFinite(faceId) || faceId <= 0) {
+            return res.status(400).json({ error: 'invalid face id' });
+        }
+        const { matchEps } = _aiFacesEps();
+        const limit = Math.max(1, Math.min(20, Number(req.query?.limit) || 5));
+        const r = suggestPeopleForFace(faceId, { matchEps, limit });
+        if (!r.ok) {
+            const status = r.reason === 'not_found' ? 404 : 400;
+            return res.status(status).json({ error: r.reason || 'suggest failed' });
+        }
+        res.json({ success: true, faceId, matchEps, suggestions: r.suggestions });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.post('/api/ai/faces/:id/new-person', async (req, res) => {
+    try {
+        const faceId = Number(req.params.id);
+        if (!Number.isFinite(faceId) || faceId <= 0) {
+            return res.status(400).json({ error: 'invalid face id' });
+        }
+        const label = req.body?.label == null ? null : String(req.body.label).trim().slice(0, 100) || null;
+        const r = splitFacePerson([faceId], label);
+        if (!r.personId || !r.moved) {
+            return res.status(404).json({ error: 'face not found or already moved' });
+        }
+        log({
+            source: 'ai',
+            level: 'info',
+            msg: `faces/new-person: face=${faceId} → person=${r.personId} label=${label || '(unlabelled)'}`,
+        });
+        res.json({ success: true, ...r, label });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
 app.get('/api/ai/faces/:id/crop', async (req, res) => {
     try {
         const faceId = Number(req.params.id);
@@ -8932,6 +9009,30 @@ app.post('/api/ai/faces/:id/reassign', async (req, res) => {
             source: 'ai',
             level: 'info',
             msg: `faces/reassign: face=${faceId} from=${r.oldPersonId} to=${r.newPersonId}`,
+        });
+        res.json({ success: true, ...r });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// Permanently delete one face detection (used by Unclassified review
+// "remove face" — drops a bad detection so it cannot re-cluster).
+app.delete('/api/ai/faces/:id', async (req, res) => {
+    try {
+        const faceId = Number(req.params.id);
+        if (!Number.isFinite(faceId) || faceId <= 0) {
+            return res.status(400).json({ error: 'invalid face id' });
+        }
+        const r = deleteFace(faceId);
+        if (!r.ok) {
+            const status = r.reason === 'not_found' ? 404 : 400;
+            return res.status(status).json({ error: r.reason || 'delete failed' });
+        }
+        log({
+            source: 'ai',
+            level: 'info',
+            msg: `faces/delete: face=${faceId} oldPerson=${r.oldPersonId ?? 'null'} personDeleted=${r.personDeleted}`,
         });
         res.json({ success: true, ...r });
     } catch (e) {

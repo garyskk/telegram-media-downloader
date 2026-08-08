@@ -103,6 +103,17 @@ let _faceReviewToken = 0;
 let _faceReviewGridClickHandler = null;
 const _FACE_REVIEW_PAGE_SIZE = 100;
 
+// Unclassified faces review — opened from the Unclassified KPI tile.
+let _unclassifiedReviewActive = false;
+let _unclassifiedOffset = 0;
+let _unclassifiedTotal = 0;
+let _unclassifiedToken = 0;
+const _unclassifiedSelectedIds = new Set(); // multi-select face ids
+let _unclassifiedFocusFaceId = null; // last toggled — drives suggestions
+let _unclassifiedSuggestions = [];
+let _unclassifiedGridClickHandler = null;
+const _UNCLASSIFIED_PAGE_SIZE = 100;
+
 // Running render token — incremented on every _renderPeopleGrid call so
 // stale async chunks abort when a newer render starts (e.g. typing in
 // the search box while the previous chunk render is still in flight).
@@ -294,6 +305,39 @@ function _bindOnce() {
     $('#ai-split-commit-btn')?.addEventListener('click', _commitSplit);
     $('#ai-person-review-faces-btn')?.addEventListener('click', _toggleFaceReview);
     $('#ai-face-review-close-btn')?.addEventListener('click', _closeFaceReview);
+    $('#ai-unclassified-close-btn')?.addEventListener('click', _closeUnclassifiedReview);
+    $('#ai-unclassified-sel-clear-btn')?.addEventListener('click', () => {
+        _unclassifiedSelectedIds.clear();
+        _unclassifiedFocusFaceId = null;
+        _syncUnclassifiedSelectionUi();
+    });
+    $('#ai-unclassified-sel-assign-btn')?.addEventListener('click', () => {
+        const ids = [..._unclassifiedSelectedIds];
+        if (!ids.length) return;
+        _assignUnclassifiedFaces(ids);
+    });
+    $('#ai-unclassified-sel-new-btn')?.addEventListener('click', () => {
+        const ids = [..._unclassifiedSelectedIds];
+        if (!ids.length) return;
+        _newPersonFromUnclassifiedFaces(ids);
+    });
+    $('#ai-unclassified-sel-remove-btn')?.addEventListener('click', () => {
+        const ids = [..._unclassifiedSelectedIds];
+        if (!ids.length) return;
+        _removeUnclassifiedFaces(ids);
+    });
+    const noiseTile = $('#ai-stat-noise-tile');
+    noiseTile?.addEventListener('click', () => {
+        const n = Number(_lastStatus?.counts?.noiseFaces ?? 0);
+        if (n > 0) _openUnclassifiedReview();
+    });
+    noiseTile?.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            const n = Number(_lastStatus?.counts?.noiseFaces ?? 0);
+            if (n > 0) _openUnclassifiedReview();
+        }
+    });
     $('#ai-people-excluded-toggle')?.addEventListener('click', () => {
         const body = $('#ai-people-excluded-body');
         const chevron = $('#ai-people-excluded-chevron');
@@ -587,9 +631,17 @@ function _renderStatus(status) {
     // any cluster as noise points. Excluded identities are omitted from
     // this counter (they stay person_id NULL by design).
     const noiseEl = $('#ai-stat-noise');
+    const noiseTile = $('#ai-stat-noise-tile');
     if (noiseEl) {
         const noise = Number(counts.noiseFaces ?? counts.unclassified ?? 0);
         noiseEl.textContent = noise.toLocaleString();
+        if (noiseTile) {
+            const clickable = noise > 0;
+            noiseTile.classList.toggle('opacity-60', !clickable);
+            noiseTile.style.cursor = clickable ? 'pointer' : 'default';
+            noiseTile.setAttribute('aria-disabled', clickable ? 'false' : 'true');
+            noiseTile.tabIndex = clickable ? 0 : -1;
+        }
     }
 
     // Quality backfill — show only when faces lack quality scores
@@ -2390,6 +2442,665 @@ function _removeFaceReviewTile(tileEl) {
     const grid = $('#ai-face-review-grid');
     if (grid && !grid.querySelector('.ai-face-review-tile')) {
         grid.innerHTML = `<div class="col-span-full text-center text-xs text-tg-textSecondary py-8">${escapeHtml(i18nT('maintenance.ai.no_faces', 'No faces in this cluster.'))}</div>`;
+    }
+}
+
+// ---- Unclassified faces review -------------------------------------------
+
+function _openUnclassifiedReview() {
+    if (_faceReviewActive) _closeFaceReview();
+    if (_splitModeActive) _exitSplitMode();
+    _unclassifiedReviewActive = true;
+    _unclassifiedSelectedIds.clear();
+    _unclassifiedFocusFaceId = null;
+    _unclassifiedSuggestions = [];
+    _unclassifiedOffset = 0;
+    const panel = $('#ai-unclassified-review');
+    if (panel) {
+        panel.classList.remove('hidden');
+        panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }
+    _hideUnclassifiedSuggestions();
+    _syncUnclassifiedSelectionUi();
+    _loadUnclassifiedReview({ append: false });
+}
+
+function _closeUnclassifiedReview() {
+    _unclassifiedReviewActive = false;
+    _unclassifiedSelectedIds.clear();
+    _unclassifiedFocusFaceId = null;
+    _unclassifiedSuggestions = [];
+    $('#ai-unclassified-review')?.classList.add('hidden');
+    _hideUnclassifiedSuggestions();
+    _syncUnclassifiedSelectionUi();
+    const grid = $('#ai-unclassified-grid');
+    if (grid) grid.innerHTML = '';
+}
+
+async function _loadUnclassifiedReview({ append = false } = {}) {
+    if (!_unclassifiedReviewActive) return;
+    const grid = $('#ai-unclassified-grid');
+    const countEl = $('#ai-unclassified-count');
+    if (!grid) return;
+    const token = ++_unclassifiedToken;
+
+    if (!append) {
+        grid.innerHTML = `<div class="col-span-full text-center text-xs text-tg-textSecondary py-8">${escapeHtml(i18nT('common.loading', 'Loading…'))}</div>`;
+        if (countEl) countEl.textContent = '';
+    }
+
+    try {
+        const r = await api.get(
+            `/api/ai/faces/unclassified?limit=${_UNCLASSIFIED_PAGE_SIZE}&offset=${_unclassifiedOffset}`,
+        );
+        if (token !== _unclassifiedToken) return;
+        if (!r?.success) throw new Error(r?.error || 'load failed');
+        const faces = r.faces || [];
+        _unclassifiedTotal = Number(r.total) || 0;
+
+        if (!append && !faces.length) {
+            grid.innerHTML = `<div class="col-span-full text-center text-xs text-tg-textSecondary py-8">${escapeHtml(i18nT('maintenance.ai.unclassified.empty', 'No unclassified faces.'))}</div>`;
+            if (countEl) {
+                countEl.textContent = _unclassifiedTotal
+                    ? i18nTf(
+                          'maintenance.ai.unclassified.count',
+                          { n: _unclassifiedTotal },
+                          `${_unclassifiedTotal.toLocaleString()} unclassified`,
+                      )
+                    : '';
+            }
+            // No rows returned for this offset — don't claim phantom "remaining".
+            _unclassifiedOffset = _unclassifiedTotal;
+            _renderUnclassifiedLoadMore();
+            _syncUnclassifiedSelectionUi();
+            return;
+        }
+
+        const html = faces.map(_unclassifiedTile).join('');
+        if (append) {
+            grid.insertAdjacentHTML('beforeend', html);
+        } else {
+            grid.innerHTML = html;
+        }
+        _unclassifiedOffset += faces.length;
+        if (countEl) {
+            countEl.textContent = i18nTf(
+                'maintenance.ai.unclassified.count',
+                { n: _unclassifiedTotal },
+                `${_unclassifiedTotal.toLocaleString()} unclassified`,
+            );
+        }
+        _wireUnclassifiedGrid();
+        _renderUnclassifiedLoadMore();
+        _syncUnclassifiedSelectionUi();
+    } catch (e) {
+        if (token !== _unclassifiedToken) return;
+        if (!append) {
+            grid.innerHTML = `<div class="col-span-full text-center text-xs text-red-300 py-8">${escapeHtml(e.message)}</div>`;
+        }
+    }
+}
+
+function _renderUnclassifiedLoadMore() {
+    const grid = $('#ai-unclassified-grid');
+    const panel = $('#ai-unclassified-review');
+    if (!grid || !panel) return;
+    const existing = panel.querySelector('.ai-unclassified-load-more-btn');
+    if (existing) existing.remove();
+    if (_unclassifiedOffset >= _unclassifiedTotal) return;
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className =
+        'ai-unclassified-load-more-btn w-full py-2.5 mx-1.5 mb-1.5 rounded-xl text-xs font-medium text-tg-textSecondary border border-tg-border/30 hover:border-tg-blue/50 hover:text-tg-blue hover:bg-tg-blue/5 transition-all';
+    btn.textContent = i18nTf(
+        'maintenance.ai.face_review_load_more',
+        { n: (_unclassifiedTotal - _unclassifiedOffset).toLocaleString() },
+        `Show more (${(_unclassifiedTotal - _unclassifiedOffset).toLocaleString()} remaining)`,
+    );
+    btn.addEventListener('click', () => _loadUnclassifiedReview({ append: true }));
+    grid.after(btn);
+}
+
+function _unclassifiedTile(row) {
+    const faceId = row.face_id;
+    const dlId = row.download_id;
+    const name = escapeHtml(row.file_name || `#${dlId}`);
+    const selected = _unclassifiedSelectedIds.has(Number(faceId));
+    const qLabel = _qualityBadgeLabel(row.quality_score);
+    const qBadge = qLabel
+        ? `<span class="absolute top-1 left-1 h-[15px] px-1.5 rounded-full bg-black/70 text-white text-[8px] font-medium flex items-center justify-center leading-none backdrop-blur-sm">${qLabel}</span>`
+        : '';
+    const selBadge = selected
+        ? `<span class="ai-unclassified-sel-badge absolute bottom-1 left-1 w-5 h-5 rounded-full bg-tg-blue text-white flex items-center justify-center shadow"><i class="ri-check-line text-[11px]"></i></span>`
+        : '';
+    const selRing = selected ? ' ring-2 ring-tg-blue ring-offset-1 ring-offset-tg-bg' : '';
+    const meta = encodeURIComponent(
+        JSON.stringify({
+            id: dlId,
+            file_name: row.file_name || '',
+            file_type: row.file_type || '',
+            file_path: String(row.file_path || '').replace(/\\/g, '/'),
+            file_size: Number(row.file_size) || 0,
+            group_id: row.group_id || null,
+            group_name: row.group_name || '',
+            pinned: !!row.pinned,
+        }),
+    );
+    return `
+        <div class="ai-unclassified-tile group relative rounded-xl overflow-hidden shadow-sm hover:shadow-lg transition-all duration-200 bg-tg-bg/40${selRing}" data-face-id="${faceId}" data-dl-id="${dlId}" data-meta="${meta}">
+            <button type="button" class="ai-unclassified-select block w-full cursor-pointer" title="${escapeHtml(i18nT('maintenance.ai.unclassified.select', 'Tap to select'))} — ${name}">
+                <img src="/api/ai/faces/${faceId}/crop?w=160" alt="${name}" loading="lazy"
+                    class="aspect-square w-full object-cover transition-transform duration-300 group-hover:scale-105">
+            </button>
+            ${qBadge}
+            ${selBadge}
+            <div class="absolute inset-0 bg-gradient-to-t from-black/60 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-200 pointer-events-none flex items-end p-1.5">
+                <span class="text-white text-[10px] leading-tight line-clamp-1 font-medium drop-shadow">${name}</span>
+            </div>
+            <div class="absolute top-1 right-1 flex flex-col gap-1 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity duration-200">
+                <button type="button" class="ai-unclassified-open w-5 h-5 rounded-full bg-black/70 hover:bg-tg-blue flex items-center justify-center shadow"
+                    title="${escapeHtml(i18nT('maintenance.ai.face_review_open_source', 'Open source photo'))}">
+                    <i class="ri-external-link-line text-white text-[10px]"></i>
+                </button>
+                <button type="button" class="ai-unclassified-assign w-5 h-5 rounded-full bg-black/70 hover:bg-tg-blue flex items-center justify-center shadow"
+                    title="${escapeHtml(i18nT('maintenance.ai.unclassified.assign', 'Assign to person…'))}">
+                    <i class="ri-user-shared-line text-white text-[10px]"></i>
+                </button>
+                <button type="button" class="ai-unclassified-new w-5 h-5 rounded-full bg-black/70 hover:bg-emerald-500 flex items-center justify-center shadow"
+                    title="${escapeHtml(i18nT('maintenance.ai.unclassified.new_person', 'Create new person'))}">
+                    <i class="ri-user-add-line text-white text-[10px]"></i>
+                </button>
+                <button type="button" class="ai-unclassified-remove w-5 h-5 rounded-full bg-black/70 hover:bg-red-500 flex items-center justify-center shadow"
+                    title="${escapeHtml(i18nT('maintenance.ai.unclassified.remove', 'Remove face'))}">
+                    <i class="ri-delete-bin-line text-white text-[10px]"></i>
+                </button>
+            </div>
+        </div>
+    `;
+}
+
+function _wireUnclassifiedGrid() {
+    const grid = $('#ai-unclassified-grid');
+    if (!grid) return;
+    if (_unclassifiedGridClickHandler) grid.removeEventListener('click', _unclassifiedGridClickHandler);
+
+    _unclassifiedGridClickHandler = (e) => {
+        const assignBtn = e.target.closest('.ai-unclassified-assign');
+        const newBtn = e.target.closest('.ai-unclassified-new');
+        const removeBtn = e.target.closest('.ai-unclassified-remove');
+        const openBtn = e.target.closest('.ai-unclassified-open');
+        const selectBtn = e.target.closest('.ai-unclassified-select');
+        const tile = e.target.closest('.ai-unclassified-tile');
+        if (!tile) return;
+        const faceId = Number(tile.dataset.faceId);
+
+        if (assignBtn) {
+            e.preventDefault();
+            e.stopPropagation();
+            _assignUnclassifiedFaces([faceId]);
+            return;
+        }
+        if (newBtn) {
+            e.preventDefault();
+            e.stopPropagation();
+            _newPersonFromUnclassifiedFaces([faceId]);
+            return;
+        }
+        if (removeBtn) {
+            e.preventDefault();
+            e.stopPropagation();
+            _removeUnclassifiedFaces([faceId]);
+            return;
+        }
+        if (openBtn) {
+            e.preventDefault();
+            e.stopPropagation();
+            const allTiles = Array.from(grid.querySelectorAll('.ai-unclassified-tile'));
+            const viewerFiles = allTiles.map(_personPhotoToViewerFile).filter(Boolean);
+            const idx = allTiles.indexOf(tile);
+            if (idx >= 0 && viewerFiles[idx]) {
+                viewerFiles[idx].highlightFaceId = faceId;
+            }
+            if (viewerFiles.length) openMediaViewerForReview(viewerFiles, Math.max(0, idx));
+            return;
+        }
+        if (selectBtn) {
+            e.preventDefault();
+            _toggleUnclassifiedSelection(faceId);
+        }
+    };
+    grid.addEventListener('click', _unclassifiedGridClickHandler);
+}
+
+function _toggleUnclassifiedSelection(faceId) {
+    const id = Number(faceId);
+    if (!Number.isFinite(id) || id <= 0) return;
+    if (_unclassifiedSelectedIds.has(id)) {
+        _unclassifiedSelectedIds.delete(id);
+        _unclassifiedFocusFaceId =
+            _unclassifiedSelectedIds.size > 0
+                ? [..._unclassifiedSelectedIds].at(-1)
+                : null;
+    } else {
+        _unclassifiedSelectedIds.add(id);
+        _unclassifiedFocusFaceId = id;
+    }
+    _syncUnclassifiedSelectionUi();
+}
+
+function _syncUnclassifiedSelectionUi() {
+    const grid = $('#ai-unclassified-grid');
+    grid?.querySelectorAll('.ai-unclassified-tile').forEach((t) => {
+        const id = Number(t.dataset.faceId);
+        const on = _unclassifiedSelectedIds.has(id);
+        t.classList.toggle('ring-2', on);
+        t.classList.toggle('ring-tg-blue', on);
+        t.classList.toggle('ring-offset-1', on);
+        t.classList.toggle('ring-offset-tg-bg', on);
+        let badge = t.querySelector('.ai-unclassified-sel-badge');
+        if (on) {
+            if (!badge) {
+                badge = document.createElement('span');
+                badge.className =
+                    'ai-unclassified-sel-badge absolute bottom-1 left-1 w-5 h-5 rounded-full bg-tg-blue text-white flex items-center justify-center shadow';
+                badge.innerHTML = '<i class="ri-check-line text-[11px]"></i>';
+                t.appendChild(badge);
+            }
+        } else if (badge) {
+            badge.remove();
+        }
+    });
+
+    const bar = $('#ai-unclassified-sel-bar');
+    const countEl = $('#ai-unclassified-sel-count');
+    const n = _unclassifiedSelectedIds.size;
+    if (bar) {
+        bar.classList.remove('hidden');
+        bar.classList.add('flex');
+    }
+    if (countEl) {
+        countEl.textContent =
+            n === 0
+                ? i18nT('maintenance.ai.unclassified.sel_hint', 'Tap faces to select')
+                : i18nTf('maintenance.ai.unclassified.sel_n', { n }, `${n} selected`);
+    }
+    const disabled = n === 0;
+    $('#ai-unclassified-sel-assign-btn')?.toggleAttribute('disabled', disabled);
+    $('#ai-unclassified-sel-new-btn')?.toggleAttribute('disabled', disabled);
+    $('#ai-unclassified-sel-remove-btn')?.toggleAttribute('disabled', disabled);
+
+    if (_unclassifiedFocusFaceId && _unclassifiedSelectedIds.has(_unclassifiedFocusFaceId)) {
+        _loadUnclassifiedSuggestions(_unclassifiedFocusFaceId);
+    } else {
+        _unclassifiedSuggestions = [];
+        _hideUnclassifiedSuggestions();
+    }
+}
+
+function _hideUnclassifiedSuggestions() {
+    $('#ai-unclassified-suggestions')?.classList.add('hidden');
+    const list = $('#ai-unclassified-suggestions-list');
+    if (list) list.innerHTML = '';
+    $('#ai-unclassified-suggestions-empty')?.classList.add('hidden');
+}
+
+async function _loadUnclassifiedSuggestions(faceId) {
+    const wrap = $('#ai-unclassified-suggestions');
+    const list = $('#ai-unclassified-suggestions-list');
+    const empty = $('#ai-unclassified-suggestions-empty');
+    if (!wrap || !list) return;
+    wrap.classList.remove('hidden');
+    list.innerHTML = `<span class="text-[11px] text-tg-textSecondary">${escapeHtml(i18nT('common.loading', 'Loading…'))}</span>`;
+    empty?.classList.add('hidden');
+    const focusId = faceId;
+    try {
+        const r = await api.get(`/api/ai/faces/${faceId}/suggestions?limit=5`);
+        if (_unclassifiedFocusFaceId !== focusId) return;
+        if (!r?.success) throw new Error(r?.error || 'suggest failed');
+        _unclassifiedSuggestions = Array.isArray(r.suggestions) ? r.suggestions : [];
+        if (!_unclassifiedSuggestions.length) {
+            list.innerHTML = '';
+            empty?.classList.remove('hidden');
+            return;
+        }
+        empty?.classList.add('hidden');
+        const multiHint =
+            _unclassifiedSelectedIds.size > 1
+                ? `<p class="w-full text-[10px] text-tg-textSecondary mb-1">${escapeHtml(i18nTf('maintenance.ai.unclassified.suggest_applies_n', { n: _unclassifiedSelectedIds.size }, `Applies to all ${_unclassifiedSelectedIds.size} selected`))}</p>`
+                : '';
+        list.innerHTML =
+            multiHint +
+            _unclassifiedSuggestions
+                .map((s) => {
+                    const name = escapeHtml(s.label || `Person #${s.id}`);
+                    const dist = Number(s.distance);
+                    const distLabel = Number.isFinite(dist) ? dist.toFixed(2) : '';
+                    const sameClip = !!s.sameClip;
+                    const clipBadge = sameClip
+                        ? `<span class="text-[9px] uppercase tracking-wide text-emerald-300/90 font-medium">${escapeHtml(i18nT('maintenance.ai.unclassified.same_clip', 'Same clip'))}</span>`
+                        : '';
+                    const bust = _personAvatarBust(_peopleCache.find((p) => p.id === s.id));
+                    return `<button type="button" data-suggest-pid="${s.id}"
+                    class="ai-unclassified-suggest-chip inline-flex items-center gap-1.5 pl-0.5 pr-2 py-0.5 rounded-full ${sameClip ? 'bg-emerald-500/10 hover:bg-emerald-500/20 border border-emerald-500/30' : 'bg-tg-blue/10 hover:bg-tg-blue/20 border border-tg-blue/30'} text-[11px] text-tg-text transition-colors">
+                    <span class="w-6 h-6 rounded-full overflow-hidden bg-tg-bg/40 flex-shrink-0">
+                        <img src="/api/ai/person/${s.id}/face?w=48&v=${bust}" alt="" class="w-full h-full object-cover" loading="lazy"
+                            onerror="this.onerror=null;this.parentElement.innerHTML='<i class=\\'ri-user-line text-[10px] text-tg-textSecondary/40 flex items-center justify-center w-full h-full\\'></i>'">
+                    </span>
+                    <span class="flex flex-col items-start min-w-0 leading-tight">
+                        ${clipBadge}
+                        <span class="font-medium truncate max-w-[7rem]">${name}</span>
+                    </span>
+                    ${distLabel ? `<span class="text-tg-textSecondary tabular-nums">${distLabel}</span>` : ''}
+                </button>`;
+                })
+                .join('');
+        list.querySelectorAll('.ai-unclassified-suggest-chip').forEach((btn) => {
+            btn.addEventListener('click', () => {
+                const pid = Number(btn.dataset.suggestPid);
+                if (!Number.isFinite(pid) || pid <= 0) return;
+                const ids =
+                    _unclassifiedSelectedIds.size > 0
+                        ? [..._unclassifiedSelectedIds]
+                        : [focusId];
+                _assignUnclassifiedFacesTo(ids, pid);
+            });
+        });
+    } catch (e) {
+        if (_unclassifiedFocusFaceId !== focusId) return;
+        list.innerHTML = `<span class="text-[11px] text-red-300">${escapeHtml(e.message)}</span>`;
+    }
+}
+
+async function _assignUnclassifiedFaces(faceIds) {
+    const ids = (Array.isArray(faceIds) ? faceIds : [])
+        .map(Number)
+        .filter((id) => Number.isFinite(id) && id > 0);
+    if (!ids.length) return;
+    const focusId =
+        _unclassifiedFocusFaceId && ids.includes(_unclassifiedFocusFaceId)
+            ? _unclassifiedFocusFaceId
+            : ids[0];
+    let suggestions = _unclassifiedSuggestions;
+    if (_unclassifiedFocusFaceId !== focusId || !suggestions.length) {
+        try {
+            const r = await api.get(`/api/ai/faces/${focusId}/suggestions?limit=5`);
+            suggestions = r?.success && Array.isArray(r.suggestions) ? r.suggestions : [];
+        } catch {
+            suggestions = [];
+        }
+    }
+    const suggestIds = new Set(suggestions.map((s) => Number(s.id)));
+    const candidates = _peopleCache.filter((p) => p.id > 0 && p.id !== -1);
+    if (!candidates.length && !suggestions.length) {
+        showToast(
+            i18nT('maintenance.ai.merge_no_other', 'No other clusters to merge with.'),
+            'info',
+        );
+        return;
+    }
+
+    const makeCard = (p, { suggested = false, sameClip = false, distance = null } = {}) => {
+        const name = escapeHtml(p.label || `Person #${p.id}`);
+        const faceUrl = p.id > 0 ? `/api/ai/person/${p.id}/face?w=64&v=${_personAvatarBust(p)}` : '';
+        const imgHtml = faceUrl
+            ? `<img src="${faceUrl}" class="w-full h-full object-cover" loading="lazy" onerror="this.onerror=null;this.parentElement.innerHTML='<i class=\\'ri-user-line text-base text-tg-textSecondary/40\\'></i>'">`
+            : `<i class="ri-user-line text-base text-tg-textSecondary/40"></i>`;
+        const distLabel =
+            distance != null && Number.isFinite(Number(distance))
+                ? `<span class="text-[10px] text-tg-textSecondary tabular-nums ml-1">${Number(distance).toFixed(2)}</span>`
+                : '';
+        const badge = sameClip
+            ? `<span class="text-[9px] uppercase tracking-wide text-emerald-300 font-medium">${escapeHtml(i18nT('maintenance.ai.unclassified.same_clip', 'Same clip'))}</span>`
+            : suggested
+              ? `<span class="text-[9px] uppercase tracking-wide text-tg-blue font-medium">${escapeHtml(i18nT('maintenance.ai.unclassified.suggested', 'Suggested'))}</span>`
+              : '';
+        return `<button type="button" data-pid="${p.id}"
+            class="ai-face-reassign-card flex items-center gap-3 w-full text-left px-3 py-2.5 rounded-xl hover:bg-tg-blue/10 active:bg-tg-blue/20 transition-colors">
+            <div class="w-10 h-10 rounded-full overflow-hidden ring-1 ring-tg-border/30 flex-shrink-0 bg-tg-bg/40 flex items-center justify-center">
+                ${imgHtml}
+            </div>
+            <div class="flex-1 min-w-0">
+                <div class="flex items-center gap-1.5">${badge}<div class="text-sm font-medium text-tg-text truncate">${name}</div>${distLabel}</div>
+                <div class="text-[11px] text-tg-textSecondary">${p.face_count ?? p.faceCount ?? 0} ${escapeHtml(i18nT('maintenance.ai.faces_short', 'faces'))}</div>
+            </div>
+            <i class="ri-arrow-right-s-line text-tg-textSecondary/50 flex-shrink-0"></i>
+        </button>`;
+    };
+
+    const suggestedPeople = suggestions
+        .map((s) => {
+            const cached = candidates.find((p) => p.id === s.id) || {
+                id: s.id,
+                label: s.label,
+                face_count: s.faceCount,
+            };
+            return { p: cached, distance: s.distance, sameClip: !!s.sameClip };
+        })
+        .filter((x) => x.p);
+    const rest = candidates.filter((p) => !suggestIds.has(p.id));
+
+    const pickerContent = `
+        <div class="px-1 mb-3">
+            <input type="search" id="ai-unclassified-assign-search" placeholder="${escapeHtml(i18nT('common.search', 'Search…'))}"
+                class="tg-input w-full text-sm" autocomplete="off">
+        </div>
+        <div id="ai-unclassified-assign-list" class="flex flex-col gap-0.5 max-h-64 overflow-y-auto"></div>
+        <p id="ai-unclassified-assign-empty" class="hidden text-center text-xs text-tg-textSecondary py-4">${escapeHtml(i18nT('common.no_results', 'No matches'))}</p>`;
+
+    const targetId = await new Promise((resolve) => {
+        const entry = openSheet({
+            title:
+                ids.length > 1
+                    ? i18nTf(
+                          'maintenance.ai.unclassified.assign_n',
+                          { n: ids.length },
+                          `Assign ${ids.length} faces…`,
+                      )
+                    : i18nT('maintenance.ai.unclassified.assign', 'Assign to person…'),
+            content: pickerContent,
+            size: 'md',
+            onClose: () => resolve(null),
+        });
+        const listEl = entry.body.querySelector('#ai-unclassified-assign-list');
+        const emptyEl = entry.body.querySelector('#ai-unclassified-assign-empty');
+        const searchEl = entry.body.querySelector('#ai-unclassified-assign-search');
+
+        const renderList = (q) => {
+            if (!listEl) return;
+            const query = String(q || '')
+                .trim()
+                .toLowerCase();
+            const match = (p) => {
+                if (!query) return true;
+                return `${p.label || ''} ${p.id}`.toLowerCase().includes(query);
+            };
+            const sug = suggestedPeople.filter((x) => match(x.p));
+            const others = rest.filter(match);
+            const parts = [];
+            if (sug.length) {
+                parts.push(
+                    ...sug
+                        .slice(0, 20)
+                        .map((x) =>
+                            makeCard(x.p, {
+                                suggested: true,
+                                sameClip: x.sameClip,
+                                distance: x.distance,
+                            }),
+                        ),
+                );
+            }
+            parts.push(...others.slice(0, 80).map((p) => makeCard(p)));
+            listEl.innerHTML = parts.join('');
+            const empty = parts.length === 0;
+            if (emptyEl) emptyEl.classList.toggle('hidden', !empty);
+            listEl.querySelectorAll('.ai-face-reassign-card').forEach((cbtn) => {
+                cbtn.addEventListener('click', () => {
+                    entry.close();
+                    resolve(Number(cbtn.dataset.pid));
+                });
+            });
+        };
+        renderList('');
+        searchEl?.addEventListener('input', () => renderList(searchEl.value));
+        searchEl?.focus();
+    });
+
+    if (!targetId) return;
+    await _assignUnclassifiedFacesTo(ids, targetId);
+}
+
+async function _assignUnclassifiedFacesTo(faceIds, personId) {
+    const ids = (Array.isArray(faceIds) ? faceIds : [faceIds])
+        .map(Number)
+        .filter((id) => Number.isFinite(id) && id > 0);
+    if (!ids.length || !personId) return;
+    try {
+        let ok = 0;
+        for (const faceId of ids) {
+            const res = await api.post(`/api/ai/faces/${faceId}/reassign`, { personId });
+            if (!res?.success) throw new Error(res?.error || 'reassign failed');
+            ok += 1;
+            _removeUnclassifiedTilesByIds([faceId]);
+        }
+        showToast(
+            ok > 1
+                ? i18nTf('maintenance.ai.unclassified.assigned_n', { n: ok }, `${ok} faces moved`)
+                : i18nT('maintenance.ai.face_review_reassigned', 'Face moved'),
+            'success',
+        );
+        await refreshStatus();
+        await _loadPeople();
+    } catch (e) {
+        showToast(e.message, 'error');
+    }
+}
+
+async function _newPersonFromUnclassifiedFaces(faceIds) {
+    const ids = (Array.isArray(faceIds) ? faceIds : [faceIds])
+        .map(Number)
+        .filter((id) => Number.isFinite(id) && id > 0);
+    if (!ids.length) return;
+    const label = await promptSheet({
+        title:
+            ids.length > 1
+                ? i18nTf(
+                      'maintenance.ai.unclassified.new_person_n',
+                      { n: ids.length },
+                      `New person from ${ids.length} faces`,
+                  )
+                : i18nT('maintenance.ai.unclassified.new_person', 'Create new person'),
+        message: i18nT(
+            'maintenance.ai.unclassified.new_person_prompt',
+            'Optional name for the new person:',
+        ),
+        defaultValue: '',
+        confirmLabel: i18nT('common.save', 'Save'),
+    });
+    if (label == null) return;
+    try {
+        const body = {};
+        if (String(label).trim()) body.label = String(label).trim();
+        const res = await api.post(`/api/ai/faces/${ids[0]}/new-person`, body);
+        if (!res?.success || !res.personId) throw new Error(res?.error || 'create failed');
+        const personId = res.personId;
+        for (let i = 1; i < ids.length; i++) {
+            const r = await api.post(`/api/ai/faces/${ids[i]}/reassign`, { personId });
+            if (!r?.success) throw new Error(r?.error || 'reassign failed');
+        }
+        _removeUnclassifiedTilesByIds(ids);
+        showToast(
+            i18nT('maintenance.ai.unclassified.created', 'New person created'),
+            'success',
+        );
+        await refreshStatus();
+        await _loadPeople();
+    } catch (e) {
+        showToast(e.message, 'error');
+    }
+}
+
+async function _removeUnclassifiedFaces(faceIds) {
+    const ids = (Array.isArray(faceIds) ? faceIds : [faceIds])
+        .map(Number)
+        .filter((id) => Number.isFinite(id) && id > 0);
+    if (!ids.length) return;
+    const ok = await confirmSheet({
+        title: i18nT('maintenance.ai.unclassified.remove', 'Remove face'),
+        message:
+            ids.length > 1
+                ? i18nTf(
+                      'maintenance.ai.unclassified.remove_confirm_n',
+                      { n: ids.length },
+                      `Permanently delete ${ids.length} face detections? They will not come back on re-cluster (unless you re-scan those photos).`,
+                  )
+                : i18nT(
+                      'maintenance.ai.unclassified.remove_confirm',
+                      'Permanently delete this face detection? It will not come back on re-cluster (unless you re-scan the photo).',
+                  ),
+        confirmLabel: i18nT('common.delete', 'Delete'),
+        danger: true,
+    });
+    if (!ok) return;
+    try {
+        for (const faceId of ids) {
+            const res = await api.delete(`/api/ai/faces/${faceId}`);
+            if (!res?.success) throw new Error(res?.error || 'delete failed');
+        }
+        _removeUnclassifiedTilesByIds(ids);
+        showToast(
+            ids.length > 1
+                ? i18nTf(
+                      'maintenance.ai.unclassified.removed_n',
+                      { n: ids.length },
+                      `${ids.length} faces removed`,
+                  )
+                : i18nT('maintenance.ai.unclassified.removed', 'Face removed'),
+            'success',
+        );
+        await refreshStatus();
+    } catch (e) {
+        showToast(e.message, 'error');
+    }
+}
+
+function _removeUnclassifiedTilesByIds(faceIds) {
+    const ids = new Set(
+        (Array.isArray(faceIds) ? faceIds : [faceIds])
+            .map(Number)
+            .filter((id) => Number.isFinite(id) && id > 0),
+    );
+    const grid = $('#ai-unclassified-grid');
+    for (const id of ids) {
+        grid?.querySelector(`.ai-unclassified-tile[data-face-id="${id}"]`)?.remove();
+        _unclassifiedSelectedIds.delete(id);
+        _unclassifiedTotal = Math.max(0, _unclassifiedTotal - 1);
+        _unclassifiedOffset = Math.max(0, _unclassifiedOffset - 1);
+    }
+    if (_unclassifiedFocusFaceId && ids.has(_unclassifiedFocusFaceId)) {
+        _unclassifiedFocusFaceId =
+            _unclassifiedSelectedIds.size > 0
+                ? [..._unclassifiedSelectedIds].at(-1)
+                : null;
+    }
+    const countEl = $('#ai-unclassified-count');
+    if (countEl) {
+        countEl.textContent = i18nTf(
+            'maintenance.ai.unclassified.count',
+            { n: _unclassifiedTotal },
+            `${_unclassifiedTotal.toLocaleString()} unclassified`,
+        );
+    }
+    _renderUnclassifiedLoadMore();
+    _syncUnclassifiedSelectionUi();
+    if (grid && !grid.querySelector('.ai-unclassified-tile')) {
+        if (_unclassifiedTotal > 0) {
+            // Cleared the current page but more remain — reload from the start.
+            _unclassifiedOffset = 0;
+            _loadUnclassifiedReview({ append: false });
+        } else {
+            grid.innerHTML = `<div class="col-span-full text-center text-xs text-tg-textSecondary py-8">${escapeHtml(i18nT('maintenance.ai.unclassified.empty', 'No unclassified faces.'))}</div>`;
+        }
     }
 }
 

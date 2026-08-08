@@ -2422,47 +2422,216 @@ export function getAiCounts({ fileTypes = ['photo'], facesEpsilon = 1.05 } = {})
  * Faces with no person that are NOT within `eps` of an excluded centroid.
  * Excluded identities stay `person_id IS NULL` by design; this keeps them
  * out of the Unclassified counter so it reflects true clustering noise.
+ * Soft-deleted downloads are excluded (same filter as `listUnclassifiedFaces`)
+ * so the KPI/total never claims faces the review grid cannot show.
  */
 export function countUnclassifiedFaces(eps = 1.05) {
     const db = getDb();
     const radius = Number.isFinite(eps) && eps > 0 ? Number(eps) : 1.05;
     const excluded = listExcludedCentroids();
+    const baseSql = `
+        SELECT f.embedding
+          FROM faces f
+          JOIN downloads d ON d.id = f.download_id
+         WHERE (f.person_id IS NULL OR f.person_id = -1)
+           AND (d.user_deleted IS NULL OR d.user_deleted = 0)
+    `;
     if (!excluded.length) {
         return db
-            .prepare(`SELECT COUNT(*) AS n FROM faces WHERE person_id IS NULL OR person_id = -1`)
+            .prepare(
+                `SELECT COUNT(*) AS n
+                   FROM faces f
+                   JOIN downloads d ON d.id = f.download_id
+                  WHERE (f.person_id IS NULL OR f.person_id = -1)
+                    AND (d.user_deleted IS NULL OR d.user_deleted = 0)`,
+            )
             .get().n;
     }
     let n = 0;
-    const stmt = db.prepare(
-        `SELECT embedding FROM faces WHERE person_id IS NULL OR person_id = -1`,
-    );
-    for (const row of stmt.iterate()) {
-        if (!row.embedding) {
-            n += 1;
-            continue;
-        }
-        const dim = row.embedding.byteLength / 4;
-        if (!Number.isFinite(dim) || dim < 1) {
-            n += 1;
-            continue;
-        }
-        const emb = new Float32Array(row.embedding.buffer, row.embedding.byteOffset, dim);
-        let nearExcluded = false;
-        for (const s of excluded) {
-            if (s.centroid.length !== dim) continue;
-            let sum = 0;
-            for (let i = 0; i < dim; i++) {
-                const d = emb[i] - s.centroid[i];
-                sum += d * d;
-            }
-            if (Math.sqrt(sum) <= radius) {
-                nearExcluded = true;
-                break;
-            }
-        }
-        if (!nearExcluded) n += 1;
+    for (const row of db.prepare(baseSql).iterate()) {
+        if (!_embeddingNearExcluded(row.embedding, excluded, radius)) n += 1;
     }
     return n;
+}
+
+/**
+ * True when a face embedding blob is within `radius` of any excluded centroid.
+ * @param {Buffer|Uint8Array|null|undefined} embeddingBlob
+ * @param {Array<{ centroid: Float32Array }>} excluded
+ * @param {number} radius
+ */
+function _embeddingNearExcluded(embeddingBlob, excluded, radius) {
+    if (!excluded?.length || !embeddingBlob) return false;
+    const dim = embeddingBlob.byteLength / 4;
+    if (!Number.isFinite(dim) || dim < 1) return false;
+    const emb = new Float32Array(embeddingBlob.buffer, embeddingBlob.byteOffset, dim);
+    for (const s of excluded) {
+        if (s.centroid.length !== dim) continue;
+        let sum = 0;
+        for (let i = 0; i < dim; i++) {
+            const d = emb[i] - s.centroid[i];
+            sum += d * d;
+        }
+        if (Math.sqrt(sum) <= radius) return true;
+    }
+    return false;
+}
+
+/**
+ * Paginated unclassified face rows for the review grid — same shape as
+ * `listFacesForPerson`, omitting faces within `facesEpsilon` of any
+ * excluded centroid (matches `countUnclassifiedFaces`).
+ *
+ * @returns {{ faces: object[], total: number }}
+ */
+export function listUnclassifiedFaces({
+    limit = 50,
+    offset = 0,
+    facesEpsilon = 1.05,
+} = {}) {
+    const lim = Math.max(1, Math.min(200, Number(limit) || 50));
+    const off = Math.max(0, Number(offset) || 0);
+    const radius =
+        Number.isFinite(facesEpsilon) && facesEpsilon > 0 ? Number(facesEpsilon) : 1.05;
+    const db = getDb();
+    const excluded = listExcludedCentroids();
+    const total = countUnclassifiedFaces(radius);
+    if (total === 0 || off >= total) return { faces: [], total };
+
+    const stmt = db.prepare(`
+        SELECT f.id AS face_id, f.download_id, f.x, f.y, f.w, f.h, f.quality_score,
+               f.embedding,
+               d.file_name, d.file_type, d.file_path, d.file_size,
+               d.group_id, d.group_name, d.message_id, d.pinned, d.created_at
+          FROM faces f
+          JOIN downloads d ON d.id = f.download_id
+         WHERE (f.person_id IS NULL OR f.person_id = -1)
+           AND (d.user_deleted IS NULL OR d.user_deleted = 0)
+         ORDER BY d.created_at DESC, f.id DESC
+    `);
+    const faces = [];
+    let skipped = 0;
+    for (const row of stmt.iterate()) {
+        if (_embeddingNearExcluded(row.embedding, excluded, radius)) continue;
+        if (skipped < off) {
+            skipped += 1;
+            continue;
+        }
+        const { embedding: _emb, ...rest } = row;
+        faces.push(rest);
+        if (faces.length >= lim) break;
+    }
+    return { faces, total };
+}
+
+/**
+ * Nearest existing people for a face embedding (suggestion chips / picker).
+ * Also includes people who already have faces on the same download ("clip"),
+ * even when outside matchEps — co-occurrence is a strong prior for video
+ * frames / multi-face photos where embeddings alone are weak.
+ * @returns {{ ok: true, suggestions: Array<{ id: number, label: string|null, faceCount: number, distance: number, sameClip?: boolean }> }
+ *   | { ok: false, reason: 'not_found'|'invalid_id'|'no_embedding' }}
+ */
+export function suggestPeopleForFace(faceId, { matchEps = 0.4, limit = 5 } = {}) {
+    const fid = Number(faceId);
+    if (!Number.isFinite(fid) || fid <= 0) return { ok: false, reason: 'invalid_id' };
+    const radius = Number.isFinite(matchEps) && matchEps > 0 ? Number(matchEps) : 0.4;
+    const lim = Math.max(1, Math.min(20, Number(limit) || 5));
+    const db = getDb();
+    const row = db
+        .prepare('SELECT download_id, embedding FROM faces WHERE id = ?')
+        .get(fid);
+    if (!row) return { ok: false, reason: 'not_found' };
+    if (!row.embedding) return { ok: false, reason: 'no_embedding' };
+    const dim = row.embedding.byteLength / 4;
+    if (!Number.isFinite(dim) || dim < 1) return { ok: false, reason: 'no_embedding' };
+    const emb = new Float32Array(row.embedding.buffer, row.embedding.byteOffset, dim);
+
+    const _euclid = (a, b) => {
+        let sum = 0;
+        for (let i = 0; i < a.length; i++) {
+            const d = a[i] - b[i];
+            sum += d * d;
+        }
+        return Math.sqrt(sum);
+    };
+
+    /** @type {Map<number, { id: number, label: string|null, faceCount: number, distance: number, sameClip: boolean }>} */
+    const byId = new Map();
+
+    const upsert = (entry) => {
+        const prev = byId.get(entry.id);
+        if (!prev) {
+            byId.set(entry.id, entry);
+            return;
+        }
+        byId.set(entry.id, {
+            ...prev,
+            ...entry,
+            sameClip: prev.sameClip || entry.sameClip,
+            distance: Math.min(prev.distance, entry.distance),
+            label: entry.label ?? prev.label,
+            faceCount: entry.faceCount || prev.faceCount,
+        });
+    };
+
+    // 1) Same-clip co-occurrence: other assigned faces on this download.
+    const siblings = db
+        .prepare(
+            `SELECT f.person_id, f.embedding, p.label, p.face_count
+               FROM faces f
+               JOIN people p ON p.id = f.person_id
+              WHERE f.download_id = ?
+                AND f.id != ?
+                AND f.person_id IS NOT NULL
+                AND f.person_id > 0`,
+        )
+        .all(row.download_id, fid);
+    for (const s of siblings) {
+        if (!s.embedding) continue;
+        const sDim = s.embedding.byteLength / 4;
+        if (sDim !== dim) continue;
+        const sEmb = new Float32Array(s.embedding.buffer, s.embedding.byteOffset, sDim);
+        upsert({
+            id: Number(s.person_id),
+            label: s.label ?? null,
+            faceCount: Number(s.face_count) || 0,
+            distance: _euclid(emb, sEmb),
+            sameClip: true,
+        });
+    }
+
+    // 2) Global centroid matches within matchEps.
+    for (const p of listPeopleCentroids()) {
+        if (p.centroid.length !== dim) continue;
+        const distance = _euclid(emb, p.centroid);
+        if (distance <= radius) {
+            upsert({
+                id: p.id,
+                label: p.label,
+                faceCount: p.faceCount,
+                distance,
+                sameClip: false,
+            });
+        }
+    }
+
+    const matches = [...byId.values()];
+    // Same-clip first (strong prior), then nearest embedding distance.
+    matches.sort((a, b) => {
+        if (a.sameClip !== b.sameClip) return a.sameClip ? -1 : 1;
+        return a.distance - b.distance;
+    });
+    return {
+        ok: true,
+        suggestions: matches.slice(0, lim).map((s) => ({
+            id: s.id,
+            label: s.label,
+            faceCount: s.faceCount,
+            distance: s.distance,
+            ...(s.sameClip ? { sameClip: true } : {}),
+        })),
+    };
 }
 
 // ---- Image embeddings -----------------------------------------------------
@@ -2896,6 +3065,55 @@ export function reassignFace(faceId, personId) {
             }
         }
         return { ok: true, oldPersonId: oldPid, newPersonId: pid };
+    });
+    return tx();
+}
+
+/**
+ * Permanently delete a single face detection row. If it belonged to a
+ * person, refresh that person's centroid (or delete the person when empty)
+ * and clear a pinned cover that pointed at this face.
+ *
+ * @returns {{ ok: true, faceId: number, oldPersonId: number|null, personDeleted: boolean }
+ *   | { ok: false, reason: 'invalid_id'|'not_found' }}
+ */
+export function deleteFace(faceId) {
+    const fid = Number(faceId);
+    if (!Number.isFinite(fid) || fid <= 0) return { ok: false, reason: 'invalid_id' };
+    const db = getDb();
+    const tx = db.transaction(() => {
+        const before = db.prepare('SELECT id, person_id FROM faces WHERE id = ?').get(fid);
+        if (!before) return { ok: false, reason: 'not_found' };
+        const oldPid = before.person_id == null ? null : Number(before.person_id);
+        db.prepare('DELETE FROM faces WHERE id = ?').run(fid);
+        let personDeleted = false;
+        if (oldPid != null && Number.isFinite(oldPid) && oldPid > 0) {
+            const now = Date.now();
+            const cover = db
+                .prepare('SELECT cover_face_id FROM people WHERE id = ?')
+                .get(oldPid)?.cover_face_id;
+            if (cover != null && Number(cover) === fid) {
+                db.prepare(
+                    'UPDATE people SET cover_face_id = NULL, updated_at = ? WHERE id = ?',
+                ).run(now, oldPid);
+            }
+            const n = db.prepare('SELECT COUNT(*) AS n FROM faces WHERE person_id = ?').get(oldPid).n;
+            if (n === 0) {
+                db.prepare('DELETE FROM people WHERE id = ?').run(oldPid);
+                personDeleted = true;
+            } else {
+                recomputePersonCentroid(oldPid);
+            }
+        }
+        db.prepare(
+            'UPDATE excluded_people SET cover_face_id = NULL WHERE cover_face_id = ?',
+        ).run(fid);
+        return {
+            ok: true,
+            faceId: fid,
+            oldPersonId: oldPid,
+            personDeleted,
+        };
     });
     return tx();
 }

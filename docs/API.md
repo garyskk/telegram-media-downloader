@@ -182,6 +182,10 @@ Opt-in face detection + clustering, backed by the Python sidecar in `faces-servi
 | `POST`   | `/api/ai/faces/recluster`           | Incremental Phase B only (skip detection) — attach unassigned faces to existing People. Keeps merges/labels. |
 | `POST`   | `/api/ai/faces/rebuild`             | Destructive full DBSCAN — wipe People + exclusion denylist and reshape all clusters (ε reshuffle). Merges/exclusions lost; labels/covers carry over when centroids match. |
 | `POST`   | `/api/ai/faces/reindex`             | Confirm-sheet gated — wipes every detection + cluster + exclusion denylist and re-scans every photo. Use after switching detector model. Broadcasts `ai_faces_reindexed`. |
+| `GET`    | `/api/ai/faces/unclassified`        | Paginated unclassified face crops (`person_id` null, excluding denylisted). `{faces, total}`. `?limit=&offset=`. |
+| `GET`    | `/api/ai/faces/:id/suggestions`     | Nearest People within `labelMatchEps`, plus same-download (“clip”) co-occurrence — `{suggestions:[{id,label,faceCount,distance,sameClip?}]}`. |
+| `POST`   | `/api/ai/faces/:id/new-person`      | `{label?}` — create a new Person from this face (promote unclassified / split-of-one). |
+| `DELETE` | `/api/ai/faces/:id`                 | Permanently delete one face detection (Unclassified review remove). |
 | `POST`   | `/api/ai/preload-model/:name`       | Trigger background download of a face detection model. Proxies to sidecar `POST /preload/:name`. Returns `{model, status}`. `status` ∈ `not_downloaded`, `downloading`, `ready`, `error:…`. |
 | `GET`    | `/api/ai/preload-model/:name/status`| Check model download status. Returns `{model, status}`. |
 | `GET`    | `/api/ai/people`                    | Cluster list with cover-face + face count + `video_face_count` per person. `?page=&limit=`. |
