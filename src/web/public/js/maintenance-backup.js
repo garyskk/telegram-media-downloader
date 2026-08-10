@@ -119,7 +119,7 @@ function _renderCard(dest) {
                         ${lockHint}
                     </div>
                     <h3 class="text-tg-text text-sm font-semibold mt-1 truncate">${escapeHtml(dest.name)}</h3>
-                    <div class="text-[11px] text-tg-textSecondary capitalize">${escapeHtml(dest.mode)}${dest.cron ? ' · ' + escapeHtml(dest.cron) : ''}</div>
+                    <div class="text-[11px] text-tg-textSecondary capitalize">${escapeHtml(dest.mode)}${dest.mode === 'snapshot' && dest.cron ? ' · ' + escapeHtml(dest.cron) : ''}</div>
                 </div>
             </div>
             <div class="grid grid-cols-3 gap-2 mt-1">
@@ -210,6 +210,47 @@ function _renderAll() {
         cards.innerHTML = _destinations.map(_renderCard).join('');
     }
     _renderStats();
+    _renderCoverageStatus();
+}
+
+/** Live hint under the coverage tip: which of mirror / snapshot are present. */
+function _renderCoverageStatus() {
+    const el = $('backup-coverage-status');
+    if (!el) return;
+    const enabled = _destinations.filter((d) => d.enabled !== false && d.enabled !== 0);
+    const hasMirror = enabled.some((d) => d.mode === 'mirror');
+    const hasSnapshot = enabled.some((d) => d.mode === 'snapshot' || d.mode === 'manual');
+    if (!enabled.length) {
+        el.classList.add('hidden');
+        el.textContent = '';
+        return;
+    }
+    el.classList.remove('hidden');
+    if (hasMirror && hasSnapshot) {
+        el.textContent = i18nT(
+            'maintenance.backup.coverage_ok',
+            'Coverage looks complete — mirror + snapshot/manual are both configured.',
+        );
+        el.classList.remove('text-tg-orange');
+        el.classList.add('text-tg-green');
+    } else if (hasMirror) {
+        el.textContent = i18nT(
+            'maintenance.backup.coverage_missing_snapshot',
+            'Mirror only — add a Scheduled snapshot destination for DB, faces, config, and sessions.',
+        );
+        el.classList.remove('text-tg-green');
+        el.classList.add('text-tg-orange');
+    } else if (hasSnapshot) {
+        el.textContent = i18nT(
+            'maintenance.backup.coverage_missing_mirror',
+            'Snapshot only — add a Continuous mirror destination for the media library files.',
+        );
+        el.classList.remove('text-tg-green');
+        el.classList.add('text-tg-orange');
+    } else {
+        el.classList.add('hidden');
+        el.textContent = '';
+    }
 }
 
 function _renderStats() {
@@ -458,15 +499,20 @@ function _renderProviderHelp(providerName) {
     return '';
 }
 
-function _renderField(field, currentValue) {
+function _renderField(field, currentValue, { isEdit = false } = {}) {
     const val = currentValue == null ? '' : String(currentValue);
     const id = `bk-field-${field.name}`;
-    const label = `<label for="${id}" class="block text-xs text-tg-textSecondary mb-1">${escapeHtml(field.label)}${field.required ? ' *' : ''}</label>`;
+    const label = `<label for="${id}" class="block text-xs text-tg-textSecondary mb-1">${escapeHtml(field.label)}${field.required && !(isEdit && (field.secret || field.type === 'password')) ? ' *' : ''}</label>`;
     const help = field.help
         ? `<div class="text-[11px] text-tg-textSecondary mt-1">${escapeHtml(field.help)}</div>`
         : '';
+    const isSecret = !!(field.secret || field.type === 'password');
+    const placeholder =
+        isEdit && isSecret
+            ? i18nT('maintenance.backup.secret_keep_placeholder', 'Leave blank to keep existing')
+            : field.placeholder || '';
     if (field.type === 'textarea') {
-        return `<div class="mb-3">${label}<textarea id="${id}" data-field="${escapeHtml(field.name)}" class="tg-input w-full text-sm font-mono" rows="4" placeholder="${escapeHtml(field.placeholder || '')}">${escapeHtml(val)}</textarea>${help}</div>`;
+        return `<div class="mb-3">${label}<textarea id="${id}" data-field="${escapeHtml(field.name)}" class="tg-input w-full text-sm font-mono" rows="4" placeholder="${escapeHtml(placeholder)}">${escapeHtml(val)}</textarea>${help}</div>`;
     }
     if (field.type === 'select') {
         const opts = (field.options || [])
@@ -479,7 +525,7 @@ function _renderField(field, currentValue) {
     }
     const inputType =
         field.type === 'password' ? 'password' : field.type === 'number' ? 'number' : 'text';
-    return `<div class="mb-3">${label}<input type="${inputType}" id="${id}" data-field="${escapeHtml(field.name)}" class="tg-input w-full text-sm" placeholder="${escapeHtml(field.placeholder || '')}" value="${escapeHtml(val)}" autocomplete="off" />${help}</div>`;
+    return `<div class="mb-3">${label}<input type="${inputType}" id="${id}" data-field="${escapeHtml(field.name)}" class="tg-input w-full text-sm" placeholder="${escapeHtml(placeholder)}" value="${escapeHtml(val)}" autocomplete="off" />${help}</div>`;
 }
 
 function _collectFields(root) {
@@ -499,8 +545,14 @@ async function _openWizard(existing) {
     const renderBody = () => {
         const provider = providers.find((p) => p.name === chosenProvider) || providers[0];
         const schema = provider?.configSchema || [];
-        const config = {}; // edit mode never echoes secrets back — operator re-enters
-        const fieldsHtml = schema.map((f) => _renderField(f, config[f.name])).join('');
+        // Edit mode: prefill non-secret fields from the scrubbed config.
+        // Secrets stay blank — leave empty to keep the stored value.
+        const config = isEdit && existing?.config && typeof existing.config === 'object'
+            ? existing.config
+            : {};
+        const fieldsHtml = schema
+            .map((f) => _renderField(f, config[f.name], { isEdit }))
+            .join('');
         const helpHtml = _renderProviderHelp(provider?.name);
         return `
             <div class="space-y-4">
@@ -533,16 +585,17 @@ async function _openWizard(existing) {
                     <h4 class="text-xs uppercase tracking-wide text-tg-textSecondary mb-2" data-i18n="maintenance.backup.section.mode">Mode + schedule</h4>
                     <label class="flex items-start gap-2 mb-2 cursor-pointer">
                         <input type="radio" name="bk-mode" value="mirror" ${(existing?.mode || 'mirror') === 'mirror' ? 'checked' : ''}>
-                        <span><span class="text-tg-text text-sm" data-i18n="maintenance.backup.mode.mirror">Continuous mirror</span><br><span class="text-[11px] text-tg-textSecondary" data-i18n="maintenance.backup.mode.mirror_help">Every newly-downloaded file is queued for upload right away.</span></span>
+                        <span><span class="text-tg-text text-sm" data-i18n="maintenance.backup.mode.mirror">Continuous mirror</span><br><span class="text-[11px] text-tg-textSecondary" data-i18n="maintenance.backup.mode.mirror_help">Uploads media files and, on Run now, removes remote copies that are no longer in the live library. Does not include the database or face index.</span></span>
                     </label>
                     <label class="flex items-start gap-2 mb-2 cursor-pointer">
                         <input type="radio" name="bk-mode" value="snapshot" ${existing?.mode === 'snapshot' ? 'checked' : ''}>
-                        <span><span class="text-tg-text text-sm" data-i18n="maintenance.backup.mode.snapshot">Scheduled snapshot</span><br><span class="text-[11px] text-tg-textSecondary" data-i18n="maintenance.backup.mode.snapshot_help">Periodic full archive of db.sqlite + config + sessions, retained N copies.</span></span>
+                        <span><span class="text-tg-text text-sm" data-i18n="maintenance.backup.mode.snapshot">Scheduled snapshot</span><br><span class="text-[11px] text-tg-textSecondary" data-i18n="maintenance.backup.mode.snapshot_help">Archives db.sqlite (incl. faces) + config + sessions under snapshots/. Does not include media files.</span></span>
                     </label>
                     <label class="flex items-start gap-2 mb-3 cursor-pointer">
                         <input type="radio" name="bk-mode" value="manual" ${existing?.mode === 'manual' ? 'checked' : ''}>
-                        <span><span class="text-tg-text text-sm" data-i18n="maintenance.backup.mode.manual">Manual only</span><br><span class="text-[11px] text-tg-textSecondary" data-i18n="maintenance.backup.mode.manual_help">No auto-uploads — fires only when you click "Run now".</span></span>
+                        <span><span class="text-tg-text text-sm" data-i18n="maintenance.backup.mode.manual">Manual only</span><br><span class="text-[11px] text-tg-textSecondary" data-i18n="maintenance.backup.mode.manual_help">Same archive as snapshot, but only when you click "Run now" — no cron.</span></span>
                     </label>
+                    <p class="text-[11px] text-tg-textSecondary mb-3" data-i18n="maintenance.backup.mode.combo_hint">Tip: create two destinations (mirror + snapshot) for a full backup. They can share one bucket — snapshots use the snapshots/ folder automatically.</p>
                     <div id="bk-cron-row" class="flex gap-2 items-center" style="display:none">
                         <label class="text-xs text-tg-textSecondary w-24">Cron</label>
                         <input id="bk-cron" class="tg-input w-full text-sm font-mono" value="${escapeHtml(existing?.cron || '0 3 * * *')}" placeholder="0 3 * * *">
@@ -684,7 +737,9 @@ function _wireWizard(root, sheet, providers, existing) {
             provider,
             config: fields,
             mode,
-            cron: cron || null,
+            // Cron only applies to scheduled snapshots — clear it for
+            // mirror/manual so cards and the DB don't show a leftover schedule.
+            cron: mode === 'snapshot' ? cron || null : null,
             retainCount,
             encryption,
             passphrase: passphrase || undefined,

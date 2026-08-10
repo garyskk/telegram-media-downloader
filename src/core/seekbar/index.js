@@ -183,7 +183,9 @@ export async function purgeSeekbarForDownload(downloadId, prefetchedRow) {
             /* best-effort */
         }
     }
-    if (!prefetchedRow) deleteSeekbarSprite(id);
+    // Always drop the DB row — previously skipped when prefetchedRow was
+    // passed, which left orphan seekbar_sprites after soft-delete.
+    deleteSeekbarSprite(id);
     return 1;
 }
 

@@ -173,6 +173,14 @@ If the sidecar itself won't come up, check **Maintenance → Seekbar previews �
 
 Pre-v2.17 builds streamed the seekbar backfill via better-sqlite3's `.iterate()` cursor, which holds an exclusive connection lock across `await` boundaries — so a long-running scan could block the realtime downloader's `kv['queue_history']` writer for minutes and surface as `TypeError: This database connection is busy executing a query`. v2.17 rewrote the scan-runner to keyset pagination (`.all()` per batch); upgrade to fix.
 
+## Backup Run now: "This database connection is busy executing a query"
+
+Mirror catch-up used to walk `downloads` with better-sqlite3 `.iterate()` while enqueueing jobs on the same connection — that throws the busy-connection error and aborts the run. Current builds use keyset-paginated `.all()` batches. Upgrade, then click **Run now** again.
+
+## Backup crash-loop: `ENOENT` opening a path under `data/downloads/`
+
+Mirror upload opened missing files via `createReadStream` without a pre-check; on S3/etc. that became an uncaughtException and Docker restarted the container. Usually the DB still has soft-deleted (`user_deleted=1`) or externally deleted paths that were queued for upload. Current builds fail those jobs permanently instead of crashing. Soft-delete also clears faces for the tombstone; mirror **Run now** later prunes matching remote orphans. Upgrade and rebuild; if the container is still looping on an old image, pause/disable the mirror destination until then.
+
 ## NSFW classifier won't load: "sharp not loadable"
 
 The classifier's lazy loader couldn't `require('sharp')`. Common causes + fixes:

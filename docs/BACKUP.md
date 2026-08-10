@@ -15,19 +15,42 @@ with it. Six providers are supported out of the box:
 
 ## Modes
 
-Each destination runs in one of three modes:
+Each destination runs in **one** of three modes (create two destinations
+if you want both mirror and snapshot — they can share the same bucket or
+folder; snapshots land under `snapshots/` automatically, so no separate
+path field is needed):
 
-- **Continuous mirror.** Every newly-downloaded file is queued for
-  upload as soon as the downloader emits `download_complete`. The queue
-  is persistent — restarting the server does not lose pending uploads.
+- **Continuous mirror.** Media files only. Every newly-downloaded file
+  is queued for upload on `download_complete`. The queue is persistent —
+  restarting the server does not lose pending uploads. **Run now** also
+  reconciles the remote: lists the destination, compares to the live
+  local library (`user_deleted = 0`), uploads anything missing, and
+  **deletes remote orphans** that are no longer live locally. Soft-deleted
+  or externally removed files are not pruned from the remote until the
+  next Run now. The `snapshots/` prefix is never touched by reconcile, so
+  a shared bucket with a snapshot destination stays safe.
 - **Scheduled snapshot.** A cron expression (`0 3 * * *` for nightly
-  3am, etc.) triggers a full archive of `db.sqlite` (which now also
-  carries runtime config + web sessions) + `sessions/` packed into a
-  single `.tar.gz`, uploaded to a
-  `snapshots/` prefix on the destination. Older archives are pruned to
-  keep at most `retain_count` copies (default 7).
-- **Manual.** No automatic uploads. The destination only fires on
-  `POST /api/backup/destinations/:id/run`.
+  3am, etc.) builds a `.tar.gz` of `db.sqlite` (downloads metadata,
+  **faces / people**, NSFW flags, etc.) + `config.json` + `sessions/`,
+  uploaded under `snapshots/`. Older archives are pruned to at most
+  `retain_count` copies (default 7). Does **not** include media files
+  under `downloads/`.
+- **Manual.** Same archive as snapshot, but only on
+  `POST /api/backup/destinations/:id/run` (or the dashboard **Run now**
+  button) — no cron.
+
+### Full coverage
+
+| What | Continuous mirror | Snapshot / Manual |
+|------|-------------------|-------------------|
+| Media under `downloads/` | Yes | No |
+| `db.sqlite` (incl. faces) | No | Yes |
+| `config.json` + `sessions/` | No | Yes |
+| Faces sidecar binary / models | No (re-downloadable) | No |
+
+For a recoverable off-site copy of **both** the library and the face
+index / settings, configure **both** a mirror destination and a
+snapshot (or manual) destination.
 
 ## Adding a destination
 
@@ -35,8 +58,10 @@ Open **Maintenance → Backup → Add destination** in the dashboard. The
 wizard walks through:
 
 1. Display name + provider.
-2. Provider-specific connection form.
-3. Mode (mirror / snapshot / manual) + cron / retention.
+2. Provider-specific connection form (on **Edit**, non-secret fields are
+   prefilled; secrets stay blank — leave empty to keep the stored value).
+3. Mode (mirror / snapshot / manual) + cron / retention (cron only applies
+   to snapshot mode).
 4. Optional client-side encryption (AES-256-GCM, see below).
 5. Test connection + Save.
 
@@ -314,6 +339,8 @@ For mirror-mode files (individual photos / videos), files are
 uploaded as-is and can be downloaded directly with any S3 client / NAS
 file manager. Re-running **Maintenance → Re-index from disk** after
 copying them back into `data/downloads/` rebuilds the catalogue.
+After a restore, run mirror **Run now** once if you also want the
+remote pruned to match the restored library.
 
 ## Quotas + failure modes + retry
 
@@ -330,6 +357,16 @@ copying them back into `data/downloads/` rebuilds the catalogue.
   uploads stop within a couple of seconds.
 - **Per-destination concurrency** defaults to 3 parallel uploads.
   Override with `BACKUP_WORKERS_PER_DEST=N` in the environment.
+- **Missing local file during upload.** Soft-deleted or externally
+  removed paths used to crash the process (`ENOENT` from
+  `createReadStream`). The worker now fails that job permanently
+  instead of restart-looping. Soft-delete also clears faces /
+  embeddings / pending upload jobs for the tombstoned download; the
+  downloads row is kept (`user_deleted=1`) so Telegram backfill does
+  not re-fetch it.
+- **Mirror Run now + LIST cost.** Reconcile lists the remote prefix
+  once per Run now. On AWS S3 that is billable `LIST` traffic — prefer
+  R2 / B2 / a NAS if you click Run now often on a huge library.
 
 ## Cost considerations
 

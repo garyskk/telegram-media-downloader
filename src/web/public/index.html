@@ -3944,6 +3944,16 @@
                         </div>
                     </section>
 
+                    <!-- Full-coverage tip: one mode alone is not a complete backup. -->
+                    <div id="backup-coverage-tip" class="mb-3 flex items-start gap-2 px-3 py-2.5 rounded-xl bg-tg-blue/10 border border-tg-blue/20 text-tg-blue text-xs">
+                        <i class="ri-information-line shrink-0 mt-px"></i>
+                        <div class="min-w-0 space-y-1">
+                            <p data-i18n="maintenance.backup.coverage_tip">For a full off-site copy, add both a Continuous mirror (media files; Run now also prunes remote orphans) and a Scheduled snapshot (database, faces, config, sessions). One destination = one mode — create two if you want both.</p>
+                            <p class="text-tg-blue/80" data-i18n="maintenance.backup.coverage_path_tip">They can share the same bucket or folder. Snapshots upload under <code class="font-mono text-[11px]">snapshots/</code> automatically — no separate path setting needed.</p>
+                            <p id="backup-coverage-status" class="hidden font-medium"></p>
+                        </div>
+                    </div>
+
                     <div id="backup-empty" class="hidden bg-tg-panel rounded-xl p-8 text-center text-sm text-tg-textSecondary mb-3">
                         <i class="ri-cloud-off-line text-3xl block mb-2 text-tg-textSecondary/60"></i>
                         <div data-i18n="maintenance.backup.empty">No destinations yet — click "Add destination" to mirror your library off-host.</div>

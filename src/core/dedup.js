@@ -20,7 +20,7 @@
 
 import fs from 'fs';
 import path from 'path';
-import { getDb } from './db.js';
+import { getDb, deleteDownloadsBy } from './db.js';
 import { sha256OfFile, sha256OfFileViaPool } from './checksum.js';
 import { getDownloadsDir } from './paths.js';
 import { deferDelete } from './deferred-delete.js';
@@ -425,15 +425,8 @@ export function deleteByIds(ids) {
     // already queued for removal by deferDelete above. Keeping the row means
     // isDownloaded(groupId, messageId) still returns true, so a subsequent
     // backfill will not re-download files the operator removed via dedup.
-    // Gallery queries already filter out user_deleted rows.
-    let removed = 0;
-    for (let i = 0; i < idsToDrop.length; i += SQL_IN_CHUNK) {
-        const slice = idsToDrop.slice(i, i + SQL_IN_CHUNK);
-        const ph = slice.map(() => '?').join(',');
-        const r = db
-            .prepare(`UPDATE downloads SET user_deleted = 1 WHERE id IN (${ph})`)
-            .run(...slice);
-        removed += r.changes;
-    }
+    // Gallery queries already filter out user_deleted rows. Goes through
+    // deleteDownloadsBy so faces / embeddings / pending backup jobs are wiped.
+    const removed = idsToDrop.length ? deleteDownloadsBy({ ids: idsToDrop }) : 0;
     return { removed, freedBytes: freed, missingFiles: missing };
 }
