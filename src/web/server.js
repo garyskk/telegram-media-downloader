@@ -5130,7 +5130,9 @@ app.delete('/api/file', async (req, res) => {
         const matchingIds = matchingRows.map((row) => row.id);
         const freedBytes = matchingRows.reduce((s, row) => s + (Number(row.file_size) || 0), 0);
         const seekbarMap = collectSeekbarPaths(matchingIds);
-        db.prepare('UPDATE downloads SET user_deleted = 1 WHERE file_name = ?').run(fileName);
+        // Soft-delete via deleteDownloadsBy so faces / embeddings / pending
+        // backup jobs are wiped. Tombstone keeps isDownloaded() true.
+        if (matchingIds.length) deleteDownloadsBy({ ids: matchingIds });
         runtime.decrementDiskUsage(freedBytes);
         for (const id of matchingIds) {
             try {
@@ -5140,9 +5142,6 @@ app.delete('/api/file', async (req, res) => {
                 await purgeSeekbarForDownload(id, seekbarMap.get(id));
             } catch {}
         }
-        try {
-            purgeOrphanPeople();
-        } catch {}
         import('../core/deferred-delete.js').then((m) => m.startDrain()).catch(() => {});
 
         res.json({ success: true });
@@ -10786,15 +10785,12 @@ app.post('/api/cluster/files/delete', async (req, res) => {
         const seekbarRow = getDb()
             .prepare('SELECT sprite_path, meta_path FROM seekbar_sprites WHERE download_id = ?')
             .get(Number(row.id));
-        // Mark as user_deleted=1 instead of hard-deleting so isDownloaded()
-        // still returns true and backfill does not re-fetch this file.
-        getDb().prepare('UPDATE downloads SET user_deleted = 1 WHERE id = ?').run(Number(row.id));
+        // Soft-delete via deleteDownloadsBy so faces / embeddings / pending
+        // backup jobs are wiped. Tombstone keeps isDownloaded() true.
+        deleteDownloadsBy({ ids: [Number(row.id)] });
         if (freedBytes > 0) runtime.decrementDiskUsage(freedBytes);
         purgeThumbsForDownload(row.id).catch(() => {});
         purgeSeekbarForDownload(row.id, seekbarRow || undefined).catch(() => {});
-        try {
-            purgeOrphanPeople();
-        } catch {}
         import('../core/deferred-delete.js').then((m) => m.startDrain()).catch(() => {});
         recordClusterAudit({
             kind: 'cross_delete',
@@ -12579,16 +12575,10 @@ app.use('/files', async (req, res, next) => {
                             .map((r) => r.id);
                         if (!matchIds.length) return;
                         const seekbarMap = collectSeekbarPaths(matchIds);
-                        // Mark as user_deleted=1 instead of hard-deleting. Keeping
-                        // the row means isDownloaded() still returns true, so a
-                        // subsequent backfill will not re-download this file.
-                        // Gallery queries already filter out user_deleted rows.
-                        const result = db
-                            .prepare(
-                                `UPDATE downloads SET user_deleted = 1 WHERE file_path = ? OR file_path = ?`,
-                            )
-                            .run(fwd, bwd);
-                        if (result.changes > 0) {
+                        // Soft-delete via deleteDownloadsBy so faces /
+                        // embeddings / pending backup jobs are wiped.
+                        const changes = deleteDownloadsBy({ ids: matchIds });
+                        if (changes > 0) {
                             for (const id of matchIds) {
                                 purgeThumbsForDownload(id).catch(() => {});
                                 purgeSeekbarForDownload(id, seekbarMap.get(id)).catch(() => {});

@@ -20,7 +20,7 @@
 import fs from 'fs/promises';
 import path from 'path';
 import crypto from 'crypto';
-import { getDb, insertDownload, purgeOrphanPeople } from './db.js';
+import { getDb, insertDownload, deleteDownloadsBy, purgeSoftDeletedArtifacts } from './db.js';
 import { sanitizeName } from './downloader.js';
 import { getDownloadsDir } from './paths.js';
 import { purgeThumbsForDownload } from './thumbs.js';
@@ -163,30 +163,13 @@ export async function sweep(onProgress) {
         if (deleteIds.length) {
             _emit({ processed, total, stage: 'pruning' });
             const seekbarMap = collectSeekbarPaths(deleteIds);
-            // Mark rows as user_deleted=1 instead of hard-deleting them.
-            // This keeps isDownloaded(groupId, messageId) returning true so
-            // a subsequent backfill does not re-fetch files the operator
-            // intentionally removed. Gallery queries already filter these rows.
-            const UPDATE_CHUNK = 500;
-            const tx = getDb().transaction((ids) => {
-                let changed = 0;
-                for (let i = 0; i < ids.length; i += UPDATE_CHUNK) {
-                    const slice = ids.slice(i, i + UPDATE_CHUNK);
-                    const stmt = getDb().prepare(
-                        `UPDATE downloads SET user_deleted = 1 WHERE id IN (${slice.map(() => '?').join(',')})`,
-                    );
-                    changed += stmt.run(...slice).changes;
-                }
-                return changed;
-            });
-            result.pruned = tx(deleteIds);
+            // Soft-delete via deleteDownloadsBy so faces / embeddings /
+            // pending backup jobs are wiped along with the tombstone.
+            result.pruned = deleteDownloadsBy({ ids: deleteIds });
             for (const id of deleteIds) {
                 purgeThumbsForDownload(id).catch(() => {});
                 purgeSeekbarForDownload(id, seekbarMap.get(id)).catch(() => {});
             }
-            try {
-                purgeOrphanPeople();
-            } catch {}
             try {
                 _broadcast({
                     type: 'integrity_swept',
@@ -214,6 +197,22 @@ export function start({ broadcast, intervalMin = 60, batchSize = 64 } = {}) {
     if (broadcast) _broadcast = broadcast;
     if (Number.isFinite(batchSize) && batchSize > 0) _batchSize = Math.floor(batchSize);
     if (_timer) clearInterval(_timer);
+    // Heal soft-deleted rows that predate face/artifact cleanup on delete.
+    try {
+        const healed = purgeSoftDeletedArtifacts();
+        const n =
+            (healed.faces || 0) +
+            (healed.embeddings || 0) +
+            (healed.tags || 0) +
+            (healed.backupJobs || 0);
+        if (n > 0) {
+            console.log(
+                `[integrity] purged soft-deleted artifacts — faces=${healed.faces} embeddings=${healed.embeddings} tags=${healed.tags} backupJobs=${healed.backupJobs}`,
+            );
+        }
+    } catch (e) {
+        console.warn('[integrity] soft-deleted artifact purge failed:', e.message);
+    }
     setTimeout(() => {
         sweep()
             .then(({ scanned, pruned }) => {

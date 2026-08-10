@@ -1661,26 +1661,134 @@ export function getDownloadById(id) {
     return getDb().prepare('SELECT * FROM downloads WHERE id = ?').get(numId) || null;
 }
 
-/** Bulk-delete by ids (preferred) or file_paths. Returns the number removed.
- *  Also purges orphaned people rows whose faces were cascade-deleted.
- *  Rows are marked user_deleted=1 rather than hard-deleted so that
- *  isDownloaded() still returns true and backfill does not re-fetch them. */
+/**
+ * Soft-delete downloads by ids (preferred) or file_paths.
+ *
+ * The downloads row is kept with `user_deleted=1` so isDownloaded() still
+ * returns true and Telegram backfill does not re-fetch the file. Side
+ * effects that soft-delete previously left behind are wiped here:
+ * faces, image_embeddings, image_tags, seekbar_sprites, and any
+ * pending/uploading backup_jobs for those download ids. Orphan people
+ * (no remaining faces) are purged afterwards.
+ *
+ * Returns the number of downloads rows updated.
+ */
 export function deleteDownloadsBy(opts) {
     const db = getDb();
-    let removed = 0;
-    if (Array.isArray(opts?.ids) && opts.ids.length) {
-        const stmt = db.prepare('UPDATE downloads SET user_deleted = 1 WHERE id = ?');
-        const tx = db.transaction(() => opts.ids.reduce((n, id) => n + stmt.run(id).changes, 0));
-        removed = tx();
-    } else if (Array.isArray(opts?.filePaths) && opts.filePaths.length) {
-        const stmt = db.prepare('UPDATE downloads SET user_deleted = 1 WHERE file_path = ?');
-        const tx = db.transaction(() =>
-            opts.filePaths.reduce((n, p) => n + stmt.run(p).changes, 0),
-        );
-        removed = tx();
-    }
-    if (removed > 0) purgeOrphanPeople();
+    const ids = _resolveSoftDeleteIds(db, opts);
+    if (!ids.length) return 0;
+
+    const soft = db.prepare('UPDATE downloads SET user_deleted = 1 WHERE id = ?');
+    const removed = db.transaction((idList) => {
+        let n = 0;
+        for (const id of idList) n += soft.run(id).changes;
+        _purgeArtifactsForDownloadIds(db, idList);
+        return n;
+    })(ids);
+
+    purgeOrphanPeople();
     return removed;
+}
+
+/**
+ * One-shot cleanup for soft-deleted rows that predate face/artifact
+ * wiping on delete. Safe to run repeatedly (idempotent).
+ *
+ * @returns {{ faces:number, embeddings:number, tags:number, seekbar:number, backupJobs:number }}
+ */
+export function purgeSoftDeletedArtifacts() {
+    const db = getDb();
+    const result = db.transaction(() => {
+        const faces = db
+            .prepare(
+                `DELETE FROM faces WHERE download_id IN (
+                    SELECT id FROM downloads WHERE user_deleted = 1
+                )`,
+            )
+            .run().changes;
+        const embeddings = db
+            .prepare(
+                `DELETE FROM image_embeddings WHERE download_id IN (
+                    SELECT id FROM downloads WHERE user_deleted = 1
+                )`,
+            )
+            .run().changes;
+        const tags = db
+            .prepare(
+                `DELETE FROM image_tags WHERE download_id IN (
+                    SELECT id FROM downloads WHERE user_deleted = 1
+                )`,
+            )
+            .run().changes;
+        const seekbar = db
+            .prepare(
+                `DELETE FROM seekbar_sprites WHERE download_id IN (
+                    SELECT id FROM downloads WHERE user_deleted = 1
+                )`,
+            )
+            .run().changes;
+        const backupJobs = db
+            .prepare(
+                `UPDATE backup_jobs
+                    SET status = 'failed',
+                        error = 'download soft-deleted',
+                        finished_at = ?
+                  WHERE status IN ('pending', 'uploading')
+                    AND download_id IN (
+                        SELECT id FROM downloads WHERE user_deleted = 1
+                    )`,
+            )
+            .run(Date.now()).changes;
+        return { faces, embeddings, tags, seekbar, backupJobs };
+    })();
+    purgeOrphanPeople();
+    return result;
+}
+
+function _resolveSoftDeleteIds(db, opts) {
+    const out = [];
+    const seen = new Set();
+    const push = (id) => {
+        const n = Number(id);
+        if (!Number.isFinite(n) || n <= 0 || seen.has(n)) return;
+        seen.add(n);
+        out.push(n);
+    };
+    if (Array.isArray(opts?.ids)) {
+        for (const id of opts.ids) push(id);
+    }
+    if (Array.isArray(opts?.filePaths) && opts.filePaths.length) {
+        const stmt = db.prepare('SELECT id FROM downloads WHERE file_path = ?');
+        for (const p of opts.filePaths) {
+            if (p == null || p === '') continue;
+            const row = stmt.get(String(p));
+            if (row) push(row.id);
+        }
+    }
+    return out;
+}
+
+/** Wipe AI / seekbar / pending-backup side effects for soft-deleted ids. */
+function _purgeArtifactsForDownloadIds(db, ids) {
+    if (!ids.length) return;
+    const CHUNK = 500;
+    const now = Date.now();
+    for (let i = 0; i < ids.length; i += CHUNK) {
+        const slice = ids.slice(i, i + CHUNK);
+        const ph = slice.map(() => '?').join(',');
+        db.prepare(`DELETE FROM faces WHERE download_id IN (${ph})`).run(...slice);
+        db.prepare(`DELETE FROM image_embeddings WHERE download_id IN (${ph})`).run(...slice);
+        db.prepare(`DELETE FROM image_tags WHERE download_id IN (${ph})`).run(...slice);
+        db.prepare(`DELETE FROM seekbar_sprites WHERE download_id IN (${ph})`).run(...slice);
+        db.prepare(
+            `UPDATE backup_jobs
+                SET status = 'failed',
+                    error = 'download soft-deleted',
+                    finished_at = ?
+              WHERE status IN ('pending', 'uploading')
+                AND download_id IN (${ph})`,
+        ).run(now, ...slice);
+    }
 }
 
 export function purgeOrphanPeople() {

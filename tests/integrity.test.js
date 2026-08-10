@@ -1,6 +1,6 @@
-// Integrity sweep: confirms the boot/periodic prune walks every row, deletes
-// the ones whose file is missing on disk, and — most importantly — chunks
-// the DELETE statement so a sweep with >999 dead rows doesn't blow up on
+// Integrity sweep: confirms the boot/periodic prune walks every row, soft-
+// deletes the ones whose file is missing on disk, and — most importantly —
+// chunks the UPDATE so a sweep with >999 dead rows doesn't blow up on
 // SQLite's SQLITE_LIMIT_VARIABLE_NUMBER cap (default 999 on older builds).
 
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
@@ -46,7 +46,7 @@ function insertRow(i, { withFile } = {}) {
 }
 
 describe('integrity.sweep', () => {
-    it('chunks DELETE so >999 dead rows do not hit SQLITE_LIMIT_VARIABLE_NUMBER', async () => {
+    it('chunks soft-delete so >999 dead rows do not hit SQLITE_LIMIT_VARIABLE_NUMBER', async () => {
         // Insert 1500 rows whose files don't exist on disk. Pre-fix, the
         // sweep built a single `DELETE WHERE id IN (?,?,…)` with 1500
         // placeholders and threw "too many SQL variables" on builds where
@@ -57,8 +57,15 @@ describe('integrity.sweep', () => {
         expect(r.scanned).toBe(1500);
         expect(r.pruned).toBe(1500);
 
+        // Soft-delete keeps tombstones so isDownloaded() blocks re-fetch.
         const remaining = db.prepare('SELECT COUNT(*) AS n FROM downloads').get().n;
-        expect(remaining).toBe(0);
+        expect(remaining).toBe(1500);
+        const live = db
+            .prepare(
+                `SELECT COUNT(*) AS n FROM downloads WHERE user_deleted IS NULL OR user_deleted = 0`,
+            )
+            .get().n;
+        expect(live).toBe(0);
     });
 
     it('reports counts when every file is missing', async () => {

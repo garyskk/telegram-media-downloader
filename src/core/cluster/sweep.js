@@ -16,7 +16,14 @@
  *   tryStart()  /  getStatus()  /  abort()
  */
 
-import { findCrossClusterDuplicates, recordClusterAudit, kvGet, kvSet } from '../db.js';
+import {
+    findCrossClusterDuplicates,
+    recordClusterAudit,
+    kvGet,
+    kvSet,
+    getDb,
+    deleteDownloadsBy,
+} from '../db.js';
 import { createJobTracker } from '../job-tracker.js';
 import { getSelfPeerId } from './identity.js';
 import fs from 'fs/promises';
@@ -179,12 +186,10 @@ export async function resolveConflict(conflictId, keep) {
                 } catch {
                     await fs.unlink(abs).catch(() => {});
                 }
-                // Mark as user_deleted=1 instead of hard-deleting so
-                // isDownloaded() still returns true and backfill does not
-                // re-fetch this file after the cluster dedup sweep.
-                getDb()
-                    .prepare('UPDATE downloads SET user_deleted = 1 WHERE id = ?')
-                    .run(id);
+                // Soft-delete via deleteDownloadsBy so faces / embeddings /
+                // pending backup jobs are wiped. Tombstone keeps
+                // isDownloaded() true after cluster dedup.
+                deleteDownloadsBy({ ids: [id] });
                 purgeThumbsForDownload(id).catch(() => {});
                 purgeSeekbarForDownload(id, seekbarRow || undefined).catch(() => {});
                 unlinked++;

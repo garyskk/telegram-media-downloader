@@ -190,6 +190,9 @@ export function updateDestination(id, patch = {}) {
         next.mode = patch.mode;
     }
     if (patch.cron !== undefined) next.cron = patch.cron || null;
+    // Mirror / manual never schedule — drop any leftover cron so the
+    // destination card doesn't show a misleading schedule.
+    if (next.mode !== 'snapshot') next.cron = null;
     if (patch.retainCount != null)
         next.retain_count = Math.max(1, Math.min(365, Number(patch.retainCount) || 7));
     if (patch.enabled != null) next.enabled = patch.enabled ? 1 : 0;
@@ -200,7 +203,8 @@ export function updateDestination(id, patch = {}) {
     if (patch.config) {
         const shareSecret = _getShareSecret();
         if (!shareSecret) throw new Error('share secret not initialised');
-        const blob = encryptConfig(patch.config, shareSecret);
+        const merged = _mergeConfigPatch(dest, patch.config);
+        const blob = encryptConfig(merged, shareSecret);
         updates.push('config_blob = ?');
         params.push(blob);
     }
@@ -289,33 +293,61 @@ export async function runBackup(id) {
         return { started: true, mode: dest.mode };
     }
     // Mirror catch-up: enqueue every DB download whose backup hasn't
-    // been done yet. Stream the rows — `.all()` over a million-row library
-    // would push the in-process JS heap past the V8 limit on small VMs
-    // (Synology, single-vCPU droplets) and crash inside `Statement::JS_all`.
+    // been done yet. Keyset-paginated `.all()` — never `.iterate()`. A
+    // live `.iterate()` cursor holds the better-sqlite3 connection open
+    // for its entire lifetime; `hasJobForDownload` / `enqueue` then collide
+    // on the busy connection and throw
+    // "This database connection is busy executing a query". Each `.all()`
+    // opens and closes the statement before those writes run. Also keeps
+    // the JS heap bounded on million-row libraries (Synology / small VMs)
+    // that would otherwise OOM inside `Statement::JS_all`.
     let enqueued = 0;
-    const iter = getDb()
-        .prepare(`
+    const PAGE_SIZE = 500;
+    let afterId = 0;
+    const pageStmt = getDb().prepare(`
         SELECT id, file_name, file_path, file_size FROM downloads
          WHERE file_path IS NOT NULL
+           AND (user_deleted IS NULL OR user_deleted = 0)
+           AND id > ?
          ORDER BY id ASC
-    `)
-        .iterate();
-    for (const row of iter) {
-        if (queue.hasJobForDownload(id, row.id)) continue;
-        queue.enqueue({
-            destinationId: id,
-            downloadId: row.id,
-            remotePath: _mirrorRemotePath(row),
-        });
-        enqueued += 1;
+         LIMIT ?
+    `);
+    while (true) {
+        const page = pageStmt.all(afterId, PAGE_SIZE);
+        if (!page.length) break;
+        for (const row of page) {
+            if (queue.hasJobForDownload(id, row.id)) continue;
+            queue.enqueue({
+                destinationId: id,
+                downloadId: row.id,
+                remotePath: _mirrorRemotePath(row),
+            });
+            enqueued += 1;
+        }
+        afterId = page[page.length - 1].id;
+        if (page.length < PAGE_SIZE) break;
     }
     _wakeWorker(id);
+    // True mirror: list the remote and delete anything that isn't in the
+    // live local library (soft-deleted / missing rows). Snapshots/ is
+    // left alone so a shared bucket with a snapshot destination stays safe.
+    let pruned = 0;
+    try {
+        const r = await _reconcileMirror(dest);
+        pruned = r.deleted;
+    } catch (e) {
+        _log({
+            source: 'backup',
+            level: 'warn',
+            msg: `mirror reconcile failed for #${id}: ${e.message}`,
+        });
+    }
     _log({
         source: 'backup',
         level: 'info',
-        msg: `mirror catch-up enqueued ${enqueued} jobs for #${id}`,
+        msg: `mirror catch-up enqueued ${enqueued} jobs for #${id}; pruned ${pruned} remote orphans`,
     });
-    return { started: true, mode: 'mirror', enqueued };
+    return { started: true, mode: 'mirror', enqueued, pruned };
 }
 
 /** Pause / resume the worker. Existing pending jobs sit in the DB
@@ -459,6 +491,110 @@ function _mirrorRemotePath(row) {
     return String(row.file_path || '').replace(/\\/g, '/');
 }
 
+/**
+ * Build the set of remote paths that should exist for a live library.
+ * Soft-deleted / null-path rows are excluded.
+ */
+function _liveMirrorPathSet() {
+    const set = new Set();
+    const PAGE = 1000;
+    let afterId = 0;
+    const stmt = getDb().prepare(`
+        SELECT id, file_path FROM downloads
+         WHERE file_path IS NOT NULL
+           AND (user_deleted IS NULL OR user_deleted = 0)
+           AND id > ?
+         ORDER BY id ASC
+         LIMIT ?
+    `);
+    while (true) {
+        const page = stmt.all(afterId, PAGE);
+        if (!page.length) break;
+        for (const row of page) {
+            const p = String(row.file_path || '').replace(/\\/g, '/').replace(/^\/+/, '');
+            if (p) set.add(p);
+        }
+        afterId = page[page.length - 1].id;
+        if (page.length < PAGE) break;
+    }
+    return set;
+}
+
+function _shouldSkipRemoteMirrorName(name) {
+    const n = String(name || '').replace(/\\/g, '/').replace(/^\/+/, '');
+    if (!n) return true;
+    if (n === 'snapshots' || n.startsWith('snapshots/')) return true;
+    if (n.endsWith('.part')) return true;
+    if (n.includes('.tgdl-write-probe') || n.includes('.tgdl-test-probe')) return true;
+    return false;
+}
+
+/**
+ * List the remote destination and delete objects that aren't in the live
+ * local library. This is what makes mirror mode actually mirror — Run now
+ * both catches up uploads and prunes remote orphans.
+ *
+ * @returns {Promise<{ listed:number, deleted:number, kept:number }>}
+ */
+async function _reconcileMirror(dest) {
+    const live = _liveMirrorPathSet();
+    let cfg;
+    try {
+        cfg = _decryptCfgOrThrow(dest);
+    } catch (e) {
+        throw new Error(`credentials: ${e.message}`);
+    }
+    const ProviderClass = PROVIDER_CLASSES[dest.provider];
+    if (!ProviderClass) throw new Error(`unknown provider "${dest.provider}"`);
+    const provider = new ProviderClass();
+    const ctx = { destinationId: dest.id, log: _log, signal: new AbortController().signal };
+    let listed = 0;
+    let deleted = 0;
+    let kept = 0;
+    try {
+        await provider.init(cfg, ctx);
+        // List from the destination root. Provider.list already scopes to
+        // the configured prefix / remoteRoot / rootPath.
+        for await (const item of provider.list('', ctx)) {
+            const name = String(item?.name || '').replace(/\\/g, '/').replace(/^\/+/, '');
+            listed += 1;
+            if (_shouldSkipRemoteMirrorName(name)) {
+                kept += 1;
+                continue;
+            }
+            if (live.has(name)) {
+                kept += 1;
+                continue;
+            }
+            try {
+                await provider.delete(name, ctx);
+                deleted += 1;
+                _log({
+                    source: 'backup',
+                    level: 'info',
+                    msg: `mirror pruned orphan ${name} on #${dest.id}`,
+                });
+            } catch (e) {
+                _log({
+                    source: 'backup',
+                    level: 'warn',
+                    msg: `mirror prune failed for ${name} on #${dest.id}: ${e.message}`,
+                });
+            }
+        }
+    } finally {
+        await provider.close().catch(() => {});
+    }
+    _broadcast({
+        type: 'backup_reconcile',
+        destinationId: dest.id,
+        listed,
+        deleted,
+        kept,
+    });
+    return { listed, deleted, kept };
+}
+
 // ---- Workers --------------------------------------------------------------
 
 class Worker {
@@ -583,6 +719,36 @@ class Worker {
             remotePath = remotePath || _mirrorRemotePath(downloadRow);
         } else {
             queue.markFailed(job.id, 'job missing both snapshot_path and download_id');
+            return;
+        }
+
+        // Stale downloads rows (file deleted from disk, DB row still
+        // present) used to crash the process: S3/Dropbox/etc. open the
+        // path with createReadStream().pipe(...) before any await, so
+        // ENOENT fires as an uncaughtException and the watchdog
+        // restart-loops. Fail the job permanently instead — retrying
+        // won't bring the bytes back.
+        try {
+            await fsp.access(localPath, fs.constants.R_OK);
+        } catch (e) {
+            const msg =
+                e?.code === 'ENOENT'
+                    ? `local file missing: ${downloadRow?.file_path || localPath}`
+                    : `local file unreadable (${e?.code || e?.message}): ${downloadRow?.file_path || localPath}`;
+            queue.markFailed(job.id, msg);
+            _broadcast({
+                type: 'backup_error',
+                destinationId: this.destinationId,
+                jobId: job.id,
+                error: msg,
+                willRetry: false,
+            });
+            _markFailureOnDest(this.destinationId, msg);
+            _log({
+                source: 'backup',
+                level: 'warn',
+                msg: `job #${job.id} skipped — ${msg}`,
+            });
             return;
         }
 
@@ -1040,7 +1206,45 @@ function _scrubDest(row) {
         totalBytes: Number(row.total_bytes || 0),
         totalFiles: Number(row.total_files || 0),
         createdAt: row.created_at,
+        // Non-secret connection fields for the edit wizard. Secrets are
+        // omitted — the UI leaves those blank ("keep existing").
+        config: _publicConfig(row),
     };
+}
+
+/** Decrypt + strip secret schema fields. Returns {} if decrypt fails. */
+function _publicConfig(row) {
+    try {
+        const cfg = _decryptCfgOrThrow(row);
+        const schema = PROVIDER_CLASSES[row.provider]?.configSchema || [];
+        const secretNames = new Set(
+            schema.filter((f) => f.secret || f.type === 'password').map((f) => f.name),
+        );
+        const out = {};
+        for (const [k, v] of Object.entries(cfg || {})) {
+            if (secretNames.has(k)) continue;
+            out[k] = v;
+        }
+        return out;
+    } catch {
+        return {};
+    }
+}
+
+/** Merge patch.config onto the stored blob, keeping existing secrets when
+ *  the patch omits them or sends blanks (edit-wizard "leave blank to keep"). */
+function _mergeConfigPatch(dest, patchConfig) {
+    const existing = _decryptCfgOrThrow(dest);
+    const schema = PROVIDER_CLASSES[dest.provider]?.configSchema || [];
+    const secretNames = new Set(
+        schema.filter((f) => f.secret || f.type === 'password').map((f) => f.name),
+    );
+    const merged = { ...existing };
+    for (const [k, v] of Object.entries(patchConfig || {})) {
+        if (secretNames.has(k) && (v == null || String(v) === '')) continue;
+        merged[k] = v;
+    }
+    return merged;
 }
 
 function _bumpDestStats(id, bytes, files) {
