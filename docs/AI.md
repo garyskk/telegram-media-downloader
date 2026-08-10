@@ -297,7 +297,12 @@ The maintenance page surfaces:
   Rebuild (via centroid match on Rebuild).
 - **Merge** — fold one cluster into another. Survives **Re-cluster**
   (incremental). Lost on **Rebuild all** / Reindex. Target centroid is
-  recomputed from all faces after merge.
+  recomputed from all faces after merge. The People detail panel and
+  **Merge into…** picker surface **Suggested matches** like Unclassified
+  faces: nearest other People within `labelMatchEps` (centroid↔centroid),
+  plus same-download (“clip”) co-occurrence even outside that radius
+  (`GET /api/ai/people/:id/suggestions`). Same-clip ranks first; chips
+  and picker rows show distance and a Same clip / Suggested badge.
 - **Split** — pick faces from a cluster, create a new cluster, link
   those faces to it. The original keeps the rest.
 - **Reassign** — move one face between clusters.
@@ -679,6 +684,7 @@ All endpoints are admin-only.
 | POST   | `/api/ai/faces/rebuild`             | full wipe+DBSCAN reshape (merges lost)                 |
 | GET    | `/api/ai/people`                    | clusters with cover face + count                       |
 | GET    | `/api/ai/people/excluded`           | durable exclusion denylist (`{ excluded, total }`)     |
+| GET    | `/api/ai/people/:id/suggestions`    | nearest other People within `labelMatchEps` + same-clip co-occurrence (`{suggestions:[{id,label,faceCount,distance,sameClip?}]}`) |
 | GET    | `/api/ai/people/:id/photos`         | paginated photos in this cluster                       |
 | PATCH  | `/api/ai/people/:id`                | `{ label }` — rename                                   |
 | POST   | `/api/ai/people/:id/cover`          | `{ faceId }` — pin People avatar thumbnail             |
