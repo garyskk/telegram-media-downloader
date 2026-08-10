@@ -464,6 +464,7 @@
     "viewer.tab.videos": "วิดีโอ",
     "viewer.tab.documents": "ไฟล์",
     "viewer.tab.audio": "เสียง",
+    "viewer.shuffle": "สุ่มเล่น",
     "viewer.video.resumed": "เล่นต่อจาก {time}",
     "viewer.video.delete_title": "ลบไฟล์",
     "viewer.video.delete": "ลบ",

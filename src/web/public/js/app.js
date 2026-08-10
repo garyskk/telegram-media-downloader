@@ -166,6 +166,24 @@ async function init() {
     setupInfiniteScroll();
 
     Viewer.setupViewerEvents();
+    Viewer.onShuffleChange(() => {
+        if (state.currentPage === 'viewer') {
+            try {
+                renderMediaGrid();
+            } catch (e) {
+                console.warn('renderMediaGrid after shuffle change:', e);
+            }
+        }
+        // Sync button chrome is already handled inside viewer; keep hasMore in sync.
+        if (Viewer.isShuffleActive()) {
+            state.hasMore = Viewer.shuffleHasMore();
+        }
+    });
+    document.getElementById('gallery-shuffle-btn')?.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        void Viewer.toggleShuffle({ openPlayer: false });
+    });
 
     // Expose to window for HTML onclick handlers — pulled UP from after
     // the await chain below because inline `onclick="navigateTo('…')"` on
@@ -228,6 +246,14 @@ async function init() {
         const droppedId = m?.id;
         if (Array.isArray(state.files) && (droppedPath || droppedId != null)) {
             const before = state.files.length;
+            const victim =
+                state.files.find((f) => {
+                    if (droppedPath && (f.fullPath === droppedPath || f.path === droppedPath))
+                        return true;
+                    if (droppedId != null && f.id === droppedId) return true;
+                    return false;
+                }) || { path: droppedPath, fullPath: droppedPath, id: droppedId };
+            Viewer.removeShuffleFile(victim);
             state.files = state.files.filter((f) => {
                 if (droppedPath && (f.fullPath === droppedPath || f.path === droppedPath))
                     return false;
@@ -1738,6 +1764,7 @@ function _renderGalleryScopeMenu() {
             state.page = 1;
             state.hasMore = true;
             state.files = [];
+            Viewer.clearShuffleSilent();
             // Refresh the footer so peer counts pick up the new scope.
             loadStats();
             if (state.currentPage === 'viewer') {
@@ -1749,6 +1776,9 @@ function _renderGalleryScopeMenu() {
 }
 
 async function loadAllFiles() {
+    // Chronological reload replaces the gallery — drop any shuffle session
+    // so we don't mix shuffled keys with a fresh page-1 fetch.
+    if (state.page === 1) Viewer.clearShuffleSilent();
     state.loading = true;
     const grid = document.getElementById('media-grid');
     if (state.page === 1 && grid) grid.innerHTML = renderGallerySkeletons(12);
@@ -1804,6 +1834,7 @@ async function loadGroupFiles(groupId) {
     // at an empty grid for the duration of the network round-trip. Page 2+
     // adds rows so we don't replace what's already there.
     if (state.page === 1) {
+        Viewer.clearShuffleSilent();
         const grid = document.getElementById('media-grid');
         if (grid) grid.innerHTML = renderGallerySkeletons(12);
         document.getElementById('empty-state')?.classList.add('hidden');
@@ -1933,7 +1964,11 @@ function renderMediaGrid(opts = {}) {
     // On append, skip the time-section banding entirely — the existing
     // headers up the page stay correct visually, and re-bucketing the
     // tail in isolation can't produce sensible relative labels anyway.
-    const sections = append ? [['', filteredWithIndex]] : groupFilesByTime(filteredWithIndex);
+    // Shuffle order is random, so Today/Yesterday/Older headers are nonsense.
+    const sections =
+        append || Viewer.isShuffleActive()
+            ? [['', filteredWithIndex]]
+            : groupFilesByTime(filteredWithIndex);
 
     const html = sections
         .map(([label, items]) => {
@@ -3794,11 +3829,16 @@ async function confirmDeleteFile() {
         // can arrive before the HTTP response (server broadcasts first) and
         // pre-filter state.files, making state.currentFileIndex stale and
         // causing splice() to remove the wrong file.
+        Viewer.removeShuffleFile(file);
         state.files = state.files.filter((f) => f !== file && f.fullPath !== file.fullPath);
+        if (Viewer.isShuffleActive()) {
+            state.hasMore = Viewer.shuffleHasMore();
+        }
         renderMediaGrid();
         if (state.files.length > 0) {
             // Advance to the next file, or step back when we were on the last one.
-            Viewer.openMediaViewer(Math.min(deletedIdx, state.files.length - 1));
+            const nextIdx = Math.min(deletedIdx, state.files.length - 1);
+            Viewer.openMediaViewer(nextIdx);
         } else {
             Viewer.closeMediaViewer();
         }
@@ -3881,6 +3921,8 @@ function syncPinFilterChip() {
 function setupMediaTabs() {
     document.querySelectorAll('#media-tabs .tab-item').forEach((tab) => {
         tab.addEventListener('click', () => {
+            // Shuffle + scope chips have their own handlers.
+            if (tab.id === 'gallery-shuffle-btn' || tab.id === 'gallery-scope-chip') return;
             // The pinned toggle is a chip, NOT a type tab — it stacks with
             // the type filter instead of replacing it. Handle it separately.
             // Cycle: all → pinned → unpinned → all.
@@ -3903,6 +3945,7 @@ function setupMediaTabs() {
             }
             document.querySelectorAll('#media-tabs .tab-item').forEach((t) => {
                 if (t.dataset.pinnedToggle !== undefined) return; // leave the chip alone
+                if (t.id === 'gallery-shuffle-btn' || t.id === 'gallery-scope-chip') return;
                 t.classList.remove('active');
             });
             tab.classList.add('active');
@@ -4413,6 +4456,21 @@ function setupInfiniteScroll() {
             // currentGroupId === null on the All-Media surface — page through
             // /api/downloads/all instead of the per-group endpoint.
             if (state.currentPage !== 'viewer') return;
+            // Shuffle mode: hydrate the next playlist window instead of
+            // fetching chronological pages.
+            if (Viewer.isShuffleActive()) {
+                state.loading = true;
+                const fromIndex = state.files.length;
+                Viewer.loadMoreShuffle()
+                    .then((grew) => {
+                        if (grew) renderMediaGrid({ append: true, fromIndex });
+                        state.hasMore = Viewer.shuffleHasMore();
+                    })
+                    .finally(() => {
+                        state.loading = false;
+                    });
+                return;
+            }
             state.page++;
             if (state.currentGroupId) loadGroupFiles(state.currentGroupId);
             else loadAllFiles();
