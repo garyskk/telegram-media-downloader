@@ -190,6 +190,7 @@ Opt-in face detection + clustering, backed by the Python sidecar in `faces-servi
 | `GET`    | `/api/ai/preload-model/:name/status`| Check model download status. Returns `{model, status}`. |
 | `GET`    | `/api/ai/people`                    | Cluster list with cover-face + face count + `video_face_count` per person. `?page=&limit=`. |
 | `GET`    | `/api/ai/people/excluded`           | Durable exclusion denylist (`{excluded:[{id,label,created_at,cover_face_id}], total}`). Cover crop via `/api/ai/faces/:cover_face_id/crop`. Survives recluster; cleared on Rebuild all clusters and full faces reindex. |
+| `GET`    | `/api/ai/people/:id/suggestions`    | Nearest other People within `labelMatchEps` (centroid↔centroid), plus same-download (“clip”) co-occurrence — `{suggestions:[{id,label,faceCount,distance,sameClip?}]}`. Used by People merge chips / **Merge into…** picker. |
 | `GET`    | `/api/ai/people/:id/photos`         | Paginated photos in this cluster. |
 | `PATCH`  | `/api/ai/people/:id`                | `{label}` — rename. |
 | `POST`   | `/api/ai/people/:id/cover`          | `{faceId}` — pin this face as the People avatar (must belong to the person). Survives recluster. |

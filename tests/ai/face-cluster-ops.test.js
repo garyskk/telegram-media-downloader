@@ -1050,6 +1050,131 @@ describe('excludePerson (durable denylist)', () => {
         expect(r.suggestions[0].id).toBe(alice);
     });
 
+    it('suggestPeopleForPerson returns nearest within matchEps and excludes self', () => {
+        const alice = api.insertPerson({
+            label: 'Alice',
+            centroidBlob: f32Blob([1, 0, 0]),
+            faceCount: 2,
+        });
+        const aliceTwin = api.insertPerson({
+            label: 'Alice copy',
+            centroidBlob: f32Blob([0.98, 0.02, 0]),
+            faceCount: 1,
+        });
+        api.insertPerson({
+            label: 'Bob',
+            centroidBlob: f32Blob([0, 1, 0]),
+            faceCount: 1,
+        });
+        api.insertPerson({
+            label: 'Carol',
+            centroidBlob: f32Blob([0, 0, 1]),
+            faceCount: 1,
+        });
+
+        const near = api.suggestPeopleForPerson(alice, { matchEps: 0.4, limit: 5 });
+        expect(near.ok).toBe(true);
+        expect(near.suggestions.length).toBeGreaterThanOrEqual(1);
+        expect(near.suggestions[0].id).toBe(aliceTwin);
+        expect(near.suggestions[0].label).toBe('Alice copy');
+        expect(near.suggestions.every((s) => s.id !== alice)).toBe(true);
+
+        // Orthogonal-ish centroid stays outside a tight matchEps.
+        const far = api.insertPerson({
+            label: 'Far',
+            centroidBlob: f32Blob([0.577, 0.577, 0.577]),
+            faceCount: 1,
+        });
+        const empty = api.suggestPeopleForPerson(far, { matchEps: 0.15, limit: 5 });
+        expect(empty.ok).toBe(true);
+        expect(empty.suggestions).toEqual([]);
+    });
+
+    it('suggestPeopleForPerson rejects invalid or missing people', () => {
+        expect(api.suggestPeopleForPerson(0).ok).toBe(false);
+        expect(api.suggestPeopleForPerson(0).reason).toBe('invalid_id');
+        expect(api.suggestPeopleForPerson(-1).ok).toBe(false);
+        expect(api.suggestPeopleForPerson(999999).ok).toBe(false);
+        expect(api.suggestPeopleForPerson(999999).reason).toBe('not_found');
+    });
+
+    it('suggestPeopleForPerson includes same-clip people even outside matchEps', () => {
+        const clipA = api.insertDownload({
+            groupId: '-100777',
+            groupName: 'Faces Fixture',
+            messageId: 9201,
+            fileName: 'shared-merge.mp4',
+            fileSize: 5000,
+            fileType: 'video',
+            filePath: 'Faces_Fixture/videos/shared-merge.mp4',
+        }).lastInsertRowid;
+        const clipB = api.insertDownload({
+            groupId: '-100777',
+            groupName: 'Faces Fixture',
+            messageId: 9202,
+            fileName: 'alone-merge.mp4',
+            fileSize: 5000,
+            fileType: 'video',
+            filePath: 'Faces_Fixture/videos/alone-merge.mp4',
+        }).lastInsertRowid;
+
+        // Alice and twin share clipA but centroids are far apart.
+        const alice = api.insertPerson({
+            label: 'Alice',
+            centroidBlob: f32Blob([1, 0, 0]),
+            faceCount: 1,
+        });
+        const aliceTwin = api.insertPerson({
+            label: 'Alice copy',
+            centroidBlob: f32Blob([0, 0, 1]),
+            faceCount: 1,
+        });
+        api.insertFace({
+            downloadId: clipA,
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 40,
+            embeddingBlob: f32Blob([1, 0, 0]),
+            personId: alice,
+        });
+        api.insertFace({
+            downloadId: clipA,
+            x: 10,
+            y: 10,
+            w: 40,
+            h: 40,
+            embeddingBlob: f32Blob([0, 0, 1]),
+            personId: aliceTwin,
+        });
+
+        // Bob is embedding-close to Alice but never shares a download.
+        const bob = api.insertPerson({
+            label: 'Bob',
+            centroidBlob: f32Blob([0.98, 0.02, 0]),
+            faceCount: 1,
+        });
+        api.insertFace({
+            downloadId: clipB,
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 40,
+            embeddingBlob: f32Blob([0.98, 0.02, 0]),
+            personId: bob,
+        });
+
+        const r = api.suggestPeopleForPerson(alice, { matchEps: 0.25, limit: 5 });
+        expect(r.ok).toBe(true);
+        const byId = Object.fromEntries(r.suggestions.map((s) => [s.id, s]));
+        expect(byId[aliceTwin]).toBeTruthy();
+        expect(byId[aliceTwin].sameClip).toBe(true);
+        expect(byId[bob]).toBeTruthy();
+        expect(byId[bob].sameClip).toBeFalsy();
+        // Same-clip twin ranks ahead of embedding-only Bob.
+        expect(r.suggestions[0].id).toBe(aliceTwin);
+    });
+
     it('splitFacePerson on an unassigned face creates a person (new-person path)', () => {
         const did = downloadId();
         const faceId = api.insertFace({

@@ -114,6 +114,10 @@ let _unclassifiedSuggestions = [];
 let _unclassifiedGridClickHandler = null;
 const _UNCLASSIFIED_PAGE_SIZE = 100;
 
+// Person merge suggestions (centroid-nearest other clusters).
+let _personMergeSuggestions = [];
+let _personMergeSuggestToken = 0;
+
 // Running render token — incremented on every _renderPeopleGrid call so
 // stale async chunks abort when a newer render starts (e.g. typing in
 // the search box while the previous chunk render is still in flight).
@@ -1351,6 +1355,7 @@ async function _reindexFromScratch() {
         _peopleCache = [];
         _selectedPerson = null;
         _selectedPersonName = '';
+        _hidePersonMergeSuggestions();
         $('#ai-people-photos')?.classList.add('hidden');
         _renderPeopleGrid().catch(() => {});
         await refreshStatus();
@@ -1772,7 +1777,7 @@ async function _renderPeopleGrid() {
     }
 
     const INITIAL_RENDER = 60;
-    const LOAD_MORE_SIZE = 80;
+    const LOAD_MORE_SIZE = 30;
     const token = ++_peopleRenderToken;
 
     const attachCard = (b) => {
@@ -1924,6 +1929,13 @@ async function _showPersonPhotos() {
         }
     }
 
+    // Load merge suggestions in parallel with the photo grid (skip noise tile).
+    if (_selectedPerson > 0) {
+        _loadPersonMergeSuggestions(_selectedPerson);
+    } else {
+        _hidePersonMergeSuggestions();
+    }
+
     const grid = $('#ai-people-photos-grid');
     if (!grid) return;
     grid.innerHTML = `<div class="col-span-full text-center text-xs text-tg-textSecondary py-8">${escapeHtml(i18nT('common.loading', 'Loading…'))}</div>`;
@@ -1966,6 +1978,73 @@ async function _showPersonPhotos() {
         }
     } catch (e) {
         grid.innerHTML = `<div class="col-span-full text-center text-xs text-red-300 py-8">${escapeHtml(e.message)}</div>`;
+    }
+}
+
+function _hidePersonMergeSuggestions() {
+    _personMergeSuggestions = [];
+    _personMergeSuggestToken += 1;
+    $('#ai-person-merge-suggestions')?.classList.add('hidden');
+    const list = $('#ai-person-merge-suggestions-list');
+    if (list) list.innerHTML = '';
+    $('#ai-person-merge-suggestions-empty')?.classList.add('hidden');
+}
+
+async function _loadPersonMergeSuggestions(personId) {
+    const wrap = $('#ai-person-merge-suggestions');
+    const list = $('#ai-person-merge-suggestions-list');
+    const empty = $('#ai-person-merge-suggestions-empty');
+    if (!wrap || !list) return;
+    const token = ++_personMergeSuggestToken;
+    const focusId = Number(personId);
+    wrap.classList.remove('hidden');
+    list.innerHTML = `<span class="text-[11px] text-tg-textSecondary">${escapeHtml(i18nT('common.loading', 'Loading…'))}</span>`;
+    empty?.classList.add('hidden');
+    try {
+        const r = await api.get(`/api/ai/people/${focusId}/suggestions?limit=5`);
+        if (token !== _personMergeSuggestToken || _selectedPerson !== focusId) return;
+        if (!r?.success) throw new Error(r?.error || 'suggest failed');
+        _personMergeSuggestions = Array.isArray(r.suggestions) ? r.suggestions : [];
+        if (!_personMergeSuggestions.length) {
+            list.innerHTML = '';
+            empty?.classList.remove('hidden');
+            return;
+        }
+        empty?.classList.add('hidden');
+        list.innerHTML = _personMergeSuggestions
+            .map((s) => {
+                const name = escapeHtml(s.label || `Person #${s.id}`);
+                const dist = Number(s.distance);
+                const distLabel = Number.isFinite(dist) ? dist.toFixed(2) : '';
+                const sameClip = !!s.sameClip;
+                const clipBadge = sameClip
+                    ? `<span class="text-[9px] uppercase tracking-wide text-emerald-300/90 font-medium">${escapeHtml(i18nT('maintenance.ai.unclassified.same_clip', 'Same clip'))}</span>`
+                    : '';
+                const bust = _personAvatarBust(_peopleCache.find((p) => p.id === s.id));
+                return `<button type="button" data-suggest-pid="${s.id}"
+                    class="ai-person-merge-suggest-chip inline-flex items-center gap-1.5 pl-0.5 pr-2 py-0.5 rounded-full ${sameClip ? 'bg-emerald-500/10 hover:bg-emerald-500/20 border border-emerald-500/30' : 'bg-tg-blue/10 hover:bg-tg-blue/20 border border-tg-blue/30'} text-[11px] text-tg-text transition-colors">
+                    <span class="w-6 h-6 rounded-full overflow-hidden bg-tg-bg/40 flex-shrink-0">
+                        <img src="/api/ai/person/${s.id}/face?w=48&v=${bust}" alt="" class="w-full h-full object-cover" loading="lazy"
+                            onerror="this.onerror=null;this.parentElement.innerHTML='<i class=\\'ri-user-line text-[10px] text-tg-textSecondary/40 flex items-center justify-center w-full h-full\\'></i>'">
+                    </span>
+                    <span class="flex flex-col items-start min-w-0 leading-tight">
+                        ${clipBadge}
+                        <span class="font-medium truncate max-w-[7rem]">${name}</span>
+                    </span>
+                    ${distLabel ? `<span class="text-tg-textSecondary tabular-nums">${distLabel}</span>` : ''}
+                </button>`;
+            })
+            .join('');
+        list.querySelectorAll('.ai-person-merge-suggest-chip').forEach((btn) => {
+            btn.addEventListener('click', () => {
+                const pid = Number(btn.dataset.suggestPid);
+                if (!Number.isFinite(pid) || pid <= 0) return;
+                _confirmAndMergePerson(pid);
+            });
+        });
+    } catch (e) {
+        if (token !== _personMergeSuggestToken || _selectedPerson !== focusId) return;
+        list.innerHTML = `<span class="text-[11px] text-red-300">${escapeHtml(e.message)}</span>`;
     }
 }
 
@@ -3137,27 +3216,58 @@ async function _mergeSelectedPerson() {
         return;
     }
 
-    // Visual person-picker with search — build lazily so 1000+ candidates
-    // don't cause a multi-second innerHTML freeze on open.
-    const makeMergeCard = (p) => {
+    let suggestions = _personMergeSuggestions;
+    if (_selectedPerson > 0) {
+        try {
+            const r = await api.get(`/api/ai/people/${_selectedPerson}/suggestions?limit=5`);
+            suggestions = r?.success && Array.isArray(r.suggestions) ? r.suggestions : [];
+            _personMergeSuggestions = suggestions;
+        } catch {
+            suggestions = [];
+        }
+    }
+    const suggestIds = new Set(suggestions.map((s) => Number(s.id)));
+
+    const makeMergeCard = (p, { suggested = false, sameClip = false, distance = null } = {}) => {
         const name = escapeHtml(p.label || `Person #${p.id}`);
         const faceUrl =
             p.id > 0 ? `/api/ai/person/${p.id}/face?w=64&v=${_personAvatarBust(p)}` : '';
         const imgHtml = faceUrl
             ? `<img src="${faceUrl}" class="w-full h-full object-cover" loading="lazy" onerror="this.onerror=null;this.parentElement.innerHTML='<i class=\\'ri-user-line text-base text-tg-textSecondary/40\\'></i>'">`
             : `<i class="ri-user-line text-base text-tg-textSecondary/40"></i>`;
+        const distLabel =
+            distance != null && Number.isFinite(Number(distance))
+                ? `<span class="text-[10px] text-tg-textSecondary tabular-nums ml-1">${Number(distance).toFixed(2)}</span>`
+                : '';
+        const badge = sameClip
+            ? `<span class="text-[9px] uppercase tracking-wide text-emerald-300 font-medium">${escapeHtml(i18nT('maintenance.ai.unclassified.same_clip', 'Same clip'))}</span>`
+            : suggested
+              ? `<span class="text-[9px] uppercase tracking-wide text-tg-blue font-medium">${escapeHtml(i18nT('maintenance.ai.unclassified.suggested', 'Suggested'))}</span>`
+              : '';
         return `<button type="button" data-pid="${p.id}"
             class="ai-merge-card flex items-center gap-3 w-full text-left px-3 py-2.5 rounded-xl hover:bg-tg-blue/10 active:bg-tg-blue/20 transition-colors">
             <div class="w-10 h-10 rounded-full overflow-hidden ring-1 ring-tg-border/30 flex-shrink-0 bg-tg-bg/40 flex items-center justify-center">
                 ${imgHtml}
             </div>
             <div class="flex-1 min-w-0">
-                <div class="text-sm font-medium text-tg-text truncate">${name}</div>
-                <div class="text-[11px] text-tg-textSecondary">${p.face_count} ${escapeHtml(i18nT('maintenance.ai.faces_short', 'faces'))}</div>
+                <div class="flex items-center gap-1.5">${badge}<div class="text-sm font-medium text-tg-text truncate">${name}</div>${distLabel}</div>
+                <div class="text-[11px] text-tg-textSecondary">${p.face_count ?? p.faceCount ?? 0} ${escapeHtml(i18nT('maintenance.ai.faces_short', 'faces'))}</div>
             </div>
             <i class="ri-arrow-right-s-line text-tg-textSecondary/50 flex-shrink-0"></i>
         </button>`;
     };
+
+    const suggestedPeople = suggestions
+        .map((s) => {
+            const cached = candidates.find((p) => p.id === s.id) || {
+                id: s.id,
+                label: s.label,
+                face_count: s.faceCount,
+            };
+            return { p: cached, distance: s.distance, sameClip: !!s.sameClip };
+        })
+        .filter((x) => x.p && x.p.id !== _selectedPerson);
+    const rest = candidates.filter((p) => !suggestIds.has(p.id));
 
     const pickerContent = `
         <div class="px-1 mb-3">
@@ -3179,11 +3289,34 @@ async function _mergeSelectedPerson() {
         const emptyEl = entry.body.querySelector('#ai-merge-empty');
         const searchEl = entry.body.querySelector('#ai-merge-search');
 
-        const renderList = (list) => {
+        const renderList = (q) => {
             if (!listEl) return;
-            // Cap at 80 visible rows — search narrows results quickly.
-            listEl.innerHTML = list.slice(0, 80).map(makeMergeCard).join('');
-            const empty = list.length === 0;
+            const query = String(q || '')
+                .trim()
+                .toLowerCase();
+            const match = (p) => {
+                if (!query) return true;
+                return `${p.label || ''} ${p.id}`.toLowerCase().includes(query);
+            };
+            const sug = suggestedPeople.filter((x) => match(x.p));
+            const others = rest.filter(match);
+            const parts = [];
+            if (sug.length) {
+                parts.push(
+                    ...sug
+                        .slice(0, 20)
+                        .map((x) =>
+                            makeMergeCard(x.p, {
+                                suggested: true,
+                                sameClip: x.sameClip,
+                                distance: x.distance,
+                            }),
+                        ),
+                );
+            }
+            parts.push(...others.slice(0, 80).map((p) => makeMergeCard(p)));
+            listEl.innerHTML = parts.join('');
+            const empty = parts.length === 0;
             if (emptyEl) emptyEl.classList.toggle('hidden', !empty);
             listEl.querySelectorAll('.ai-merge-card').forEach((btn) => {
                 btn.addEventListener('click', () => {
@@ -3193,28 +3326,28 @@ async function _mergeSelectedPerson() {
             });
         };
 
-        renderList(candidates);
+        renderList('');
 
         if (searchEl) {
             searchEl.addEventListener('input', (e) => {
-                const q = String(e.target.value || '')
-                    .toLowerCase()
-                    .trim();
-                renderList(
-                    q
-                        ? candidates.filter((p) =>
-                              (p.label || `Person #${p.id}`).toLowerCase().includes(q),
-                          )
-                        : candidates,
-                );
+                renderList(e.target.value);
             });
             setTimeout(() => searchEl.focus(), 60);
         }
     });
 
     if (!targetId) return;
-    const target = candidates.find((p) => p.id === targetId);
-    const targetName = target ? target.label || `Person #${target.id}` : `#${targetId}`;
+    await _confirmAndMergePerson(targetId);
+}
+
+async function _confirmAndMergePerson(targetId) {
+    if (!_selectedPerson || !targetId || targetId === _selectedPerson) return;
+    const target =
+        _peopleCache.find((p) => p.id === targetId) ||
+        _personMergeSuggestions.find((s) => s.id === targetId);
+    const targetName = target
+        ? target.label || `Person #${target.id}`
+        : `#${targetId}`;
 
     const ok = await confirmSheet({
         title: i18nT('maintenance.ai.person_merge', 'Merge'),
@@ -3240,6 +3373,7 @@ async function _mergeSelectedPerson() {
         );
         _selectedPerson = null;
         _selectedPersonName = '';
+        _hidePersonMergeSuggestions();
         $('#ai-people-photos')?.classList.add('hidden');
         _loadPeople();
         await refreshStatus();
@@ -3274,6 +3408,7 @@ async function _deleteSelectedPerson() {
         showToast(i18nT('common.deleted', 'Deleted'), 'success');
         _selectedPerson = null;
         _selectedPersonName = '';
+        _hidePersonMergeSuggestions();
         $('#ai-people-photos')?.classList.add('hidden');
         _loadPeople();
     } catch (e) {
@@ -3299,6 +3434,7 @@ async function _excludeSelectedPerson() {
         showToast(i18nT('maintenance.ai.exclude_done', 'Excluded'), 'success');
         _selectedPerson = null;
         _selectedPersonName = '';
+        _hidePersonMergeSuggestions();
         $('#ai-people-photos')?.classList.add('hidden');
         _loadPeople();
     } catch (e) {
