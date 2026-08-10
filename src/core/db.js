@@ -2742,6 +2742,132 @@ export function suggestPeopleForFace(faceId, { matchEps = 0.4, limit = 5 } = {})
     };
 }
 
+/**
+ * Nearest other people for a person centroid (merge suggestion chips / picker).
+ * Also includes people who share at least one download ("clip") with this
+ * person's faces — even outside matchEps — so over-split clusters that
+ * still co-occur on the same media surface as merge candidates.
+ * @returns {{ ok: true, suggestions: Array<{ id: number, label: string|null, faceCount: number, distance: number, sameClip?: boolean }> }
+ *   | { ok: false, reason: 'not_found'|'invalid_id'|'no_embedding' }}
+ */
+export function suggestPeopleForPerson(personId, { matchEps = 0.4, limit = 5 } = {}) {
+    const pid = Number(personId);
+    if (!Number.isFinite(pid) || pid <= 0) return { ok: false, reason: 'invalid_id' };
+    const radius = Number.isFinite(matchEps) && matchEps > 0 ? Number(matchEps) : 0.4;
+    const lim = Math.max(1, Math.min(20, Number(limit) || 5));
+    const db = getDb();
+    const row = db
+        .prepare('SELECT id, embedding_centroid FROM people WHERE id = ?')
+        .get(pid);
+    if (!row) return { ok: false, reason: 'not_found' };
+    if (!row.embedding_centroid) return { ok: false, reason: 'no_embedding' };
+    const dim = row.embedding_centroid.byteLength / 4;
+    if (!Number.isFinite(dim) || dim < 1) return { ok: false, reason: 'no_embedding' };
+    const emb = new Float32Array(
+        row.embedding_centroid.buffer,
+        row.embedding_centroid.byteOffset,
+        dim,
+    );
+
+    const _euclid = (a, b) => {
+        let sum = 0;
+        for (let i = 0; i < a.length; i++) {
+            const d = a[i] - b[i];
+            sum += d * d;
+        }
+        return Math.sqrt(sum);
+    };
+
+    /** @type {Map<number, { id: number, label: string|null, faceCount: number, distance: number, sameClip: boolean }>} */
+    const byId = new Map();
+
+    const upsert = (entry) => {
+        const prev = byId.get(entry.id);
+        if (!prev) {
+            byId.set(entry.id, entry);
+            return;
+        }
+        byId.set(entry.id, {
+            ...prev,
+            ...entry,
+            sameClip: prev.sameClip || entry.sameClip,
+            distance: Math.min(prev.distance, entry.distance),
+            label: entry.label ?? prev.label,
+            faceCount: entry.faceCount || prev.faceCount,
+        });
+    };
+
+    // Precompute centroid distances for every other person (used by both
+    // same-clip and global match paths).
+    /** @type {Map<number, { id: number, label: string|null, faceCount: number, distance: number }>} */
+    const centroidById = new Map();
+    for (const p of listPeopleCentroids()) {
+        if (p.id === pid) continue;
+        if (p.centroid.length !== dim) continue;
+        centroidById.set(p.id, {
+            id: p.id,
+            label: p.label,
+            faceCount: p.faceCount,
+            distance: _euclid(emb, p.centroid),
+        });
+    }
+
+    // 1) Same-clip co-occurrence: other people who appear on any download
+    //    that already has a face from this person.
+    const cooccur = db
+        .prepare(
+            `SELECT DISTINCT f2.person_id AS person_id, p.label, p.face_count
+               FROM faces f1
+               JOIN faces f2 ON f2.download_id = f1.download_id
+               JOIN people p ON p.id = f2.person_id
+              WHERE f1.person_id = ?
+                AND f2.person_id IS NOT NULL
+                AND f2.person_id > 0
+                AND f2.person_id != ?`,
+        )
+        .all(pid, pid);
+    for (const s of cooccur) {
+        const otherId = Number(s.person_id);
+        const cent = centroidById.get(otherId);
+        upsert({
+            id: otherId,
+            label: s.label ?? cent?.label ?? null,
+            faceCount: Number(s.face_count) || cent?.faceCount || 0,
+            distance: cent?.distance ?? Number.POSITIVE_INFINITY,
+            sameClip: true,
+        });
+    }
+
+    // 2) Global centroid matches within matchEps.
+    for (const p of centroidById.values()) {
+        if (p.distance <= radius) {
+            upsert({
+                id: p.id,
+                label: p.label,
+                faceCount: p.faceCount,
+                distance: p.distance,
+                sameClip: false,
+            });
+        }
+    }
+
+    const matches = [...byId.values()];
+    matches.sort((a, b) => {
+        if (a.sameClip !== b.sameClip) return a.sameClip ? -1 : 1;
+        return a.distance - b.distance;
+    });
+    return {
+        ok: true,
+        suggestions: matches.slice(0, lim).map((s) => ({
+            id: s.id,
+            label: s.label,
+            faceCount: s.faceCount,
+            distance: Number.isFinite(s.distance) ? s.distance : null,
+            ...(s.sameClip ? { sameClip: true } : {}),
+        })),
+    };
+}
+
 // ---- Image embeddings -----------------------------------------------------
 
 export function setImageEmbedding(downloadId, embeddingBlob, model, now = Date.now()) {

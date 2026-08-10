@@ -3756,6 +3756,12 @@
                                     </button>
                                 </div>
                             </div>
+                            <!-- Nearest other clusters for one-tap merge (centroid match) -->
+                            <div id="ai-person-merge-suggestions" class="hidden px-3 py-2 border-b border-tg-border/20">
+                                <p class="text-[10px] uppercase tracking-wide text-tg-textSecondary mb-1.5" data-i18n="maintenance.ai.unclassified.suggestions">Suggested matches</p>
+                                <div id="ai-person-merge-suggestions-list" class="flex flex-wrap gap-1.5"></div>
+                                <p id="ai-person-merge-suggestions-empty" class="hidden text-[11px] text-tg-textSecondary/70" data-i18n="maintenance.ai.unclassified.no_match">No close match</p>
+                            </div>
                             <!-- Split mode hint banner — only visible while split mode is active -->
                             <div id="ai-split-hint" class="hidden items-center gap-2 px-3 py-2 bg-tg-blue/10 border-b border-tg-blue/20 text-xs text-tg-blue">
                                 <i class="ri-cursor-line shrink-0"></i>

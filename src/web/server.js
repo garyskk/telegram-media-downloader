@@ -168,6 +168,7 @@ import {
     listFacesForPerson,
     listUnclassifiedFaces,
     suggestPeopleForFace,
+    suggestPeopleForPerson,
     splitFacePerson,
     deleteFace,
     renamePerson,
@@ -8911,6 +8912,26 @@ app.post('/api/ai/people/:id/cover', async (req, res) => {
             return res.status(status).json({ error: r.reason || 'cover failed' });
         }
         res.json({ success: true, id, coverFaceId: r.coverFaceId });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// Nearest other People by centroid distance — merge suggestion chips / picker.
+app.get('/api/ai/people/:id/suggestions', async (req, res) => {
+    try {
+        const personId = Number(req.params.id);
+        if (!Number.isFinite(personId) || personId <= 0) {
+            return res.status(400).json({ error: 'invalid person id' });
+        }
+        const { matchEps } = _aiFacesEps();
+        const limit = Math.max(1, Math.min(20, Number(req.query?.limit) || 5));
+        const r = suggestPeopleForPerson(personId, { matchEps, limit });
+        if (!r.ok) {
+            const status = r.reason === 'not_found' ? 404 : 400;
+            return res.status(status).json({ error: r.reason || 'suggest failed' });
+        }
+        res.json({ success: true, personId, matchEps, suggestions: r.suggestions });
     } catch (e) {
         res.status(500).json({ error: e.message });
     }
