@@ -10,20 +10,23 @@ const VIEWER_PATH = join(HERE, '..', 'src/web/public/js/viewer.js');
 
 let buildShuffleOrder;
 let playlistKey;
+let dropKeyFromOrder;
 
 beforeAll(async () => {
     const src = readFileSync(VIEWER_PATH, 'utf8');
     const keyFn = src.match(/function _playlistKey\(entry\) \{[\s\S]*?\n\}/);
     const orderFn = src.match(/function _buildShuffleOrder\(keys, currentKey\) \{[\s\S]*?\n\}/);
     const fyFn = src.match(/function _fisherYates\(arr\) \{[\s\S]*?\n\}/);
-    if (!keyFn || !orderFn || !fyFn) {
+    const dropFn = src.match(/function _dropKeyFromOrder\(keys, dropKey\) \{[\s\S]*?\n\}/);
+    if (!keyFn || !orderFn || !fyFn || !dropFn) {
         throw new Error('Could not locate shuffle helpers in viewer.js');
     }
-    const wrapped = `${fyFn[0]}\n${keyFn[0]}\n${orderFn[0]}\nexport { _buildShuffleOrder, _playlistKey };`;
+    const wrapped = `${fyFn[0]}\n${keyFn[0]}\n${orderFn[0]}\n${dropFn[0]}\nexport { _buildShuffleOrder, _playlistKey, _dropKeyFromOrder };`;
     const dataUrl = `data:text/javascript;base64,${Buffer.from(wrapped).toString('base64')}`;
     const mod = await import(dataUrl);
     buildShuffleOrder = mod._buildShuffleOrder;
     playlistKey = mod._playlistKey;
+    dropKeyFromOrder = mod._dropKeyFromOrder;
 });
 
 describe('viewer shuffle helpers', () => {
@@ -48,5 +51,14 @@ describe('viewer shuffle helpers', () => {
         const ordered = buildShuffleOrder(keys, 'self:999');
         expect(ordered).toHaveLength(3);
         expect(new Set(ordered).size).toBe(3);
+    });
+
+    it('_dropKeyFromOrder removes a deleted key and keeps the rest unique', () => {
+        const keys = ['self:1', 'self:2', 'self:3', 'self:4'];
+        const next = dropKeyFromOrder(keys, 'self:2');
+        expect(next).toEqual(['self:1', 'self:3', 'self:4']);
+        expect(keys).toEqual(['self:1', 'self:2', 'self:3', 'self:4']); // pure
+        expect(dropKeyFromOrder(next, 'self:999')).toEqual(next);
+        expect(dropKeyFromOrder(keys, '')).toEqual(keys);
     });
 });

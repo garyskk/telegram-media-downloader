@@ -464,6 +464,7 @@
     "viewer.tab.videos": "Videos",
     "viewer.tab.documents": "Files",
     "viewer.tab.audio": "Audio",
+    "viewer.shuffle": "Shuffle",
     "viewer.video.resumed": "Resumed at {time}.",
     "viewer.video.delete_title": "Delete File",
     "viewer.video.delete": "Delete",
