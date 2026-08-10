@@ -315,6 +315,8 @@ let _reviewActions = null;
 // badge). Receives the current file and returns an HTML string painted
 // into #viewer-review-meta on every openMediaViewer call.
 let _reviewMetaRender = null;
+// Blocks shuffle for openMediaViewerSingle / review sessions (not the gallery).
+let _shuffleBlocked = false;
 
 /**
  * One-shot open: hand a `{ fullPath, type, name, … }` record straight to
@@ -327,6 +329,7 @@ let _reviewMetaRender = null;
  */
 export function openMediaViewerSingle(file) {
     if (!file?.fullPath) return;
+    _shuffleBlocked = true;
     state.files = [file];
     openMediaViewer(0);
 }
@@ -349,6 +352,7 @@ export function openMediaViewerSingle(file) {
  */
 export function openMediaViewerForReview(files, index, opts = {}) {
     if (!Array.isArray(files) || !files.length) return;
+    _shuffleBlocked = true;
     state.files = files;
     // Reset filter so navigateMedia walks the full provided list, not whatever
     // gallery tab was active before the maintenance page was opened.
@@ -799,7 +803,9 @@ export function openMediaViewer(index) {
     ]
         .filter(Boolean)
         .join(' • ');
-    document.getElementById('modal-counter').textContent = `${index + 1} / ${state.files.length}`;
+    document.getElementById('modal-counter').textContent = _shuffle.active
+        ? `${index + 1} / ${_shuffle.keys.length}`
+        : `${index + 1} / ${state.files.length}`;
     document.getElementById('modal-download').href = downloadUrl;
     _updatePinButton(file);
     _setTypeChip(file);
@@ -812,6 +818,7 @@ export function openMediaViewer(index) {
     if (file.type === 'images' || file.type === 'documents') _startSlideshow();
     const autoBadge = document.getElementById('modal-continuous-badge');
     if (autoBadge) autoBadge.classList.toggle('hidden', !_isAutoAdvance());
+    _syncShuffleChrome();
 
     prefetchNeighbor(index + 1);
 
@@ -2488,15 +2495,21 @@ export function closeMediaViewer() {
     // the action toolbar by mistake.
     _reviewActions = null;
     _reviewMetaRender = null;
+    _shuffleBlocked = false;
     document.getElementById('viewer-review-bar')?.classList.add('hidden');
     document.getElementById('viewer-review-actions')?.classList.add('hidden');
     document.getElementById('viewer-review-meta')?.classList.add('hidden');
+    // Leaving the modal ends shuffle and restores the gallery backing list.
+    _disableShuffle({ silent: true });
 }
 
 export function setupViewerEvents() {
     document.getElementById('modal-close')?.addEventListener('click', closeMediaViewer);
     document.getElementById('modal-prev')?.addEventListener('click', () => navigateMedia(-1));
     document.getElementById('modal-next')?.addEventListener('click', () => navigateMedia(1));
+    document.getElementById('modal-shuffle-btn')?.addEventListener('click', () => {
+        void toggleShuffle();
+    });
 
     // Share button — opens the share-link sheet for the current file.
     // Lazy-import keeps the module out of the cold-load path; it only
@@ -2752,7 +2765,339 @@ function _crossfadeTransition(callback) {
     }, 100);
 }
 
+// ---- Shuffle playlist (full library) ----------------------------------
+// Builds a no-repeat order from GET /api/downloads/ids (full filtered set),
+// hydrates slots via POST /api/downloads/by-ids, and walks that order in
+// navigateMedia. Snapshot/restore keeps the gallery's state.files intact.
+
+const SHUFFLE_HYDRATE_WINDOW = 40;
+
+let _shuffle = {
+    active: false,
+    keys: [],
+    cursor: 0,
+    cache: new Map(),
+    backupFiles: null,
+    backupIndex: 0,
+    backupFilter: 'all',
+    busy: false,
+};
+
+/** Normalize a playlist id / {id, peer_id} to a stable string key. */
+function _playlistKey(entry) {
+    if (entry == null) return '';
+    if (typeof entry === 'object') {
+        const id = Number(entry.id);
+        if (!Number.isFinite(id) || id <= 0) return '';
+        const peer = entry.peer_id || entry.peerId || 'self';
+        return `${peer && peer !== 'self' ? peer : 'self'}:${id}`;
+    }
+    const id = Number(entry);
+    if (!Number.isFinite(id) || id <= 0) return '';
+    return `self:${id}`;
+}
+
+function _filePlaylistKey(file) {
+    if (!file?.id) return '';
+    const peer = file.peer_id || file.peerId || 'self';
+    return _playlistKey({ id: file.id, peer_id: peer });
+}
+
+function _keyToPayload(key) {
+    const i = String(key).indexOf(':');
+    if (i < 0) return null;
+    const peer_id = key.slice(0, i);
+    const id = Number(key.slice(i + 1));
+    if (!Number.isFinite(id) || id <= 0) return null;
+    if (peer_id === 'self') return id;
+    return { id, peer_id };
+}
+
+/** Fisher–Yates in place. */
+function _fisherYates(arr) {
+    for (let i = arr.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        const tmp = arr[i];
+        arr[i] = arr[j];
+        arr[j] = tmp;
+    }
+    return arr;
+}
+
+/**
+ * Put `currentKey` first (if present), shuffle the rest.
+ * Pure — does not mutate the input array.
+ */
+function _buildShuffleOrder(keys, currentKey) {
+    const list = keys.slice();
+    if (!currentKey || !list.length) return _fisherYates(list);
+    const idx = list.indexOf(currentKey);
+    if (idx < 0) return _fisherYates(list);
+    list.splice(idx, 1);
+    _fisherYates(list);
+    list.unshift(currentKey);
+    return list;
+}
+
+export const _buildShuffleOrderForTests = _buildShuffleOrder;
+export const _fisherYatesForTests = _fisherYates;
+export const _playlistKeyForTests = _playlistKey;
+
+function _syncShuffleChrome() {
+    const badge = document.getElementById('modal-shuffle-badge');
+    const btn = document.getElementById('modal-shuffle-btn');
+    if (badge) badge.classList.toggle('hidden', !_shuffle.active);
+    if (btn) {
+        btn.classList.toggle('hidden', _shuffleBlocked);
+        btn.classList.toggle('bg-tg-blue/80', _shuffle.active);
+        btn.classList.toggle('bg-black/50', !_shuffle.active);
+        btn.setAttribute('aria-pressed', _shuffle.active ? 'true' : 'false');
+    }
+}
+
+function _shuffleQs() {
+    const type =
+        state.currentFilter && state.currentFilter !== 'all' ? state.currentFilter : 'all';
+    let qs = `type=${encodeURIComponent(type)}`;
+    if (state.pinnedFilter === 'pinned') qs += '&pinned=1';
+    else if (state.pinnedFilter === 'unpinned') qs += '&pinned=0';
+    if (state.currentGroup) qs += `&groupId=${encodeURIComponent(state.currentGroup)}`;
+    // Mirror app.js _galleryScopeQs
+    const viewerScope = state.viewerPeerScope;
+    if (viewerScope) {
+        qs += `&include=peers&peerId=${encodeURIComponent(viewerScope)}`;
+    } else {
+        const s = state.galleryScope;
+        if (s && s !== 'local') {
+            if (s === 'all') qs += '&include=peers';
+            else qs += `&include=peers&peerId=${encodeURIComponent(s)}`;
+        }
+    }
+    return qs;
+}
+
+function _canShuffle() {
+    if (_shuffleBlocked || _reviewActions?.length) return false;
+    if (!state.files?.length) return false;
+    return true;
+}
+
+async function _hydrateShuffleKeys(keys) {
+    const need = [];
+    for (const k of keys) {
+        if (!_shuffle.cache.has(k)) need.push(k);
+    }
+    if (!need.length) return;
+    for (let i = 0; i < need.length; i += 100) {
+        const slice = need.slice(i, i + 100);
+        const payload = slice.map(_keyToPayload).filter((x) => x != null);
+        if (!payload.length) continue;
+        const res = await api.post('/api/downloads/by-ids', { ids: payload });
+        for (const file of res?.files || []) {
+            const k = _filePlaylistKey(file);
+            if (k) _shuffle.cache.set(k, file);
+        }
+    }
+}
+
+/** Rebuild state.files as a dense prefix of hydrated shuffle keys (index-aligned). */
+function _materializeShuffleFiles(uptoExclusive) {
+    const end = Math.min(
+        _shuffle.keys.length,
+        Math.max(0, uptoExclusive == null ? _shuffle.keys.length : uptoExclusive),
+    );
+    const files = [];
+    for (let i = 0; i < end; i++) {
+        const f = _shuffle.cache.get(_shuffle.keys[i]);
+        if (!f) break; // stop at first hole so indices stay contiguous
+        files.push(f);
+    }
+    state.files = files;
+}
+
+async function _ensureShuffleWindow(centerIdx) {
+    const start = Math.max(0, centerIdx - 2);
+    const end = Math.min(_shuffle.keys.length, centerIdx + SHUFFLE_HYDRATE_WINDOW);
+    // Always hydrate from 0..end so materialize can build a contiguous prefix
+    // covering the cursor (needed after jumps / reshuffle).
+    await _hydrateShuffleKeys(_shuffle.keys.slice(0, end));
+    // Also backfill a couple behind the cursor when walking backward.
+    if (start > 0) await _hydrateShuffleKeys(_shuffle.keys.slice(start, end));
+    _materializeShuffleFiles(end);
+}
+
+async function _enableShuffle() {
+    if (_shuffle.busy || _shuffle.active) return;
+    if (!_canShuffle()) {
+        showToast(
+            i18nT('toast.viewer_shuffle_unavailable', 'Shuffle is not available here'),
+            'info',
+        );
+        return;
+    }
+    _shuffle.busy = true;
+    try {
+        const current = state.files[state.currentFileIndex];
+        const currentKey = _filePlaylistKey(current);
+        const res = await api.get(`/api/downloads/ids?${_shuffleQs()}`);
+        const rawIds = res?.ids || [];
+        if (!rawIds.length) {
+            showToast(i18nT('toast.viewer_shuffle_empty', 'No files to shuffle'), 'info');
+            return;
+        }
+        const keys = rawIds.map(_playlistKey).filter(Boolean);
+        if (!keys.length) {
+            showToast(i18nT('toast.viewer_shuffle_empty', 'No files to shuffle'), 'info');
+            return;
+        }
+
+        _shuffle.backupFiles = state.files.slice();
+        _shuffle.backupIndex = state.currentFileIndex;
+        _shuffle.backupFilter = state.currentFilter || 'all';
+        // Seed cache from whatever the gallery already loaded.
+        for (const f of state.files) {
+            const k = _filePlaylistKey(f);
+            if (k && f?.fullPath) _shuffle.cache.set(k, f);
+        }
+
+        _shuffle.keys = _buildShuffleOrder(keys, currentKey);
+        _shuffle.cursor = 0;
+        _shuffle.active = true;
+        state.currentFilter = 'all';
+
+        await _ensureShuffleWindow(0);
+        if (!state.files.length) {
+            _disableShuffle({ silent: true });
+            showToast(i18nT('toast.viewer_shuffle_empty', 'No files to shuffle'), 'info');
+            return;
+        }
+        _syncShuffleChrome();
+        openMediaViewer(0);
+        showToast(
+            i18nTf(
+                'toast.viewer_shuffle_on',
+                { count: _shuffle.keys.length },
+                `Shuffle on · ${_shuffle.keys.length} files`,
+            ),
+            'info',
+        );
+    } catch (e) {
+        console.error('enable shuffle:', e);
+        _disableShuffle({ silent: true });
+        showToast(
+            i18nT('toast.viewer_shuffle_error', 'Could not start shuffle'),
+            'error',
+        );
+    } finally {
+        _shuffle.busy = false;
+    }
+}
+
+function _disableShuffle({ silent = false } = {}) {
+    if (!_shuffle.active && _shuffle.backupFiles == null) {
+        _syncShuffleChrome();
+        return;
+    }
+    const backup = _shuffle.backupFiles;
+    const backupIndex = _shuffle.backupIndex;
+    const backupFilter = _shuffle.backupFilter;
+    const wasActive = _shuffle.active;
+    _shuffle = {
+        active: false,
+        keys: [],
+        cursor: 0,
+        cache: new Map(),
+        backupFiles: null,
+        backupIndex: 0,
+        backupFilter: 'all',
+        busy: false,
+    };
+    if (Array.isArray(backup)) {
+        state.files = backup;
+        state.currentFilter = backupFilter || 'all';
+        state.currentFileIndex = Math.max(
+            0,
+            Math.min(backupIndex || 0, Math.max(0, state.files.length - 1)),
+        );
+    }
+    _syncShuffleChrome();
+    if (wasActive && !silent) {
+        showToast(i18nT('toast.viewer_shuffle_off', 'Shuffle off'), 'info');
+    }
+}
+
+async function toggleShuffle() {
+    if (_shuffle.active) {
+        const idx = state.currentFileIndex;
+        const file = state.files[idx];
+        _disableShuffle();
+        // Stay on the same file if it still exists in the restored gallery list.
+        if (file) {
+            const restoredIdx = state.files.findIndex(
+                (f) => _filePlaylistKey(f) === _filePlaylistKey(file),
+            );
+            if (restoredIdx >= 0) openMediaViewer(restoredIdx);
+            else if (state.files.length) openMediaViewer(Math.min(idx, state.files.length - 1));
+        }
+        return;
+    }
+    await _enableShuffle();
+}
+
+async function _reshuffleKeepingCurrent() {
+    const current = state.files[state.currentFileIndex];
+    const currentKey = _filePlaylistKey(current);
+    _shuffle.keys = _buildShuffleOrder(_shuffle.keys, currentKey);
+    _shuffle.cursor = 0;
+    await _ensureShuffleWindow(0);
+}
+
+async function navigateShuffle(dir) {
+    if (_shuffle.busy) return;
+    const n = _shuffle.keys.length;
+    if (!n) return;
+
+    let next = _shuffle.cursor + dir;
+    if (next >= n || next < 0) {
+        if (!_isAutoAdvance()) return;
+        _shuffle.busy = true;
+        try {
+            await _reshuffleKeepingCurrent();
+            // After reshuffle current is at 0; advance one step in dir.
+            next = dir > 0 ? 1 : n - 1;
+            if (n === 1) next = 0;
+        } finally {
+            _shuffle.busy = false;
+        }
+    }
+
+    _shuffle.busy = true;
+    try {
+        await _ensureShuffleWindow(Math.max(0, next));
+        // Re-resolve index after materialize (failed hydrates may shrink list).
+        if (next >= state.files.length) {
+            if (_isAutoAdvance() && state.files.length) {
+                await _reshuffleKeepingCurrent();
+                next = state.files.length > 1 ? 1 : 0;
+            } else return;
+        }
+        _shuffle.cursor = next;
+        _stopSlideshow();
+        _crossfadeTransition(() => openMediaViewer(next));
+    } catch (e) {
+        console.error('navigate shuffle:', e);
+        showToast(i18nT('toast.viewer_shuffle_error', 'Could not start shuffle'), 'error');
+    } finally {
+        _shuffle.busy = false;
+    }
+}
+
 function navigateMedia(dir) {
+    if (_shuffle.active) {
+        void navigateShuffle(dir);
+        return;
+    }
+
     const currentFilter = state.currentFilter || 'all';
     const visible =
         currentFilter === 'all' ? state.files : state.files.filter((f) => f.type === currentFilter);
