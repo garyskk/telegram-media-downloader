@@ -66,6 +66,8 @@ A few `/api/auth/*` routes are explicitly registered before the global auth midd
 |---|---|---|
 | `GET`    | `/api/downloads`                    | Aggregate per group. |
 | `GET`    | `/api/downloads/all`                | Cross-group All-Media list, paginated. `?page=&limit=&type=`. **`?include=local\|peers\|all`** (admin-only) UNIONs `peer_downloads` into the result; **`?peerId=<id>`** narrows to one peer. Each row carries `peer_id` (`'self'` or peer's id) + `peer_name`. Default `local` is backward-compatible. |
+| `GET`    | `/api/downloads/ids`                | Full matching ID set for player shuffle (no page limit). Same `?type=` / `?pinned=` / `?groupId=` / `?include=` / `?peerId=` filters as `/all`. Local → `{ ids: number[], total }`; federated → `{ ids: [{ id, peer_id }], total }`. Guests forced to `local`. |
+| `POST`   | `/api/downloads/by-ids`             | Hydrate shuffle slots. Body `{ ids: number[] \| { id, peer_id }[] }` (max 100). Returns gallery tile-shaped `{ files: […] }` in request order. Guest-allowed; peer keys ignored for guests. |
 | `GET`    | `/api/downloads/:groupId`           | Paginated rows for one group. `?type=images\|videos\|documents\|audio`. Same `?include=` / `?peerId=` federation params as `/all`. |
 | `GET`    | `/api/downloads/search`             | `?q=…&page=&limit=&groupId=`. Same `?include=` federation param. |
 | `POST`   | `/api/downloads/bulk-delete`        | `{ids?, paths?}`. Also purges thumbnail cache for every removed id. |

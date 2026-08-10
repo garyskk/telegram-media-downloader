@@ -145,7 +145,7 @@ src/web/public/js/
 ├── nsfw-ui.js        # NSFW review sheet (lazy-loaded from settings.js)
 ├── share.js          # Share-link sheet (lazy-loaded from viewer + settings)
 ├── gallery-select.js # Drag-to-select lasso + ctrl/shift gestures + keyboard
-├── viewer.js         # full-screen media viewer (seekbar sprite hover preview)
+├── viewer.js         # full-screen media viewer (seekbar hover preview, continuous play, full-library shuffle)
 ├── maintenance-thumbs.js / maintenance-seekbar.js / maintenance-ai.js / maintenance-nsfw.js / maintenance-video.js / maintenance-duplicates.js / maintenance-logs.js / maintenance-hub.js
 ├── queue.js          # IDM-style queue page (append-on-scroll, in-place patch)
 ├── backfill.js       # Backfill page (active jobs + recent + start)
