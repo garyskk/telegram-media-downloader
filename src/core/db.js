@@ -1276,6 +1276,143 @@ export function getDownloads(groupId, limit = 50, offset = 0, type = 'all', opts
     return { files: rows, total };
 }
 
+const _DOWNLOAD_TYPE_MAP = {
+    images: 'photo',
+    videos: 'video',
+    documents: 'document',
+    audio: 'audio',
+};
+
+/** Shared WHERE fragments for listDownloadIds* (same filters as getAllDownloads). */
+function _downloadIdWhere(type = 'all', opts = {}, { groupId } = {}) {
+    const clauses = ['(d.user_deleted IS NULL OR d.user_deleted = 0)'];
+    const params = [];
+    if (groupId != null && groupId !== '') {
+        clauses.push('d.group_id = ?');
+        params.push(String(groupId));
+    }
+    if (type !== 'all' && _DOWNLOAD_TYPE_MAP[type]) {
+        clauses.push('d.file_type = ?');
+        params.push(_DOWNLOAD_TYPE_MAP[type]);
+    }
+    if (opts.pinnedOnly) clauses.push('d.pinned = 1');
+    else if (opts.unpinnedOnly) clauses.push('d.pinned = 0');
+    return { where: ' WHERE ' + clauses.join(' AND '), params };
+}
+
+/**
+ * All matching download PKs for the current gallery filters — no LIMIT.
+ * Used by the player shuffle playlist so random mode covers the full
+ * library, not just the ~100-item grid page.
+ *
+ * @returns {{ ids: number[], total: number }}
+ */
+export function listDownloadIds(type = 'all', opts = {}) {
+    const { where, params } = _downloadIdWhere(type, opts);
+    const db = getDb();
+    const ids = db.prepare(`SELECT d.id AS id FROM downloads d${where} ORDER BY d.id ASC`).all(
+        ...params,
+    ).map((r) => r.id);
+    return { ids, total: ids.length };
+}
+
+/**
+ * Per-group variant of listDownloadIds.
+ * @returns {{ ids: number[], total: number }}
+ */
+export function listDownloadIdsForGroup(groupId, type = 'all', opts = {}) {
+    const { where, params } = _downloadIdWhere(type, opts, { groupId });
+    const db = getDb();
+    const ids = db.prepare(`SELECT d.id AS id FROM downloads d${where} ORDER BY d.id ASC`).all(
+        ...params,
+    ).map((r) => r.id);
+    return { ids, total: ids.length };
+}
+
+/**
+ * Fetch full download rows (+ seekbar duration) by PK, preserving the
+ * caller's id order. Soft-deleted rows are excluded. Chunks IN lists
+ * at 500 to stay under SQLite variable limits.
+ *
+ * @param {Array<number|string>} ids
+ * @returns {Array<object>}
+ */
+export function getDownloadsByIds(ids) {
+    if (!ids?.length) return [];
+    const nums = [];
+    const seen = new Set();
+    for (const raw of ids) {
+        const n = Number(raw);
+        if (!Number.isFinite(n) || n <= 0 || seen.has(n)) continue;
+        seen.add(n);
+        nums.push(n);
+    }
+    if (!nums.length) return [];
+
+    const db = getDb();
+    const byId = new Map();
+    for (let i = 0; i < nums.length; i += 500) {
+        const slice = nums.slice(i, i + 500);
+        const ph = slice.map(() => '?').join(',');
+        const rows = db
+            .prepare(
+                `SELECT d.*, sb.duration_sec FROM downloads d
+                 LEFT JOIN seekbar_sprites sb ON sb.download_id = d.id
+                 WHERE d.id IN (${ph})
+                   AND (d.user_deleted IS NULL OR d.user_deleted = 0)`,
+            )
+            .all(...slice);
+        for (const r of rows) byId.set(r.id, r);
+    }
+    // Preserve request order (including duplicates if the caller asked).
+    const out = [];
+    const emitted = new Set();
+    for (const raw of ids) {
+        const n = Number(raw);
+        if (!Number.isFinite(n) || emitted.has(n)) continue;
+        const row = byId.get(n);
+        if (row) {
+            out.push(row);
+            emitted.add(n);
+        }
+    }
+    return out;
+}
+
+/**
+ * Look up peer_downloads rows by (peer_id, remote_id) pairs. Returns rows
+ * shaped like the federated gallery SELECT (peer_id + id=remote_id).
+ *
+ * @param {Array<{ peer_id?: string, peerId?: string, id: number|string }>} keys
+ * @returns {Array<object>}
+ */
+export function getPeerDownloadsByKeys(keys) {
+    if (!keys?.length) return [];
+    const db = getDb();
+    const stmt = db.prepare(
+        `SELECT peer_id,
+                remote_id AS id, group_id, group_name, message_id, file_name, file_size, file_type,
+                file_path, file_hash, status, created_at, nsfw_score,
+                0 AS pinned,
+                NULL AS duration_sec
+           FROM peer_downloads
+          WHERE peer_id = ? AND remote_id = ?`,
+    );
+    const out = [];
+    const seen = new Set();
+    for (const k of keys) {
+        const peerId = String(k.peer_id || k.peerId || '');
+        const remoteId = Number(k.id);
+        if (!peerId || peerId === 'self' || !Number.isFinite(remoteId) || remoteId <= 0) continue;
+        const sk = `${peerId}:${remoteId}`;
+        if (seen.has(sk)) continue;
+        seen.add(sk);
+        const row = stmt.get(peerId, remoteId);
+        if (row) out.push(row);
+    }
+    return out;
+}
+
 /**
  * Full-text-ish search over downloaded files. LIKE-based; cheap on the
  * sub-100k row counts we expect.

@@ -63,6 +63,10 @@ import {
     getDownloadHashesForIds,
     setDownloadPinned,
     getDownloadById,
+    listDownloadIds,
+    listDownloadIdsForGroup,
+    getDownloadsByIds,
+    getPeerDownloadsByKeys,
     kvGet,
     kvSet,
     recordUpdateAttempt,
@@ -1175,7 +1179,10 @@ const GUEST_GET_ALLOW = [
     '/api/monitor/status', // engine state (running/stopped) — no config secrets
     '/api/files/token', // file-access bearer token (guests can view files)
 ];
-const GUEST_OTHER_ALLOW = new Set(['POST /api/logout']);
+const GUEST_OTHER_ALLOW = new Set([
+    'POST /api/logout',
+    'POST /api/downloads/by-ids', // hydrate shuffle playlist slots (same media guests can already list)
+]);
 
 function isGuestAllowed(req) {
     // The middleware is mounted at `/api`, so inside this function `req.path`
@@ -4534,13 +4541,155 @@ app.get('/api/downloads/all', async (req, res) => {
     }
 });
 
+// 5b. Playlist IDs for player shuffle — full matching set (no page limit).
+// Must be registered before `/api/downloads/:groupId` so "ids" is not
+// treated as a group id.
+app.get('/api/downloads/ids', async (req, res) => {
+    try {
+        const type = req.query.type || 'all';
+        const groupId = req.query.groupId ? String(req.query.groupId) : null;
+        const pinnedOnly = req.query.pinned === '1' || req.query.pinned === 'true';
+        const unpinnedOnly =
+            !pinnedOnly && (req.query.pinned === '0' || req.query.pinned === 'false');
+        const pinnedFirst = req.query.pinnedFirst === '1' || req.query.pinnedFirst === 'true';
+        const reqInclude =
+            req.query.include === 'peers' || req.query.include === 'all'
+                ? req.query.include
+                : 'local';
+        const include = req.role === 'guest' ? 'local' : reqInclude;
+        const peerIdFilter =
+            req.role !== 'guest' && req.query.peerId ? String(req.query.peerId) : null;
+        const opts = {
+            pinnedOnly,
+            unpinnedOnly,
+            pinnedFirst,
+            include,
+            ...(peerIdFilter ? { peerId: peerIdFilter } : {}),
+        };
+
+        // Local fast path — one SELECT id query, no pagination.
+        if (include === 'local') {
+            const result = groupId
+                ? listDownloadIdsForGroup(groupId, type, opts)
+                : listDownloadIds(type, opts);
+            return res.json({ ids: result.ids, total: result.total });
+        }
+
+        // Federated: page existing list helpers and emit {id, peer_id} keys
+        // so peer remote_ids stay distinguishable from local PKs.
+        const PAGE = 500;
+        const keys = [];
+        let total = 0;
+        let offset = 0;
+        for (;;) {
+            const pageResult = groupId
+                ? getDownloadsForGroupFederated(groupId, PAGE, offset, type, opts)
+                : getAllDownloadsFederated(PAGE, offset, type, opts);
+            total = Number(pageResult.total) || 0;
+            for (const row of pageResult.files || []) {
+                keys.push({
+                    id: row.id,
+                    peer_id: row.peer_id && row.peer_id !== 'self' ? row.peer_id : 'self',
+                });
+            }
+            offset += PAGE;
+            if (!pageResult.files?.length || keys.length >= total || offset > total + PAGE) break;
+        }
+        res.json({ ids: keys, total: keys.length || total });
+    } catch (e) {
+        console.error('GET /api/downloads/ids:', e);
+        res.status(500).json({ error: 'Internal error' });
+    }
+});
+
+// 5c. Hydrate shuffle playlist slots by id (local) or {id, peer_id} (federated).
+app.post('/api/downloads/by-ids', async (req, res) => {
+    try {
+        const raw = Array.isArray(req.body?.ids) ? req.body.ids : [];
+        if (!raw.length) return res.json({ files: [] });
+        if (raw.length > 100) {
+            return res.status(400).json({ error: 'ids capped at 100 per request' });
+        }
+
+        const localIds = [];
+        const peerKeys = [];
+        for (const entry of raw) {
+            if (entry != null && typeof entry === 'object') {
+                const peerId = entry.peer_id || entry.peerId || 'self';
+                const id = Number(entry.id);
+                if (!Number.isFinite(id) || id <= 0) continue;
+                if (peerId && peerId !== 'self') peerKeys.push({ id, peer_id: String(peerId) });
+                else localIds.push(id);
+            } else {
+                const id = Number(entry);
+                if (Number.isFinite(id) && id > 0) localIds.push(id);
+            }
+        }
+
+        // Guests cannot hydrate peer catalog rows.
+        if (req.role === 'guest') peerKeys.length = 0;
+
+        const localRows = getDownloadsByIds(localIds).map((r) => ({ ...r, peer_id: 'self' }));
+        const peerRows = peerKeys.length ? getPeerDownloadsByKeys(peerKeys) : [];
+
+        let config = {};
+        try {
+            config = loadConfig();
+        } catch {
+            /* ok */
+        }
+        const configGroups = new Map((config.groups || []).map((g) => [String(g.id), g]));
+        const peerNameMap = new Map();
+        if (peerRows.length) {
+            try {
+                for (const p of listPeers()) peerNameMap.set(String(p.peerId), p.name || p.peerId);
+            } catch {
+                /* cluster not initialised */
+            }
+        }
+
+        const byKey = new Map();
+        for (const row of localRows) {
+            byKey.set(`self:${row.id}`, mapDownloadRowToGalleryFile(row, { configGroups, peerNameMap }));
+        }
+        for (const row of peerRows) {
+            byKey.set(`${row.peer_id}:${row.id}`, mapDownloadRowToGalleryFile(row, { configGroups, peerNameMap }));
+        }
+
+        // Preserve request order.
+        const files = [];
+        const seen = new Set();
+        for (const entry of raw) {
+            let key;
+            if (entry != null && typeof entry === 'object') {
+                const peerId = entry.peer_id || entry.peerId || 'self';
+                const id = Number(entry.id);
+                if (!Number.isFinite(id) || id <= 0) continue;
+                key = `${peerId && peerId !== 'self' ? peerId : 'self'}:${id}`;
+            } else {
+                const id = Number(entry);
+                if (!Number.isFinite(id) || id <= 0) continue;
+                key = `self:${id}`;
+            }
+            if (seen.has(key)) continue;
+            seen.add(key);
+            const file = byKey.get(key);
+            if (file) files.push(file);
+        }
+        res.json({ files });
+    } catch (e) {
+        console.error('POST /api/downloads/by-ids:', e);
+        res.status(500).json({ error: 'Internal error' });
+    }
+});
+
 // 5. Downloads Per Group (SQLite Pagination).
-// Reject the literal "search" segment up-front — Express matches routes in
-// declaration order, and there's a `GET /api/downloads/search` further down
-// that the SPA calls for free-text search. Without this guard the search
-// route would be shadowed and always return an empty group payload.
+// Reject the literal "search" / "ids" segments up-front — Express matches
+// routes in declaration order, and there's a `GET /api/downloads/search`
+// further down (and `ids` above) that the SPA calls. Without this guard
+// those routes would be shadowed and always return an empty group payload.
 app.get('/api/downloads/:groupId', async (req, res, next) => {
-    if (req.params.groupId === 'search') return next();
+    if (req.params.groupId === 'search' || req.params.groupId === 'ids') return next();
     try {
         const { groupId } = req.params;
         const page = parseInt(req.query.page) || 1;
@@ -12798,6 +12947,53 @@ async function downloadProfilePhoto(groupId) {
 }
 
 // ============ SERVER START ============
+
+/**
+ * Map a downloads / peer_downloads row to the gallery tile + viewer file
+ * shape used by `/api/downloads/all` and `/api/downloads/by-ids`.
+ */
+function mapDownloadRowToGalleryFile(row, { configGroups, peerNameMap } = {}) {
+    const typeFolder =
+        row.file_type === 'photo'
+            ? 'images'
+            : row.file_type === 'video'
+              ? 'videos'
+              : row.file_type === 'audio'
+                ? 'audio'
+                : row.file_type === 'sticker'
+                  ? 'stickers'
+                  : 'documents';
+    const stored = (row.file_path || '').replace(/\\/g, '/');
+    const groups = configGroups instanceof Map ? configGroups : new Map();
+    const fallbackFolder = sanitizeName(
+        groups.get(String(row.group_id))?.name || row.group_name || String(row.group_id),
+    );
+    const fullPath =
+        stored && stored.includes('/')
+            ? stored
+            : `${fallbackFolder}/${typeFolder}/${row.file_name}`;
+    const isPeerRow = row.peer_id && row.peer_id !== 'self';
+    const names = peerNameMap instanceof Map ? peerNameMap : new Map();
+    return {
+        id: row.id,
+        name: row.file_name,
+        path: row.file_path,
+        fullPath,
+        size: row.file_size,
+        sizeFormatted: formatBytes(row.file_size),
+        type: typeFolder,
+        extension: path.extname(row.file_name || ''),
+        modified: row.created_at,
+        groupId: row.group_id,
+        groupName: groups.get(String(row.group_id))?.name || row.group_name || null,
+        pendingUntil: row.pending_until || null,
+        rescuedAt: row.rescued_at || null,
+        pinned: !!row.pinned,
+        peer_id: row.peer_id || 'self',
+        peer_name: isPeerRow ? names.get(String(row.peer_id)) || null : null,
+        duration: row.duration_sec ?? null,
+    };
+}
 
 function formatBytes(bytes) {
     if (!bytes || bytes === 0) return '0 B';

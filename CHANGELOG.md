@@ -5,6 +5,7 @@ All notable changes to this project are documented here. The format is based on 
 ## [Unreleased]
 
 ### Added
+- **Player shuffle (full library).** Media modal shuffle button builds a no-repeat playlist from every file matching the current gallery filters (group / All Media, type chip, pinned chip, federation scope) — not just the ~100-item loaded page. Current item stays first; continuous play reshuffles when the playlist wraps. Gallery `state.files` is snapshotted and restored on shuffle-off / close. New `GET /api/downloads/ids` + `POST /api/downloads/by-ids` (guest-allowed hydrate).
 - **People merge suggestions.** Selecting a face cluster loads nearest other People for one-tap merge (detail-panel chips + ranked **Merge into…** picker), mirroring Unclassified face suggestions. `GET /api/ai/people/:id/suggestions` ranks by centroid distance within `labelMatchEps` and same-download (“clip”) co-occurrence; Same clip ranks first.
 - **Live progress for in-flight video face scans.** A single `POST /detect/video` call can legitimately run for tens of minutes on a long/dense video (see the duration-independent sampling redesign below), during which the maintenance dashboard previously looked frozen — the scan progress bar only advances once per *video*, not once per *frame*. The sidecar now tracks decode position per request (keyed by a `job_id` the Node client generates) and exposes it via `GET /detect/video/status/{job_id}`; `detectFacesInVideo` polls it every `videoProgressPollMs` (default 5s, `TGDL_FACES_VIDEO_PROGRESS_POLL_MS`) while the request is in flight and forwards it up through `scan-runner.js` to the dashboard, which now shows e.g. `Video: clip.mp4 — 42% decoded (3,412/8,120 frames)` instead of a static "Scanning…". The same decode position is now also folded into the existing 5s-throttled `aiPeople progress — …` console/`docker compose logs` line (e.g. `aiPeople progress — 101/592 video: clip.mp4 42% (3412/8120 frames)`), so it's visible without the dashboard open at all. Best-effort telemetry only — a poll failure, a 404, or an older sidecar without `job_id` support never affects the returned faces.
 - **Mirror Run now reconciles the remote.** Lists the destination, uploads missing live files, and deletes remote orphans that are no longer in the live library (`user_deleted = 0`). Soft-deletes are not pruned from the remote until the next Run now. The `snapshots/` prefix is skipped so a shared bucket with a snapshot destination stays safe.
@@ -29,7 +30,7 @@ All notable changes to this project are documented here. The format is based on 
 - **Mirror upload of a missing local file crash-looped the process.** S3/etc. `createReadStream().pipe(...)` turned `ENOENT` into an uncaughtException. The worker now fails that job permanently when the local file is unreadable.
 
 ### Service worker
-- `VERSION = 'v2246'`
+- `VERSION = 'v2245-10'`
 
 ## [2.24.5] — 2026-05-31
 
