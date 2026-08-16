@@ -26,6 +26,7 @@ All notable changes to this project are documented here. The format is based on 
 - **Mirror destination cards no longer show a cron schedule** — cron only applies to snapshot mode; saving a non-snapshot destination clears any leftover cron.
 
 ### Fixed
+- **Video player buffering spinner stuck on during smooth progressive playback.** The spinner was shown on the network `stalled` event, which browsers fire whenever the byte-range download pauses after filling the buffer — even while frames keep advancing. Spinner visibility is now gated on media `readyState` (cold start / true playback starvation / seek into a hole), with a `timeupdate` safety clear.
 - **Empty gap under the video seekbar filmstrip.** Removed the unused `#preview-strip-container` (`min-h-[72px]`) from the media modal — it was never populated by JS and reserved a blank band between the filmstrip and the info bar.
 - **Delete while shuffle active could reopen the deleted file.** Next/prev and rematerialize still held the id in the shuffle playlist; delete now drops keys/cache/backup and advances to the next remaining item (also on WS `file_deleted`).
 - **Long video scans failing with a generic `fetch failed`.** Node's built-in `fetch` (undici) enforces its own hardcoded 300s `headersTimeout`/`bodyTimeout` independent of the app's own `AbortController`-based timeout — a `/detect/video` (or a large `/detect/batch`, or a `/detect/batch-b64` chunk) request still legitimately in flight past 5 minutes was killed by undici itself, surfacing as a network error even though the sidecar was still working. This went unnoticed before because every request finished well under 5 minutes; the duration-independent video sampling above means a long/dense video can now legitimately take much longer. Every faces-client request whose own timeout can exceed 300s now passes an explicit `undici` `Agent` dispatcher with matching timeouts. Note: a video that hit this before the fix was still marked as scanned (0 faces recorded) and won't be retried automatically — re-run "Reindex from scratch" (or manually clear `ai_indexed_at` for the affected file) after upgrading.
@@ -33,7 +34,7 @@ All notable changes to this project are documented here. The format is based on 
 - **Mirror upload of a missing local file crash-looped the process.** S3/etc. `createReadStream().pipe(...)` turned `ENOENT` into an uncaughtException. The worker now fails that job permanently when the local file is unreadable.
 
 ### Service worker
-- `VERSION = 'v2245-12'`
+- `VERSION = 'v2245-13'`
 
 ## [2.24.5] — 2026-05-31
 

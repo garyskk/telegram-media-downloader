@@ -1021,6 +1021,25 @@ function formatTime(seconds) {
     return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${pad(m)}:${pad(s)}`;
 }
 
+/**
+ * Whether the buffering spinner should be visible.
+ *
+ * Driven by media readyState — NOT by the network `stalled` event.
+ * Progressive HTTP streaming fires `stalled` whenever the browser pauses
+ * the byte-range fetch after filling its buffer; playback can still be
+ * perfectly smooth. Gating on readyState matches the HTML comment on
+ * `#video-spinner` ("shown while readyState < HAVE_FUTURE_DATA").
+ *
+ * @param {{ readyState: number, paused: boolean, seeking: boolean }} media
+ */
+function shouldShowVideoSpinner({ readyState, paused, seeking }) {
+    // HAVE_CURRENT_DATA = 2 — no decoded frame yet → cold-start spinner.
+    if (readyState < 2) return true;
+    // HAVE_FUTURE_DATA = 3 — playing/seeking without the next frame queued.
+    if ((seeking || !paused) && readyState < 3) return true;
+    return false;
+}
+
 class VideoPlayer {
     constructor() {
         this.video = document.getElementById('modal-video');
@@ -1298,11 +1317,16 @@ class VideoPlayer {
             this.durTime.textContent = formatTime(this.video.duration || 0);
             this._renderBuffered();
         };
-        this.video.onwaiting = () => this._showSpinner(true);
-        this.video.onstalled = () => this._showSpinner(true);
-        this.video.oncanplay = () => this._showSpinner(false);
-        this.video.onplaying = () => this._showSpinner(false);
-        this.video.onloadeddata = () => this._showSpinner(false);
+        // Buffering spinner: sync from readyState. Never blindly trust
+        // `stalled` — that event means the *download* paused, which is
+        // normal once the progressive buffer is full.
+        this.video.onwaiting = () => this._syncSpinner();
+        this.video.onstalled = () => this._syncSpinner();
+        this.video.oncanplay = () => this._syncSpinner();
+        this.video.oncanplaythrough = () => this._syncSpinner();
+        this.video.onplaying = () => this._syncSpinner();
+        this.video.onloadeddata = () => this._syncSpinner();
+        this.video.onseeked = () => this._syncSpinner();
         this.video.onerror = () => this._showError();
         this.video.onratechange = () => this._refreshSpeedUi();
 
@@ -2018,6 +2042,11 @@ class VideoPlayer {
     _onTimeUpdate() {
         const v = this.video;
         this.curTime.textContent = formatTime(v.currentTime);
+        // Safety net: if frames are advancing, clear a stuck spinner
+        // left behind by a spurious waiting/stalled race.
+        if (this.spinner && !this.spinner.classList.contains('hidden')) {
+            this._syncSpinner();
+        }
         if (Number.isFinite(v.duration) && v.duration > 0) {
             const pct = Math.max(0, Math.min(100, (v.currentTime / v.duration) * 100));
             this.progressFill.style.width = `${pct}%`;
@@ -2210,6 +2239,18 @@ class VideoPlayer {
 
     _showSpinner(on) {
         this.spinner.classList.toggle('hidden', !on);
+    }
+
+    /** Recompute spinner from media readyState (see shouldShowVideoSpinner). */
+    _syncSpinner() {
+        if (!this.spinner || !this.video) return;
+        this._showSpinner(
+            shouldShowVideoSpinner({
+                readyState: this.video.readyState,
+                paused: this.video.paused,
+                seeking: this.video.seeking,
+            }),
+        );
     }
 
     _showError() {
