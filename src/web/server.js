@@ -8547,9 +8547,23 @@ app.get('/api/ai/people', async (req, res) => {
         const limit = Math.max(1, Math.min(2000, Number(req.query?.limit) || 100));
         const offset = Math.max(0, Number(req.query?.offset) || 0);
         const scope = String(req.query?.scope || 'local').toLowerCase();
-        const local = listPeople({ limit, offset });
+        // Accept `sort`/`sortBy` and `dir`/`sortDir` (aliases). Whitelist
+        // enforced inside listPeople — unknown values fall back to defaults.
+        const sortByRaw = String(req.query?.sortBy || req.query?.sort || 'face_count');
+        const sortDirRaw = String(req.query?.sortDir || req.query?.dir || 'desc');
+        const sortBy = ['face_count', 'avg_quality', 'name'].includes(sortByRaw)
+            ? sortByRaw
+            : 'face_count';
+        const sortDir = sortDirRaw.toLowerCase() === 'asc' ? 'asc' : 'desc';
+        const local = listPeople({ limit, offset, sortBy, sortDir });
         if (scope !== 'federated') {
-            return res.json({ success: true, scope: 'local', ...local });
+            return res.json({
+                success: true,
+                scope: 'local',
+                sortBy,
+                sortDir,
+                ...local,
+            });
         }
         // Federated — list local clusters first, then peer summaries
         // tagged with the owning peer id. The UI's cover thumbnail is
@@ -8559,13 +8573,14 @@ app.get('/api/ai/people', async (req, res) => {
             const { listPeers } = await import('../core/cluster/peers.js');
             const { relayTo } = await import('../core/cluster/relay.js');
             const peers = listPeers();
+            const peerQs = `limit=${limit}&sortBy=${encodeURIComponent(sortBy)}&sortDir=${encodeURIComponent(sortDir)}`;
             const peerLists = await Promise.all(
                 peers.map(async (p) => {
                     try {
                         const r = await relayTo({
                             targetPeerId: p.peerId,
                             method: 'GET',
-                            path: `/api/ai/people?limit=${limit}`,
+                            path: `/api/ai/people?${peerQs}`,
                         });
                         if (!r.ok) return [];
                         const json = await r.json();
@@ -8588,6 +8603,8 @@ app.get('/api/ai/people', async (req, res) => {
             return res.json({
                 success: true,
                 scope: 'federated',
+                sortBy,
+                sortDir,
                 people: merged,
                 total: merged.length,
                 peerErrors,

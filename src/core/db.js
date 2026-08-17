@@ -3640,9 +3640,29 @@ export function restorePinnedCoverFaces(faceIds) {
     return n;
 }
 
-export function listPeople({ limit = 500, offset = 0 } = {}) {
+const PEOPLE_SORT_BY = new Set(['face_count', 'avg_quality', 'name']);
+
+/**
+ * List face-cluster people with cover face + counts.
+ * @param {{ limit?: number, offset?: number, sortBy?: string, sortDir?: string }} [opts]
+ *   `sortBy`: `face_count` (default) | `avg_quality` | `name`
+ *   `sortDir`: `desc` (default) | `asc` — shared direction for every field
+ */
+export function listPeople({ limit = 500, offset = 0, sortBy = 'face_count', sortDir = 'desc' } = {}) {
     const lim = Math.max(1, Math.min(2000, Number(limit) || 500));
     const off = Math.max(0, Number(offset) || 0);
+    const by = PEOPLE_SORT_BY.has(String(sortBy || '')) ? String(sortBy) : 'face_count';
+    const dir = String(sortDir || '').toLowerCase() === 'asc' ? 'ASC' : 'DESC';
+    // Whitelisted column expressions only — never interpolate raw input.
+    let orderExpr;
+    if (by === 'avg_quality') {
+        orderExpr = `avg_quality ${dir}, p.id ASC`;
+    } else if (by === 'name') {
+        // Unlabeled (NULL/empty) always last, regardless of direction.
+        orderExpr = `(p.label IS NULL OR p.label = '') ASC, p.label COLLATE NOCASE ${dir}, p.id ASC`;
+    } else {
+        orderExpr = `face_count ${dir}, p.id ASC`;
+    }
     const db = getDb();
     const rows = db
         .prepare(`
@@ -3689,7 +3709,7 @@ export function listPeople({ limit = 500, offset = 0 } = {}) {
                WHERE fex.person_id = p.id
                  AND (dex.user_deleted IS NULL OR dex.user_deleted = 0)
          ) > 0
-         ORDER BY face_count DESC, p.id ASC
+         ORDER BY ${orderExpr}
          LIMIT ? OFFSET ?
     `)
         .all(lim, off);

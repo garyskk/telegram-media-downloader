@@ -1947,3 +1947,104 @@ describe('full rebuild Phase B (clears exclusions)', () => {
         expect(unassigned).toBe(0);
     });
 });
+
+describe('listPeople sortBy / sortDir', () => {
+    function seedThreePeople() {
+        const did = downloadId();
+        const alice = api.insertPerson({
+            label: 'Alice',
+            centroidBlob: f32Blob([1, 0, 0]),
+            faceCount: 1,
+        });
+        const bob = api.insertPerson({
+            label: 'Bob',
+            centroidBlob: f32Blob([0, 1, 0]),
+            faceCount: 1,
+        });
+        const unlabeled = api.insertPerson({
+            label: null,
+            centroidBlob: f32Blob([0, 0, 1]),
+            faceCount: 1,
+        });
+        // Alice: 3 faces @ quality 0.9 → avg 0.9
+        for (let i = 0; i < 3; i++) {
+            api.insertFace({
+                downloadId: did,
+                x: 0,
+                y: 0,
+                w: 40,
+                h: 40,
+                embeddingBlob: f32Blob([1, 0, 0]),
+                personId: alice,
+                qualityScore: 0.9,
+            });
+        }
+        // Bob: 1 face @ quality 0.2
+        api.insertFace({
+            downloadId: did,
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 40,
+            embeddingBlob: f32Blob([0, 1, 0]),
+            personId: bob,
+            qualityScore: 0.2,
+        });
+        // Unlabeled: 2 faces @ quality 0.5
+        for (let i = 0; i < 2; i++) {
+            api.insertFace({
+                downloadId: did,
+                x: 0,
+                y: 0,
+                w: 40,
+                h: 40,
+                embeddingBlob: f32Blob([0, 0, 1]),
+                personId: unlabeled,
+                qualityScore: 0.5,
+            });
+        }
+        return { alice, bob, unlabeled };
+    }
+
+    it('defaults to face_count DESC', () => {
+        const { alice, bob, unlabeled } = seedThreePeople();
+        const ids = api.listPeople({}).people.map((p) => p.id);
+        expect(ids).toEqual([alice, unlabeled, bob]);
+    });
+
+    it('sorts face_count ASC', () => {
+        const { alice, bob, unlabeled } = seedThreePeople();
+        const ids = api
+            .listPeople({ sortBy: 'face_count', sortDir: 'asc' })
+            .people.map((p) => p.id);
+        expect(ids).toEqual([bob, unlabeled, alice]);
+    });
+
+    it('sorts avg_quality DESC and ASC', () => {
+        const { alice, bob, unlabeled } = seedThreePeople();
+        const desc = api
+            .listPeople({ sortBy: 'avg_quality', sortDir: 'desc' })
+            .people.map((p) => p.id);
+        expect(desc).toEqual([alice, unlabeled, bob]);
+        const asc = api
+            .listPeople({ sortBy: 'avg_quality', sortDir: 'asc' })
+            .people.map((p) => p.id);
+        expect(asc).toEqual([bob, unlabeled, alice]);
+    });
+
+    it('sorts name ASC and DESC (null labels last)', () => {
+        const { alice, bob, unlabeled } = seedThreePeople();
+        const asc = api.listPeople({ sortBy: 'name', sortDir: 'asc' }).people.map((p) => p.id);
+        expect(asc).toEqual([alice, bob, unlabeled]);
+        const desc = api.listPeople({ sortBy: 'name', sortDir: 'desc' }).people.map((p) => p.id);
+        expect(desc).toEqual([bob, alice, unlabeled]);
+    });
+
+    it('rejects unknown sortBy / sortDir and falls back to defaults', () => {
+        const { alice, bob, unlabeled } = seedThreePeople();
+        const ids = api
+            .listPeople({ sortBy: 'DROP TABLE', sortDir: 'SIDEWAYS' })
+            .people.map((p) => p.id);
+        expect(ids).toEqual([alice, unlabeled, bob]);
+    });
+});

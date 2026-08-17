@@ -78,6 +78,7 @@ const _peopleFilter = {
     videosOnly: false,
     hideLowQuality: false,
     sortBy: 'face_count',
+    sortDir: 'desc',
 };
 
 // Scan phase tracking — distinguishes Phase A (per-image detect) from
@@ -128,6 +129,7 @@ export async function init() {
         _bindOnce();
         _initOnce = true;
     }
+    _syncPeopleSortDirUi();
     _setActionButtonsEnabled(false);
     await refreshStatus();
     _refreshDoctor().catch(() => {});
@@ -284,17 +286,29 @@ function _bindOnce() {
         const btn = e.target.closest('.ai-sort-btn');
         if (!btn) return;
         const sortBy = btn.dataset.sort;
-        if (!sortBy || sortBy === _peopleFilter.sortBy) return;
-        _peopleFilter.sortBy = sortBy;
-        for (const b of document.querySelectorAll('#ai-people-sort-group .ai-sort-btn')) {
-            if (b.dataset.sort === sortBy) {
-                b.classList.remove('text-tg-textSecondary');
-                b.classList.add('bg-tg-blue/10', 'text-tg-blue');
-            } else {
-                b.classList.remove('bg-tg-blue/10', 'text-tg-blue');
-                b.classList.add('text-tg-textSecondary');
+        if (!sortBy) return;
+        // Re-clicking the active field toggles direction; switching fields
+        // keeps the shared Asc/Desc toggle as-is.
+        if (sortBy === _peopleFilter.sortBy) {
+            _peopleFilter.sortDir = _peopleFilter.sortDir === 'asc' ? 'desc' : 'asc';
+        } else {
+            _peopleFilter.sortBy = sortBy;
+            for (const b of document.querySelectorAll('#ai-people-sort-group .ai-sort-btn')) {
+                if (b.dataset.sort === sortBy) {
+                    b.classList.remove('text-tg-textSecondary');
+                    b.classList.add('bg-tg-blue/10', 'text-tg-blue');
+                } else {
+                    b.classList.remove('bg-tg-blue/10', 'text-tg-blue');
+                    b.classList.add('text-tg-textSecondary');
+                }
             }
         }
+        _syncPeopleSortDirUi();
+        _renderPeopleGrid().catch(() => {});
+    });
+    $('#ai-people-sort-dir')?.addEventListener('click', () => {
+        _peopleFilter.sortDir = _peopleFilter.sortDir === 'asc' ? 'desc' : 'asc';
+        _syncPeopleSortDirUi();
         _renderPeopleGrid().catch(() => {});
     });
     $('#ai-people-refresh-btn')?.addEventListener('click', () => _loadPeople());
@@ -1603,13 +1617,41 @@ function _onScanDone(feature, msg) {
 
 async function _loadPeople() {
     try {
-        const r = await api.get('/api/ai/people?limit=2000');
+        const sortBy = encodeURIComponent(_peopleFilter.sortBy || 'face_count');
+        const sortDir = encodeURIComponent(_peopleFilter.sortDir === 'asc' ? 'asc' : 'desc');
+        const r = await api.get(`/api/ai/people?limit=2000&sortBy=${sortBy}&sortDir=${sortDir}`);
         if (!r.success) return;
         _peopleCache = Array.isArray(r.people) ? r.people : [];
         await _renderPeopleGrid();
         await _loadExcludedPeople();
     } catch (e) {
         console.warn('ai/people:', e);
+    }
+}
+
+function _syncPeopleSortDirUi() {
+    const btn = $('#ai-people-sort-dir');
+    if (!btn) return;
+    const asc = _peopleFilter.sortDir === 'asc';
+    btn.dataset.dir = asc ? 'asc' : 'desc';
+    const titleKey = asc
+        ? 'maintenance.ai.people.sort.dir_asc'
+        : 'maintenance.ai.people.sort.dir_desc';
+    const titleFallback = asc ? 'Sort ascending' : 'Sort descending';
+    const title = i18nT(titleKey, titleFallback);
+    btn.title = title;
+    btn.setAttribute('aria-label', title);
+    const icon = btn.querySelector('i');
+    if (icon) {
+        icon.classList.toggle('ri-sort-asc', asc);
+        icon.classList.toggle('ri-sort-desc', !asc);
+    }
+    // Name field icon mirrors A→Z / Z→A when that field is active.
+    const nameBtn = document.querySelector('#ai-people-sort-group .ai-sort-btn[data-sort="name"] i');
+    if (nameBtn) {
+        const nameActive = _peopleFilter.sortBy === 'name';
+        nameBtn.classList.toggle('ri-sort-alphabet-asc', !nameActive || asc);
+        nameBtn.classList.toggle('ri-sort-alphabet-desc', nameActive && !asc);
     }
 }
 
@@ -1674,6 +1716,7 @@ async function _renderPeopleGrid() {
     const videosOnly = _peopleFilter.videosOnly;
     const hideLQ = _peopleFilter.hideLowQuality;
     const sortBy = _peopleFilter.sortBy || 'face_count';
+    const sortDir = _peopleFilter.sortDir === 'asc' ? 1 : -1;
     const filtered = _peopleCache.filter((p) => {
         if (unlabeled && p.label) return false;
         if (videosOnly && !(Number(p.video_face_count) > 0)) return false;
@@ -1686,9 +1729,21 @@ async function _renderPeopleGrid() {
         return true;
     });
     if (sortBy === 'avg_quality') {
-        filtered.sort((a, b) => (Number(b.avg_quality) || 0) - (Number(a.avg_quality) || 0));
+        filtered.sort(
+            (a, b) => ((Number(a.avg_quality) || 0) - (Number(b.avg_quality) || 0)) * sortDir,
+        );
     } else if (sortBy === 'name') {
-        filtered.sort((a, b) => (a.label || `zzz${a.id}`).localeCompare(b.label || `zzz${b.id}`));
+        // Unlabeled always last (match API: null/empty after labeled names).
+        filtered.sort((a, b) => {
+            const aEmpty = !a.label;
+            const bEmpty = !b.label;
+            if (aEmpty !== bEmpty) return aEmpty ? 1 : -1;
+            return (a.label || '').localeCompare(b.label || '') * sortDir;
+        });
+    } else {
+        filtered.sort(
+            (a, b) => ((Number(a.face_count) || 0) - (Number(b.face_count) || 0)) * sortDir,
+        );
     }
 
     const countText = $('#ai-people-count-text') || count;

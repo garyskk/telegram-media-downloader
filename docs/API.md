@@ -190,7 +190,7 @@ Opt-in face detection + clustering, backed by the Python sidecar in `faces-servi
 | `DELETE` | `/api/ai/faces/:id`                 | Permanently delete one face detection (Unclassified review remove). |
 | `POST`   | `/api/ai/preload-model/:name`       | Trigger background download of a face detection model. Proxies to sidecar `POST /preload/:name`. Returns `{model, status}`. `status` ∈ `not_downloaded`, `downloading`, `ready`, `error:…`. |
 | `GET`    | `/api/ai/preload-model/:name/status`| Check model download status. Returns `{model, status}`. |
-| `GET`    | `/api/ai/people`                    | Cluster list with cover-face + face count + `video_face_count` per person. `?page=&limit=`. |
+| `GET`    | `/api/ai/people`                    | Cluster list with cover-face + face count + `video_face_count` per person. `?limit=&offset=&sortBy=face_count\|avg_quality\|name&sortDir=asc\|desc` (aliases: `sort`, `dir`). Default `face_count` + `desc`. |
 | `GET`    | `/api/ai/people/excluded`           | Durable exclusion denylist (`{excluded:[{id,label,created_at,cover_face_id}], total}`). Cover crop via `/api/ai/faces/:cover_face_id/crop`. Survives recluster; cleared on Rebuild all clusters and full faces reindex. |
 | `GET`    | `/api/ai/people/:id/suggestions`    | Nearest other People within `labelMatchEps` (centroid↔centroid), plus same-download (“clip”) co-occurrence — `{suggestions:[{id,label,faceCount,distance,sameClip?}]}`. Used by People merge chips / **Merge into…** picker. |
 | `GET`    | `/api/ai/people/:id/photos`         | Paginated photos in this cluster. |

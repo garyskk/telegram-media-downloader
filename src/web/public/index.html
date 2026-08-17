@@ -3614,20 +3614,32 @@
                                 <div id="ai-people-sort-group" class="inline-flex items-center rounded-full border border-tg-border/30 overflow-hidden">
                                     <button type="button" data-sort="face_count"
                                         class="ai-sort-btn px-2.5 py-1 text-[11px] font-medium transition-all select-none bg-tg-blue/10 text-tg-blue border-r border-tg-border/20"
-                                        title="Sort by face count">
+                                        title="Sort by face count"
+                                        data-i18n-title="maintenance.ai.people.sort.face_count">
                                         <i class="ri-group-line text-[10px]"></i>
                                     </button>
                                     <button type="button" data-sort="avg_quality"
                                         class="ai-sort-btn px-2.5 py-1 text-[11px] font-medium text-tg-textSecondary hover:text-tg-blue transition-all select-none border-r border-tg-border/20"
-                                        title="Sort by quality score">
+                                        title="Sort by quality score"
+                                        data-i18n-title="maintenance.ai.people.sort.avg_quality">
                                         <i class="ri-medal-line text-[10px]"></i>
                                     </button>
                                     <button type="button" data-sort="name"
                                         class="ai-sort-btn px-2.5 py-1 text-[11px] font-medium text-tg-textSecondary hover:text-tg-blue transition-all select-none"
-                                        title="Sort by name">
+                                        title="Sort by name"
+                                        data-i18n-title="maintenance.ai.people.sort.name">
                                         <i class="ri-sort-alphabet-asc text-[10px]"></i>
                                     </button>
                                 </div>
+                                <button id="ai-people-sort-dir" type="button"
+                                    class="inline-flex items-center justify-center w-7 h-7 rounded-full border border-tg-border/30 text-tg-textSecondary hover:text-tg-blue hover:border-tg-blue/50 transition-all select-none"
+                                    title="Sort descending"
+                                    data-i18n-title="maintenance.ai.people.sort.dir_desc"
+                                    aria-label="Sort descending"
+                                    data-i18n-aria-label="maintenance.ai.people.sort.dir_desc"
+                                    data-dir="desc">
+                                    <i class="ri-sort-desc text-[12px]" aria-hidden="true"></i>
+                                </button>
                             </div>
                             <!-- Quality legend -->
                             <div id="ai-quality-legend" class="hidden flex items-center gap-3 text-[10px] text-tg-textSecondary/70 mt-0.5">

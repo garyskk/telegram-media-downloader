@@ -5,6 +5,7 @@ All notable changes to this project are documented here. The format is based on 
 ## [Unreleased]
 
 ### Added
+- **People grid Asc/Desc sort.** Shared direction toggle next to Faces / Quality / Name (persists across field changes; re-clicking the active field also flips direction). `GET /api/ai/people` accepts `sortBy`/`sort` (`face_count` \| `avg_quality` \| `name`) and `sortDir`/`dir` (`asc` \| `desc`); default remains `face_count` + `desc`. Unlabeled names stay last in either direction.
 - **Gallery shuffle mode (synced with player).** Media-tabs Shuffle chip + player button share one session. Enabling from the grid shuffles the full filtered ID set into the gallery without opening the lightbox; closing the player keeps the shuffled order. Infinite scroll hydrates the next shuffle window (not chronological pages). Time-section headers (Today / Yesterday / Older) are suppressed while shuffled. Filter/group/scope reloads clear the session.
 - **Player shuffle (full library).** Builds a no-repeat playlist from every file matching the current gallery filters (group / All Media, type chip, pinned chip, federation scope) — not just the ~100-item loaded page. Current item stays first when enabling from the player; continuous play reshuffles when the playlist wraps. New `GET /api/downloads/ids` + `POST /api/downloads/by-ids` (guest-allowed hydrate).
 - **People merge suggestions.** Selecting a face cluster loads nearest other People for one-tap merge (detail-panel chips + ranked **Merge into…** picker), mirroring Unclassified face suggestions. `GET /api/ai/people/:id/suggestions` ranks by centroid distance within `labelMatchEps` and same-download (“clip”) co-occurrence; Same clip ranks first.
@@ -34,7 +35,7 @@ All notable changes to this project are documented here. The format is based on 
 - **Mirror upload of a missing local file crash-looped the process.** S3/etc. `createReadStream().pipe(...)` turned `ENOENT` into an uncaughtException. The worker now fails that job permanently when the local file is unreadable.
 
 ### Service worker
-- `VERSION = 'v2245-13'`
+- `VERSION = 'v2245-14'`
 
 ## [2.24.5] — 2026-05-31
 
