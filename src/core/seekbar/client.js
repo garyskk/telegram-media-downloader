@@ -128,9 +128,60 @@ export async function submitOne({
     return _fetch('/v1/sprite', {
         method: 'POST',
         body: JSON.stringify(body),
-        timeoutMs: 10 * 60_000,
+        // Async submit is a short enqueue; sync waits up to 60s on the
+        // sidecar then returns. Neither needs the old 10-minute hang.
+        timeoutMs: async ? 30_000 : 90_000,
         signal,
     });
+}
+
+export async function getJob(jobId, opts = {}) {
+    return _fetch(`/v1/jobs/${encodeURIComponent(jobId)}`, {
+        method: 'GET',
+        timeoutMs: opts.timeoutMs || 15_000,
+        signal: opts.signal || null,
+    });
+}
+
+const _TERMINAL_JOB = new Set(['done', 'failed', 'cancelled', 'error']);
+
+/**
+ * Poll GET /v1/jobs/:id until the sidecar job reaches a terminal status
+ * or `timeoutMs` elapses. Short GETs avoid Go WriteTimeout / undici
+ * bodyTimeout ceilings that make a single long sync POST unusable for
+ * 1h+ clips.
+ *
+ * Throws `ffmpeg timeout Ns` (transient — not a no-stream error) when
+ * the budget runs out while the job is still pending/running.
+ */
+export async function waitForJob(jobId, { timeoutMs, signal, pollMs = 1000 } = {}) {
+    const id = String(jobId || '');
+    if (!id) throw new Error('job id required');
+    const budget = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 5 * 60_000;
+    const interval = Math.max(1, Number(pollMs) || 1000);
+    const deadline = Date.now() + budget;
+    let last = null;
+    while (Date.now() < deadline) {
+        if (signal?.aborted) {
+            const err = new Error('aborted');
+            err.name = 'AbortError';
+            throw err;
+        }
+        try {
+            last = await getJob(id, { signal });
+            const status = String(last?.status || '').toLowerCase();
+            if (_TERMINAL_JOB.has(status)) return last;
+        } catch (e) {
+            if (e?.status === 404) throw e;
+            if (signal?.aborted || e?.name === 'AbortError') throw e;
+            last = e;
+        }
+        const wait = Math.min(interval, Math.max(0, deadline - Date.now()));
+        if (wait <= 0) break;
+        await new Promise((r) => setTimeout(r, wait));
+    }
+    const sec = Math.max(1, Math.round(budget / 1000));
+    throw new Error(`ffmpeg timeout ${sec}s`);
 }
 
 export async function submitBatch(items) {

@@ -32,6 +32,7 @@ import {
     getMetaFilePath,
     getSeekbarConfig,
     getSpritePath,
+    spriteTimeoutMs,
 } from './generator.js';
 import { buildAllSeekbar, purgeAllSeekbar } from './scan-runner.js';
 
@@ -42,6 +43,7 @@ export {
     getSeekbarConfig,
     getSpritePath,
     purgeAllSeekbar,
+    spriteTimeoutMs,
 };
 
 export function getSeekbarQueueDepths() {
