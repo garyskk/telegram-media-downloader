@@ -1024,19 +1024,32 @@ function formatTime(seconds) {
 /**
  * Whether the buffering spinner should be visible.
  *
- * Driven by media readyState — NOT by the network `stalled` event.
- * Progressive HTTP streaming fires `stalled` whenever the browser pauses
- * the byte-range fetch after filling its buffer; playback can still be
- * perfectly smooth. Gating on readyState matches the HTML comment on
- * `#video-spinner` ("shown while readyState < HAVE_FUTURE_DATA").
+ * Cold start is readyState-driven. Mid-playback stalls are NOT: Chrome
+ * (and others) leave `readyState` at HAVE_ENOUGH_DATA while firing the
+ * `waiting` event, and HTMLMediaElement has no `waiting` property to
+ * read later. The caller must pass a sticky flag set on `waiting` and
+ * cleared on `playing` / advancing `timeupdate`.
  *
- * @param {{ readyState: number, paused: boolean, seeking: boolean }} media
+ * Never key off the network `stalled` event — progressive HTTP streaming
+ * fires it whenever the byte-range fetch pauses after filling the buffer,
+ * while playback can still be perfectly smooth.
+ *
+ * @param {{ readyState: number, paused: boolean, seeking: boolean, waiting?: boolean }} media
  */
-function shouldShowVideoSpinner({ readyState, paused, seeking }) {
-    // HAVE_CURRENT_DATA = 2 — no decoded frame yet → cold-start spinner.
+function shouldShowVideoSpinner({ readyState, paused, seeking, waiting }) {
+    // HAVE_NOTHING / HAVE_METADATA — no picture yet (initial src / load()).
     if (readyState < 2) return true;
-    // HAVE_FUTURE_DATA = 3 — playing/seeking without the next frame queued.
-    if ((seeking || !paused) && readyState < 3) return true;
+    // Don't cover the centre-play button while the user has paused.
+    if (paused) return false;
+    // Spec event for "playback stopped for lack of data" — independent
+    // of readyState, because browsers often leave that at 4.
+    if (waiting) return true;
+    // Seek while playing: readyState also stays at 4 until the new
+    // position decodes. A short delay in `_syncSpinner` swallows
+    // buffered seeks that finish instantly.
+    if (seeking) return true;
+    // Spec-faithful fallback when readyState actually dropped.
+    if (readyState < 3) return true;
     return false;
 }
 
@@ -1113,6 +1126,10 @@ class VideoPlayer {
         this._dragging = false;
         this._wasPlayingBeforeDrag = false;
         this._resumePlayed = false;
+        this._playbackWaiting = false;
+        this._spinnerDelay = null;
+        this._suppressSpinnerSync = false;
+        this._lastPlayhead = null;
         this._hideTimer = null;
         this._lastDoubleTapAt = 0;
         this._lastTapAt = 0;
@@ -1281,10 +1298,12 @@ class VideoPlayer {
         this.video.onplay = () => {
             this._refreshPlayIcons();
             if (this.video.paused === false) this._scheduleHide();
+            this._syncSpinner();
         };
         this.video.onpause = () => {
             this._refreshPlayIcons();
             this._showControls(true);
+            this._syncSpinner();
         };
         this.video.onended = () => {
             this._refreshPlayIcons();
@@ -1317,16 +1336,31 @@ class VideoPlayer {
             this.durTime.textContent = formatTime(this.video.duration || 0);
             this._renderBuffered();
         };
-        // Buffering spinner: sync from readyState. Never blindly trust
-        // `stalled` — that event means the *download* paused, which is
-        // normal once the progressive buffer is full.
-        this.video.onwaiting = () => this._syncSpinner();
-        this.video.onstalled = () => this._syncSpinner();
+        // Buffering spinner: `waiting` is the real "playback starved"
+        // signal (sticky flag — there is no element.waiting property).
+        // Never blindly trust `stalled` — that event means the *download*
+        // paused, which is normal once the progressive buffer is full.
+        this.video.onwaiting = () => {
+            this._playbackWaiting = true;
+            this._syncSpinner();
+        };
+        this.video.onplaying = () => {
+            this._playbackWaiting = false;
+            this._syncSpinner();
+        };
+        this.video.onseeking = () => this._syncSpinner();
+        this.video.onseeked = () => this._syncSpinner();
         this.video.oncanplay = () => this._syncSpinner();
         this.video.oncanplaythrough = () => this._syncSpinner();
-        this.video.onplaying = () => this._syncSpinner();
         this.video.onloadeddata = () => this._syncSpinner();
-        this.video.onseeked = () => this._syncSpinner();
+        this.video.onloadstart = () => {
+            // New source: lift the load()-time suppress so cold-start
+            // readyState (HAVE_NOTHING) can show the spinner, and so a
+            // stale timeupdate from the previous clip can't hide it.
+            this._suppressSpinnerSync = false;
+            this._syncSpinner();
+        };
+        this.video.onstalled = () => this._syncSpinner();
         this.video.onerror = () => this._showError();
         this.video.onratechange = () => this._refreshSpeedUi();
 
@@ -1409,6 +1443,16 @@ class VideoPlayer {
         this.playBtn.setAttribute('aria-label', i18nT('viewer.video.play', 'Play'));
         this.centerPlay.classList.remove('hidden');
         this._hideError();
+        // Freeze spinner sync until loadstart so a delayed timeupdate /
+        // seeked from the previous clip can't hide the cold-start spinner
+        // while readyState is still the old file's HAVE_ENOUGH_DATA.
+        this._playbackWaiting = false;
+        this._lastPlayhead = null;
+        if (this._spinnerDelay) {
+            clearTimeout(this._spinnerDelay);
+            this._spinnerDelay = null;
+        }
+        this._suppressSpinnerSync = true;
         this._showSpinner(true);
 
         // Restore persisted volume + mute + speed.
@@ -1526,6 +1570,13 @@ class VideoPlayer {
         this._currentUrl = null;
         this._storageKey = null;
         this._resumePlayed = false;
+        this._playbackWaiting = false;
+        this._lastPlayhead = null;
+        this._suppressSpinnerSync = false;
+        if (this._spinnerDelay) {
+            clearTimeout(this._spinnerDelay);
+            this._spinnerDelay = null;
+        }
         if (this._hideTimer) {
             clearTimeout(this._hideTimer);
             this._hideTimer = null;
@@ -2042,9 +2093,24 @@ class VideoPlayer {
     _onTimeUpdate() {
         const v = this.video;
         this.curTime.textContent = formatTime(v.currentTime);
-        // Safety net: if frames are advancing, clear a stuck spinner
-        // left behind by a spurious waiting/stalled race.
-        if (this.spinner && !this.spinner.classList.contains('hidden')) {
+        // Safety net: if frames are advancing, the `waiting` flag (and
+        // a visible spinner) is stale — browsers sometimes never fire
+        // `playing` after a brief stall.
+        const t = v.currentTime;
+        if (
+            this._playbackWaiting &&
+            !v.seeking &&
+            Number.isFinite(t) &&
+            this._lastPlayhead != null &&
+            t !== this._lastPlayhead
+        ) {
+            this._playbackWaiting = false;
+        }
+        this._lastPlayhead = t;
+        if (
+            this.spinner &&
+            (!this.spinner.classList.contains('hidden') || this._spinnerDelay || this._playbackWaiting)
+        ) {
             this._syncSpinner();
         }
         if (Number.isFinite(v.duration) && v.duration > 0) {
@@ -2238,19 +2304,40 @@ class VideoPlayer {
     }
 
     _showSpinner(on) {
+        if (this._spinnerDelay) {
+            clearTimeout(this._spinnerDelay);
+            this._spinnerDelay = null;
+        }
         this.spinner.classList.toggle('hidden', !on);
     }
 
-    /** Recompute spinner from media readyState (see shouldShowVideoSpinner). */
+    /**
+     * Recompute spinner from media state (see shouldShowVideoSpinner).
+     * Cold start (no frame yet) shows immediately; mid-playback waits
+     * and seeks are delayed so a buffered skip doesn't flash the icon.
+     */
     _syncSpinner() {
+        if (this._suppressSpinnerSync) return;
         if (!this.spinner || !this.video) return;
-        this._showSpinner(
-            shouldShowVideoSpinner({
-                readyState: this.video.readyState,
-                paused: this.video.paused,
-                seeking: this.video.seeking,
-            }),
-        );
+        const show = shouldShowVideoSpinner({
+            readyState: this.video.readyState,
+            paused: this.video.paused,
+            seeking: this.video.seeking,
+            waiting: !!this._playbackWaiting,
+        });
+        if (!show) {
+            this._showSpinner(false);
+            return;
+        }
+        if (this.video.readyState < 2) {
+            this._showSpinner(true);
+            return;
+        }
+        if (!this.spinner.classList.contains('hidden') || this._spinnerDelay) return;
+        this._spinnerDelay = setTimeout(() => {
+            this._spinnerDelay = null;
+            this.spinner.classList.remove('hidden');
+        }, 200);
     }
 
     _showError() {

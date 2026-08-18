@@ -29,6 +29,14 @@ const HAVE_CURRENT_DATA = 2;
 const HAVE_FUTURE_DATA = 3;
 const HAVE_ENOUGH_DATA = 4;
 
+const playing = (over = {}) => ({
+    readyState: HAVE_ENOUGH_DATA,
+    paused: false,
+    seeking: false,
+    waiting: false,
+    ...over,
+});
+
 describe('shouldShowVideoSpinner', () => {
     it('shows during cold start before any decoded frame', () => {
         expect(shouldShowVideoSpinner({ readyState: HAVE_NOTHING, paused: true, seeking: false })).toBe(
@@ -46,17 +54,21 @@ describe('shouldShowVideoSpinner', () => {
         expect(
             shouldShowVideoSpinner({ readyState: HAVE_ENOUGH_DATA, paused: true, seeking: false }),
         ).toBe(false);
+        // `waiting` while paused still yields to the centre-play button.
+        expect(shouldShowVideoSpinner(playing({ paused: true, waiting: true }))).toBe(false);
     });
 
     it('hides while playing smoothly with buffered future data', () => {
         // Progressive download often pauses the network fetch after the
-        // buffer fills — that fires `stalled`, but readyState stays high.
+        // buffer fills — that fires `stalled`, but readyState stays high
+        // and `waiting` does not fire. Spinner must stay off.
         expect(
             shouldShowVideoSpinner({ readyState: HAVE_FUTURE_DATA, paused: false, seeking: false }),
         ).toBe(false);
         expect(
             shouldShowVideoSpinner({ readyState: HAVE_ENOUGH_DATA, paused: false, seeking: false }),
         ).toBe(false);
+        expect(shouldShowVideoSpinner(playing())).toBe(false);
     });
 
     it('shows when playback is starved for the next frame', () => {
@@ -68,12 +80,33 @@ describe('shouldShowVideoSpinner', () => {
         );
     });
 
-    it('shows while seeking into a hole without future data', () => {
+    it('shows on waiting even when readyState stays HAVE_ENOUGH_DATA', () => {
+        // Chrome (and others) leave readyState at 4 while firing `waiting`.
+        // There is no HTMLMediaElement.waiting property — the event is
+        // the only signal. readyState-only gating hid the spinner for
+        // every mid-playback stall after the initial load.
+        expect(shouldShowVideoSpinner(playing({ waiting: true }))).toBe(true);
+        expect(shouldShowVideoSpinner(playing({ readyState: HAVE_FUTURE_DATA, waiting: true }))).toBe(
+            true,
+        );
+    });
+
+    it('shows while seeking during playback regardless of readyState', () => {
+        expect(shouldShowVideoSpinner(playing({ seeking: true }))).toBe(true);
         expect(
-            shouldShowVideoSpinner({ readyState: HAVE_CURRENT_DATA, paused: true, seeking: true }),
+            shouldShowVideoSpinner(playing({ readyState: HAVE_CURRENT_DATA, seeking: true })),
         ).toBe(true);
+    });
+
+    it('hides while paused-scrubbing so the sprite preview stays unobstructed', () => {
+        expect(shouldShowVideoSpinner(playing({ paused: true, seeking: true }))).toBe(false);
         expect(
-            shouldShowVideoSpinner({ readyState: HAVE_ENOUGH_DATA, paused: false, seeking: true }),
+            shouldShowVideoSpinner({
+                readyState: HAVE_CURRENT_DATA,
+                paused: true,
+                seeking: true,
+                waiting: false,
+            }),
         ).toBe(false);
     });
 });
