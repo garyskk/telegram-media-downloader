@@ -777,6 +777,9 @@ class Worker {
                         bytes: head.size,
                         skipped: true,
                     });
+                    if (job.snapshot_path) {
+                        await _finalizeSnapshotJob(this.destinationId, job.snapshot_path);
+                    }
                     return;
                 }
             } catch {
@@ -820,6 +823,9 @@ class Worker {
                 level: 'info',
                 msg: `uploaded ${remotePath} (${result.bytes} B) → #${this.destinationId}`,
             });
+            if (job.snapshot_path) {
+                await _finalizeSnapshotJob(this.destinationId, job.snapshot_path);
+            }
         } catch (e) {
             const msg = e?.message || String(e);
             const { willRetry, nextRetryAt } = queue.markRetry(job.id, msg);
@@ -949,7 +955,10 @@ async function _kickSnapshotRun(dest) {
         const stamp = _isoCompact(new Date());
         const archivePath = path.join(SNAPSHOTS_DIR, `snapshot-${stamp}.tar.gz`);
         await _buildSnapshotArchive(archivePath);
-        // Enqueue the upload.
+        // Enqueue the upload. Retention + staging cleanup run in the
+        // worker after a successful (or size-skip) snapshot upload via
+        // `_finalizeSnapshotJob` — not on a timer that can race the
+        // upload or be lost on process restart.
         const remotePath = `snapshots/${path.basename(archivePath)}`;
         queue.enqueue({
             destinationId: dest.id,
@@ -957,18 +966,6 @@ async function _kickSnapshotRun(dest) {
             remotePath,
         });
         _wakeWorker(dest.id);
-        // Apply retention — keep the last N archives on the remote.
-        // Done after a short delay so the just-uploaded file is included
-        // in the listing.
-        setTimeout(() => {
-            _applyRetention(dest.id).catch((e) => {
-                _log({
-                    source: 'backup',
-                    level: 'warn',
-                    msg: `retention prune failed for #${dest.id}: ${e.message}`,
-                });
-            });
-        }, 60 * 1000);
         _log({
             source: 'backup',
             level: 'info',
@@ -1135,10 +1132,47 @@ async function _writeTarGz(srcDir, archivePath) {
     await finished;
 }
 
-async function _applyRetention(destinationId) {
+/**
+ * After a snapshot job succeeds (upload or size-skip): drop the local
+ * staging archive, then prune remote + leftover staging to retain_count.
+ * Best-effort — never fails the upload job.
+ */
+async function _finalizeSnapshotJob(destinationId, snapshotPath) {
+    if (snapshotPath) {
+        try {
+            await fsp.unlink(snapshotPath);
+        } catch (e) {
+            if (e?.code !== 'ENOENT') {
+                _log({
+                    source: 'backup',
+                    level: 'warn',
+                    msg: `staging unlink failed for ${snapshotPath}: ${e.message}`,
+                });
+            }
+        }
+    }
+    try {
+        await _applyRetention(destinationId);
+    } catch (e) {
+        _log({
+            source: 'backup',
+            level: 'warn',
+            msg: `retention prune failed for #${destinationId}: ${e.message}`,
+        });
+    }
+}
+
+/**
+ * Keep the newest `retain_count` archives under remote `snapshots/` and
+ * prune leftover local `data/backups/snapshot-*.tar.gz` staging files.
+ * Applies to snapshot and manual modes (same archive layout).
+ *
+ * Exported for unit tests.
+ */
+export async function _applyRetention(destinationId) {
     const dest = _loadDestRow(destinationId);
     if (!dest || !dest.enabled) return;
-    if (dest.mode !== 'snapshot') return;
+    if (dest.mode !== 'snapshot' && dest.mode !== 'manual') return;
     const keep = Math.max(1, Number(dest.retain_count) || 7);
     let cfg;
     try {
@@ -1156,18 +1190,49 @@ async function _applyRetention(destinationId) {
         for await (const item of provider.list('snapshots/', ctx)) {
             items.push(item);
         }
-        items.sort((a, b) => b.mtime - a.mtime);
+        items.sort((a, b) => {
+            const dm = (Number(b.mtime) || 0) - (Number(a.mtime) || 0);
+            if (dm !== 0) return dm;
+            return String(b.name || '').localeCompare(String(a.name || ''));
+        });
         const toDelete = items.slice(keep);
         for (const item of toDelete) {
-            await provider.delete(item.name, ctx).catch(() => {});
-            _log({
-                source: 'backup',
-                level: 'info',
-                msg: `retention pruned ${item.name} on #${destinationId}`,
-            });
+            try {
+                await provider.delete(item.name, ctx);
+                _log({
+                    source: 'backup',
+                    level: 'info',
+                    msg: `retention pruned ${item.name} on #${destinationId}`,
+                });
+            } catch (e) {
+                _log({
+                    source: 'backup',
+                    level: 'warn',
+                    msg: `retention delete failed for ${item.name} on #${destinationId}: ${e.message}`,
+                });
+            }
         }
     } finally {
         await provider.close().catch(() => {});
+    }
+    await _pruneLocalStaging(keep);
+}
+
+/** Cap leftover local snapshot staging files; never touches db-pre-update-*. */
+async function _pruneLocalStaging(keep) {
+    let names;
+    try {
+        names = await fsp.readdir(SNAPSHOTS_DIR);
+    } catch (e) {
+        if (e?.code === 'ENOENT') return;
+        throw e;
+    }
+    const snaps = names
+        .filter((n) => /^snapshot-\d{8}-\d{6}\.tar\.gz$/.test(n))
+        .sort()
+        .reverse();
+    for (const name of snaps.slice(keep)) {
+        await fsp.unlink(path.join(SNAPSHOTS_DIR, name)).catch(() => {});
     }
 }
 
