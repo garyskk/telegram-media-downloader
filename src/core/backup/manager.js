@@ -98,6 +98,17 @@ export function init(deps = {}) {
                 });
             }
             _scheduleSnapshot(dest);
+            // Catch up remote prune + UI counters without waiting for the
+            // next snapshot upload (lifetime total_files used to only grow).
+            if (dest.mode === 'snapshot' || dest.mode === 'manual') {
+                _applyRetention(dest.id).catch((e) => {
+                    _log({
+                        source: 'backup',
+                        level: 'warn',
+                        msg: `boot retention failed for #${dest.id}: ${e.message}`,
+                    });
+                });
+            }
         }
     }
 }
@@ -332,16 +343,22 @@ export async function runBackup(id) {
     // live local library (soft-deleted / missing rows). Snapshots/ is
     // left alone so a shared bucket with a snapshot destination stays safe.
     let pruned = 0;
+    let reconcileOk = true;
     try {
         const r = await _reconcileMirror(dest);
         pruned = r.deleted;
     } catch (e) {
+        reconcileOk = false;
+        _markFailureOnDest(id, `mirror reconcile failed: ${e.message}`);
         _log({
             source: 'backup',
             level: 'warn',
             msg: `mirror reconcile failed for #${id}: ${e.message}`,
         });
     }
+    // A successful Run now (even with 0 new uploads) clears a sticky
+    // Error pill left by an earlier per-file failure.
+    if (reconcileOk) _markSuccessOnDest(id);
     _log({
         source: 'backup',
         level: 'info',
@@ -727,7 +744,9 @@ class Worker {
         // path with createReadStream().pipe(...) before any await, so
         // ENOENT fires as an uncaughtException and the watchdog
         // restart-loops. Fail the job permanently instead — retrying
-        // won't bring the bytes back.
+        // won't bring the bytes back. Do NOT paint the destination
+        // Error pill: one missing path is a per-file data issue, and a
+        // later successful Run now / upload must be able to clear state.
         try {
             await fsp.access(localPath, fs.constants.R_OK);
         } catch (e) {
@@ -743,7 +762,6 @@ class Worker {
                 error: msg,
                 willRetry: false,
             });
-            _markFailureOnDest(this.destinationId, msg);
             _log({
                 source: 'backup',
                 level: 'warn',
@@ -1162,10 +1180,15 @@ async function _finalizeSnapshotJob(destinationId, snapshotPath) {
     }
 }
 
+/** Remote snapshot archive names (with or without a `snapshots/` prefix). */
+const SNAPSHOT_REMOTE_RE = /(?:^|\/)snapshot-\d{8}-\d{6}\.tar\.gz$/i;
+
 /**
  * Keep the newest `retain_count` archives under remote `snapshots/` and
  * prune leftover local `data/backups/snapshot-*.tar.gz` staging files.
  * Applies to snapshot and manual modes (same archive layout).
+ * Reconciles destination total_files/total_bytes to the kept remotes so
+ * the UI card is not a lifetime upload counter.
  *
  * Exported for unit tests.
  */
@@ -1188,6 +1211,7 @@ export async function _applyRetention(destinationId) {
         await provider.init(cfg, ctx);
         const items = [];
         for await (const item of provider.list('snapshots/', ctx)) {
+            if (!SNAPSHOT_REMOTE_RE.test(String(item?.name || ''))) continue;
             items.push(item);
         }
         items.sort((a, b) => {
@@ -1195,16 +1219,21 @@ export async function _applyRetention(destinationId) {
             if (dm !== 0) return dm;
             return String(b.name || '').localeCompare(String(a.name || ''));
         });
+        const keepItems = items.slice(0, keep);
         const toDelete = items.slice(keep);
+        const remaining = [...keepItems];
+        let pruned = 0;
         for (const item of toDelete) {
             try {
                 await provider.delete(item.name, ctx);
+                pruned += 1;
                 _log({
                     source: 'backup',
                     level: 'info',
                     msg: `retention pruned ${item.name} on #${destinationId}`,
                 });
             } catch (e) {
+                remaining.push(item);
                 _log({
                     source: 'backup',
                     level: 'warn',
@@ -1212,6 +1241,16 @@ export async function _applyRetention(destinationId) {
                 });
             }
         }
+        _setDestStats(
+            destinationId,
+            remaining.reduce((s, it) => s + (Number(it.size) || 0), 0),
+            remaining.length,
+        );
+        _log({
+            source: 'backup',
+            level: 'info',
+            msg: `retention: listed ${items.length}, keep ${keep}, pruned ${pruned} on #${destinationId}`,
+        });
     } finally {
         await provider.close().catch(() => {});
     }
@@ -1323,6 +1362,30 @@ function _bumpDestStats(id, bytes, files) {
          WHERE id = ?
     `)
         .run(Number(bytes) || 0, Number(files) || 1, Date.now(), Number(id));
+}
+
+/** Absolute replace of destination size counters (post-retention reconcile). */
+function _setDestStats(id, bytes, files) {
+    getDb()
+        .prepare(`
+        UPDATE backup_destinations
+           SET total_bytes = ?,
+               total_files = ?
+         WHERE id = ?
+    `)
+        .run(Math.max(0, Number(bytes) || 0), Math.max(0, Number(files) || 0), Number(id));
+}
+
+/** Clear sticky Error pill after a destination-level success (e.g. Run now). */
+function _markSuccessOnDest(id) {
+    getDb()
+        .prepare(`
+        UPDATE backup_destinations
+           SET last_success_at = ?,
+               last_error = NULL
+         WHERE id = ?
+    `)
+        .run(Date.now(), Number(id));
 }
 
 function _markFailureOnDest(id, error) {

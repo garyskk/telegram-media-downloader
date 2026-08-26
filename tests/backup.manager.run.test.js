@@ -148,5 +148,36 @@ describe('backup/manager runBackup mirror catch-up', () => {
             return row?.status === 'failed' ? row : null;
         });
         expect(job.error).toMatch(/local file missing/i);
+        // Per-file missing bytes are not a destination outage — the card
+        // must not stick on Error forever because of one tombstoned path.
+        const st = manager.getDestinationStatus(destId);
+        expect(st.lastError).toBeFalsy();
+    });
+
+    it('clears sticky last_error after a successful mirror Run now', async () => {
+        const destId = manager.addDestination({
+            name: 'mirror-clear-error',
+            provider: 'local',
+            mode: 'mirror',
+            enabled: true,
+            config: { rootPath: BACKUP_ROOT },
+        });
+        manager.pause(destId);
+
+        db.prepare(
+            `UPDATE backup_destinations
+                SET last_error = ?, last_failure_at = ?
+              WHERE id = ?`,
+        ).run('local file missing: stale/path.jpg', Date.now() - 60_000, destId);
+
+        expect(manager.getDestinationStatus(destId).lastError).toMatch(/local file missing/);
+
+        const r = await manager.runBackup(destId);
+        expect(r.started).toBe(true);
+        expect(r.mode).toBe('mirror');
+
+        const st = manager.getDestinationStatus(destId);
+        expect(st.lastError).toBeFalsy();
+        expect(st.lastSuccessAt).toBeTruthy();
     });
 });
