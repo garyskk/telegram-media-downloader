@@ -5,7 +5,7 @@ All notable changes to this project are documented here. The format is based on 
 ## [Unreleased]
 
 ### Added
-- **People grid Asc/Desc sort.** Shared direction toggle next to Faces / Quality / Name (persists across field changes; re-clicking the active field also flips direction). `GET /api/ai/people` accepts `sortBy`/`sort` (`face_count` \| `avg_quality` \| `name`) and `sortDir`/`dir` (`asc` \| `desc`); default remains `face_count` + `desc`. Unlabeled names stay last in either direction.
+- **People grid Asc/Desc sort.** Shared direction toggle next to Faces / Quality / Name (persists across field changes; re-clicking the active field also flips direction). `GET /api/ai/people` accepts `sortBy`/`sort` (`face_count` \| `avg_quality` \| `name`) and `sortDir`/`dir` (`asc` \| `desc`); default remains `face_count` + `desc`. Name sort includes unlabeled: they lead on Asc and trail on Desc (sorted by id among themselves); labeled names sort A–Z / Z–A.
 - **Gallery shuffle mode (synced with player).** Media-tabs Shuffle chip + player button share one session. Enabling from the grid shuffles the full filtered ID set into the gallery without opening the lightbox; closing the player keeps the shuffled order. Infinite scroll hydrates the next shuffle window (not chronological pages). Time-section headers (Today / Yesterday / Older) are suppressed while shuffled. Filter/group/scope reloads clear the session.
 - **Player shuffle (full library).** Builds a no-repeat playlist from every file matching the current gallery filters (group / All Media, type chip, pinned chip, federation scope) — not just the ~100-item loaded page. Current item stays first when enabling from the player; continuous play reshuffles when the playlist wraps. New `GET /api/downloads/ids` + `POST /api/downloads/by-ids` (guest-allowed hydrate).
 - **People merge suggestions.** Selecting a face cluster loads nearest other People for one-tap merge (detail-panel chips + ranked **Merge into…** picker), mirroring Unclassified face suggestions. `GET /api/ai/people/:id/suggestions` ranks by centroid distance within `labelMatchEps` and same-download (“clip”) co-occurrence; Same clip ranks first.
@@ -27,6 +27,7 @@ All notable changes to this project are documented here. The format is based on 
 - **Mirror destination cards no longer show a cron schedule** — cron only applies to snapshot mode; saving a non-snapshot destination clears any leftover cron.
 
 ### Fixed
+- **People Name sort ignored unlabeled clusters.** Asc/Desc only reordered labeled people while `Person #N` stayed pinned at the bottom. Unlabeled now lead on Asc and trail on Desc (by id); labeled still sort A–Z / Z–A.
 - **Backup destination Error pill stuck after a successful run.** A per-file `local file missing` failure set `last_error` on the destination; a later mirror Run now with 0 new uploads never cleared it, so the card stayed red. Missing/unreadable local files now fail only the job (not the destination), and a successful mirror Run now clears `last_error` / bumps `last_success_at`.
 - **Snapshot destination Files/Size counters never shrank after retention.** Upload always bumped `total_files`/`total_bytes`; prune never reconciled them, so the card kept climbing (e.g. 38) even when only `retain_count` archives remained. Retention now resets those counters from the kept remotes, logs `listed/keep/pruned`, and re-runs on boot for snapshot/manual destinations so a backlog is cleared without waiting for the next upload.
 - **Scheduled snapshot retention did not remove old copies.** Local staging archives under `data/backups/snapshot-*.tar.gz` were never deleted after upload (so daily runs could leave ~30+ files despite Retain copies = 7). Remote prune also ran on a fragile 60s timer after enqueue (not after upload success), skipped manual-mode destinations, and logged “pruned” even when delete failed. Retention now runs after a successful/skipped snapshot upload, applies to snapshot + manual, unlinks staging, caps leftover local `snapshot-*.tar.gz` to `retain_count`, and only logs prune success when delete succeeds.
@@ -40,7 +41,7 @@ All notable changes to this project are documented here. The format is based on 
 - **Seekbar sprites for 1h+ videos died at 120s with a fake "does not contain any stream" error.** Sprite encodes walk the whole file, but they reused the thumbnail ffmpeg kill (120s) and treated a sidecar 60s sync wait as a miss — which started a second ffmpeg. Node now submits async, polls the sidecar job, and uses a duration-scaled budget (`clamp(5 min, 1× realtime, 60 min)`). Timeouts stay retryable; gallery thumbs stay at 120s.
 
 ### Service worker
-- `VERSION = 'v2245-16'`
+- `VERSION = 'v2245-19'`
 
 ## [2.24.5] — 2026-05-31
 

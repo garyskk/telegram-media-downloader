@@ -2032,10 +2032,10 @@ describe('listPeople sortBy / sortDir', () => {
         expect(asc).toEqual([bob, unlabeled, alice]);
     });
 
-    it('sorts name ASC and DESC (null labels last)', () => {
+    it('sorts name ASC/DESC with unlabeled first on ASC and last on DESC', () => {
         const { alice, bob, unlabeled } = seedThreePeople();
         const asc = api.listPeople({ sortBy: 'name', sortDir: 'asc' }).people.map((p) => p.id);
-        expect(asc).toEqual([alice, bob, unlabeled]);
+        expect(asc).toEqual([unlabeled, alice, bob]);
         const desc = api.listPeople({ sortBy: 'name', sortDir: 'desc' }).people.map((p) => p.id);
         expect(desc).toEqual([bob, alice, unlabeled]);
     });
