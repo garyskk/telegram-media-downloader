@@ -343,16 +343,22 @@ export async function runBackup(id) {
     // live local library (soft-deleted / missing rows). Snapshots/ is
     // left alone so a shared bucket with a snapshot destination stays safe.
     let pruned = 0;
+    let reconcileOk = true;
     try {
         const r = await _reconcileMirror(dest);
         pruned = r.deleted;
     } catch (e) {
+        reconcileOk = false;
+        _markFailureOnDest(id, `mirror reconcile failed: ${e.message}`);
         _log({
             source: 'backup',
             level: 'warn',
             msg: `mirror reconcile failed for #${id}: ${e.message}`,
         });
     }
+    // A successful Run now (even with 0 new uploads) clears a sticky
+    // Error pill left by an earlier per-file failure.
+    if (reconcileOk) _markSuccessOnDest(id);
     _log({
         source: 'backup',
         level: 'info',
@@ -738,7 +744,9 @@ class Worker {
         // path with createReadStream().pipe(...) before any await, so
         // ENOENT fires as an uncaughtException and the watchdog
         // restart-loops. Fail the job permanently instead — retrying
-        // won't bring the bytes back.
+        // won't bring the bytes back. Do NOT paint the destination
+        // Error pill: one missing path is a per-file data issue, and a
+        // later successful Run now / upload must be able to clear state.
         try {
             await fsp.access(localPath, fs.constants.R_OK);
         } catch (e) {
@@ -754,7 +762,6 @@ class Worker {
                 error: msg,
                 willRetry: false,
             });
-            _markFailureOnDest(this.destinationId, msg);
             _log({
                 source: 'backup',
                 level: 'warn',
@@ -1367,6 +1374,18 @@ function _setDestStats(id, bytes, files) {
          WHERE id = ?
     `)
         .run(Math.max(0, Number(bytes) || 0), Math.max(0, Number(files) || 0), Number(id));
+}
+
+/** Clear sticky Error pill after a destination-level success (e.g. Run now). */
+function _markSuccessOnDest(id) {
+    getDb()
+        .prepare(`
+        UPDATE backup_destinations
+           SET last_success_at = ?,
+               last_error = NULL
+         WHERE id = ?
+    `)
+        .run(Date.now(), Number(id));
 }
 
 function _markFailureOnDest(id, error) {
