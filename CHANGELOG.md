@@ -27,6 +27,7 @@ All notable changes to this project are documented here. The format is based on 
 - **Mirror destination cards no longer show a cron schedule** — cron only applies to snapshot mode; saving a non-snapshot destination clears any leftover cron.
 
 ### Fixed
+- **Scheduled snapshot retention did not remove old copies.** Local staging archives under `data/backups/snapshot-*.tar.gz` were never deleted after upload (so daily runs could leave ~30+ files despite Retain copies = 7). Remote prune also ran on a fragile 60s timer after enqueue (not after upload success), skipped manual-mode destinations, and logged “pruned” even when delete failed. Retention now runs after a successful/skipped snapshot upload, applies to snapshot + manual, unlinks staging, caps leftover local `snapshot-*.tar.gz` to `retain_count`, and only logs prune success when delete succeeds.
 - **Video player buffering spinner stuck on during smooth progressive playback.** The spinner was shown on the network `stalled` event, which browsers fire whenever the byte-range download pauses after filling the buffer — even while frames keep advancing. `stalled` is ignored for showing the spinner.
 - **Video player buffering spinner never reappeared after the first load.** Gating only on `readyState` missed real mid-playback waits: Chrome leaves `readyState` at `HAVE_ENOUGH_DATA` while firing `waiting`, and there is no `HTMLMediaElement.waiting` property to read later. Spinner now follows a sticky `waiting` flag plus in-progress `seeking` while playing (200ms delay so buffered skips don't flash); `stalled` still does not show it.
 - **Empty gap under the video seekbar filmstrip.** Removed the unused `#preview-strip-container` (`min-h-[72px]`) from the media modal — it was never populated by JS and reserved a blank band between the filmstrip and the info bar.
@@ -37,7 +38,7 @@ All notable changes to this project are documented here. The format is based on 
 - **Seekbar sprites for 1h+ videos died at 120s with a fake "does not contain any stream" error.** Sprite encodes walk the whole file, but they reused the thumbnail ffmpeg kill (120s) and treated a sidecar 60s sync wait as a miss — which started a second ffmpeg. Node now submits async, polls the sidecar job, and uses a duration-scaled budget (`clamp(5 min, 1× realtime, 60 min)`). Timeouts stay retryable; gallery thumbs stay at 120s.
 
 ### Service worker
-- `VERSION = 'v2245-15'`
+- `VERSION = 'v2245-16'`
 
 ## [2.24.5] — 2026-05-31
 
