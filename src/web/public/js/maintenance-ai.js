@@ -1733,12 +1733,17 @@ async function _renderPeopleGrid() {
             (a, b) => ((Number(a.avg_quality) || 0) - (Number(b.avg_quality) || 0)) * sortDir,
         );
     } else if (sortBy === 'name') {
-        // Unlabeled always last (match API: null/empty after labeled names).
+        // Unlabeled first on ASC, last on DESC (match API); among them by id.
         filtered.sort((a, b) => {
-            const aEmpty = !a.label;
-            const bEmpty = !b.label;
-            if (aEmpty !== bEmpty) return aEmpty ? 1 : -1;
-            return (a.label || '').localeCompare(b.label || '') * sortDir;
+            const aEmpty = !String(a.label || '').trim();
+            const bEmpty = !String(b.label || '').trim();
+            if (aEmpty !== bEmpty) return (aEmpty ? -1 : 1) * sortDir;
+            if (aEmpty) return (Number(a.id) - Number(b.id)) * sortDir;
+            return (
+                String(a.label).localeCompare(String(b.label), undefined, {
+                    sensitivity: 'base',
+                }) * sortDir
+            );
         });
     } else {
         filtered.sort(

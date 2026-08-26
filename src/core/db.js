@@ -3658,8 +3658,11 @@ export function listPeople({ limit = 500, offset = 0, sortBy = 'face_count', sor
     if (by === 'avg_quality') {
         orderExpr = `avg_quality ${dir}, p.id ASC`;
     } else if (by === 'name') {
-        // Unlabeled (NULL/empty) always last, regardless of direction.
-        orderExpr = `(p.label IS NULL OR p.label = '') ASC, p.label COLLATE NOCASE ${dir}, p.id ASC`;
+        // Unlabeled participate: first on ASC, last on DESC; among them by id.
+        // Labeled sort A↔Z. Empty-group flag uses the opposite dir so the
+        // unlabeled block moves when Asc/Desc flips (not pinned forever).
+        const emptyDir = dir === 'ASC' ? 'DESC' : 'ASC';
+        orderExpr = `(p.label IS NULL OR TRIM(p.label) = '') ${emptyDir}, p.label COLLATE NOCASE ${dir}, p.id ${dir}`;
     } else {
         orderExpr = `face_count ${dir}, p.id ASC`;
     }
