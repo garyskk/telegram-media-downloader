@@ -209,6 +209,42 @@ describe('backup snapshot retention', () => {
         );
     });
 
+    it('reconciles destination total_files/bytes to remaining remotes', async () => {
+        const destId = manager.addDestination({
+            name: 'retain-stats',
+            provider: 'local',
+            mode: 'snapshot',
+            cron: '0 3 * * *',
+            retainCount: 3,
+            enabled: true,
+            config: { rootPath: BACKUP_ROOT },
+        });
+        manager.pause(destId);
+
+        // Inflate the lifetime counters the way production did before
+        // retention reconciled them (upload bumps, prune never shrank).
+        db.prepare(
+            `UPDATE backup_destinations SET total_files = 40, total_bytes = 999999 WHERE id = ?`,
+        ).run(destId);
+
+        seedRemoteSnapshots(7);
+        await manager._applyRetention(destId);
+
+        const row = db
+            .prepare(`SELECT total_files, total_bytes FROM backup_destinations WHERE id = ?`)
+            .get(destId);
+        expect(row.total_files).toBe(3);
+        // Newest three files are snap-5/6/7 — each "snap-N" is N bytes of
+        // ASCII payload from seedRemoteSnapshots (`snap-${i}`).
+        const expectedBytes = Buffer.byteLength('snap-5') + Buffer.byteLength('snap-6') + Buffer.byteLength('snap-7');
+        expect(row.total_bytes).toBe(expectedBytes);
+
+        const summary = logs.find(
+            (l) => l.level === 'info' && /retention: listed 7, keep 3, pruned 4/.test(l.msg || ''),
+        );
+        expect(summary).toBeTruthy();
+    });
+
     it('does not log retention pruned when delete fails', async () => {
         const destId = manager.addDestination({
             name: 'retain-delete-fail',
