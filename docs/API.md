@@ -175,16 +175,17 @@ Near-duplicate videos and partial clips (a shorter video inside a longer one). E
 |---|---|---|
 | `POST` | `/api/maintenance/similar/scan` | Enhanced seekbar generate: one ffmpeg decode writes hover sprite + 1 fps pHashes. Skip when fingerprint `file_hash` still matches. Broadcasts `similar_progress`. |
 | `POST` | `/api/maintenance/similar/scan/stop` | Cancel the in-flight scan. |
-| `GET`  | `/api/maintenance/similar/status` | JobTracker snapshot. |
-| `GET`  | `/api/maintenance/similar/stats` | `{totalVideos, fingerprinted, missing, lastScan}`. Survives restart via `kv['similar_last_scan']`. |
-| `POST` | `/api/maintenance/similar/analyze` | Group similar / optional partial. Body: `{checkPartialClips?:bool}`. |
-| `GET`  | `/api/maintenance/similar/groups` | Persisted groups with keep/remove members. |
+| `GET`  | `/api/maintenance/similar/status` | Scan JobTracker snapshot plus nested `analyze` snapshot. |
+| `GET`  | `/api/maintenance/similar/stats` | `{totalVideos, fingerprinted, missing, lastScan, lastAnalyze}`. Survives restart via `kv['similar_last_scan']` / `kv['similar_last_analyze']`. |
+| `POST` | `/api/maintenance/similar/analyze` | Rebuild `kind='similar'` groups. Body: `{checkPartialClips?:bool}` (partial matching is a no-op until Phase 5). Broadcasts `similar_analyze_progress`. |
+| `POST` | `/api/maintenance/similar/analyze/stop` | Cancel the in-flight analyze. |
+| `GET`  | `/api/maintenance/similar/groups` | Persisted groups with keep/remove members. `?kind=similar\|partial\|partial_review`. |
 | `POST` | `/api/maintenance/similar/delete` | `{ids:[…]}` — same delete path as exact-dedup. |
-| `POST` | `/api/maintenance/similar/ignore` | `{aId, bId, kind}` — false-positive pair. |
-| `GET`  | `/api/maintenance/similar/ignore` | List ignored pairs. |
+| `POST` | `/api/maintenance/similar/ignore` | `{aId, bId, kind?}` — false-positive pair (`kind` defaults to `similar`). |
+| `GET`  | `/api/maintenance/similar/ignore` | List ignored pairs. `?kind=`. |
 | `DELETE` | `/api/maintenance/similar/ignore/:id` | Un-ignore. |
 
-Routes for Scan are live. Analyze / groups / ignore land in later phases. Schema is in `data/db.sqlite` already.
+Scan + similar Analyze are live. Partial matching and the Maintenance card land in later phases. Schema is in `data/db.sqlite` already.
 
 ## AI / Face clustering (v2.16+)
 
@@ -282,6 +283,8 @@ The dashboard proxies these via `/api/ai/preload-model/…` above, but the sidec
 | `dedup_progress`       | `{stage, processed, total, hashed, errored}` |
 | `similar_progress`     | `{stage, processed, total, generated, skipped, errored}` |
 | `similar_done`         | `{processed, generated, skipped, errored, durationMs, cancelled}` |
+| `similar_analyze_progress` | `{stage, processed, total, comparedPairs, groups}` |
+| `similar_analyze_done` | `{similarGroups, comparedPairs, cancelled, durationMs, checkPartialClips, partialSkipped}` |
 | `thumbs_progress`      | `{stage, processed, total, built, skipped, errored}` |
 | `nsfw_progress`        | `{scanned, total, candidates, keep, running}` |
 | `nsfw_done`            | `{scanned, candidates, keep, durationMs}` |

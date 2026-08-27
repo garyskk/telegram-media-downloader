@@ -141,10 +141,13 @@ describe('similar groups, ignores, partial-scan resume', () => {
         const b = seedVideo('ign-b');
         const id1 = api.addSimilarIgnore({ aId: b, bId: a, kind: 'partial' });
         expect(id1).toBeGreaterThan(0);
-        expect(() => api.addSimilarIgnore({ aId: a, bId: b, kind: 'partial' })).toThrow();
+        expect(api.addSimilarIgnore({ aId: a, bId: b, kind: 'partial' })).toBe(id1);
         expect(api.isSimilarPairIgnored(a, b, 'partial')).toBe(true);
         expect(api.isSimilarPairIgnored(b, a, 'partial')).toBe(true);
         expect(api.isSimilarPairIgnored(a, b, 'similar')).toBe(false);
+        expect(api.listSimilarIgnores({ kind: 'partial' }).some((r) => r.id === id1)).toBe(true);
+        expect(api.deleteSimilarIgnore(id1)).toBe(1);
+        expect(api.isSimilarPairIgnored(a, b, 'partial')).toBe(false);
     });
 
     it('records a partial-scan resume cursor', () => {

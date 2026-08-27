@@ -132,8 +132,17 @@ import {
     health as seekbarClientHealth,
     probeHwaccel as probeSeekbarHwaccel,
 } from '../core/seekbar/client.js';
-import { scanSimilarClips } from '../core/similar/index.js';
-import { countSeekbarSprites, countVideoDownloads, getSeekbarSprite, getSimilarScanStats } from '../core/db.js';
+import { scanSimilarClips, analyzeSimilarClips } from '../core/similar/index.js';
+import {
+    countSeekbarSprites,
+    countVideoDownloads,
+    getSeekbarSprite,
+    getSimilarScanStats,
+    listSimilarGroups,
+    listSimilarIgnores,
+    addSimilarIgnore,
+    deleteSimilarIgnore,
+} from '../core/db.js';
 import {
     startScan as nsfwStartScan,
     cancelScan as nsfwCancelScan,
@@ -7087,9 +7096,9 @@ app.post('/api/maintenance/seekbar/sidecar/restart', async (req, res) => {
     }
 });
 
-// ====== Similar clips (fingerprint Scan) ==================================
+// ====== Similar clips (fingerprint Scan + Analyze) ========================
 // Dual-output seekbar generate. Skip when fingerprint file_hash still
-// matches. Analyze / groups / ignore land in later phases.
+// matches. Analyze rebuilds similar_groups (partial matcher is Phase 5).
 
 app.post('/api/maintenance/similar/scan', async (req, res) => {
     const tracker = _jobTrackers.similarScan;
@@ -7116,7 +7125,10 @@ app.post('/api/maintenance/similar/scan/stop', (req, res) => {
 });
 
 app.get('/api/maintenance/similar/status', (req, res) => {
-    res.json(_jobTrackers.similarScan.getStatus());
+    res.json({
+        ..._jobTrackers.similarScan.getStatus(),
+        analyze: _jobTrackers.similarAnalyze.getStatus(),
+    });
 });
 
 app.get('/api/maintenance/similar/stats', (req, res) => {
@@ -7125,7 +7137,105 @@ app.get('/api/maintenance/similar/stats', (req, res) => {
             success: true,
             ...getSimilarScanStats(),
             lastScan: kvGet('similar_last_scan') || null,
+            lastAnalyze: kvGet('similar_last_analyze') || null,
         });
+    } catch (e) {
+        res.status(500).json({ error: e?.message || String(e) });
+    }
+});
+
+app.post('/api/maintenance/similar/analyze', async (req, res) => {
+    const checkPartialClips = Boolean((req.body || {}).checkPartialClips);
+    const tracker = _jobTrackers.similarAnalyze;
+    const r = tracker.tryStart(async ({ onProgress, signal }) => {
+        try {
+            kvSet('pending_job_similarAnalyze', { startedAt: Date.now() });
+        } catch {}
+        const result = await analyzeSimilarClips({ onProgress, signal, checkPartialClips });
+        try {
+            kvSet('pending_job_similarAnalyze', null);
+        } catch {}
+        try {
+            kvSet('similar_last_analyze', { finishedAt: Date.now(), ...result });
+        } catch {}
+        return result;
+    });
+    if (!r.started) return res.status(409).json(r);
+    res.json({ started: true });
+});
+
+app.post('/api/maintenance/similar/analyze/stop', (req, res) => {
+    _jobTrackers.similarAnalyze.cancel();
+    res.json({ success: true });
+});
+
+app.get('/api/maintenance/similar/groups', (req, res) => {
+    try {
+        const kind = req.query.kind ? String(req.query.kind) : undefined;
+        res.json({ success: true, groups: listSimilarGroups({ kind }) });
+    } catch (e) {
+        res.status(500).json({ error: e?.message || String(e) });
+    }
+});
+
+app.post('/api/maintenance/similar/delete', async (req, res) => {
+    try {
+        const { ids } = req.body || {};
+        if (!Array.isArray(ids) || !ids.length) {
+            return res.status(400).json({ error: 'ids array required' });
+        }
+        const cleanIds = ids.map(Number).filter((n) => Number.isInteger(n) && n > 0);
+        if (!cleanIds.length) {
+            return res.status(400).json({ error: 'No valid ids supplied' });
+        }
+        const seekbarMap = collectSeekbarPaths(cleanIds);
+        const r = dedupDeleteByIds(cleanIds);
+        for (const id of cleanIds) {
+            try {
+                await purgeThumbsForDownload(id);
+            } catch {}
+            try {
+                await purgeSeekbarForDownload(id, seekbarMap.get(id));
+            } catch {}
+        }
+        try {
+            import('../core/deferred-delete.js').then((m) => m.startDrain()).catch(() => {});
+        } catch {}
+        try {
+            broadcast({ type: 'bulk_delete', count: cleanIds.length });
+        } catch {}
+        res.json({ success: true, ...r });
+    } catch (e) {
+        res.status(500).json({ error: e?.message || String(e) });
+    }
+});
+
+app.post('/api/maintenance/similar/ignore', (req, res) => {
+    try {
+        const { aId, bId, kind, note } = req.body || {};
+        const k = kind == null ? 'similar' : String(kind);
+        const id = addSimilarIgnore({ aId, bId, kind: k, note });
+        res.json({ success: true, id });
+    } catch (e) {
+        res.status(400).json({ error: e?.message || String(e) });
+    }
+});
+
+app.get('/api/maintenance/similar/ignore', (req, res) => {
+    try {
+        const kind = req.query.kind ? String(req.query.kind) : undefined;
+        res.json({ success: true, ignores: listSimilarIgnores({ kind }) });
+    } catch (e) {
+        res.status(500).json({ error: e?.message || String(e) });
+    }
+});
+
+app.delete('/api/maintenance/similar/ignore/:id', (req, res) => {
+    try {
+        const id = Number(req.params.id);
+        const changes = deleteSimilarIgnore(id);
+        if (!changes) return res.status(404).json({ error: 'ignore not found' });
+        res.json({ success: true });
     } catch (e) {
         res.status(500).json({ error: e?.message || String(e) });
     }
@@ -13224,6 +13334,12 @@ const _jobTrackers = {
         broadcast,
         log,
         eventPrefix: 'similar',
+    }),
+    similarAnalyze: createJobTracker({
+        kind: 'similarAnalyze',
+        broadcast,
+        log,
+        eventPrefix: 'similar_analyze',
     }),
     // Same race fix as thumbsBuild — `let _faststartRunning` had the
     // identical broadcast-before-flag-reset window. Prefix 'faststart'

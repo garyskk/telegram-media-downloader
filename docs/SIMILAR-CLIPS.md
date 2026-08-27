@@ -9,9 +9,9 @@ UI, and delete all stay in Node.
 Exact byte-identical files are **not** this feature. Those stay on
 Maintenance → Duplicates (SHA-256 in `src/core/dedup.js`).
 
-> **Status.** Phases 1–3 (schema, dual-output seekbar, Scan JobTracker)
-> are in the tree. Analyze / UI land in later phases. This file is the
-> living spec (same role as [docs/AI.md](AI.md) for faces).
+> **Status.** Phases 1–4 (schema, dual-output seekbar, Scan, similar
+> Analyze) are in the tree. Partial matching / UI land in later phases.
+> This file is the living spec (same role as [docs/AI.md](AI.md) for faces).
 
 **Out of scope:** similar still images, heavy crop / mirror / speed
 change, DINOv2, the faces sidecar, a second SQLite file, hashing old
@@ -101,13 +101,18 @@ Pipeline order: **similar → optional partial**. Exact SHA-256 pairs are
 left to the Duplicates page and are not re-checked here.
 
 - **Similar** — duration within ±10% and time-aligned Hamming on the
-  frame hashes. Cheap filter: 64-bit `aggregate_hash` + 120 s duration
-  buckets. Keep the **larger** file; suggest remove for the smaller
-  re-encode.
+  frame hashes. Cheap filter: 64-bit `aggregate_hash` (loose Hamming
+  gate) + 120 s duration buckets (±1 neighbour). Keep the **larger**
+  file; suggest remove for the smaller re-encode. Re-analyze replaces
+  `kind='similar'` groups; `partial` / `partial_review` rows stay.
+  Last-run summary in `kv['similar_last_analyze']`. JobTracker + WS
+  `similar_analyze_progress` / `similar_analyze_done`.
 - **Partial** (checkbox, off by default) — shorter sequence as a
   contiguous time-aligned run inside a longer parent. Confirmed vs
   `partial_review` bands. Keep the **longer** video (or the larger file
   when durations match). Interrupt-safe via `similar_partial_scans`.
+  The Analyze body accepts `checkPartialClips`; matching is a no-op
+  until Phase 5.
 
 False-positive pairs go to `similar_ignores` (canonical `a_id < b_id`)
 and survive re-analyze.
@@ -141,22 +146,25 @@ fires on a hard `DELETE`.
 ## API surface
 
 All endpoints are admin-only. See [docs/API.md](API.md#similar-clips)
-for the table. Handlers land with Scan / Analyze / UI.
+for the table. Scan + similar Analyze are live; partial matching and
+the Maintenance card land later.
 
 | Method | Path | Notes |
 |---|---|---|
 | `POST` | `/api/maintenance/similar/scan` | Dual-output seekbar generate |
 | `POST` | `/api/maintenance/similar/scan/stop` | Cancel |
-| `GET`  | `/api/maintenance/similar/status` | JobTracker snapshot |
-| `GET`  | `/api/maintenance/similar/stats` | Coverage + last scan |
+| `GET`  | `/api/maintenance/similar/status` | Scan snapshot + nested `analyze` |
+| `GET`  | `/api/maintenance/similar/stats` | Coverage + last scan / analyze |
 | `POST` | `/api/maintenance/similar/analyze` | `{ checkPartialClips?: bool }` |
+| `POST` | `/api/maintenance/similar/analyze/stop` | Cancel Analyze |
 | `GET`  | `/api/maintenance/similar/groups` | Persisted groups |
 | `POST` | `/api/maintenance/similar/delete` | `{ ids: […] }` |
 | `POST` | `/api/maintenance/similar/ignore` | `{ aId, bId, kind }` |
 | `GET`  | `/api/maintenance/similar/ignore` | List |
 | `DELETE` | `/api/maintenance/similar/ignore/:id` | Un-ignore |
 
-WS: `similar_progress`, `similar_done`.
+WS: `similar_progress` / `similar_done` (Scan),
+`similar_analyze_progress` / `similar_analyze_done` (Analyze).
 
 ## Related subsystem knobs
 
@@ -205,6 +213,6 @@ copies. Remove them there; similar-clips is for re-encodes and excerpts.
 | 1. Schema + this doc | **done** | Tables, accessors, soft-delete purge |
 | 2. Seekbar dual output | **done** | ffmpeg `split`, pHash helper |
 | 3. Scan JobTracker | **done** | regenerate / skip by `file_hash` |
-| 4. Similar matcher | pending | groups + APIs |
+| 4. Similar matcher | **done** | groups + Analyze / ignore / delete APIs |
 | 5. Partial matcher | pending | duration buckets, ignore, resume |
 | 6. Maintenance UI | pending | hub card, page, i18n |

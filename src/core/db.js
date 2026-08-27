@@ -5579,6 +5579,54 @@ export function getVideoFrameHashes(downloadId) {
         .all(Number(downloadId));
 }
 
+/** Fingerprinted live videos ready for Analyze (no clusterref / soft-deleted). */
+export function listFingerprintsForAnalyze() {
+    return getDb()
+        .prepare(
+            `SELECT vf.download_id AS id,
+                    vf.duration_sec,
+                    vf.aggregate_hash,
+                    vf.frame_count,
+                    d.file_hash,
+                    d.file_size,
+                    d.file_name
+               FROM video_fingerprints vf
+               JOIN downloads d ON d.id = vf.download_id
+              WHERE d.file_type = 'video'
+                AND d.file_path IS NOT NULL
+                AND d.file_path NOT LIKE '_clusterref/%'
+                AND (d.user_deleted IS NULL OR d.user_deleted = 0)
+                AND vf.frame_count > 0
+                AND vf.duration_sec IS NOT NULL
+              ORDER BY vf.download_id`,
+        )
+        .all();
+}
+
+export function getVideoFrameHashesForIds(ids) {
+    const list = [
+        ...new Set((ids || []).map(Number).filter((n) => Number.isInteger(n) && n > 0)),
+    ];
+    if (!list.length) return [];
+    const db = getDb();
+    const out = [];
+    for (let i = 0; i < list.length; i += _SQL_IN_CHUNK) {
+        const slice = list.slice(i, i + _SQL_IN_CHUNK);
+        const ph = slice.map(() => '?').join(',');
+        out.push(
+            ...db
+                .prepare(
+                    `SELECT download_id, t_sec, phash
+                       FROM video_frame_hashes
+                      WHERE download_id IN (${ph})
+                      ORDER BY download_id, t_sec`,
+                )
+                .all(...slice),
+        );
+    }
+    return out;
+}
+
 export function insertSimilarGroup({ kind, confidence, offsetSec, members, createdAt } = {}) {
     if (!_SIMILAR_KINDS.has(kind)) throw new Error(`invalid similar group kind: ${kind}`);
     const db = getDb();
@@ -5622,15 +5670,64 @@ export function listSimilarGroupMembers(groupId) {
 export function addSimilarIgnore({ aId, bId, kind, note, ignoredAt } = {}) {
     if (!_SIMILAR_KINDS.has(kind)) throw new Error(`invalid similar ignore kind: ${kind}`);
     const [a, b] = _pairIds(aId, bId);
-    return Number(
-        getDb()
-            .prepare(
-                `INSERT INTO similar_ignores (a_id, b_id, kind, ignored_at, note)
-                 VALUES (?, ?, ?, ?, ?)`,
-            )
-            .run(a, b, kind, Math.floor(ignoredAt || Date.now()), note == null ? null : String(note))
-            .lastInsertRowid,
+    const db = getDb();
+    const r = db
+        .prepare(
+            `INSERT OR IGNORE INTO similar_ignores (a_id, b_id, kind, ignored_at, note)
+             VALUES (?, ?, ?, ?, ?)`,
+        )
+        .run(a, b, kind, Math.floor(ignoredAt || Date.now()), note == null ? null : String(note));
+    if (r.changes) return Number(r.lastInsertRowid);
+    const row = db
+        .prepare('SELECT id FROM similar_ignores WHERE kind = ? AND a_id = ? AND b_id = ?')
+        .get(kind, a, b);
+    return Number(row?.id) || 0;
+}
+
+export function listSimilarIgnores({ kind } = {}) {
+    const db = getDb();
+    if (kind) {
+        if (!_SIMILAR_KINDS.has(kind)) return [];
+        return db
+            .prepare('SELECT * FROM similar_ignores WHERE kind = ? ORDER BY id DESC')
+            .all(kind);
+    }
+    return db.prepare('SELECT * FROM similar_ignores ORDER BY id DESC').all();
+}
+
+export function deleteSimilarIgnore(id) {
+    const n = Number(id);
+    if (!Number.isInteger(n) || n <= 0) return 0;
+    return getDb().prepare('DELETE FROM similar_ignores WHERE id = ?').run(n).changes;
+}
+
+export function deleteSimilarGroupsByKind(kind) {
+    if (!_SIMILAR_KINDS.has(kind)) throw new Error(`invalid similar group kind: ${kind}`);
+    return getDb().prepare('DELETE FROM similar_groups WHERE kind = ?').run(kind).changes;
+}
+
+export function listSimilarGroups({ kind } = {}) {
+    const db = getDb();
+    const groups = kind
+        ? !_SIMILAR_KINDS.has(kind)
+            ? []
+            : db.prepare('SELECT * FROM similar_groups WHERE kind = ? ORDER BY id DESC').all(kind)
+        : db.prepare('SELECT * FROM similar_groups ORDER BY id DESC').all();
+    const membersStmt = db.prepare(
+        `SELECT m.group_id, m.download_id, m.role, m.reason,
+                d.file_name, d.file_size, d.file_path, d.file_hash, d.file_type,
+                vf.duration_sec
+           FROM similar_group_members m
+           JOIN downloads d ON d.id = m.download_id
+           LEFT JOIN video_fingerprints vf ON vf.download_id = d.id
+          WHERE m.group_id = ?
+          ORDER BY CASE m.role WHEN 'keep' THEN 0 WHEN 'remove' THEN 1 ELSE 2 END,
+                   m.download_id`,
     );
+    return groups.map((g) => ({
+        ...g,
+        members: membersStmt.all(g.id),
+    }));
 }
 
 export function isSimilarPairIgnored(aId, bId, kind) {
