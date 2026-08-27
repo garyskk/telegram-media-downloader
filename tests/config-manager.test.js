@@ -64,6 +64,7 @@ describe('config manager (kv-backed)', () => {
         expect(cfg.advanced).toBeTruthy();
         expect(cfg.advanced.downloader.maxConcurrency).toBe(20);
         expect(cfg.advanced.history.shortBreakEveryN).toBe(100);
+        expect(cfg.advanced.similarClips.fingerprintFps).toBe(1);
         expect(cfg.rescue.retentionHours).toBe(48);
         // User values preserved:
         expect(cfg.telegram.apiId).toBe('x');

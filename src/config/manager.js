@@ -156,6 +156,24 @@ const DEFAULT_CONFIG = {
             // ('', 'vaapi', 'qsv', 'cuda', 'videotoolbox', 'd3d11va', 'dxva2').
             hwaccel: null,
         },
+        // Similar clips (near-duplicate videos + partial-clip detection).
+        // Fingerprints are 1 fps pHashes written by the seekbar ffmpeg
+        // split into the same db.sqlite. Hover sprite knobs stay under
+        // `seekbar.*` and do not control fingerprint cadence.
+        similarClips: {
+            similarThreshold: 5,
+            durationTolerance: 0.1,
+            partialMatchRatio: 0.5,
+            partialFrameThreshold: 10,
+            partialShortClipSec: 300,
+            partialShortMatchRatio: 0.35,
+            partialReviewMatchRatio: 0.1,
+            partialReviewMinMatchedFrames: 2,
+            fingerprintFps: 1,
+            fingerprintMaxFrames: 7200,
+            fingerprintTilePx: 32,
+            durationBucketSec: 120,
+        },
         // AI subsystem (semantic search + auto-tag + face clustering).
         // Master switch defaults OFF so existing installs are unaffected.
         // Search (embeddings) + Auto-tag were removed in this release;
@@ -655,6 +673,10 @@ function mergeConfig(userConfig) {
                 ...(userAdvanced.integrity || {}),
             },
             web: { ...DEFAULT_CONFIG.advanced.web, ...(userAdvanced.web || {}) },
+            similarClips: {
+                ...DEFAULT_CONFIG.advanced.similarClips,
+                ...(userAdvanced.similarClips || {}),
+            },
             // Spread `ai` so the operator's saved tagLabels, hfToken, etc.
             // win over the defaults but missing keys (added in a later
             // release) still pick up their default value.

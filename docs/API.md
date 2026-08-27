@@ -167,6 +167,25 @@ Opt-in feature — generates WebP sprite-sheet timeline thumbnails for video hov
 | `POST` | `/api/maintenance/seekbar/sidecar-test` | CORS proxy — test connection to an arbitrary seekbar sidecar URL. Body: `{url, token?}`. Returns `{ok, version}`. |
 | `POST` | `/api/maintenance/seekbar/sidecar/restart` | Tear down + respawn the Go sidecar. Use after changing hwaccel / concurrency / port range. Broadcasts `seekbar_sidecar_status`. |
 
+## Similar clips
+
+Near-duplicate videos and partial clips (a shorter video inside a longer one). Exact byte-identical files stay on Maintenance → Duplicates (SHA-256). See [docs/SIMILAR-CLIPS.md](SIMILAR-CLIPS.md).
+
+| Method | Path | Notes |
+|---|---|---|
+| `POST` | `/api/maintenance/similar/scan` | Enhanced seekbar generate: one ffmpeg decode writes hover sprite + 1 fps pHashes. Skip when fingerprint `file_hash` still matches. Broadcasts `similar_progress`. |
+| `POST` | `/api/maintenance/similar/scan/stop` | Cancel the in-flight scan. |
+| `GET`  | `/api/maintenance/similar/status` | JobTracker snapshot. |
+| `GET`  | `/api/maintenance/similar/stats` | `{totalVideos, fingerprinted, missing, lastScan}`. Survives restart via `kv['similar_last_scan']`. |
+| `POST` | `/api/maintenance/similar/analyze` | Group similar / optional partial. Body: `{checkPartialClips?:bool}`. |
+| `GET`  | `/api/maintenance/similar/groups` | Persisted groups with keep/remove members. |
+| `POST` | `/api/maintenance/similar/delete` | `{ids:[…]}` — same delete path as exact-dedup. |
+| `POST` | `/api/maintenance/similar/ignore` | `{aId, bId, kind}` — false-positive pair. |
+| `GET`  | `/api/maintenance/similar/ignore` | List ignored pairs. |
+| `DELETE` | `/api/maintenance/similar/ignore/:id` | Un-ignore. |
+
+Routes are specified here; Scan/Analyze handlers land in later phases. Schema is in `data/db.sqlite` already.
+
 ## AI / Face clustering (v2.16+)
 
 Opt-in face detection + clustering, backed by the Python sidecar in `faces-service/`. Off by default; flip `config.advanced.ai.enabled` + `config.advanced.ai.faceClustering`. All endpoints are admin-only. See [docs/AI.md](AI.md) for the deep dive.
@@ -261,6 +280,8 @@ The dashboard proxies these via `/api/ai/preload-model/…` above, but the sidec
 | `history_deleted` / `history_cleared`   | Cross-tab Recent-backfills sync. |
 | `history_stalled`      | `{pending, cap, stallSeconds}` |
 | `dedup_progress`       | `{stage, processed, total, hashed, errored}` |
+| `similar_progress`     | `{stage, processed, total, fingerprinted, skipped, errored}` |
+| `similar_done`         | `{processed, fingerprinted, skipped, errored, durationMs}` |
 | `thumbs_progress`      | `{stage, processed, total, built, skipped, errored}` |
 | `nsfw_progress`        | `{scanned, total, candidates, keep, running}` |
 | `nsfw_done`            | `{scanned, candidates, keep, durationMs}` |
