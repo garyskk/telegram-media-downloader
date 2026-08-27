@@ -205,3 +205,75 @@ describe('similar-clips cleanup', () => {
         expect(api.listSimilarGroupMembers(groupId)[0].download_id).toBe(keep);
     });
 });
+
+describe('similar scan paging', () => {
+    function markSprite(id, format) {
+        api.upsertSeekbarSprite({
+            downloadId: id,
+            spritePath: '',
+            metaPath: '',
+            frames: format === 'webp' ? 8 : 0,
+            cols: 10,
+            rows: 1,
+            tileW: 160,
+            format,
+            bytes: 0,
+            generatedAt: Date.now(),
+        });
+    }
+
+    it('pages local videos that need a fingerprint and skips clusterref / seekbar markers', () => {
+        const need = seedVideo('need-hash');
+        const photoMsg = _msg++;
+        api.insertDownload({
+            groupId: '-100similar',
+            groupName: 'Similar',
+            messageId: photoMsg,
+            fileName: 'p.jpg',
+            fileSize: 10,
+            fileType: 'photo',
+            filePath: 'Similar/photos/p.jpg',
+            fileHash: 'photo-h',
+        });
+        const cluster = seedVideo('cl-h');
+        db.prepare(`UPDATE downloads SET file_path = '_clusterref/peer/1' WHERE id = ?`).run(cluster);
+        const failed = seedVideo('fail-h');
+        markSprite(failed, 'failed');
+        const missing = seedVideo('miss-h');
+        markSprite(missing, 'missing');
+        const noDur = seedVideo('nodur-h');
+        markSprite(noDur, 'no_duration');
+        const hasSprite = seedVideo('sprite-h');
+        markSprite(hasSprite, 'webp');
+        const current = seedVideo('cur-h');
+        api.upsertVideoFingerprint({
+            downloadId: current,
+            durationSec: 1,
+            aggregateHash: 'aaaaaaaaaaaaaaaa',
+            frameCount: 1,
+            fileHash: 'cur-h',
+        });
+        const stale = seedVideo('old-h');
+        api.upsertVideoFingerprint({
+            downloadId: stale,
+            durationSec: 1,
+            aggregateHash: 'bbbbbbbbbbbbbbbb',
+            frameCount: 1,
+            fileHash: 'stale-old',
+        });
+
+        const page = api.pageSimilarScanVideos({ beforeId: Number.MAX_SAFE_INTEGER, limit: 200 });
+        const ids = page.map((r) => r.id);
+        expect(ids).toEqual(expect.arrayContaining([need, hasSprite, stale]));
+        expect(ids).not.toContain(cluster);
+        expect(ids).not.toContain(failed);
+        expect(ids).not.toContain(missing);
+        expect(ids).not.toContain(noDur);
+        expect(ids).not.toContain(current);
+
+        const stats = api.getSimilarScanStats();
+        expect(stats.totalVideos).toBeGreaterThanOrEqual(4);
+        expect(stats.missing).toBeGreaterThanOrEqual(3);
+        expect(stats.fingerprinted).toBeGreaterThanOrEqual(2);
+    });
+});

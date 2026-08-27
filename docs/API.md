@@ -184,7 +184,7 @@ Near-duplicate videos and partial clips (a shorter video inside a longer one). E
 | `GET`  | `/api/maintenance/similar/ignore` | List ignored pairs. |
 | `DELETE` | `/api/maintenance/similar/ignore/:id` | Un-ignore. |
 
-Routes are specified here; Scan/Analyze handlers land in later phases. Schema is in `data/db.sqlite` already.
+Routes for Scan are live. Analyze / groups / ignore land in later phases. Schema is in `data/db.sqlite` already.
 
 ## AI / Face clustering (v2.16+)
 
@@ -280,8 +280,8 @@ The dashboard proxies these via `/api/ai/preload-model/…` above, but the sidec
 | `history_deleted` / `history_cleared`   | Cross-tab Recent-backfills sync. |
 | `history_stalled`      | `{pending, cap, stallSeconds}` |
 | `dedup_progress`       | `{stage, processed, total, hashed, errored}` |
-| `similar_progress`     | `{stage, processed, total, fingerprinted, skipped, errored}` |
-| `similar_done`         | `{processed, fingerprinted, skipped, errored, durationMs}` |
+| `similar_progress`     | `{stage, processed, total, generated, skipped, errored}` |
+| `similar_done`         | `{processed, generated, skipped, errored, durationMs, cancelled}` |
 | `thumbs_progress`      | `{stage, processed, total, built, skipped, errored}` |
 | `nsfw_progress`        | `{scanned, total, candidates, keep, running}` |
 | `nsfw_done`            | `{scanned, candidates, keep, durationMs}` |

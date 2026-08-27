@@ -36,6 +36,7 @@ import {
     upsertVideoFingerprint,
 } from '../db.js';
 import { hashRgb24Sequence, xorAggregate } from '../phash.js';
+import { getSimilarClipsConfig } from '../similar/config.js';
 import {
     ffmpegHasLibwebp,
     hasFfmpeg,
@@ -66,13 +67,6 @@ export const SEEKBAR_DEFAULTS = Object.freeze({
     concurrency: 8,
     maxRetries: 3,
     hwaccel: null,
-});
-
-/** Fingerprint branch knobs — independent of hover `intervalSec` / `maxTiles`. */
-export const SIMILAR_CLIPS_DEFAULTS = Object.freeze({
-    fingerprintFps: 1,
-    fingerprintMaxFrames: 7200,
-    fingerprintTilePx: 32,
 });
 
 /** Floor so a cold ffmpeg + dense short clip still has headroom. */
@@ -117,15 +111,7 @@ export function getSeekbarConfig() {
     return { ...SEEKBAR_DEFAULTS, ...stored };
 }
 
-export function getSimilarClipsConfig() {
-    let stored = {};
-    try {
-        stored = loadConfig()?.advanced?.similarClips || {};
-    } catch {
-        /* fall through to defaults */
-    }
-    return { ...SIMILAR_CLIPS_DEFAULTS, ...stored };
-}
+export { getSimilarClipsConfig };
 
 export function getFingerprintRawPath(downloadId) {
     return path.join(SEEKBAR_DIR, `${Number(downloadId)}.fp.raw`);

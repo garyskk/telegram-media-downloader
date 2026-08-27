@@ -9,9 +9,9 @@ UI, and delete all stay in Node.
 Exact byte-identical files are **not** this feature. Those stay on
 Maintenance → Duplicates (SHA-256 in `src/core/dedup.js`).
 
-> **Status.** Phases 1–2 (schema + dual-output seekbar) are in the tree.
-> Scan / Analyze / UI land in later phases. This file is the living spec
-> (same role as [docs/AI.md](AI.md) for faces).
+> **Status.** Phases 1–3 (schema, dual-output seekbar, Scan JobTracker)
+> are in the tree. Analyze / UI land in later phases. This file is the
+> living spec (same role as [docs/AI.md](AI.md) for faces).
 
 **Out of scope:** similar still images, heavy crop / mirror / speed
 change, DINOv2, the faces sidecar, a second SQLite file, hashing old
@@ -54,8 +54,7 @@ density stays under `advanced.seekbar.*` and does **not** control
 fingerprint cadence (fixed 1 fps).
 
 Env-var precedence (same rule as faces): `TGDL_SIMILAR_*` > kv-config >
-default. Env wiring lands with Scan/Analyze; the keys below are already
-seeded in `DEFAULT_CONFIG`.
+default. Scan reads these through `src/core/similar/config.js`.
 
 ### Config + env var reference
 
@@ -205,7 +204,7 @@ copies. Remove them there; similar-clips is for re-encodes and excerpts.
 |---|---|---|
 | 1. Schema + this doc | **done** | Tables, accessors, soft-delete purge |
 | 2. Seekbar dual output | **done** | ffmpeg `split`, pHash helper |
-| 3. Scan JobTracker | pending | regenerate / skip by `file_hash` |
+| 3. Scan JobTracker | **done** | regenerate / skip by `file_hash` |
 | 4. Similar matcher | pending | groups + APIs |
 | 5. Partial matcher | pending | duration buckets, ignore, resume |
 | 6. Maintenance UI | pending | hub card, page, i18n |

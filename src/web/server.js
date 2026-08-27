@@ -132,7 +132,8 @@ import {
     health as seekbarClientHealth,
     probeHwaccel as probeSeekbarHwaccel,
 } from '../core/seekbar/client.js';
-import { countSeekbarSprites, countVideoDownloads, getSeekbarSprite } from '../core/db.js';
+import { scanSimilarClips } from '../core/similar/index.js';
+import { countSeekbarSprites, countVideoDownloads, getSeekbarSprite, getSimilarScanStats } from '../core/db.js';
 import {
     startScan as nsfwStartScan,
     cancelScan as nsfwCancelScan,
@@ -7086,6 +7087,50 @@ app.post('/api/maintenance/seekbar/sidecar/restart', async (req, res) => {
     }
 });
 
+// ====== Similar clips (fingerprint Scan) ==================================
+// Dual-output seekbar generate. Skip when fingerprint file_hash still
+// matches. Analyze / groups / ignore land in later phases.
+
+app.post('/api/maintenance/similar/scan', async (req, res) => {
+    const tracker = _jobTrackers.similarScan;
+    const r = tracker.tryStart(async ({ onProgress, signal }) => {
+        try {
+            kvSet('pending_job_similarScan', { startedAt: Date.now() });
+        } catch {}
+        const result = await scanSimilarClips({ onProgress, signal });
+        try {
+            kvSet('pending_job_similarScan', null);
+        } catch {}
+        try {
+            kvSet('similar_last_scan', { finishedAt: Date.now(), ...result });
+        } catch {}
+        return result;
+    });
+    if (!r.started) return res.status(409).json(r);
+    res.json({ started: true });
+});
+
+app.post('/api/maintenance/similar/scan/stop', (req, res) => {
+    _jobTrackers.similarScan.cancel();
+    res.json({ success: true });
+});
+
+app.get('/api/maintenance/similar/status', (req, res) => {
+    res.json(_jobTrackers.similarScan.getStatus());
+});
+
+app.get('/api/maintenance/similar/stats', (req, res) => {
+    try {
+        res.json({
+            success: true,
+            ...getSimilarScanStats(),
+            lastScan: kvGet('similar_last_scan') || null,
+        });
+    } catch (e) {
+        res.status(500).json({ error: e?.message || String(e) });
+    }
+});
+
 // Public sprite + meta — admin and guest both can fetch (sprites are
 // derived assets that already gate behind the share-link / library ACL
 // on the row itself).
@@ -13173,6 +13218,12 @@ const _jobTrackers = {
         broadcast,
         log,
         eventPrefix: 'seekbar_rebuild',
+    }),
+    similarScan: createJobTracker({
+        kind: 'similarScan',
+        broadcast,
+        log,
+        eventPrefix: 'similar',
     }),
     // Same race fix as thumbsBuild — `let _faststartRunning` had the
     // identical broadcast-before-flag-reset window. Prefix 'faststart'

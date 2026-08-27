@@ -5340,6 +5340,105 @@ export function countVideoDownloads() {
     );
 }
 
+const _SIMILAR_SKIP_FORMATS = `'failed','missing','no_duration'`;
+const _SIMILAR_ELIGIBLE = `
+    d.file_type = 'video'
+    AND d.file_path IS NOT NULL
+    AND d.file_path NOT LIKE '_clusterref/%'
+    AND (d.user_deleted IS NULL OR d.user_deleted = 0)
+    AND (s.download_id IS NULL OR s.format NOT IN (${_SIMILAR_SKIP_FORMATS}))
+`;
+const _SIMILAR_NEEDS_FP = `
+    (
+      vf.download_id IS NULL
+      OR (d.file_hash IS NOT NULL AND (vf.file_hash IS NULL OR vf.file_hash != d.file_hash))
+    )
+`;
+
+/**
+ * Local videos Scan may fingerprint. Excludes peer `_clusterref` rows
+ * and seekbar skip markers (`failed` / `missing` / `no_duration`).
+ */
+export function countSimilarScanVideos() {
+    return (
+        Number(
+            getDb()
+                .prepare(
+                    `SELECT COUNT(*) AS n
+                       FROM downloads d
+                       LEFT JOIN seekbar_sprites s ON s.download_id = d.id
+                      WHERE ${_SIMILAR_ELIGIBLE}`,
+                )
+                .get().n,
+        ) || 0
+    );
+}
+
+/** Eligible videos whose fingerprint is missing or stale vs `downloads.file_hash`. */
+export function countSimilarScanPending() {
+    return (
+        Number(
+            getDb()
+                .prepare(
+                    `SELECT COUNT(*) AS n
+                       FROM downloads d
+                       LEFT JOIN seekbar_sprites s ON s.download_id = d.id
+                       LEFT JOIN video_fingerprints vf ON vf.download_id = d.id
+                      WHERE ${_SIMILAR_ELIGIBLE}
+                        AND ${_SIMILAR_NEEDS_FP}`,
+                )
+                .get().n,
+        ) || 0
+    );
+}
+
+export function countVideoFingerprints() {
+    return (
+        Number(
+            getDb()
+                .prepare(
+                    `SELECT COUNT(*) AS n
+                       FROM video_fingerprints vf
+                       JOIN downloads d ON d.id = vf.download_id
+                      WHERE d.file_type = 'video'
+                        AND d.file_path IS NOT NULL
+                        AND d.file_path NOT LIKE '_clusterref/%'
+                        AND (d.user_deleted IS NULL OR d.user_deleted = 0)`,
+                )
+                .get().n,
+        ) || 0
+    );
+}
+
+export function getSimilarScanStats() {
+    const totalVideos = countSimilarScanVideos();
+    const fingerprinted = countVideoFingerprints();
+    const missing = countSimilarScanPending();
+    return { totalVideos, fingerprinted, missing };
+}
+
+/**
+ * Keyset page of videos that still need a fingerprint encode.
+ * Snapshot via `.all()` — never hold a cursor across await.
+ */
+export function pageSimilarScanVideos({ beforeId, limit = 200 } = {}) {
+    const before = Number.isFinite(Number(beforeId)) ? Number(beforeId) : Number.MAX_SAFE_INTEGER;
+    const lim = Math.max(1, Math.min(2000, Number(limit) || 200));
+    return getDb()
+        .prepare(
+            `SELECT d.id, d.file_path, d.file_type, d.file_size, d.file_name, d.file_hash
+               FROM downloads d
+               LEFT JOIN seekbar_sprites s ON s.download_id = d.id
+               LEFT JOIN video_fingerprints vf ON vf.download_id = d.id
+              WHERE ${_SIMILAR_ELIGIBLE}
+                AND ${_SIMILAR_NEEDS_FP}
+                AND d.id < ?
+              ORDER BY d.id DESC
+              LIMIT ?`,
+        )
+        .all(before, lim);
+}
+
 // ── NSFW hash blocklist ─────────────────────────────────────────────────────
 
 export function addNsfwBlocklistBatch(entries) {
