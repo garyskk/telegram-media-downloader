@@ -234,6 +234,7 @@
                      page. No nav row rendered. -->
                 <div class="hidden">
                     <div data-page="maintenance-duplicates"></div>
+                    <div data-page="maintenance-similar"></div>
                     <div data-page="maintenance-thumbs"></div>
                     <div data-page="maintenance-video"></div>
                     <div data-page="maintenance-nsfw"></div>
@@ -807,6 +808,9 @@
                     <div class="maintenance-tabs-scroll">
                         <a class="maintenance-tab" data-mt-page="maintenance-duplicates" href="#/maintenance/duplicates" role="tab" data-i18n-title="nav.maintenance.duplicates" title="Duplicates">
                             <i class="ri-file-copy-2-line"></i><span data-i18n="nav.maintenance.duplicates">Duplicates</span>
+                        </a>
+                        <a class="maintenance-tab" data-mt-page="maintenance-similar" href="#/maintenance/similar" role="tab" data-i18n-title="nav.maintenance.similar" title="Similar clips">
+                            <i class="ri-scissors-cut-line"></i><span data-i18n="nav.maintenance.similar">Similar clips</span>
                         </a>
                         <a class="maintenance-tab" data-mt-page="maintenance-thumbs" href="#/maintenance/thumbs" role="tab" data-i18n-title="nav.maintenance.thumbs" title="Thumbnails">
                             <i class="ri-image-2-line"></i><span data-i18n="nav.maintenance.thumbs">Thumbnails</span>
@@ -2232,6 +2236,151 @@
                             <div id="dup-summary" class="text-xs text-tg-textSecondary"></div>
                             <button id="dup-delete-btn" type="button" class="px-4 py-2 rounded-lg bg-red-500/20 text-red-300 hover:bg-red-500/30 font-medium text-sm transition">
                                 <i class="ri-delete-bin-line mr-1"></i><span data-i18n="maintenance.duplicates.delete_selected">Delete selected</span>
+                            </button>
+                        </div>
+                    </section>
+                </div>
+
+                <!-- Maintenance / Similar clips (admin-only) -->
+                <div id="page-maintenance-similar" class="hidden max-w-5xl mx-auto px-3 sm:px-4" data-admin-only
+                     data-page-title-key="maintenance.similar.page_title"
+                     data-page-subtitle-key="maintenance.similar.subtitle">
+                    <section class="bg-tg-panel rounded-xl p-4 mb-3">
+                        <div class="flex items-start justify-between gap-3 flex-wrap">
+                            <div class="min-w-0">
+                                <h2 class="text-tg-text text-base font-semibold" data-i18n="maintenance.similar.page_title">Similar clips</h2>
+                                <p class="text-xs text-tg-textSecondary mt-0.5" data-i18n="maintenance.similar.subtitle">Find near-duplicate videos and shorter clips inside longer ones. Exact byte-identical files stay on Duplicates. Scan writes 1 fps hashes; Analyze groups them.</p>
+                            </div>
+                            <div class="flex items-center gap-2 shrink-0 flex-wrap justify-end">
+                                <button id="sim-scan-stop-btn" type="button" class="hidden tg-btn-secondary text-xs px-3 py-1.5 inline-flex items-center gap-1.5 text-red-400 border-red-400/40 hover:bg-red-400/10">
+                                    <i class="ri-stop-circle-line"></i><span data-i18n="maintenance.similar.stop">Stop</span>
+                                </button>
+                                <button id="sim-scan-btn" type="button" class="tg-btn-secondary text-xs px-3 py-1.5 inline-flex items-center gap-1.5"
+                                        title="Regenerate 1 fps fingerprints via the seekbar ffmpeg pass.">
+                                    <i class="ri-fingerprint-line"></i><span data-i18n="maintenance.similar.scan">Scan</span>
+                                </button>
+                                <button id="sim-analyze-stop-btn" type="button" class="hidden tg-btn-secondary text-xs px-3 py-1.5 inline-flex items-center gap-1.5 text-red-400 border-red-400/40 hover:bg-red-400/10">
+                                    <i class="ri-stop-circle-line"></i><span data-i18n="maintenance.similar.stop">Stop</span>
+                                </button>
+                                <button id="sim-analyze-btn" type="button" class="tg-btn text-xs px-3 py-1.5 inline-flex items-center gap-1.5"
+                                        title="Group similar videos (and optional partial clips).">
+                                    <i class="ri-search-line"></i><span data-i18n="maintenance.similar.analyze">Analyze</span>
+                                </button>
+                            </div>
+                        </div>
+                        <label class="mt-3 inline-flex items-center gap-2 text-xs text-tg-text cursor-pointer">
+                            <input id="sim-partial-check" type="checkbox" class="shrink-0">
+                            <span data-i18n="maintenance.similar.check_partial">Also find shorter clips inside longer videos</span>
+                        </label>
+
+                        <div id="sim-scan-progress" class="hidden mt-3" role="status" aria-live="polite">
+                            <div class="text-sm text-tg-text mb-1.5 flex items-center gap-1.5 font-medium">
+                                <i class="ri-loader-4-line animate-spin text-tg-blue"></i>
+                                <span id="sim-scan-progress-stage" data-i18n="maintenance.similar.progress.scanning">Scanning…</span>
+                            </div>
+                            <div class="h-2 bg-tg-bg/60 rounded overflow-hidden">
+                                <div id="sim-scan-progress-bar" class="h-full bg-tg-blue transition-all" style="width:0%"></div>
+                            </div>
+                            <div id="sim-scan-progress-pct" class="text-[11px] text-tg-textSecondary mt-1 tabular-nums text-right"></div>
+                        </div>
+                        <div id="sim-analyze-progress" class="hidden mt-3" role="status" aria-live="polite">
+                            <div class="text-sm text-tg-text mb-1.5 flex items-center gap-1.5 font-medium">
+                                <i class="ri-loader-4-line animate-spin text-violet-300"></i>
+                                <span id="sim-analyze-progress-stage" data-i18n="maintenance.similar.progress.analyzing">Analyzing…</span>
+                            </div>
+                            <div class="h-2 bg-tg-bg/60 rounded overflow-hidden">
+                                <div id="sim-analyze-progress-bar" class="h-full bg-violet-400 transition-all" style="width:0%"></div>
+                            </div>
+                            <div id="sim-analyze-progress-pct" class="text-[11px] text-tg-textSecondary mt-1 tabular-nums text-right"></div>
+                        </div>
+
+                        <div class="mt-3 grid grid-cols-2 sm:grid-cols-4 gap-2 text-center">
+                            <div class="bg-tg-bg/40 rounded-lg p-3">
+                                <div class="text-[10px] uppercase tracking-wide text-tg-textSecondary" data-i18n="maintenance.similar.stats.total">Videos</div>
+                                <div id="sim-stat-total" class="text-xl font-semibold text-tg-text tabular-nums">—</div>
+                            </div>
+                            <div class="bg-tg-bg/40 rounded-lg p-3">
+                                <div class="text-[10px] uppercase tracking-wide text-tg-textSecondary" data-i18n="maintenance.similar.stats.fingerprinted">Fingerprinted</div>
+                                <div id="sim-stat-fp" class="text-xl font-semibold text-tg-text tabular-nums">—</div>
+                            </div>
+                            <div class="bg-tg-bg/40 rounded-lg p-3">
+                                <div class="text-[10px] uppercase tracking-wide text-tg-textSecondary" data-i18n="maintenance.similar.stats.missing">Awaiting scan</div>
+                                <div id="sim-stat-missing" class="text-xl font-semibold text-tg-orange tabular-nums">—</div>
+                            </div>
+                            <div class="bg-tg-bg/40 rounded-lg p-3">
+                                <div class="text-[10px] uppercase tracking-wide text-tg-textSecondary" data-i18n="maintenance.similar.stats.last_scan">Last scan</div>
+                                <div id="sim-stat-last" class="text-xs text-tg-text tabular-nums leading-tight pt-1">—</div>
+                            </div>
+                        </div>
+                        <div id="sim-stat-summary" class="hidden mt-2 text-xs text-tg-textSecondary text-center"></div>
+                    </section>
+
+                    <section class="bg-tg-panel rounded-xl p-4 mb-3">
+                        <h3 class="text-tg-text text-sm font-medium mb-3 flex items-center gap-2">
+                            <i class="ri-equalizer-line text-tg-textSecondary"></i>
+                            <span data-i18n="maintenance.similar.settings.title">Matching settings</span>
+                        </h3>
+                        <div class="grid grid-cols-2 sm:grid-cols-3 gap-3">
+                            <div>
+                                <label for="setting-adv-similarClips-similarThreshold" class="text-tg-text text-xs block mb-1" data-i18n="maintenance.similar.settings.threshold">Similar Hamming</label>
+                                <input id="setting-adv-similarClips-similarThreshold" type="number" min="0" max="32" step="1" class="tg-input w-full text-sm" value="5">
+                            </div>
+                            <div>
+                                <label for="setting-adv-similarClips-durationTolerance" class="text-tg-text text-xs block mb-1" data-i18n="maintenance.similar.settings.duration">Duration ±</label>
+                                <input id="setting-adv-similarClips-durationTolerance" type="number" min="0" max="1" step="0.01" class="tg-input w-full text-sm" value="0.1">
+                            </div>
+                            <div>
+                                <label for="setting-adv-similarClips-durationBucketSec" class="text-tg-text text-xs block mb-1" data-i18n="maintenance.similar.settings.bucket">Bucket (s)</label>
+                                <input id="setting-adv-similarClips-durationBucketSec" type="number" min="10" max="3600" step="10" class="tg-input w-full text-sm" value="120">
+                            </div>
+                        </div>
+                        <details class="mt-3">
+                            <summary class="text-xs text-tg-textSecondary cursor-pointer" data-i18n="maintenance.similar.settings.partial_heading">Partial-clip knobs</summary>
+                            <div class="mt-3 grid grid-cols-2 sm:grid-cols-3 gap-3">
+                                <div>
+                                    <label for="setting-adv-similarClips-partialMatchRatio" class="text-tg-text text-xs block mb-1" data-i18n="maintenance.similar.settings.partial_ratio">Match ratio</label>
+                                    <input id="setting-adv-similarClips-partialMatchRatio" type="number" min="0" max="1" step="0.05" class="tg-input w-full text-sm" value="0.5">
+                                </div>
+                                <div>
+                                    <label for="setting-adv-similarClips-partialFrameThreshold" class="text-tg-text text-xs block mb-1" data-i18n="maintenance.similar.settings.partial_frame">Frame Hamming</label>
+                                    <input id="setting-adv-similarClips-partialFrameThreshold" type="number" min="0" max="64" step="1" class="tg-input w-full text-sm" value="10">
+                                </div>
+                                <div>
+                                    <label for="setting-adv-similarClips-partialShortClipSec" class="text-tg-text text-xs block mb-1" data-i18n="maintenance.similar.settings.short_sec">Short clip (s)</label>
+                                    <input id="setting-adv-similarClips-partialShortClipSec" type="number" min="1" max="7200" step="1" class="tg-input w-full text-sm" value="300">
+                                </div>
+                                <div>
+                                    <label for="setting-adv-similarClips-partialShortMatchRatio" class="text-tg-text text-xs block mb-1" data-i18n="maintenance.similar.settings.short_ratio">Short ratio</label>
+                                    <input id="setting-adv-similarClips-partialShortMatchRatio" type="number" min="0" max="1" step="0.05" class="tg-input w-full text-sm" value="0.35">
+                                </div>
+                                <div>
+                                    <label for="setting-adv-similarClips-partialReviewMatchRatio" class="text-tg-text text-xs block mb-1" data-i18n="maintenance.similar.settings.review_ratio">Review ratio</label>
+                                    <input id="setting-adv-similarClips-partialReviewMatchRatio" type="number" min="0" max="1" step="0.05" class="tg-input w-full text-sm" value="0.1">
+                                </div>
+                                <div>
+                                    <label for="setting-adv-similarClips-partialReviewMinMatchedFrames" class="text-tg-text text-xs block mb-1" data-i18n="maintenance.similar.settings.review_frames">Review min frames</label>
+                                    <input id="setting-adv-similarClips-partialReviewMinMatchedFrames" type="number" min="1" max="100" step="1" class="tg-input w-full text-sm" value="2">
+                                </div>
+                            </div>
+                        </details>
+                    </section>
+
+                    <section class="bg-tg-panel rounded-xl p-4">
+                        <div class="flex items-center justify-between gap-2 flex-wrap mb-3">
+                            <div id="sim-totals" class="text-sm text-tg-text"></div>
+                            <div class="flex items-center gap-1 flex-wrap">
+                                <button type="button" data-sim-kind="" data-active="1" class="text-[11px] px-2 py-1 rounded-md bg-tg-blue/20 text-tg-blue" data-i18n="maintenance.similar.filter.all">All</button>
+                                <button type="button" data-sim-kind="similar" data-active="0" class="text-[11px] px-2 py-1 rounded-md text-tg-textSecondary hover:bg-tg-bg/40" data-i18n="maintenance.similar.kind.similar">Similar</button>
+                                <button type="button" data-sim-kind="partial" data-active="0" class="text-[11px] px-2 py-1 rounded-md text-tg-textSecondary hover:bg-tg-bg/40" data-i18n="maintenance.similar.kind.partial">Partial</button>
+                                <button type="button" data-sim-kind="partial_review" data-active="0" class="text-[11px] px-2 py-1 rounded-md text-tg-textSecondary hover:bg-tg-bg/40" data-i18n="maintenance.similar.kind.partial_review">Review</button>
+                            </div>
+                        </div>
+                        <div id="sim-empty" class="text-center py-8 text-sm text-tg-textSecondary" data-i18n="maintenance.similar.empty">No groups yet — Scan fingerprints, then Analyze.</div>
+                        <div id="sim-list" class="max-h-[60vh] overflow-y-auto pr-1"></div>
+                        <div class="mt-3 flex items-center justify-between gap-3 flex-wrap">
+                            <div id="sim-summary" class="text-xs text-tg-textSecondary"></div>
+                            <button id="sim-delete-btn" type="button" class="px-4 py-2 rounded-lg bg-red-500/20 text-red-300 hover:bg-red-500/30 font-medium text-sm transition">
+                                <i class="ri-delete-bin-line mr-1"></i><span data-i18n="maintenance.similar.delete_selected">Delete selected</span>
                             </button>
                         </div>
                     </section>

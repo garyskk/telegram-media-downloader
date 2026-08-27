@@ -185,7 +185,7 @@ Near-duplicate videos and partial clips (a shorter video inside a longer one). E
 | `GET`  | `/api/maintenance/similar/ignore` | List ignored pairs. `?kind=`. |
 | `DELETE` | `/api/maintenance/similar/ignore/:id` | Un-ignore. |
 
-Scan + Analyze (similar and optional partial) are live. The Maintenance card lands in Phase 6. Schema is in `data/db.sqlite` already.
+Scan + Analyze (similar and optional partial) and the Maintenance hub card (`#/maintenance/similar`) are live. Schema is in `data/db.sqlite` already.
 
 ## AI / Face clustering (v2.16+)
 

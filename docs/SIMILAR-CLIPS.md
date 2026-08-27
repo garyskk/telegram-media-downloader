@@ -9,9 +9,9 @@ UI, and delete all stay in Node.
 Exact byte-identical files are **not** this feature. Those stay on
 Maintenance → Duplicates (SHA-256 in `src/core/dedup.js`).
 
-> **Status.** Phases 1–5 (schema, dual-output seekbar, Scan, similar
-> Analyze, partial matcher) are in the tree. The Maintenance UI lands
-> in Phase 6. This file is the living spec (same role as
+> **Status.** Phases 1–6 are in the tree: schema, dual-output seekbar,
+> Scan, similar Analyze, partial matcher, and the Maintenance hub card
+> + similar-clips page. This file is the living spec (same role as
 > [docs/AI.md](AI.md) for faces).
 
 **Out of scope:** similar still images, heavy crop / mirror / speed
@@ -149,8 +149,8 @@ fires on a hard `DELETE`.
 ## API surface
 
 All endpoints are admin-only. See [docs/API.md](API.md#similar-clips)
-for the table. Scan + Analyze (similar and optional partial) are live;
-the Maintenance card lands in Phase 6.
+for the table. Scan + Analyze (similar and optional partial) and the
+Maintenance hub card (`#/maintenance/similar`) are live.
 
 | Method | Path | Notes |
 |---|---|---|
@@ -218,4 +218,4 @@ copies. Remove them there; similar-clips is for re-encodes and excerpts.
 | 3. Scan JobTracker | **done** | regenerate / skip by `file_hash` |
 | 4. Similar matcher | **done** | groups + Analyze / ignore / delete APIs |
 | 5. Partial matcher | **done** | duration buckets, ignore, resume |
-| 6. Maintenance UI | pending | hub card, page, i18n |
+| 6. Maintenance UI | **done** | hub card, page, i18n |

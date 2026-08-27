@@ -132,7 +132,7 @@ import {
     health as seekbarClientHealth,
     probeHwaccel as probeSeekbarHwaccel,
 } from '../core/seekbar/client.js';
-import { scanSimilarClips, analyzeSimilarClips } from '../core/similar/index.js';
+import { scanSimilarClips, analyzeSimilarClips, SIMILAR_CLIPS_DEFAULTS } from '../core/similar/index.js';
 import {
     countSeekbarSprites,
     countVideoDownloads,
@@ -11917,6 +11917,10 @@ app.post('/api/config', async (req, res) => {
                     ...(cur.seekbar || {}),
                     ...(inc.seekbar || {}),
                 },
+                similarClips: {
+                    ...(cur.similarClips || {}),
+                    ...(inc.similarClips || {}),
+                },
             };
             // ffmpeg hwaccel — allow-list validation. An attacker who
             // got past the admin gate could otherwise pass arbitrary
@@ -12184,6 +12188,61 @@ app.post('/api/config', async (req, res) => {
             // it alongside the dashboard passwordHash).
             sk.sidecarUrl = typeof sk.sidecarUrl === 'string' ? sk.sidecarUrl.trim() : '';
             sk.apiToken = typeof sk.apiToken === 'string' ? sk.apiToken.trim().slice(0, 256) : '';
+
+            const sc = merged.similarClips;
+            const scDef = SIMILAR_CLIPS_DEFAULTS;
+            const clampFloat = (v, lo, hi, def) => {
+                const n = Number(v);
+                if (!Number.isFinite(n)) return def;
+                return Math.max(lo, Math.min(hi, n));
+            };
+            sc.similarThreshold = clampInt(sc.similarThreshold, 0, 32, scDef.similarThreshold);
+            sc.durationTolerance = clampFloat(sc.durationTolerance, 0, 1, scDef.durationTolerance);
+            sc.partialMatchRatio = clampFloat(sc.partialMatchRatio, 0, 1, scDef.partialMatchRatio);
+            sc.partialFrameThreshold = clampInt(
+                sc.partialFrameThreshold,
+                0,
+                64,
+                scDef.partialFrameThreshold,
+            );
+            sc.partialShortClipSec = clampInt(
+                sc.partialShortClipSec,
+                1,
+                7200,
+                scDef.partialShortClipSec,
+            );
+            sc.partialShortMatchRatio = clampFloat(
+                sc.partialShortMatchRatio,
+                0,
+                1,
+                scDef.partialShortMatchRatio,
+            );
+            sc.partialReviewMatchRatio = clampFloat(
+                sc.partialReviewMatchRatio,
+                0,
+                1,
+                scDef.partialReviewMatchRatio,
+            );
+            sc.partialReviewMinMatchedFrames = clampInt(
+                sc.partialReviewMinMatchedFrames,
+                1,
+                100,
+                scDef.partialReviewMinMatchedFrames,
+            );
+            sc.fingerprintFps = clampFloat(sc.fingerprintFps, 0.1, 4, scDef.fingerprintFps);
+            sc.fingerprintMaxFrames = clampInt(
+                sc.fingerprintMaxFrames,
+                10,
+                72000,
+                scDef.fingerprintMaxFrames,
+            );
+            sc.fingerprintTilePx = clampInt(sc.fingerprintTilePx, 8, 64, scDef.fingerprintTilePx);
+            sc.durationBucketSec = clampInt(
+                sc.durationBucketSec,
+                10,
+                3600,
+                scDef.durationBucketSec,
+            );
 
             newConfig.advanced = merged;
         }
