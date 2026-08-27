@@ -1,13 +1,14 @@
 /**
- * Partial-clip matcher: shorter 1 fps sequence as a contiguous run
- * inside a longer parent. Confirmed vs partial_review bands.
+ * Partial-clip matcher: shorter scene sequence aligned inside a
+ * same-or-longer parent (Smith-Waterman). Confirmed vs partial_review
+ * bands.
  *
  * Parent lookup is duration-sorted (same length or longer), not the
  * similar-video ±1 bucket gate — a 10 s clip must still see a 250 s
  * parent. Exact SHA-256 pairs and similar_ignores are skipped.
  */
 
-import { hammingHex } from '../phash.js';
+import { alignHashSequences } from './align.js';
 import { durationBucket, durationsWithinTolerance, similarPairKey } from './matcher.js';
 
 const YIELD_EVERY_PARENTS = 50;
@@ -22,41 +23,24 @@ export function effectivePartialMatchRatio(
 }
 
 /**
- * Best contiguous alignment of clip hashes inside parent hashes.
- * @returns {{ ratio: number, startIndex: number, matched: number }}
+ * Best local alignment of clip hashes inside parent hashes.
+ * `ratio` is coverage of the clip (shorter) sequence.
+ * @returns {{ ratio: number, startIndex: number, matched: number, offsetSec: number }}
  */
-export function bestSubsequenceMatch(clipHashes, parentHashes, { frameThreshold = 10 } = {}) {
+export function bestSubsequenceMatch(clipHashes, parentHashes, { frameThreshold = 70 } = {}) {
     const clip = Array.isArray(clipHashes) ? clipHashes : [];
     const parent = Array.isArray(parentHashes) ? parentHashes : [];
     if (!clip.length || !parent.length || clip.length > parent.length) {
-        return { ratio: 0, startIndex: 0, matched: 0 };
+        return { ratio: 0, startIndex: 0, matched: 0, offsetSec: 0 };
     }
-    const thresh = Number(frameThreshold);
-    const cap = Number.isFinite(thresh) ? thresh : 10;
-    const clipLen = clip.length;
-    const maxStart = parent.length - clipLen;
-    let bestRatio = 0;
-    let bestStart = 0;
-    let bestMatches = 0;
-    for (let start = 0; start <= maxStart; start++) {
-        let matches = 0;
-        for (let offset = 0; offset < clipLen; offset++) {
-            try {
-                if (hammingHex(String(clip[offset]), String(parent[start + offset])) <= cap) {
-                    matches++;
-                }
-            } catch {
-                /* skip bad hex */
-            }
-        }
-        const ratio = matches / clipLen;
-        if (ratio > bestRatio) {
-            bestRatio = ratio;
-            bestStart = start;
-            bestMatches = matches;
-        }
-    }
-    return { ratio: bestRatio, startIndex: bestStart, matched: bestMatches };
+    const cap = Number.isFinite(Number(frameThreshold)) ? Number(frameThreshold) : 70;
+    const r = alignHashSequences(clip, parent, { matchHamming: cap });
+    return {
+        ratio: r.coverageA,
+        startIndex: Math.max(0, r.startIndexB),
+        matched: r.matched,
+        offsetSec: r.offsetBSec == null ? 0 : r.offsetBSec,
+    };
 }
 
 export function iterParentCandidates(
@@ -80,10 +64,6 @@ export function iterParentCandidates(
         out.push(parent);
     }
     return out;
-}
-
-function _phashes(frames) {
-    return (Array.isArray(frames) ? frames : []).map((f) => String(f.phash));
 }
 
 function _pickKeepRemove(clip, parent) {
@@ -132,7 +112,7 @@ function _proposal({ clip, parent, kind, ratio, matched, clipFrameCount, offsetS
  */
 export async function findPartialClipGroups(videos, opts = {}) {
     const matchRatio = opts.matchRatio ?? 0.5;
-    const frameThreshold = opts.frameThreshold ?? 10;
+    const frameThreshold = opts.frameThreshold ?? 70;
     const durationBucketSec = Number(opts.durationBucketSec) || 120;
     const shortClipSec = opts.shortClipSec ?? 300;
     const shortMatchRatio = opts.shortMatchRatio ?? 0.35;
@@ -168,7 +148,6 @@ export async function findPartialClipGroups(videos, opts = {}) {
             continue;
         }
         const clipFrames = framesById.get(clip.id) || [];
-        const clipHashes = _phashes(clipFrames);
         const requiredRatio = effectivePartialMatchRatio(clip.durationSec, {
             matchRatio,
             shortClipSec,
@@ -198,13 +177,16 @@ export async function findPartialClipGroups(videos, opts = {}) {
             }
 
             const parentFrames = framesById.get(parent.id) || [];
-            const parentHashes = _phashes(parentFrames);
-            if (clipHashes.length > parentHashes.length) continue;
+            if (clipFrames.length > parentFrames.length) continue;
 
-            const { ratio, startIndex, matched } = bestSubsequenceMatch(clipHashes, parentHashes, {
-                frameThreshold,
-            });
-            const offsetSec = parentFrames[startIndex]?.tSec ?? startIndex;
+            const { ratio, startIndex, matched, offsetSec: alignedOffset } = bestSubsequenceMatch(
+                clipFrames,
+                parentFrames,
+                { frameThreshold },
+            );
+            const offsetSec = Number.isFinite(alignedOffset)
+                ? alignedOffset
+                : parentFrames[startIndex]?.tSec ?? startIndex;
             if (ratio >= requiredRatio) {
                 const g = _proposal({
                     clip,
@@ -212,7 +194,7 @@ export async function findPartialClipGroups(videos, opts = {}) {
                     kind: 'partial',
                     ratio,
                     matched,
-                    clipFrameCount: clipHashes.length,
+                    clipFrameCount: clipFrames.length,
                     offsetSec,
                 });
                 clipGroups.push(g);
@@ -235,7 +217,7 @@ export async function findPartialClipGroups(videos, opts = {}) {
                         kind: 'partial_review',
                         ratio: bestReview.ratio,
                         matched: bestReview.matched,
-                        clipFrameCount: clipHashes.length,
+                        clipFrameCount: clipFrames.length,
                         offsetSec: bestReview.offsetSec,
                     }),
                 );
@@ -247,7 +229,7 @@ export async function findPartialClipGroups(videos, opts = {}) {
         clipsScanned++;
         skipClipIds.add(Number(clip.id));
         try {
-            onClipComplete?.(clip, clipGroups, clipHashes.length);
+            onClipComplete?.(clip, clipGroups, clipFrames.length);
         } catch {
             /* persist must not abort matching */
         }

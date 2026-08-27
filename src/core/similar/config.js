@@ -1,23 +1,27 @@
 /**
  * similarClips config: TGDL_SIMILAR_* env > kv `advanced.similarClips` > defaults.
  * Empty env is ignored so compose must not inject `:-0` pins.
+ * Sampling is scene-or-floor (`sceneThreshold` / `floorIntervalSec`).
  */
 
 import { loadConfig } from '../../config/manager.js';
 
+export const FINGERPRINT_ALGO = 'pdq-scene-v1';
+
 export const SIMILAR_CLIPS_DEFAULTS = Object.freeze({
-    similarThreshold: 5,
+    similarThreshold: 50,
     durationTolerance: 0.1,
     partialMatchRatio: 0.5,
-    partialFrameThreshold: 10,
+    partialFrameThreshold: 70,
     partialShortClipSec: 300,
     partialShortMatchRatio: 0.35,
     partialReviewMatchRatio: 0.1,
     partialReviewMinMatchedFrames: 2,
-    fingerprintFps: 1,
     fingerprintMaxFrames: 7200,
-    fingerprintTilePx: 32,
+    fingerprintTilePx: 64,
     durationBucketSec: 120,
+    sceneThreshold: 0.1,
+    floorIntervalSec: 3,
 });
 
 const ENV_MAP = Object.freeze({
@@ -29,10 +33,11 @@ const ENV_MAP = Object.freeze({
     partialShortMatchRatio: 'TGDL_SIMILAR_PARTIAL_SHORT_MATCH_RATIO',
     partialReviewMatchRatio: 'TGDL_SIMILAR_PARTIAL_REVIEW_MATCH_RATIO',
     partialReviewMinMatchedFrames: 'TGDL_SIMILAR_PARTIAL_REVIEW_MIN_MATCHED_FRAMES',
-    fingerprintFps: 'TGDL_SIMILAR_FINGERPRINT_FPS',
     fingerprintMaxFrames: 'TGDL_SIMILAR_FINGERPRINT_MAX_FRAMES',
     fingerprintTilePx: 'TGDL_SIMILAR_FINGERPRINT_TILE_PX',
     durationBucketSec: 'TGDL_SIMILAR_DURATION_BUCKET_SEC',
+    sceneThreshold: 'TGDL_SIMILAR_SCENE_THRESHOLD',
+    floorIntervalSec: 'TGDL_SIMILAR_FLOOR_INTERVAL_SEC',
 });
 
 const INT_KEYS = new Set([
@@ -63,6 +68,7 @@ export function getSimilarClipsConfig() {
         /* defaults */
     }
     const merged = { ...SIMILAR_CLIPS_DEFAULTS, ...stored };
+    delete merged.fingerprintFps;
     for (const [key, envName] of Object.entries(ENV_MAP)) {
         const raw = process.env[envName];
         if (raw === undefined || raw === null || String(raw).trim() === '') continue;

@@ -157,22 +157,22 @@ const DEFAULT_CONFIG = {
             hwaccel: null,
         },
         // Similar clips (near-duplicate videos + partial-clip detection).
-        // Fingerprints are 1 fps pHashes written by the seekbar ffmpeg
-        // split into the same db.sqlite. Hover sprite knobs stay under
-        // `seekbar.*` and do not control fingerprint cadence.
+        // Similar-clips PDQ fingerprints are a separate ffmpeg walk from
+        // hover sprites. Hover knobs stay under `seekbar.*`.
         similarClips: {
-            similarThreshold: 5,
+            similarThreshold: 50,
             durationTolerance: 0.1,
             partialMatchRatio: 0.5,
-            partialFrameThreshold: 10,
+            partialFrameThreshold: 70,
             partialShortClipSec: 300,
             partialShortMatchRatio: 0.35,
             partialReviewMatchRatio: 0.1,
             partialReviewMinMatchedFrames: 2,
-            fingerprintFps: 1,
             fingerprintMaxFrames: 7200,
-            fingerprintTilePx: 32,
+            fingerprintTilePx: 64,
             durationBucketSec: 120,
+            sceneThreshold: 0.1,
+            floorIntervalSec: 3,
         },
         // AI subsystem (semantic search + auto-tag + face clustering).
         // Master switch defaults OFF so existing installs are unaffected.
@@ -673,10 +673,7 @@ function mergeConfig(userConfig) {
                 ...(userAdvanced.integrity || {}),
             },
             web: { ...DEFAULT_CONFIG.advanced.web, ...(userAdvanced.web || {}) },
-            similarClips: {
-                ...DEFAULT_CONFIG.advanced.similarClips,
-                ...(userAdvanced.similarClips || {}),
-            },
+            similarClips: _mergeSimilarClips(userAdvanced.similarClips),
             // Spread `ai` so the operator's saved tagLabels, hfToken, etc.
             // win over the defaults but missing keys (added in a later
             // release) still pick up their default value.
@@ -693,6 +690,12 @@ function mergeConfig(userConfig) {
             filters: { ...DEFAULT_FILTERS, ...(group.filters || {}) },
         })),
     };
+}
+
+function _mergeSimilarClips(userSc) {
+    const user = userSc && typeof userSc === 'object' ? { ...userSc } : {};
+    delete user.fingerprintFps;
+    return { ...DEFAULT_CONFIG.advanced.similarClips, ...user };
 }
 
 /**

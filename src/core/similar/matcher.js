@@ -1,16 +1,19 @@
 /**
- * Time-aligned similar-video matcher.
+ * Similar-video matcher using Smith-Waterman over hash sequences.
  *
- * Similar = duration within ±tolerance and mean per-frame Hamming
- * (aligned from t=0 at 1 fps) ≤ similarThreshold. Cheap pair filter:
- * 120 s duration buckets (±1 neighbour) plus a loose aggregate_hash
- * Hamming gate. Exact SHA-256 pairs and similar_ignores are skipped.
+ * Similar = duration within ±tolerance, coverage of both sequences
+ * ≥ minCoverage, and mean aligned Hamming ≤ similarThreshold. Cheap
+ * pair filter: 120 s duration buckets (±1 neighbour) plus a loose
+ * aggregate_hash Hamming gate. Exact SHA-256 pairs and similar_ignores
+ * are skipped.
  */
 
 import { hammingHex } from '../phash.js';
+import { alignHashSequences } from './align.js';
 
 const YIELD_EVERY_PAIRS = 200;
-const AGGREGATE_GATE_MIN = 16;
+const AGGREGATE_GATE_MIN = 64;
+const DEFAULT_MIN_COVERAGE = 0.7;
 
 export function durationsWithinTolerance(left, right, tolerance = 0.1) {
     if (left == null || right == null) return false;
@@ -35,21 +38,9 @@ export function similarPairKey(aId, bId) {
     return a < b ? `${a}:${b}` : `${b}:${a}`;
 }
 
-/** Mean Hamming over the overlapping 1 fps prefix. Infinity if empty. */
-export function timeAlignedMeanHamming(framesA, framesB) {
-    const a = Array.isArray(framesA) ? framesA : [];
-    const b = Array.isArray(framesB) ? framesB : [];
-    const n = Math.min(a.length, b.length);
-    if (n <= 0) return Infinity;
-    let sum = 0;
-    for (let i = 0; i < n; i++) {
-        try {
-            sum += hammingHex(String(a[i].phash), String(b[i].phash));
-        } catch {
-            return Infinity;
-        }
-    }
-    return sum / n;
+function _hashBits(frames) {
+    const hex = String(frames?.[0]?.phash || frames?.[0] || '');
+    return hex.length >= 64 ? 256 : 64;
 }
 
 function _aggregateTooFar(aggA, aggB, threshold) {
@@ -75,9 +66,12 @@ function _pickKeep(left, right) {
  */
 export async function findSimilarVideoGroups(videos, opts = {}) {
     const threshold = Number(opts.threshold);
-    const maxHamming = Number.isFinite(threshold) && threshold >= 0 ? threshold : 5;
+    const maxHamming = Number.isFinite(threshold) && threshold >= 0 ? threshold : 50;
     const durationTolerance = opts.durationTolerance ?? 0.1;
     const durationBucketSec = Number(opts.durationBucketSec) || 120;
+    const minCoverage = Number.isFinite(Number(opts.minCoverage))
+        ? Number(opts.minCoverage)
+        : DEFAULT_MIN_COVERAGE;
     const ignored = new Set(opts.ignoredPairs || []);
     const framesById = opts.framesById instanceof Map ? opts.framesById : new Map();
     const signal = opts.signal;
@@ -123,16 +117,30 @@ export async function findSimilarVideoGroups(videos, opts = {}) {
             if (!durationsWithinTolerance(left.durationSec, right.durationSec, durationTolerance)) {
                 continue;
             }
-            if (_aggregateTooFar(left.aggregateHash, right.aggregateHash, maxHamming)) continue;
+            const framesA = framesById.get(left.id);
+            const framesB = framesById.get(right.id);
+            // Extra/missing scenes (bumpers) change the XOR a lot; only
+            // use the cheap gate when both sequences have the same length.
+            if (
+                Array.isArray(framesA) &&
+                Array.isArray(framesB) &&
+                framesA.length === framesB.length &&
+                _aggregateTooFar(left.aggregateHash, right.aggregateHash, maxHamming)
+            ) {
+                continue;
+            }
 
-            const mean = timeAlignedMeanHamming(framesById.get(left.id), framesById.get(right.id));
+            const aligned = alignHashSequences(framesA, framesB, { matchHamming: maxHamming });
+            if (aligned.coverageA < minCoverage || aligned.coverageB < minCoverage) continue;
+            const mean = aligned.meanHamming;
             if (!Number.isFinite(mean) || mean > maxHamming) continue;
 
             const keep = _pickKeep(left, right);
             const remove = keep === left ? right : left;
+            const bits = _hashBits(framesA || framesB);
             groups.push({
                 kind: 'similar',
-                confidence: Math.max(0, 1 - mean / 64),
+                confidence: Math.max(0, 1 - mean / bits),
                 meanHamming: mean,
                 members: [
                     {

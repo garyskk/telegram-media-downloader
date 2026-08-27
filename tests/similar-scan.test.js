@@ -6,21 +6,13 @@ import path from 'path';
 const DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'tgdl-similar-scan-'));
 process.env.TGDL_DATA_DIR = DATA_DIR;
 
-const generateForDownload = vi.hoisted(() => vi.fn());
+const generateFingerprintForDownload = vi.hoisted(() => vi.fn());
 
-vi.mock('../src/core/seekbar/generator.js', async (importOriginal) => {
+vi.mock('../src/core/similar/fingerprint.js', async (importOriginal) => {
     const actual = await importOriginal();
     return {
         ...actual,
-        generateForDownload,
-        getSeekbarConfig: () => ({
-            concurrency: 2,
-            intervalSec: 4,
-            maxTiles: 240,
-            columns: 10,
-            tileWidth: 160,
-            format: 'webp',
-        }),
+        generateFingerprintForDownload,
     };
 });
 
@@ -52,7 +44,8 @@ afterAll(() => {
 });
 
 afterEach(() => {
-    generateForDownload.mockReset();
+    generateFingerprintForDownload.mockReset();
+    db.prepare('DELETE FROM downloads').run();
 });
 
 function seedVideo(fileHash = 'h') {
@@ -73,28 +66,43 @@ function seedVideo(fileHash = 'h') {
 }
 
 describe('fingerprintIsCurrent', () => {
-    it('is true when stored fingerprint file_hash matches the download', () => {
+    it('is true only when file_hash matches and algo is pdq-scene-v1', () => {
         const row = seedVideo('same-h');
         api.upsertVideoFingerprint({
             downloadId: row.id,
             durationSec: 1,
-            aggregateHash: 'cccccccccccccccc',
+            aggregateHash: 'c'.repeat(64),
             frameCount: 1,
+            algo: 'pdq-scene-v1',
             fileHash: 'same-h',
         });
         expect(fingerprintIsCurrent(row)).toBe(true);
         expect(fingerprintIsCurrent({ ...row, file_hash: 'other' })).toBe(false);
     });
+
+    it('is false for leftover phash-v1 rows even when file_hash matches', () => {
+        const row = seedVideo('legacy-h');
+        api.upsertVideoFingerprint({
+            downloadId: row.id,
+            durationSec: 1,
+            aggregateHash: 'cccccccccccccccc',
+            frameCount: 1,
+            algo: 'phash-v1',
+            fileHash: 'legacy-h',
+        });
+        expect(fingerprintIsCurrent(row)).toBe(false);
+    });
 });
 
 describe('scanSimilarClips', () => {
-    it('skips current fingerprints and regenerates missing/stale with overwrite always', async () => {
+    it('skips current PDQ fingerprints and regenerates missing/stale/legacy algo', async () => {
         const current = seedVideo('cur-scan');
         api.upsertVideoFingerprint({
             downloadId: current.id,
             durationSec: 1,
-            aggregateHash: 'dddddddddddddddd',
+            aggregateHash: 'd'.repeat(64),
             frameCount: 1,
+            algo: 'pdq-scene-v1',
             fileHash: 'cur-scan',
         });
         const missing = seedVideo('miss-scan');
@@ -102,33 +110,42 @@ describe('scanSimilarClips', () => {
         api.upsertVideoFingerprint({
             downloadId: stale.id,
             durationSec: 1,
-            aggregateHash: 'eeeeeeeeeeeeeeee',
+            aggregateHash: 'e'.repeat(64),
             frameCount: 1,
+            algo: 'pdq-scene-v1',
             fileHash: 'old-scan',
         });
+        const legacy = seedVideo('legacy-scan');
+        api.upsertVideoFingerprint({
+            downloadId: legacy.id,
+            durationSec: 1,
+            aggregateHash: 'ffffffffffffffff',
+            frameCount: 1,
+            algo: 'phash-v1',
+            fileHash: 'legacy-scan',
+        });
 
-        generateForDownload.mockImplementation(async (row) => ({
+        generateFingerprintForDownload.mockImplementation(async (row) => ({
             download_id: row.id,
             frames: 8,
+            algo: 'pdq-scene-v1',
         }));
 
         const result = await scanSimilarClips();
-        expect(result.generated).toBe(2);
-        expect(result.skipped).toBe(0);
+        expect(result.generated).toBe(3);
         expect(result.errored).toBe(0);
-        expect(generateForDownload).toHaveBeenCalledTimes(2);
-        const ids = generateForDownload.mock.calls.map((c) => c[0].id).sort();
-        expect(ids).toEqual([missing.id, stale.id].sort());
-        for (const call of generateForDownload.mock.calls) {
-            expect(call[2]).toEqual(expect.objectContaining({ overwrite: 'always' }));
-        }
-        expect(generateForDownload.mock.calls.some((c) => c[0].id === current.id)).toBe(false);
+        expect(generateFingerprintForDownload).toHaveBeenCalledTimes(3);
+        const ids = generateFingerprintForDownload.mock.calls.map((c) => c[0].id).sort();
+        expect(ids).toEqual([missing.id, stale.id, legacy.id].sort());
+        expect(generateFingerprintForDownload.mock.calls.some((c) => c[0].id === current.id)).toBe(
+            false,
+        );
     });
 
-    it('counts generate skip/error and marks seekbar failed on permanent ffmpeg errors', async () => {
+    it('counts generate skip/error without writing seekbar sprites', async () => {
         const gone = seedVideo('gone-scan');
         const bad = seedVideo('bad-scan');
-        generateForDownload.mockImplementation(async (row) => {
+        generateFingerprintForDownload.mockImplementation(async (row) => {
             if (row.id === gone.id) return { skipped: 'missing' };
             throw new Error('does not contain any stream');
         });
@@ -136,20 +153,20 @@ describe('scanSimilarClips', () => {
         const result = await scanSimilarClips();
         expect(result.skipped).toBeGreaterThanOrEqual(1);
         expect(result.errored).toBeGreaterThanOrEqual(1);
-        expect(api.getSeekbarSprite(gone.id)?.format).toBe('missing');
-        expect(api.getSeekbarSprite(bad.id)?.format).toBe('failed');
+        expect(api.getSeekbarSprite(gone.id)).toBeFalsy();
+        expect(api.getSeekbarSprite(bad.id)).toBeFalsy();
     });
 
     it('stops paging when aborted', async () => {
         seedVideo('abort-a');
         seedVideo('abort-b');
-        generateForDownload.mockResolvedValue({ frames: 1 });
+        generateFingerprintForDownload.mockResolvedValue({ frames: 1 });
         const ac = new AbortController();
         ac.abort();
         const result = await scanSimilarClips({ signal: ac.signal });
         expect(result.cancelled).toBe(true);
         expect(result.processed).toBe(0);
-        expect(generateForDownload).not.toHaveBeenCalled();
+        expect(generateFingerprintForDownload).not.toHaveBeenCalled();
     });
 
     it("persists kv['similar_last_scan'] from the JobTracker runFn shape", async () => {

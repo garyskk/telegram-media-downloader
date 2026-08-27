@@ -512,7 +512,7 @@ function initSchema() {
             duration_sec    REAL,
             aggregate_hash  TEXT,
             frame_count     INTEGER NOT NULL DEFAULT 0,
-            algo            TEXT    NOT NULL DEFAULT 'phash-v1',
+            algo            TEXT    NOT NULL DEFAULT 'pdq-scene-v1',
             indexed_at      INTEGER NOT NULL,
             file_hash       TEXT,
             FOREIGN KEY (download_id) REFERENCES downloads(id) ON DELETE CASCADE
@@ -5340,24 +5340,24 @@ export function countVideoDownloads() {
     );
 }
 
-const _SIMILAR_SKIP_FORMATS = `'failed','missing','no_duration'`;
+const _SIMILAR_ALGO = 'pdq-scene-v1';
 const _SIMILAR_ELIGIBLE = `
     d.file_type = 'video'
     AND d.file_path IS NOT NULL
     AND d.file_path NOT LIKE '_clusterref/%'
     AND (d.user_deleted IS NULL OR d.user_deleted = 0)
-    AND (s.download_id IS NULL OR s.format NOT IN (${_SIMILAR_SKIP_FORMATS}))
 `;
 const _SIMILAR_NEEDS_FP = `
     (
       vf.download_id IS NULL
+      OR vf.algo IS NULL
+      OR vf.algo != '${_SIMILAR_ALGO}'
       OR (d.file_hash IS NOT NULL AND (vf.file_hash IS NULL OR vf.file_hash != d.file_hash))
     )
 `;
 
 /**
- * Local videos Scan may fingerprint. Excludes peer `_clusterref` rows
- * and seekbar skip markers (`failed` / `missing` / `no_duration`).
+ * Local videos Scan may fingerprint. Excludes peer `_clusterref` rows.
  */
 export function countSimilarScanVideos() {
     return (
@@ -5366,7 +5366,6 @@ export function countSimilarScanVideos() {
                 .prepare(
                     `SELECT COUNT(*) AS n
                        FROM downloads d
-                       LEFT JOIN seekbar_sprites s ON s.download_id = d.id
                       WHERE ${_SIMILAR_ELIGIBLE}`,
                 )
                 .get().n,
@@ -5382,7 +5381,6 @@ export function countSimilarScanPending() {
                 .prepare(
                     `SELECT COUNT(*) AS n
                        FROM downloads d
-                       LEFT JOIN seekbar_sprites s ON s.download_id = d.id
                        LEFT JOIN video_fingerprints vf ON vf.download_id = d.id
                       WHERE ${_SIMILAR_ELIGIBLE}
                         AND ${_SIMILAR_NEEDS_FP}`,
@@ -5428,7 +5426,6 @@ export function pageSimilarScanVideos({ beforeId, limit = 200 } = {}) {
         .prepare(
             `SELECT d.id, d.file_path, d.file_type, d.file_size, d.file_name, d.file_hash
                FROM downloads d
-               LEFT JOIN seekbar_sprites s ON s.download_id = d.id
                LEFT JOIN video_fingerprints vf ON vf.download_id = d.id
               WHERE ${_SIMILAR_ELIGIBLE}
                 AND ${_SIMILAR_NEEDS_FP}
@@ -5497,8 +5494,8 @@ export function getDownloadHashesForIds(ids) {
 
 // ---- Similar clips / video fingerprints ------------------------------------
 //
-// Perceptual hashes produced by the seekbar ffmpeg split (1 fps branch).
-// Tables live in the same db.sqlite as downloads — not a second database.
+// Perceptual hashes from the similar-clips ffmpeg runner (PDQ-256,
+// algo pdq-scene-v1). Tables live in the same db.sqlite as downloads.
 
 const _SIMILAR_KINDS = new Set(['similar', 'partial', 'partial_review']);
 const _SIMILAR_ROLES = new Set(['keep', 'remove', 'review']);
@@ -5532,7 +5529,7 @@ export function upsertVideoFingerprint(row) {
             row.durationSec == null ? null : Number(row.durationSec),
             row.aggregateHash == null ? null : String(row.aggregateHash),
             Math.max(0, Number(row.frameCount) || 0),
-            String(row.algo || 'phash-v1'),
+            String(row.algo || 'pdq-scene-v1'),
             Math.floor(row.indexedAt || Date.now()),
             row.fileHash == null ? null : String(row.fileHash),
         ).changes;
@@ -5773,4 +5770,38 @@ export function listSimilarPartialScans() {
               ORDER BY download_id`,
         )
         .all();
+}
+
+/**
+ * Wipe similar-clips fingerprints, groups, and partial-resume cursors.
+ * Keeps `similar_ignores` (download-id pairs) and hover `seekbar_sprites`.
+ * Does not start a Scan.
+ */
+export function purgeSimilarClipsRecords() {
+    const db = getDb();
+    return db.transaction(() => {
+        const fingerprints =
+            Number(db.prepare('SELECT COUNT(*) AS n FROM video_fingerprints').get()?.n) || 0;
+        const groups = Number(db.prepare('SELECT COUNT(*) AS n FROM similar_groups').get()?.n) || 0;
+        const partialScans =
+            Number(db.prepare('SELECT COUNT(*) AS n FROM similar_partial_scans').get()?.n) || 0;
+        db.prepare('DELETE FROM video_frame_hashes').run();
+        db.prepare('DELETE FROM video_fingerprints').run();
+        db.prepare('DELETE FROM similar_groups').run();
+        db.prepare('DELETE FROM similar_partial_scans').run();
+        const now = Date.now();
+        const kv = db.prepare(
+            `INSERT INTO kv (key, value, updated_at) VALUES (?, ?, ?)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+        );
+        for (const key of [
+            'similar_last_scan',
+            'similar_last_analyze',
+            'pending_job_similarScan',
+            'pending_job_similarAnalyze',
+        ]) {
+            kv.run(key, 'null', now);
+        }
+        return { fingerprints, groups, partialScans };
+    })();
 }

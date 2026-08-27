@@ -124,15 +124,6 @@ export async function submitOne({
         if (Number.isFinite(cfg.quality) && cfg.quality > 0) {
             body.quality = cfg.quality;
         }
-        if (Number.isFinite(cfg.fingerprintFps) && cfg.fingerprintFps > 0) {
-            body.fingerprint_fps = cfg.fingerprintFps;
-        }
-        if (Number.isFinite(cfg.fingerprintMaxFrames) && cfg.fingerprintMaxFrames > 0) {
-            body.fingerprint_max_frames = cfg.fingerprintMaxFrames;
-        }
-        if (Number.isFinite(cfg.fingerprintTilePx) && cfg.fingerprintTilePx > 0) {
-            body.fingerprint_tile_px = cfg.fingerprintTilePx;
-        }
     }
     return _fetch('/v1/sprite', {
         method: 'POST',

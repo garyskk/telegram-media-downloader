@@ -1,9 +1,10 @@
 /**
  * Maintenance → Similar clips.
  *
- * Scan (1 fps fingerprints via seekbar ffmpeg) then Analyze (similar
- * whole-videos, optional partial clips). Groups are keep/remove/review
- * from the server — delete selected extras, ignore false-positive pairs.
+ * Scan (scene+PDQ fingerprints) then Analyze (similar whole-videos,
+ * optional partial clips). Groups are keep/remove/review from the
+ * server — delete selected extras, ignore false-positive pairs, or
+ * Purge records to wipe hashes without touching hover sprites.
  */
 
 import { ws } from './ws.js';
@@ -70,8 +71,10 @@ function _setBusyButtons() {
     const scanStop = $('sim-scan-stop-btn');
     const anBtn = $('sim-analyze-btn');
     const anStop = $('sim-analyze-stop-btn');
+    const purgeBtn = $('sim-purge-btn');
     if (scanBtn) scanBtn.disabled = busy;
     if (anBtn) anBtn.disabled = busy;
+    if (purgeBtn) purgeBtn.disabled = busy;
     if (scanStop) {
         scanStop.classList.toggle('hidden', !_scanRunning);
         scanStop.disabled = !_scanRunning;
@@ -446,6 +449,45 @@ async function _ignorePair(btn) {
     }
 }
 
+async function _purgeRecords() {
+    $('sim-more-menu')?.removeAttribute('open');
+    const ok = await confirmSheet({
+        title: i18nT('maintenance.similar.purge_confirm_title', 'Purge similar records?'),
+        message: i18nT(
+            'maintenance.similar.purge_confirm_body',
+            'This wipes every fingerprint, every similar/partial group, and partial-resume cursors. Hover sprites are not touched. Ignored pairs are kept. Next Scan regenerates hashes.',
+        ),
+        confirmLabel: i18nT('maintenance.similar.purge_confirm_btn', 'Purge records'),
+        danger: true,
+    });
+    if (!ok) return;
+    try {
+        const r = await api.post('/api/maintenance/similar/purge', {});
+        if (!r?.success) throw new Error(r?.error || 'purge failed');
+        showToast(
+            i18nT(
+                'maintenance.similar.purged',
+                'Records purged — run Scan to regenerate fingerprints',
+            ),
+            'success',
+        );
+        await Promise.all([_refreshGroups(), _refreshStats()]);
+    } catch (e) {
+        if (e?.status === 409 || e?.data?.code === 'ALREADY_RUNNING') {
+            showToast(
+                i18nT(
+                    'maintenance.similar.purge_busy',
+                    'Scan or Analyze is running. Cancel it first.',
+                ),
+                'error',
+            );
+            return;
+        }
+        const msg = e?.data?.error || e?.message || 'unknown';
+        showToast(`${i18nT('maintenance.similar.purge_failed', 'Purge failed')}: ${msg}`, 'error');
+    }
+}
+
 function _onScanProgress(m) {
     _scanRunning = true;
     _setBusyButtons();
@@ -545,6 +587,7 @@ function _wirePage() {
     $('sim-analyze-btn')?.addEventListener('click', _startAnalyze);
     $('sim-analyze-stop-btn')?.addEventListener('click', _stopAnalyze);
     $('sim-delete-btn')?.addEventListener('click', _deleteSelected);
+    $('sim-purge-btn')?.addEventListener('click', _purgeRecords);
     $('sim-partial-check')?.addEventListener('change', _persistPartialFlag);
     document.querySelectorAll('[data-sim-kind]').forEach((btn) => {
         btn.addEventListener('click', () => _setKindFilter(btn.dataset.simKind || ''));
@@ -575,6 +618,9 @@ function _wireWs() {
     ws.on('similar_done', _onScanDone);
     ws.on('similar_analyze_progress', _onAnalyzeProgress);
     ws.on('similar_analyze_done', _onAnalyzeDone);
+    ws.on('similar_purged', () => {
+        Promise.all([_refreshGroups(), _refreshStats()]).catch(() => {});
+    });
     ws.on('__ws_open', () => {
         _recoverStatus();
         _refreshStats();

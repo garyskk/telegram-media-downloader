@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -84,13 +84,16 @@ describe('effectivePartialMatchRatio', () => {
 });
 
 describe('bestSubsequenceMatch', () => {
-    it('finds the best contiguous alignment and offset', () => {
-        const { ratio, startIndex, matched } = bestSubsequenceMatch([H0, H1, H2], [HA, H0, H1, H2, HF], {
-            frameThreshold: 0,
-        });
+    it('finds the local alignment and parent offset', () => {
+        const { ratio, startIndex, matched, offsetSec } = bestSubsequenceMatch(
+            [H0, H1, H2],
+            [HA, H0, H1, H2, HF],
+            { frameThreshold: 0 },
+        );
         expect(ratio).toBe(1);
         expect(startIndex).toBe(1);
         expect(matched).toBe(3);
+        expect(offsetSec).toBe(1);
     });
 
     it('rejects a clip longer than the parent', () => {
@@ -103,6 +106,15 @@ describe('bestSubsequenceMatch', () => {
         const { ratio, matched } = bestSubsequenceMatch([H0, H1], [H0, HF], { frameThreshold: 0 });
         expect(matched).toBe(1);
         expect(ratio).toBe(0.5);
+    });
+
+    it('covers a clip that skipped a parent scene', () => {
+        const { ratio, matched, startIndex } = bestSubsequenceMatch([H0, H2], [H0, H1, H2], {
+            frameThreshold: 0,
+        });
+        expect(ratio).toBe(1);
+        expect(matched).toBe(2);
+        expect(startIndex).toBe(0);
     });
 });
 
@@ -243,6 +255,33 @@ describe('findPartialClipGroups', () => {
         expect(groups).toHaveLength(1);
         expect(groups[0].kind).toBe('partial');
     });
+
+    it('uses parent t_sec as offset, not a 1 fps frame index', async () => {
+        const clipH = [H0, H1, H2];
+        const parentH = [HA, H0, H1, H2, HF];
+        const parentFrames = [
+            { tSec: 0, phash: HA },
+            { tSec: 3.1, phash: H0 },
+            { tSec: 5.7, phash: H1 },
+            { tSec: 11, phash: H2 },
+            { tSec: 20, phash: HF },
+        ];
+        const { groups } = await findPartialClipGroups(
+            [
+                video({ id: 1, durationSec: 10, fileHash: 'clip', fileSize: 100, hashes: clipH }),
+                video({ id: 2, durationSec: 60, fileHash: 'full', fileSize: 1000, hashes: parentH }),
+            ],
+            {
+                ...opts,
+                framesById: new Map([
+                    [1, framesOf(clipH)],
+                    [2, parentFrames],
+                ]),
+            },
+        );
+        expect(groups).toHaveLength(1);
+        expect(groups[0].offsetSec).toBeCloseTo(3.1, 5);
+    });
 });
 
 function seedVideo({ fileHash = 'h', fileSize = 1000 } = {}) {
@@ -266,7 +305,7 @@ function seedFingerprint(id, { durationSec, fileHash, hashes }) {
         durationSec,
         aggregateHash: xorAggregate(hashes),
         frameCount: hashes.length,
-        algo: 'phash-v1',
+        algo: 'pdq-scene-v1',
         fileHash,
         indexedAt: Date.now(),
     });
@@ -277,7 +316,15 @@ function seedFingerprint(id, { durationSec, fileHash, hashes }) {
 }
 
 describe('analyzeSimilarClips partial', () => {
+    beforeEach(() => {
+        // These fixtures use 16-hex tags, not PDQ-256. Keep per-scene
+        // Hamming exact so HA/H0/… stay distinct under the new default 70.
+        process.env.TGDL_SIMILAR_PARTIAL_FRAME_THRESHOLD = '0';
+        process.env.TGDL_SIMILAR_THRESHOLD = '5';
+    });
     afterEach(() => {
+        delete process.env.TGDL_SIMILAR_PARTIAL_FRAME_THRESHOLD;
+        delete process.env.TGDL_SIMILAR_THRESHOLD;
         db.prepare('DELETE FROM downloads').run();
         _msg = 1;
     });
@@ -329,7 +376,7 @@ describe('analyzeSimilarClips partial', () => {
             }),
         ).toHaveLength(1);
 
-        const clip2H = [H1, H2, HF];
+        const clip2H = [HA, H2, HF];
         const clip2 = seedVideo({ fileHash: 'run-c2', fileSize: 80 });
         seedFingerprint(clip2, { durationSec: 10, fileHash: 'run-c2', hashes: clip2H });
         const third = await analyzeSimilarClips({ checkPartialClips: true });

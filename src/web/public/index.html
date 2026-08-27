@@ -2249,14 +2249,14 @@
                         <div class="flex items-start justify-between gap-3 flex-wrap">
                             <div class="min-w-0">
                                 <h2 class="text-tg-text text-base font-semibold" data-i18n="maintenance.similar.page_title">Similar clips</h2>
-                                <p class="text-xs text-tg-textSecondary mt-0.5" data-i18n="maintenance.similar.subtitle">Find near-duplicate videos and shorter clips inside longer ones. Exact byte-identical files stay on Duplicates. Scan writes 1 fps hashes; Analyze groups them.</p>
+                                <p class="text-xs text-tg-textSecondary mt-0.5" data-i18n="maintenance.similar.subtitle">Find near-duplicate videos and shorter clips inside longer ones. Exact byte-identical files stay on Duplicates. Scan writes scene+PDQ fingerprints; Analyze aligns them.</p>
                             </div>
                             <div class="flex items-center gap-2 shrink-0 flex-wrap justify-end">
                                 <button id="sim-scan-stop-btn" type="button" class="hidden tg-btn-secondary text-xs px-3 py-1.5 inline-flex items-center gap-1.5 text-red-400 border-red-400/40 hover:bg-red-400/10">
                                     <i class="ri-stop-circle-line"></i><span data-i18n="maintenance.similar.stop">Stop</span>
                                 </button>
                                 <button id="sim-scan-btn" type="button" class="tg-btn-secondary text-xs px-3 py-1.5 inline-flex items-center gap-1.5"
-                                        title="Regenerate 1 fps fingerprints via the seekbar ffmpeg pass.">
+                                        title="Regenerate scene-aware PDQ fingerprints.">
                                     <i class="ri-fingerprint-line"></i><span data-i18n="maintenance.similar.scan">Scan</span>
                                 </button>
                                 <button id="sim-analyze-stop-btn" type="button" class="hidden tg-btn-secondary text-xs px-3 py-1.5 inline-flex items-center gap-1.5 text-red-400 border-red-400/40 hover:bg-red-400/10">
@@ -2266,6 +2266,19 @@
                                         title="Group similar videos (and optional partial clips).">
                                     <i class="ri-search-line"></i><span data-i18n="maintenance.similar.analyze">Analyze</span>
                                 </button>
+                                <details id="sim-more-menu" class="relative">
+                                    <summary class="tg-btn-secondary text-xs px-2 py-1.5 inline-flex items-center gap-1 cursor-pointer list-none"
+                                             title="More actions" aria-haspopup="menu">
+                                        <i class="ri-more-2-fill"></i>
+                                    </summary>
+                                    <div class="absolute right-0 top-full mt-1 z-30 w-56 bg-tg-panel border border-tg-border rounded-lg shadow-xl py-1" role="menu">
+                                        <button id="sim-purge-btn" type="button" class="w-full text-left px-3 py-2 text-xs text-tg-text hover:bg-tg-bg/40 inline-flex items-center gap-2"
+                                                data-i18n-title="maintenance.similar.purge_tooltip"
+                                                title="Wipe fingerprints, similar/partial groups, and resume cursors. Hover sprites and ignored pairs stay. Next Scan regenerates hashes.">
+                                            <i class="ri-delete-bin-6-line text-yellow-300"></i><span data-i18n="maintenance.similar.purge">Purge records</span>
+                                        </button>
+                                    </div>
+                                </details>
                             </div>
                         </div>
                         <label class="mt-3 inline-flex items-center gap-2 text-xs text-tg-text cursor-pointer">
@@ -2323,7 +2336,7 @@
                         <div class="grid grid-cols-2 sm:grid-cols-3 gap-3">
                             <div>
                                 <label for="setting-adv-similarClips-similarThreshold" class="text-tg-text text-xs block mb-1" data-i18n="maintenance.similar.settings.threshold">Similar Hamming</label>
-                                <input id="setting-adv-similarClips-similarThreshold" type="number" min="0" max="32" step="1" class="tg-input w-full text-sm" value="5">
+                                <input id="setting-adv-similarClips-similarThreshold" type="number" min="0" max="128" step="1" class="tg-input w-full text-sm" value="50">
                             </div>
                             <div>
                                 <label for="setting-adv-similarClips-durationTolerance" class="text-tg-text text-xs block mb-1" data-i18n="maintenance.similar.settings.duration">Duration ±</label>
@@ -2332,6 +2345,14 @@
                             <div>
                                 <label for="setting-adv-similarClips-durationBucketSec" class="text-tg-text text-xs block mb-1" data-i18n="maintenance.similar.settings.bucket">Bucket (s)</label>
                                 <input id="setting-adv-similarClips-durationBucketSec" type="number" min="10" max="3600" step="10" class="tg-input w-full text-sm" value="120">
+                            </div>
+                            <div>
+                                <label for="setting-adv-similarClips-sceneThreshold" class="text-tg-text text-xs block mb-1" data-i18n="maintenance.similar.settings.scene">Scene threshold</label>
+                                <input id="setting-adv-similarClips-sceneThreshold" type="number" min="0" max="1" step="0.01" class="tg-input w-full text-sm" value="0.1">
+                            </div>
+                            <div>
+                                <label for="setting-adv-similarClips-floorIntervalSec" class="text-tg-text text-xs block mb-1" data-i18n="maintenance.similar.settings.floor">Floor (s)</label>
+                                <input id="setting-adv-similarClips-floorIntervalSec" type="number" min="0.5" max="30" step="0.5" class="tg-input w-full text-sm" value="3">
                             </div>
                         </div>
                         <details class="mt-3">
@@ -2343,7 +2364,7 @@
                                 </div>
                                 <div>
                                     <label for="setting-adv-similarClips-partialFrameThreshold" class="text-tg-text text-xs block mb-1" data-i18n="maintenance.similar.settings.partial_frame">Frame Hamming</label>
-                                    <input id="setting-adv-similarClips-partialFrameThreshold" type="number" min="0" max="64" step="1" class="tg-input w-full text-sm" value="10">
+                                    <input id="setting-adv-similarClips-partialFrameThreshold" type="number" min="0" max="128" step="1" class="tg-input w-full text-sm" value="70">
                                 </div>
                                 <div>
                                     <label for="setting-adv-similarClips-partialShortClipSec" class="text-tg-text text-xs block mb-1" data-i18n="maintenance.similar.settings.short_sec">Short clip (s)</label>

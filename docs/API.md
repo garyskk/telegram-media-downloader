@@ -173,17 +173,18 @@ Near-duplicate videos and partial clips (a shorter video inside a longer one). E
 
 | Method | Path | Notes |
 |---|---|---|
-| `POST` | `/api/maintenance/similar/scan` | Enhanced seekbar generate: one ffmpeg decode writes hover sprite + 1 fps pHashes. Skip when fingerprint `file_hash` still matches. Broadcasts `similar_progress`. |
+| `POST` | `/api/maintenance/similar/scan` | Similar-only ffmpeg: scene-or-floor `select`, 64×64 PDQ-256 + real pts. Skip when fingerprint `file_hash` matches and `algo` is `pdq-scene-v1`. Broadcasts `similar_progress`. |
 | `POST` | `/api/maintenance/similar/scan/stop` | Cancel the in-flight scan. |
-| `GET`  | `/api/maintenance/similar/status` | Scan JobTracker snapshot plus nested `analyze` snapshot. |
+| `GET`  | `/api/maintenance/similar/status` | Scan JobTracker snapshot plus nested `analyze` snapshot. Hub running pill is Scan **or** Analyze. |
 | `GET`  | `/api/maintenance/similar/stats` | `{totalVideos, fingerprinted, missing, lastScan, lastAnalyze}`. Survives restart via `kv['similar_last_scan']` / `kv['similar_last_analyze']`. |
-| `POST` | `/api/maintenance/similar/analyze` | Rebuild `kind='similar'` groups, then optional partial. Body: `{checkPartialClips?:bool}`. Broadcasts `similar_analyze_progress`. |
+| `POST` | `/api/maintenance/similar/analyze` | Rebuild `kind='similar'` groups (Smith-Waterman), then optional partial. Body: `{checkPartialClips?:bool}`. Broadcasts `similar_analyze_progress`. |
 | `POST` | `/api/maintenance/similar/analyze/stop` | Cancel the in-flight analyze. |
 | `GET`  | `/api/maintenance/similar/groups` | Persisted groups with keep/remove members. `?kind=similar\|partial\|partial_review`. |
 | `POST` | `/api/maintenance/similar/delete` | `{ids:[…]}` — same delete path as exact-dedup. |
 | `POST` | `/api/maintenance/similar/ignore` | `{aId, bId, kind?}` — false-positive pair (`kind` defaults to `similar`). |
 | `GET`  | `/api/maintenance/similar/ignore` | List ignored pairs. `?kind=`. |
 | `DELETE` | `/api/maintenance/similar/ignore/:id` | Un-ignore. |
+| `POST` | `/api/maintenance/similar/purge` | Wipe fingerprints, groups, and partial-resume cursors. Keeps `similar_ignores` and hover sprites. `409` `{code:'ALREADY_RUNNING'}` if Scan or Analyze is running. Broadcasts `similar_purged`. Does not start Scan. |
 
 Scan + Analyze (similar and optional partial) and the Maintenance hub card (`#/maintenance/similar`) are live. Schema is in `data/db.sqlite` already.
 
@@ -285,6 +286,7 @@ The dashboard proxies these via `/api/ai/preload-model/…` above, but the sidec
 | `similar_done`         | `{processed, generated, skipped, errored, durationMs, cancelled}` |
 | `similar_analyze_progress` | `{stage, processed, total, comparedPairs, groups}` |
 | `similar_analyze_done` | `{similarGroups, comparedPairs, cancelled, durationMs, checkPartialClips, partialSkipped, partialGroups, partialReviewGroups, partialClipsScanned}` |
+| `similar_purged`       | `{ts}` — fingerprints/groups/resume wiped; ignores kept |
 | `thumbs_progress`      | `{stage, processed, total, built, skipped, errored}` |
 | `nsfw_progress`        | `{scanned, total, candidates, keep, running}` |
 | `nsfw_done`            | `{scanned, candidates, keep, durationMs}` |

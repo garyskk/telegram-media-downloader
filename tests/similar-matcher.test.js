@@ -12,7 +12,6 @@ let db;
 let api;
 let durationsWithinTolerance;
 let durationBucket;
-let timeAlignedMeanHamming;
 let findSimilarVideoGroups;
 let analyzeSimilarClips;
 let kvSet;
@@ -29,7 +28,6 @@ beforeAll(async () => {
     ({
         durationsWithinTolerance,
         durationBucket,
-        timeAlignedMeanHamming,
         findSimilarVideoGroups,
     } = await import('../src/core/similar/matcher.js'));
     ({ analyzeSimilarClips } = await import('../src/core/similar/analyze-runner.js'));
@@ -88,25 +86,6 @@ describe('durationBucket', () => {
         expect(durationBucket(119, 120)).toBe(0);
         expect(durationBucket(120, 120)).toBe(1);
         expect(durationBucket(250, 120)).toBe(2);
-    });
-});
-
-describe('timeAlignedMeanHamming', () => {
-    it('is 0 for identical sequences and averages per-frame distance', () => {
-        const a = framesOf([HASH_A, HASH_A, HASH_A]);
-        expect(timeAlignedMeanHamming(a, a)).toBe(0);
-        const b = framesOf([flipBits(HASH_A, 4), flipBits(HASH_A, 2), HASH_A]);
-        expect(timeAlignedMeanHamming(a, b)).toBeCloseTo(2, 5);
-    });
-
-    it('compares the overlapping prefix when lengths differ', () => {
-        const short = framesOf([HASH_A, HASH_A]);
-        const longer = framesOf([HASH_A, HASH_A, HASH_B]);
-        expect(timeAlignedMeanHamming(short, longer)).toBe(0);
-    });
-
-    it('returns Infinity when either side has no frames', () => {
-        expect(timeAlignedMeanHamming([], framesOf([HASH_A]))).toBe(Infinity);
     });
 });
 
@@ -217,6 +196,45 @@ describe('findSimilarVideoGroups', () => {
         );
         expect(groups).toHaveLength(1);
     });
+
+    it('groups videos that share content despite an extra intro bumper', async () => {
+        const content = [HASH_A, HASH_A, HASH_A, HASH_A];
+        const withBumper = [HASH_B, ...content];
+        const { groups } = await findSimilarVideoGroups(
+            [
+                video({ id: 1, durationSec: 10, fileHash: 'sha-a', fileSize: 2000, hashes: withBumper }),
+                video({ id: 2, durationSec: 10.5, fileHash: 'sha-b', fileSize: 900, hashes: content }),
+            ],
+            {
+                ...opts,
+                framesById: new Map([
+                    [1, framesOf(withBumper)],
+                    [2, framesOf(content)],
+                ]),
+            },
+        );
+        expect(groups).toHaveLength(1);
+        expect(groups[0].kind).toBe('similar');
+    });
+
+    it('rejects pairs whose aligned coverage is below minCoverage', async () => {
+        const hashesA = [HASH_A, HASH_A];
+        const hashesB = [HASH_A, HASH_A, HASH_B, HASH_B, HASH_B];
+        const { groups } = await findSimilarVideoGroups(
+            [
+                video({ id: 1, durationSec: 10, fileHash: 'a', fileSize: 2, hashes: hashesA }),
+                video({ id: 2, durationSec: 10, fileHash: 'b', fileSize: 1, hashes: hashesB }),
+            ],
+            {
+                ...opts,
+                framesById: new Map([
+                    [1, framesOf(hashesA)],
+                    [2, framesOf(hashesB)],
+                ]),
+            },
+        );
+        expect(groups).toHaveLength(0);
+    });
 });
 
 function seedVideo({ fileHash = 'h', fileSize = 1000, fileName } = {}) {
@@ -240,7 +258,7 @@ function seedFingerprint(id, { durationSec, fileHash, hashes }) {
         durationSec,
         aggregateHash: xorAggregate(hashes),
         frameCount: hashes.length,
-        algo: 'phash-v1',
+        algo: 'pdq-scene-v1',
         fileHash,
         indexedAt: Date.now(),
     });

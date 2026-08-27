@@ -1026,7 +1026,7 @@ export function loadAdvanced(config) {
     wireToggle('setting-adv-seekbar-autoOnDownload', sk.autoOnDownload !== false);
 
     const sc = adv.similarClips || {};
-    _setIfNum('setting-adv-similarClips-similarThreshold', sc.similarThreshold, 5);
+    _setIfNum('setting-adv-similarClips-similarThreshold', sc.similarThreshold, 50);
     const _setIfFloat = (id, val, def) => {
         const el = document.getElementById(id);
         if (!el) return;
@@ -1034,8 +1034,10 @@ export function loadAdvanced(config) {
     };
     _setIfFloat('setting-adv-similarClips-durationTolerance', sc.durationTolerance, 0.1);
     _setIfNum('setting-adv-similarClips-durationBucketSec', sc.durationBucketSec, 120);
+    _setIfFloat('setting-adv-similarClips-sceneThreshold', sc.sceneThreshold, 0.1);
+    _setIfFloat('setting-adv-similarClips-floorIntervalSec', sc.floorIntervalSec, 3);
     _setIfFloat('setting-adv-similarClips-partialMatchRatio', sc.partialMatchRatio, 0.5);
-    _setIfNum('setting-adv-similarClips-partialFrameThreshold', sc.partialFrameThreshold, 10);
+    _setIfNum('setting-adv-similarClips-partialFrameThreshold', sc.partialFrameThreshold, 70);
     _setIfNum('setting-adv-similarClips-partialShortClipSec', sc.partialShortClipSec, 300);
     _setIfFloat('setting-adv-similarClips-partialShortMatchRatio', sc.partialShortMatchRatio, 0.35);
     _setIfFloat('setting-adv-similarClips-partialReviewMatchRatio', sc.partialReviewMatchRatio, 0.1);
@@ -1541,13 +1543,15 @@ function _gatherScopedPayload(page) {
         return {
             advanced: {
                 similarClips: {
-                    similarThreshold: num('setting-adv-similarClips-similarThreshold', 5),
+                    similarThreshold: num('setting-adv-similarClips-similarThreshold', 50),
                     durationTolerance: flt('setting-adv-similarClips-durationTolerance', 0.1),
                     durationBucketSec: num('setting-adv-similarClips-durationBucketSec', 120),
+                    sceneThreshold: flt('setting-adv-similarClips-sceneThreshold', 0.1),
+                    floorIntervalSec: flt('setting-adv-similarClips-floorIntervalSec', 3),
                     partialMatchRatio: flt('setting-adv-similarClips-partialMatchRatio', 0.5),
                     partialFrameThreshold: num(
                         'setting-adv-similarClips-partialFrameThreshold',
-                        10,
+                        70,
                     ),
                     partialShortClipSec: num('setting-adv-similarClips-partialShortClipSec', 300),
                     partialShortMatchRatio: flt(

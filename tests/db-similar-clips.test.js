@@ -88,7 +88,7 @@ describe('video fingerprint accessors', () => {
             durationSec: 12.5,
             aggregateHash: '0123456789abcdef',
             frameCount: 2,
-            algo: 'phash-v1',
+            algo: 'pdq-scene-v1',
             fileHash: 'hash-1',
             indexedAt: 1_700_000_000_000,
         });
@@ -101,7 +101,7 @@ describe('video fingerprint accessors', () => {
         expect(fp.duration_sec).toBe(12.5);
         expect(fp.aggregate_hash).toBe('0123456789abcdef');
         expect(fp.frame_count).toBe(2);
-        expect(fp.algo).toBe('phash-v1');
+        expect(fp.algo).toBe('pdq-scene-v1');
         expect(fp.file_hash).toBe('hash-1');
         expect(api.videoFingerprintMatchesHash(id, 'hash-1')).toBe(true);
         expect(api.videoFingerprintMatchesHash(id, 'other')).toBe(false);
@@ -225,7 +225,7 @@ describe('similar scan paging', () => {
         });
     }
 
-    it('pages local videos that need a fingerprint and skips clusterref / seekbar markers', () => {
+    it('pages local videos that need a fingerprint and skips clusterref / current algo', () => {
         const need = seedVideo('need-hash');
         const photoMsg = _msg++;
         api.insertDownload({
@@ -252,9 +252,19 @@ describe('similar scan paging', () => {
         api.upsertVideoFingerprint({
             downloadId: current,
             durationSec: 1,
-            aggregateHash: 'aaaaaaaaaaaaaaaa',
+            aggregateHash: 'a'.repeat(64),
             frameCount: 1,
+            algo: 'pdq-scene-v1',
             fileHash: 'cur-h',
+        });
+        const staleAlgo = seedVideo('algo-h');
+        api.upsertVideoFingerprint({
+            downloadId: staleAlgo,
+            durationSec: 1,
+            aggregateHash: 'cccccccccccccccc',
+            frameCount: 1,
+            algo: 'phash-v1',
+            fileHash: 'algo-h',
         });
         const stale = seedVideo('old-h');
         api.upsertVideoFingerprint({
@@ -267,11 +277,8 @@ describe('similar scan paging', () => {
 
         const page = api.pageSimilarScanVideos({ beforeId: Number.MAX_SAFE_INTEGER, limit: 200 });
         const ids = page.map((r) => r.id);
-        expect(ids).toEqual(expect.arrayContaining([need, hasSprite, stale]));
+        expect(ids).toEqual(expect.arrayContaining([need, hasSprite, stale, staleAlgo, failed, missing, noDur]));
         expect(ids).not.toContain(cluster);
-        expect(ids).not.toContain(failed);
-        expect(ids).not.toContain(missing);
-        expect(ids).not.toContain(noDur);
         expect(ids).not.toContain(current);
 
         const stats = api.getSimilarScanStats();

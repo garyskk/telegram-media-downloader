@@ -132,7 +132,12 @@ import {
     health as seekbarClientHealth,
     probeHwaccel as probeSeekbarHwaccel,
 } from '../core/seekbar/client.js';
-import { scanSimilarClips, analyzeSimilarClips, SIMILAR_CLIPS_DEFAULTS } from '../core/similar/index.js';
+import {
+    scanSimilarClips,
+    analyzeSimilarClips,
+    unlinkLeftoverFingerprintRaws,
+    SIMILAR_CLIPS_DEFAULTS,
+} from '../core/similar/index.js';
 import {
     countSeekbarSprites,
     countVideoDownloads,
@@ -142,6 +147,7 @@ import {
     listSimilarIgnores,
     addSimilarIgnore,
     deleteSimilarIgnore,
+    purgeSimilarClipsRecords,
 } from '../core/db.js';
 import {
     startScan as nsfwStartScan,
@@ -7097,8 +7103,9 @@ app.post('/api/maintenance/seekbar/sidecar/restart', async (req, res) => {
 });
 
 // ====== Similar clips (fingerprint Scan + Analyze) ========================
-// Dual-output seekbar generate. Skip when fingerprint file_hash still
-// matches. Analyze rebuilds similar_groups; optional partial clips.
+// Similar-clips fingerprint Scan + Analyze.
+// Scan uses the similar-only ffmpeg runner (not seekbar). Skip when
+// file_hash matches and algo is pdq-scene-v1.
 
 app.post('/api/maintenance/similar/scan', async (req, res) => {
     const tracker = _jobTrackers.similarScan;
@@ -7236,6 +7243,31 @@ app.delete('/api/maintenance/similar/ignore/:id', (req, res) => {
         const changes = deleteSimilarIgnore(id);
         if (!changes) return res.status(404).json({ error: 'ignore not found' });
         res.json({ success: true });
+    } catch (e) {
+        res.status(500).json({ error: e?.message || String(e) });
+    }
+});
+
+app.post('/api/maintenance/similar/purge', async (req, res) => {
+    try {
+        if (
+            _jobTrackers.similarScan.getStatus().running ||
+            _jobTrackers.similarAnalyze.getStatus().running
+        ) {
+            return res.status(409).json({
+                error: 'A similar Scan or Analyze is already running. Cancel it before purging records.',
+                code: 'ALREADY_RUNNING',
+            });
+        }
+        const counts = purgeSimilarClipsRecords();
+        let leftoverRaws = 0;
+        try {
+            leftoverRaws = await unlinkLeftoverFingerprintRaws();
+        } catch (e) {
+            console.warn('[similar] leftover fp.raw unlink failed:', e?.message || e);
+        }
+        broadcast({ type: 'similar_purged', ts: Date.now() });
+        res.json({ success: true, leftoverRaws, ...counts });
     } catch (e) {
         res.status(500).json({ error: e?.message || String(e) });
     }
@@ -12196,13 +12228,13 @@ app.post('/api/config', async (req, res) => {
                 if (!Number.isFinite(n)) return def;
                 return Math.max(lo, Math.min(hi, n));
             };
-            sc.similarThreshold = clampInt(sc.similarThreshold, 0, 32, scDef.similarThreshold);
+            sc.similarThreshold = clampInt(sc.similarThreshold, 0, 128, scDef.similarThreshold);
             sc.durationTolerance = clampFloat(sc.durationTolerance, 0, 1, scDef.durationTolerance);
             sc.partialMatchRatio = clampFloat(sc.partialMatchRatio, 0, 1, scDef.partialMatchRatio);
             sc.partialFrameThreshold = clampInt(
                 sc.partialFrameThreshold,
                 0,
-                64,
+                128,
                 scDef.partialFrameThreshold,
             );
             sc.partialShortClipSec = clampInt(
@@ -12229,20 +12261,22 @@ app.post('/api/config', async (req, res) => {
                 100,
                 scDef.partialReviewMinMatchedFrames,
             );
-            sc.fingerprintFps = clampFloat(sc.fingerprintFps, 0.1, 4, scDef.fingerprintFps);
             sc.fingerprintMaxFrames = clampInt(
                 sc.fingerprintMaxFrames,
                 10,
                 72000,
                 scDef.fingerprintMaxFrames,
             );
-            sc.fingerprintTilePx = clampInt(sc.fingerprintTilePx, 8, 64, scDef.fingerprintTilePx);
+            sc.fingerprintTilePx = clampInt(sc.fingerprintTilePx, 32, 64, scDef.fingerprintTilePx);
             sc.durationBucketSec = clampInt(
                 sc.durationBucketSec,
                 10,
                 3600,
                 scDef.durationBucketSec,
             );
+            sc.sceneThreshold = clampFloat(sc.sceneThreshold, 0, 1, scDef.sceneThreshold);
+            sc.floorIntervalSec = clampFloat(sc.floorIntervalSec, 0.5, 30, scDef.floorIntervalSec);
+            delete sc.fingerprintFps;
 
             newConfig.advanced = merged;
         }

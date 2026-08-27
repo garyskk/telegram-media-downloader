@@ -1,58 +1,54 @@
 # Similar clips
 
 Near-duplicate **videos** and **partial clips** (a shorter video that
-appears inside a longer one). Backed by 1 fps perceptual hashes written
-during the existing seekbar ffmpeg pass — one decode, two outputs
-(hover WebP + hashes in `data/db.sqlite`). Matching, the Maintenance
-UI, and delete all stay in Node.
+appears inside a longer one). Scan writes scene-aware **PDQ-256**
+fingerprints with its own ffmpeg walk. Analyze aligns hash sequences
+with Smith-Waterman. Matching, the Maintenance UI, and delete stay in
+Node. Hover sprites stay on the Seekbar page — they are a separate
+pipeline.
 
 Exact byte-identical files are **not** this feature. Those stay on
 Maintenance → Duplicates (SHA-256 in `src/core/dedup.js`).
 
-> **Status.** Phases 1–6 are in the tree: schema, dual-output seekbar,
-> Scan, similar Analyze, partial matcher, and the Maintenance hub card
-> + similar-clips page. This file is the living spec (same role as
+> **Status.** Scene-aware sampling + PDQ + sequence alignment is in the
+> tree. This file is the living spec (same role as
 > [docs/AI.md](AI.md) for faces).
 
-**Out of scope:** similar still images, heavy crop / mirror / speed
-change, DINOv2, the faces sidecar, a second SQLite file, hashing old
-4 s hover sprites as a fingerprint shortcut.
+**Out of scope:** similar still images, heavy crop / zoom recuts,
+DINOv2, the faces sidecar, a second SQLite file, GOP-keyframe-only
+decode (`-skip_frame nokey`).
 
 ## Architecture
 
 ```
-Maintenance → Similar clips Scan
-        │
-        ▼
-video ──► existing seekbar ffmpeg (one decode)
-              ├─ branch A: fps≈1/4, scale 160px, tile
-              │              → data/seekbar/{id}.webp  (player hover, unchanged)
-              └─ branch B: fps=1,   scale 32px
-                             → video_fingerprints
-                             → video_frame_hashes     (same data/db.sqlite)
+video ──► Seekbar ffmpeg          → data/seekbar/{id}.webp  (player hover)
+     └──► Similar ffmpeg          → video_fingerprints
+              select scene|floor      video_frame_hashes     (same data/db.sqlite)
+              64×64 PDQ-256 + pts
 
-Analyze (Node)  → similar_groups / similar_group_members
-Ignore          → similar_ignores
-Partial resume  → similar_partial_scans
-Delete          → existing dedup.deleteByIds
+Analyze (Node, Smith-Waterman)
+              ├─ similar          (coverage of both ≥ ~0.7, duration ±10%)
+              └─ partial          (coverage of the shorter sequence)
+Ignore        → similar_ignores   (kept across Purge records)
+Partial resume → similar_partial_scans
+Delete        → existing dedup.deleteByIds
 ```
 
-There is **no** faces-service endpoint and **no** second video decoder.
-Missing fingerprints are filled by calling the same
-`generateForDownload` path the Seekbar page already uses (overwrite when
-no current fingerprint). New downloads hit that path via
-`pregenerateSeekbar` after faststart, once the dual-output generator
-ships.
+There is **no** faces-service endpoint. Similar Scan never calls
+`generateForDownload` or the Go seekbar sidecar.
 
-Old hover-only sprites are **not** reused as hashes — they are too
-sparse on long videos (default `maxTiles: 240` stretches a 2-hour file
-to ~30 s per tile). Scan regenerates through the enhanced generator.
+Freshness: `file_hash` match **and** `algo === pdq-scene-v1`. New
+downloads also call `pregenerateFingerprint` next to
+`pregenerateSeekbar` (two walks).
+
+Old 1 fps pHash rows (`phash-v1`) are stale. Purge records (or a
+one-off sqlite3 wipe of those tables) then Scan.
 
 ## Configuration
 
 Surface: `config.advanced.similarClips` (`kv['config']`). Hover-sprite
 density stays under `advanced.seekbar.*` and does **not** control
-fingerprint cadence (fixed 1 fps).
+fingerprint sampling.
 
 Env-var precedence (same rule as faces): `TGDL_SIMILAR_*` > kv-config >
 default. Scan reads these through `src/core/similar/config.js`.
@@ -61,18 +57,19 @@ default. Scan reads these through `src/core/similar/config.js`.
 
 | Config key | Env var | Default | Description |
 |---|---|---|---|
-| `similarThreshold` | `TGDL_SIMILAR_THRESHOLD` | `5` | Max Hamming distance (bits) for similar whole videos |
+| `similarThreshold` | `TGDL_SIMILAR_THRESHOLD` | `50` | Max mean aligned Hamming (PDQ-256 bits) for similar whole videos. Clamp 0–128 |
 | `durationTolerance` | `TGDL_SIMILAR_DURATION_TOLERANCE` | `0.1` | Similar pair: durations within ± this fraction |
-| `partialMatchRatio` | `TGDL_SIMILAR_PARTIAL_MATCH_RATIO` | `0.5` | Min time-aligned frame match ratio for a confirmed partial |
-| `partialFrameThreshold` | `TGDL_SIMILAR_PARTIAL_FRAME_THRESHOLD` | `10` | Max per-frame Hamming distance in partial matching |
+| `partialMatchRatio` | `TGDL_SIMILAR_PARTIAL_MATCH_RATIO` | `0.5` | Min coverage of the shorter sequence for a confirmed partial |
+| `partialFrameThreshold` | `TGDL_SIMILAR_PARTIAL_FRAME_THRESHOLD` | `70` | Max per-scene Hamming for a SW match. Clamp 0–128 |
 | `partialShortClipSec` | `TGDL_SIMILAR_PARTIAL_SHORT_CLIP_SEC` | `300` | Clips ≤ this duration use the short-clip ratio |
 | `partialShortMatchRatio` | `TGDL_SIMILAR_PARTIAL_SHORT_MATCH_RATIO` | `0.35` | Match ratio for short clips |
 | `partialReviewMatchRatio` | `TGDL_SIMILAR_PARTIAL_REVIEW_MATCH_RATIO` | `0.1` | Weak hits land in `partial_review` |
-| `partialReviewMinMatchedFrames` | `TGDL_SIMILAR_PARTIAL_REVIEW_MIN_MATCHED_FRAMES` | `2` | Min matched frames for a review candidate |
-| `fingerprintFps` | `TGDL_SIMILAR_FINGERPRINT_FPS` | `1` | Fingerprint branch sample rate (do not tie to seekbar `intervalSec`) |
-| `fingerprintMaxFrames` | `TGDL_SIMILAR_FINGERPRINT_MAX_FRAMES` | `7200` | Runaway cap (~2 h at 1 fps) |
-| `fingerprintTilePx` | `TGDL_SIMILAR_FINGERPRINT_TILE_PX` | `32` | Scale on the hash branch (pHash native size) |
-| `durationBucketSec` | `TGDL_SIMILAR_DURATION_BUCKET_SEC` | `120` | Parent lookup bucket width for partial analyze |
+| `partialReviewMinMatchedFrames` | `TGDL_SIMILAR_PARTIAL_REVIEW_MIN_MATCHED_FRAMES` | `2` | Min matched scenes for a review candidate |
+| `sceneThreshold` | `TGDL_SIMILAR_SCENE_THRESHOLD` | `0.1` | ffmpeg `scene` score; sample when exceeded (or floor) |
+| `floorIntervalSec` | `TGDL_SIMILAR_FLOOR_INTERVAL_SEC` | `3` | Minimum seconds between samples |
+| `fingerprintMaxFrames` | `TGDL_SIMILAR_FINGERPRINT_MAX_FRAMES` | `7200` | Runaway cap on packed RGB frames |
+| `fingerprintTilePx` | `TGDL_SIMILAR_FINGERPRINT_TILE_PX` | `64` | ffmpeg scale before PDQ (32–64; PDQ resamples to 64) |
+| `durationBucketSec` | `TGDL_SIMILAR_DURATION_BUCKET_SEC` | `120` | Similar-video cheap filter (±1 neighbour). Partial parents are duration-sorted, not ±1 bucket |
 
 Do **not** inject these with compose `:-0` defaults — that would pin
 the value and ignore Maintenance settings. Leave unset unless you
@@ -83,42 +80,56 @@ intend a deploy-time override.
 ### Scan
 
 1. Page videos with a resolvable local `file_path` (skip peer/federated
-   rows, skip seekbar `failed` / `missing` / `no_duration` markers).
-2. If `video_fingerprints.file_hash` still equals `downloads.file_hash`,
-   skip — no regenerate.
-3. Otherwise run enhanced `generateForDownload`: one ffmpeg walk writes
-   the hover sprite **and** 1 fps pHashes. Aspect is normalized
-   (letterbox-to-square / strip bars) on the 32 px branch before DCT
-   pHash. Timestamps are `i * 1.0s` on that branch.
+   rows).
+2. If `video_fingerprints.file_hash` still equals `downloads.file_hash`
+   **and** `algo` is `pdq-scene-v1`, skip.
+3. Otherwise run similar-only ffmpeg: `select` scene-or-floor, 64×64
+   RGB, `showinfo` pts, PDQ-256. Reject the run if packed-frame count
+   disagrees with pts count.
 4. Persist `video_fingerprints` + replace `video_frame_hashes` for that
    `download_id`.
 
-Progress is decode-bound. JobTracker + WS `similar_progress` /
-`similar_done`. Last-run summary in `kv['similar_last_scan']`.
+Progress is decode-bound (no hover WebP encode). JobTracker + WS
+`similar_progress` / `similar_done`. Last-run summary in
+`kv['similar_last_scan']`.
 
 ### Analyze
 
 Pipeline order: **similar → optional partial**. Exact SHA-256 pairs are
 left to the Duplicates page and are not re-checked here.
 
-- **Similar** — duration within ±10% and time-aligned Hamming on the
-  frame hashes. Cheap filter: 64-bit `aggregate_hash` (loose Hamming
-  gate) + 120 s duration buckets (±1 neighbour). Keep the **larger**
-  file; suggest remove for the smaller re-encode. Re-analyze replaces
+- **Similar** — duration within ±10% **and** Smith-Waterman coverage of
+  **both** sequences ≥ ~0.7 **and** mean aligned Hamming ≤
+  `similarThreshold`. Extra intro/bumper frames are gaps, not a t=0
+  prefix compare. Cheap filter: duration buckets (±1 neighbour) plus a
+  loose `aggregate_hash` XOR gate (only when both sequences have the
+  same length). Keep the **larger** file. Re-analyze replaces
   `kind='similar'` groups; `partial` / `partial_review` rows stay.
   Last-run summary in `kv['similar_last_analyze']`. JobTracker + WS
   `similar_analyze_progress` / `similar_analyze_done`.
-- **Partial** (checkbox, off by default) — shorter sequence as a
-  contiguous time-aligned run inside a longer parent. Confirmed vs
-  `partial_review` bands. Keep the **longer** video (or the larger file
-  when durations match). Interrupt-safe via `similar_partial_scans`
-  (skip clips already scanned at the same frame count, and clips already
-  a `remove`/`review` member of a non-ignored partial group). New clips
-  still compare against every longer parent. Exact SHA-256 pairs and
-  `similar_ignores` (`partial` / `partial_review`) are skipped.
+- **Partial** (checkbox, off by default) — high coverage of the
+  **shorter** sequence inside a same-or-longer parent. `offset_sec` is
+  the parent’s real `t_sec` at the alignment start (not a 1 fps index).
+  Confirmed vs `partial_review` bands. Keep the **longer** video (or
+  the larger file when durations match). Interrupt-safe via
+  `similar_partial_scans`. Exact SHA-256 pairs and `similar_ignores`
+  are skipped.
 
 False-positive pairs go to `similar_ignores` (canonical `a_id < b_id`)
-and survive re-analyze.
+and survive re-analyze **and** Purge records.
+
+### Purge records
+
+Confirm-gated overflow control on the similar page.
+`POST /api/maintenance/similar/purge`:
+
+- `409` `ALREADY_RUNNING` if Scan or Analyze is running
+- Deletes fingerprints, frame hashes, groups (CASCADE members), and
+  partial-resume cursors
+- Keeps `similar_ignores` and hover `seekbar_sprites`
+- Best-effort unlink of leftover `{id}.fp.raw` under `data/seekbar/`
+- Does **not** start a Scan. Operator hits Scan afterwards.
+- Broadcasts `similar_purged`
 
 ### Delete
 
@@ -135,8 +146,8 @@ in `src/core/db.js` `initSchema`). **No second database.**
 
 | Table | Role |
 |---|---|
-| `video_fingerprints` | One row per video: duration, aggregate 64-bit hash, frame count, `algo` (`phash-v1`), `file_hash`, `indexed_at` |
-| `video_frame_hashes` | `(download_id, t_sec)` → 16-char hex pHash |
+| `video_fingerprints` | One row per video: duration, aggregate hash, frame count, `algo` (`pdq-scene-v1`), `file_hash`, `indexed_at` |
+| `video_frame_hashes` | `(download_id, t_sec)` → 64-char hex PDQ |
 | `similar_groups` | `kind` ∈ `similar` \| `partial` \| `partial_review`, confidence, optional `offset_sec` |
 | `similar_group_members` | `role` ∈ `keep` \| `remove` \| `review` |
 | `similar_ignores` | False-positive pairs (`CHECK a_id < b_id`) |
@@ -148,13 +159,11 @@ fires on a hard `DELETE`.
 
 ## API surface
 
-All endpoints are admin-only. See [docs/API.md](API.md#similar-clips)
-for the table. Scan + Analyze (similar and optional partial) and the
-Maintenance hub card (`#/maintenance/similar`) are live.
+All endpoints are admin-only. See [docs/API.md](API.md#similar-clips).
 
 | Method | Path | Notes |
 |---|---|---|
-| `POST` | `/api/maintenance/similar/scan` | Dual-output seekbar generate |
+| `POST` | `/api/maintenance/similar/scan` | Similar-only ffmpeg; skip when `file_hash` + `algo` current |
 | `POST` | `/api/maintenance/similar/scan/stop` | Cancel |
 | `GET`  | `/api/maintenance/similar/status` | Scan snapshot + nested `analyze` |
 | `GET`  | `/api/maintenance/similar/stats` | Coverage + last scan / analyze |
@@ -165,18 +174,19 @@ Maintenance hub card (`#/maintenance/similar`) are live.
 | `POST` | `/api/maintenance/similar/ignore` | `{ aId, bId, kind }` |
 | `GET`  | `/api/maintenance/similar/ignore` | List |
 | `DELETE` | `/api/maintenance/similar/ignore/:id` | Un-ignore |
+| `POST` | `/api/maintenance/similar/purge` | Wipe hashes/groups/resume; keep ignores; `409` if busy |
 
 WS: `similar_progress` / `similar_done` (Scan),
-`similar_analyze_progress` / `similar_analyze_done` (Analyze).
+`similar_analyze_progress` / `similar_analyze_done` (Analyze),
+`similar_purged` (Purge records).
 
 ## Related subsystem knobs
 
 ### Seekbar hover sprite
 
 `advanced.seekbar.intervalSec` (default 4) and `maxTiles` (default 240)
-shape the **player** WebP only. They must stay modest so hour-long
-videos do not ship a huge hover sheet. Fingerprint density is
-`similarClips.fingerprintFps` (1.0), not those knobs.
+shape the **player** WebP only. Fingerprint sampling is
+`sceneThreshold` / `floorIntervalSec`, not those knobs.
 
 ### Exact duplicates
 
@@ -191,31 +201,22 @@ point `FACES_SERVICE_URL` at this feature.
 
 ## Troubleshooting
 
-**Scan will take as long as a Seekbar rebuild.** Each video without a
-current fingerprint is a full sequential ffmpeg decode. That is
-expected. Cancel via Stop; already-written fingerprints are kept.
+**Scan is still decode-bound.** Scene `select` walks every frame. It no
+longer pays hover WebP encode or a 1 fps packed dump. Cancel via Stop;
+already-written fingerprints are kept.
 
-**“No groups after Analyze.”** Scan must finish first. Photos are
-ignored. Peer `_clusterref` rows have no local file. Seekbar skip
-markers (`failed` / `missing` / `no_duration`) are not unique videos —
-they are skipped, not hashed.
+**“No groups after Analyze.”** Scan must finish first (`algo` =
+`pdq-scene-v1`). Photos are ignored. Peer `_clusterref` rows have no
+local file.
 
 **Short clip not found inside a long video.** Partial is off by default.
-Turn on `checkPartialClips`. The parent must have 1 fps fingerprints
-(Scan / regenerate), not a leftover hover-only sprite.
+Turn on `checkPartialClips`. The parent must have scene+PDQ
+fingerprints, not a leftover `phash-v1` row.
+
+**Stale `phash-v1` rows skipped forever?** Skip requires current algo.
+Purge records (or sqlite3 delete of fingerprint tables) then Scan.
 
 **Faces sidecar is down.** Irrelevant. Similar clips does not call it.
 
 **Duplicates page still shows the same files.** Those are byte-identical
 copies. Remove them there; similar-clips is for re-encodes and excerpts.
-
-## Phased delivery
-
-| Phase | Status | What |
-|---|---|---|
-| 1. Schema + this doc | **done** | Tables, accessors, soft-delete purge |
-| 2. Seekbar dual output | **done** | ffmpeg `split`, pHash helper |
-| 3. Scan JobTracker | **done** | regenerate / skip by `file_hash` |
-| 4. Similar matcher | **done** | groups + Analyze / ignore / delete APIs |
-| 5. Partial matcher | **done** | duration buckets, ignore, resume |
-| 6. Maintenance UI | **done** | hub card, page, i18n |

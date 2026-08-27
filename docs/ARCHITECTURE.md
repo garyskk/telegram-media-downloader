@@ -80,7 +80,7 @@ data/
 | `cluster_audit` table | `src/core/cluster/audit.js` | (new in v2.10) |
 | `faces` + `people` tables | `src/core/ai/faces.js` + `src/core/db.js` | (new in v2.16) |
 | `seekbar_sprites` table | `src/core/seekbar/generator.js` + `src/core/db.js` | (new in v2.17) |
-| `video_fingerprints` + `similar_*` tables | `src/core/db.js` (seekbar ffmpeg 1 fps branch writes hashes) | similar-clips |
+| `video_fingerprints` + `similar_*` tables | `src/core/similar/` (scene+PDQ ffmpeg; Smith-Waterman Analyze) | similar-clips |
 
 `saveConfig()` emits a `change` event on an in-process `EventEmitter` after every commit — `monitor.js` subscribes via `watchConfig()` and reloads without any filesystem watcher. Migration from JSON files is one-shot, idempotent, and runs inside `getDb()`; source files are renamed to `*.migrated` and kept as a reversible backup. The auto-update audit table is finalised on every container boot — any `triggered` row whose `from_version` *or* `from_instance_id` differs from the running container is promoted to `success`, capturing the actual transition observed (the `from_instance_id` column was added in v2.10 to handle `:latest`-tag rebuilds where semver is unchanged).
 
@@ -271,4 +271,4 @@ Optional federation across two or more dashboards. Each peer keeps its own DB an
 
 See `docs/CLUSTER.md` for operator setup, troubleshooting, and the per-pair-secret migration story.
 
-See `docs/SIMILAR-CLIPS.md` for near-duplicate video / partial-clip detection (1 fps hashes from the seekbar ffmpeg pass, stored in the same `db.sqlite`).
+See `docs/SIMILAR-CLIPS.md` for near-duplicate video / partial-clip detection (scene-aware PDQ-256 fingerprints in the same `db.sqlite`, separate from seekbar hover sprites).

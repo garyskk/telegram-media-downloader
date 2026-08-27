@@ -1,23 +1,18 @@
 /**
  * Seekbar sprite generator. One ffmpeg call per video → WebP sprite
- * sheet + JSON sidecar, plus a 1 fps RGB24 dump hashed into
- * `video_fingerprints` / `video_frame_hashes` (similar-clips).
- * Deterministic: same source bytes + same config always produce the
- * same on-disk artefacts, so the cache-friendliness promise in the
- * spec holds.
+ * sheet + JSON sidecar. Deterministic: same source bytes + same config
+ * always produce the same on-disk artefacts.
  *
  * Algorithm (per-clip):
  *   1. ffprobe → duration.
- *   2. Pick a frame count: `clamp(ceil(duration / interval), 12, maxTiles)`.
+ *   2. Pick a frame count from duration tiers, capped by maxTiles.
  *      Recompute `interval = duration / frames` so the last sample lands
  *      on the clip's final second.
  *   3. Lay tiles out as `cols × ceil(frames / cols)`.
- *   4. ffmpeg `filter_complex split=2`:
- *        hover  → fps=1/interval, scale=W:-2, tile → .webp
- *        hash   → fps=1 (capped), 32×32 contain+pad, raw rgb24 → pHash
+ *   4. ffmpeg `-vf` fps=1/interval, scale=W:-2, tile → .webp
  *      libwebp present → encode hover in-process. libwebp missing →
  *      tiled JPEG then sharp WebP (mirrors thumbs.js).
- *   5. Atomic .tmp → final rename for both the sprite and the JSON.
+ *   5. Atomic .tmp → final rename for the sprite and the JSON.
  */
 
 import { spawn } from 'child_process';
@@ -28,15 +23,7 @@ import path from 'path';
 import sharp from 'sharp';
 
 import { loadConfig } from '../../config/manager.js';
-import {
-    getDownloadById,
-    resetNsfwVideoResult,
-    replaceVideoFrameHashes,
-    upsertSeekbarSprite,
-    upsertVideoFingerprint,
-} from '../db.js';
-import { hashRgb24Sequence, xorAggregate } from '../phash.js';
-import { getSimilarClipsConfig } from '../similar/config.js';
+import { resetNsfwVideoResult, upsertSeekbarSprite } from '../db.js';
 import {
     ffmpegHasLibwebp,
     hasFfmpeg,
@@ -109,172 +96,6 @@ export function getSeekbarConfig() {
         /* fall through to defaults */
     }
     return { ...SEEKBAR_DEFAULTS, ...stored };
-}
-
-export { getSimilarClipsConfig };
-
-export function getFingerprintRawPath(downloadId) {
-    return path.join(SEEKBAR_DIR, `${Number(downloadId)}.fp.raw`);
-}
-
-/**
- * 1 fps (by default) fingerprint layout. Caps at `fingerprintMaxFrames`
- * so a multi-hour file does not dump unbounded raw RGB. Interval is
- * recomputed so samples still span the full duration — unlike hover
- * `maxTiles`, this is a runaway cap, not a sparse seekbar budget.
- */
-export function planFingerprint(durationSec, similarCfg = {}) {
-    const fps = Math.max(0.25, Number(similarCfg.fingerprintFps) || 1);
-    const maxFrames = Math.max(1, Math.floor(Number(similarCfg.fingerprintMaxFrames) || 7200));
-    let tilePx = Math.floor(Number(similarCfg.fingerprintTilePx) || 32);
-    if (!Number.isFinite(tilePx) || tilePx < 8) tilePx = 32;
-    tilePx = Math.min(64, tilePx);
-
-    const dur = Number(durationSec);
-    if (!Number.isFinite(dur) || dur <= 0) {
-        return { frames: 1, intervalSec: 1, tilePx, fps };
-    }
-    let frames = Math.ceil(dur * fps);
-    if (!Number.isFinite(frames) || frames < 1) frames = 1;
-    frames = Math.min(frames, maxFrames);
-    return { frames, intervalSec: dur / frames, tilePx, fps };
-}
-
-/**
- * One-decode graph: hover sprite on `[hout]`, 32×32 letterboxed RGB on `[fout]`.
- * `scaleVf(tileW)` is the optional GPU upload-scale for the hover branch.
- */
-export function buildDualFilterComplex(plan, fpPlan, scaleVf = null) {
-    const hoverScale = scaleVf ? scaleVf(plan.tileW) : `scale=${plan.tileW}:-2:flags=fast_bilinear`;
-    const px = fpPlan.tilePx;
-    const hover = `fps=1/${plan.intervalSec},${hoverScale},tile=${plan.cols}x${plan.rows}`;
-    const fp = `fps=1/${fpPlan.intervalSec},scale=${px}:${px}:force_original_aspect_ratio=decrease:flags=fast_bilinear,pad=${px}:${px}:(ow-iw)/2:(oh-ih)/2:black,format=rgb24`;
-    return `[0:v]split=2[h][f];[h]${hover}[hout];[f]${fp}[fout]`;
-}
-
-/**
- * ffmpeg argv for the dual-output encode (binary not included).
- * Hover gets `-frames:v 1` on its map only so the fingerprint branch
- * can emit every sampled frame.
- */
-export function buildSpriteFfmpegArgs({
-    srcAbs,
-    dstTmp,
-    plan,
-    fpPlan,
-    fpRawAbs,
-    useWebp,
-    quality,
-    hwArgs = [],
-    scaleVf = null,
-}) {
-    const q = Math.max(1, Math.min(100, Number(quality) || 70));
-    const graph = buildDualFilterComplex(plan, fpPlan, scaleVf);
-    const args = [
-        '-hide_banner',
-        '-loglevel',
-        'error',
-        '-y',
-        ...hwArgs,
-        '-i',
-        srcAbs,
-        '-an',
-        '-filter_complex',
-        graph,
-        '-map',
-        '[hout]',
-        '-frames:v',
-        '1',
-    ];
-    if (useWebp) {
-        args.push(
-            '-c:v',
-            'libwebp',
-            '-quality',
-            String(q),
-            '-compression_level',
-            '6',
-            '-f',
-            'webp',
-            dstTmp,
-        );
-    } else {
-        args.push(
-            '-q:v',
-            String(Math.max(2, Math.min(31, Math.round(31 - q / 4)))),
-            dstTmp,
-        );
-    }
-    args.push('-map', '[fout]', '-f', 'rawvideo', '-pix_fmt', 'rgb24', fpRawAbs);
-    return args;
-}
-
-/**
- * Read `{id}.fp.raw`, persist pHashes, then delete the dump.
- * Missing / unreadable raw is a no-op so older sidecars still produce
- * a hover sprite.
- */
-export async function persistFingerprintFromRaw({
-    downloadId,
-    rawPath,
-    fpPlan,
-    durationSec,
-    fileHash,
-}) {
-    const id = Number(downloadId);
-    if (!Number.isInteger(id) || id <= 0) return null;
-    if (!rawPath || !existsSync(rawPath)) return null;
-    let buf = null;
-    try {
-        buf = await fs.readFile(rawPath);
-    } catch {
-        buf = null;
-    }
-    try {
-        await fs.unlink(rawPath);
-    } catch {}
-    if (!buf?.length) return null;
-    const frames = hashRgb24Sequence(buf, fpPlan?.tilePx || 32, fpPlan?.intervalSec || 1);
-    if (!frames.length) return null;
-    const aggregateHash = xorAggregate(frames.map((f) => f.phash));
-    upsertVideoFingerprint({
-        downloadId: id,
-        durationSec,
-        aggregateHash,
-        frameCount: frames.length,
-        algo: 'phash-v1',
-        fileHash: fileHash == null ? null : String(fileHash),
-    });
-    replaceVideoFrameHashes(id, frames);
-    return { frameCount: frames.length, aggregateHash };
-}
-
-async function _persistFingerprint(id, rawPath, fpPlan, durationSec, row) {
-    const fileHash = row?.file_hash ?? getDownloadById(id)?.file_hash ?? null;
-    try {
-        await persistFingerprintFromRaw({
-            downloadId: id,
-            rawPath,
-            fpPlan,
-            durationSec,
-            fileHash,
-        });
-    } catch (e) {
-        console.warn(
-            '[seekbar-generator] fingerprint persist failed:',
-            String(e?.message || e).slice(0, 160),
-        );
-    }
-}
-
-function _locateFpRaw(downloadId, sidecarResult) {
-    const candidates = [sidecarResult?.fp_raw_path, getFingerprintRawPath(downloadId)].filter(
-        Boolean,
-    );
-    for (const p of candidates) {
-        if (p && existsSync(p)) return p;
-    }
-    return null;
 }
 
 function _spritePath(downloadId, format = 'webp') {
@@ -387,37 +208,78 @@ export function planSprite(durationSec, cfg) {
     return { frames, intervalSec: interval, cols, rows, tileW };
 }
 
+/**
+ * ffmpeg argv for a hover-only sprite encode (binary not included).
+ */
+export function buildSpriteFilter(plan, scaleVf = null) {
+    const hoverScale = scaleVf ? scaleVf(plan.tileW) : `scale=${plan.tileW}:-2:flags=fast_bilinear`;
+    return `fps=1/${plan.intervalSec},${hoverScale},tile=${plan.cols}x${plan.rows}`;
+}
+
+export function buildSpriteFfmpegArgs({
+    srcAbs,
+    dstTmp,
+    plan,
+    useWebp,
+    quality,
+    hwArgs = [],
+    scaleVf = null,
+}) {
+    const q = Math.max(1, Math.min(100, Number(quality) || 70));
+    const args = [
+        '-hide_banner',
+        '-loglevel',
+        'error',
+        '-y',
+        ...hwArgs,
+        '-i',
+        srcAbs,
+        '-frames:v',
+        '1',
+        '-an',
+        '-vf',
+        buildSpriteFilter(plan, scaleVf),
+    ];
+    if (useWebp) {
+        args.push(
+            '-c:v',
+            'libwebp',
+            '-quality',
+            String(q),
+            '-compression_level',
+            '6',
+            '-f',
+            'webp',
+            dstTmp,
+        );
+    } else {
+        args.push('-q:v', String(Math.max(2, Math.min(31, Math.round(31 - q / 4)))), dstTmp);
+    }
+    return args;
+}
+
 async function _writeAtomic(absPath, body) {
     const tmp = absPath + '.tmp.' + crypto.randomBytes(4).toString('hex');
     await fs.writeFile(tmp, body);
     await fs.rename(tmp, absPath);
 }
 
-async function _runSpriteFfmpeg({ srcAbs, dstAbs, plan, fpPlan, fpRawAbs, cfg, timeoutMs }) {
+async function _runSpriteFfmpeg({ srcAbs, dstAbs, plan, cfg, timeoutMs }) {
     const useWebp =
         (cfg.format === 'webp' || !cfg.format) && ffmpegHasLibwebp() && dstAbs.endsWith('.webp');
-    // Upload pipeline: GPU accelerates decode (frames land on CPU for the fps
-    // SW filter), then each selected frame is uploaded to GPU for scale and
-    // downloaded before the tile SW filter. Falls back to pure SW scale when
-    // no GPU scaler is available for the configured backend.
     const { inputArgs: hwa, scaleVf } = hwaccelUploadPipeline(cfg.hwaccel ?? null);
     const tmp = dstAbs + '.tmp.' + crypto.randomBytes(4).toString('hex');
-    const fpTmp = fpRawAbs + '.tmp.' + crypto.randomBytes(4).toString('hex');
     const common = {
         srcAbs,
         plan,
-        fpPlan,
-        fpRawAbs: fpTmp,
         quality: cfg.quality,
         hwArgs: hwa,
         scaleVf,
     };
     const _cleanupTmp = async () => {
-        for (const p of [tmp, fpTmp]) {
-            try {
-                if (existsSync(p)) await fs.unlink(p);
-            } catch {}
-        }
+        try {
+            if (existsSync(tmp)) await fs.unlink(tmp);
+        } catch {}
     };
     if (useWebp) {
         try {
@@ -426,18 +288,12 @@ async function _runSpriteFfmpeg({ srcAbs, dstAbs, plan, fpPlan, fpRawAbs, cfg, t
                 timeoutMs ? { timeoutMs } : {},
             );
             await fs.rename(tmp, dstAbs);
-            try {
-                await fs.rename(fpTmp, fpRawAbs);
-            } catch {}
         } catch (e) {
             await _cleanupTmp();
             throw e;
         }
         return;
     }
-    // JPEG fallback: render a tiled JPEG, optionally re-encode to WebP via
-    // sharp so callers asking for `format:'webp'` on a libwebp-less ffmpeg
-    // still get a WebP sprite.
     const jpgTmp = tmp + '.jpg';
     try {
         await runFfmpegArgs(
@@ -455,11 +311,6 @@ async function _runSpriteFfmpeg({ srcAbs, dstAbs, plan, fpPlan, fpRawAbs, cfg, t
             await fs.rename(tmp, dstAbs);
         } else {
             await fs.rename(jpgTmp, dstAbs);
-        }
-        if (existsSync(fpTmp)) {
-            try {
-                await fs.rename(fpTmp, fpRawAbs);
-            } catch {}
         }
     } finally {
         try {
@@ -569,9 +420,6 @@ export async function generateForDownload(row, cfg = null, opts = {}) {
     if (!duration) return { skipped: 'no_duration' };
 
     const plan = planSprite(duration, conf);
-    const similar = getSimilarClipsConfig();
-    const fpPlan = planFingerprint(duration, similar);
-    const fpRawAbs = getFingerprintRawPath(id);
     await _ensureSeekbarDir();
     const timeoutMs = spriteTimeoutMs(duration);
 
@@ -588,7 +436,7 @@ export async function generateForDownload(row, cfg = null, opts = {}) {
                 videoId: String(id),
                 srcPath: srcAbs,
                 async: true,
-                cfg: { ...conf, ...similar },
+                cfg: conf,
                 signal: opts.signal || null,
             });
             submitted = true;
@@ -653,13 +501,6 @@ export async function generateForDownload(row, cfg = null, opts = {}) {
                     generatedAt: sidecarMeta.generated_at,
                 });
                 await _notifyNsfwSpriteReady(id);
-                await _persistFingerprint(
-                    id,
-                    _locateFpRaw(id, r),
-                    fpPlan,
-                    sidecarMeta.duration_sec,
-                    row,
-                );
                 return sidecarMeta;
             }
             throw new Error(errMsg || `sidecar status ${status || 'unknown'}`);
@@ -699,8 +540,6 @@ export async function generateForDownload(row, cfg = null, opts = {}) {
                 srcAbs,
                 dstAbs,
                 plan,
-                fpPlan,
-                fpRawAbs,
                 cfg: conf,
                 timeoutMs,
             });
@@ -774,7 +613,6 @@ export async function generateForDownload(row, cfg = null, opts = {}) {
         generatedAt: meta.generated_at,
     });
     await _notifyNsfwSpriteReady(id);
-    await _persistFingerprint(id, fpRawAbs, fpPlan, duration, row);
 
     return meta;
 }

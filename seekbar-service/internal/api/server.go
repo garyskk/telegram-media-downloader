@@ -268,14 +268,11 @@ func (s *Server) findSprite(id string) (string, bool) {
 // ---- Submission ----
 
 type submitOneReq struct {
-	VideoID              string  `json:"video_id"`
-	Path                 string  `json:"path"`
-	Priority             int     `json:"priority"`
-	Overwrite            string  `json:"overwrite,omitempty"`
-	Async                bool    `json:"async"`
-	FingerprintFps       float64 `json:"fingerprint_fps"`
-	FingerprintMaxFrames int     `json:"fingerprint_max_frames"`
-	FingerprintTilePx    int     `json:"fingerprint_tile_px"`
+	VideoID   string `json:"video_id"`
+	Path      string `json:"path"`
+	Priority  int    `json:"priority"`
+	Overwrite string `json:"overwrite,omitempty"`
+	Async     bool   `json:"async"`
 }
 
 func (s *Server) handleSubmitOne(w http.ResponseWriter, r *http.Request) {
@@ -297,13 +294,10 @@ func (s *Server) handleSubmitOne(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	j := &worker.Job{
-		ID:          uuid.NewString(),
-		VideoID:     req.VideoID,
-		SrcPath:     req.Path,
-		Priority:    req.Priority,
-		FpFps:       req.FingerprintFps,
-		FpMaxFrames: req.FingerprintMaxFrames,
-		FpTilePx:    req.FingerprintTilePx,
+		ID:       uuid.NewString(),
+		VideoID:  req.VideoID,
+		SrcPath:  req.Path,
+		Priority: req.Priority,
 	}
 	s.trackJob(j)
 	s.pool.Submit(j)
@@ -358,13 +352,10 @@ func (s *Server) handleSubmitBatch(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		j := &worker.Job{
-			ID:          uuid.NewString(),
-			VideoID:     item.VideoID,
-			SrcPath:     item.Path,
-			Priority:    item.Priority,
-			FpFps:       item.FingerprintFps,
-			FpMaxFrames: item.FingerprintMaxFrames,
-			FpTilePx:    item.FingerprintTilePx,
+			ID:       uuid.NewString(),
+			VideoID:  item.VideoID,
+			SrcPath:  item.Path,
+			Priority: item.Priority,
 		}
 		s.trackJob(j)
 		s.pool.Submit(j)

@@ -73,7 +73,7 @@ describe('deleteDownloadsBy soft-delete cleanup', () => {
         ).run(id, Date.now());
         db.prepare(
             `INSERT INTO video_fingerprints (download_id, duration_sec, aggregate_hash, frame_count, algo, indexed_at, file_hash)
-             VALUES (?, 1, '0123456789abcdef', 1, 'phash-v1', ?, 'soft-hash')`,
+             VALUES (?, 1, '0123456789abcdef', 1, 'pdq-scene-v1', ?, 'soft-hash')`,
         ).run(id, Date.now());
 
         db.prepare(`

@@ -64,11 +64,31 @@ describe('config manager (kv-backed)', () => {
         expect(cfg.advanced).toBeTruthy();
         expect(cfg.advanced.downloader.maxConcurrency).toBe(20);
         expect(cfg.advanced.history.shortBreakEveryN).toBe(100);
-        expect(cfg.advanced.similarClips.fingerprintFps).toBe(1);
+        expect(cfg.advanced.similarClips.similarThreshold).toBe(50);
+        expect(cfg.advanced.similarClips.sceneThreshold).toBe(0.1);
+        expect(cfg.advanced.similarClips.fingerprintFps).toBeUndefined();
         expect(cfg.rescue.retentionHours).toBe(48);
         // User values preserved:
         expect(cfg.telegram.apiId).toBe('x');
         expect(cfg.telegram.apiHash).toBe('y');
+    });
+
+    it('strips leftover fingerprintFps and keeps stored Hamming', () => {
+        dbApi.kvSet('config', {
+            advanced: {
+                similarClips: {
+                    similarThreshold: 5,
+                    partialFrameThreshold: 10,
+                    fingerprintFps: 1,
+                },
+            },
+        });
+        const cfg = manager.loadConfig();
+        expect(cfg.advanced.similarClips.similarThreshold).toBe(5);
+        expect(cfg.advanced.similarClips.partialFrameThreshold).toBe(10);
+        expect(cfg.advanced.similarClips.fingerprintFps).toBeUndefined();
+        expect(cfg.advanced.similarClips.sceneThreshold).toBe(0.1);
+        expect(cfg.advanced.similarClips.floorIntervalSec).toBe(3);
     });
 
     it('self-heals (writes back) when merge surfaced new keys', () => {
