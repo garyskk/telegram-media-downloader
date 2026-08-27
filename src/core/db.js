@@ -5764,3 +5764,13 @@ export function getSimilarPartialScan(downloadId) {
             .get(Number(downloadId)) || null
     );
 }
+
+export function listSimilarPartialScans() {
+    return getDb()
+        .prepare(
+            `SELECT download_id, frame_count, scanned_at
+               FROM similar_partial_scans
+              ORDER BY download_id`,
+        )
+        .all();
+}

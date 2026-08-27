@@ -7098,7 +7098,7 @@ app.post('/api/maintenance/seekbar/sidecar/restart', async (req, res) => {
 
 // ====== Similar clips (fingerprint Scan + Analyze) ========================
 // Dual-output seekbar generate. Skip when fingerprint file_hash still
-// matches. Analyze rebuilds similar_groups (partial matcher is Phase 5).
+// matches. Analyze rebuilds similar_groups; optional partial clips.
 
 app.post('/api/maintenance/similar/scan', async (req, res) => {
     const tracker = _jobTrackers.similarScan;

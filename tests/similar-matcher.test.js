@@ -279,7 +279,7 @@ describe('analyzeSimilarClips', () => {
         const result = await analyzeSimilarClips();
         expect(result.similarGroups).toBe(1);
         expect(result.cancelled).toBe(false);
-        expect(result.partialSkipped).toBe(false);
+        expect(result.partialSkipped).toBe(true);
 
         const groups = api.listSimilarGroups();
         expect(groups.some((g) => g.id === staleSimilar)).toBe(false);
@@ -317,10 +317,10 @@ describe('analyzeSimilarClips', () => {
         expect(result.cancelled).toBe(false);
     });
 
-    it('does not run partial matching when checkPartialClips is set (Phase 5)', async () => {
+    it('skips partial matching unless checkPartialClips is set', async () => {
         const before = api.listSimilarGroups({ kind: 'partial' }).length;
-        const result = await analyzeSimilarClips({ checkPartialClips: true });
-        expect(result.checkPartialClips).toBe(true);
+        const result = await analyzeSimilarClips();
+        expect(result.checkPartialClips).toBe(false);
         expect(result.partialSkipped).toBe(true);
         expect(api.listSimilarGroups({ kind: 'partial' })).toHaveLength(before);
     });

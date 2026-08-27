@@ -7,4 +7,10 @@ export {
     findSimilarVideoGroups,
     similarPairKey,
 } from './matcher.js';
+export {
+    effectivePartialMatchRatio,
+    bestSubsequenceMatch,
+    iterParentCandidates,
+    findPartialClipGroups,
+} from './partial.js';
 export { analyzeSimilarClips } from './analyze-runner.js';

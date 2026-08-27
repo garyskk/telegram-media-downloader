@@ -9,9 +9,10 @@ UI, and delete all stay in Node.
 Exact byte-identical files are **not** this feature. Those stay on
 Maintenance → Duplicates (SHA-256 in `src/core/dedup.js`).
 
-> **Status.** Phases 1–4 (schema, dual-output seekbar, Scan, similar
-> Analyze) are in the tree. Partial matching / UI land in later phases.
-> This file is the living spec (same role as [docs/AI.md](AI.md) for faces).
+> **Status.** Phases 1–5 (schema, dual-output seekbar, Scan, similar
+> Analyze, partial matcher) are in the tree. The Maintenance UI lands
+> in Phase 6. This file is the living spec (same role as
+> [docs/AI.md](AI.md) for faces).
 
 **Out of scope:** similar still images, heavy crop / mirror / speed
 change, DINOv2, the faces sidecar, a second SQLite file, hashing old
@@ -110,9 +111,11 @@ left to the Duplicates page and are not re-checked here.
 - **Partial** (checkbox, off by default) — shorter sequence as a
   contiguous time-aligned run inside a longer parent. Confirmed vs
   `partial_review` bands. Keep the **longer** video (or the larger file
-  when durations match). Interrupt-safe via `similar_partial_scans`.
-  The Analyze body accepts `checkPartialClips`; matching is a no-op
-  until Phase 5.
+  when durations match). Interrupt-safe via `similar_partial_scans`
+  (skip clips already scanned at the same frame count, and clips already
+  a `remove`/`review` member of a non-ignored partial group). New clips
+  still compare against every longer parent. Exact SHA-256 pairs and
+  `similar_ignores` (`partial` / `partial_review`) are skipped.
 
 False-positive pairs go to `similar_ignores` (canonical `a_id < b_id`)
 and survive re-analyze.
@@ -146,8 +149,8 @@ fires on a hard `DELETE`.
 ## API surface
 
 All endpoints are admin-only. See [docs/API.md](API.md#similar-clips)
-for the table. Scan + similar Analyze are live; partial matching and
-the Maintenance card land later.
+for the table. Scan + Analyze (similar and optional partial) are live;
+the Maintenance card lands in Phase 6.
 
 | Method | Path | Notes |
 |---|---|---|
@@ -214,5 +217,5 @@ copies. Remove them there; similar-clips is for re-encodes and excerpts.
 | 2. Seekbar dual output | **done** | ffmpeg `split`, pHash helper |
 | 3. Scan JobTracker | **done** | regenerate / skip by `file_hash` |
 | 4. Similar matcher | **done** | groups + Analyze / ignore / delete APIs |
-| 5. Partial matcher | pending | duration buckets, ignore, resume |
+| 5. Partial matcher | **done** | duration buckets, ignore, resume |
 | 6. Maintenance UI | pending | hub card, page, i18n |
