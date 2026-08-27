@@ -9,9 +9,9 @@ UI, and delete all stay in Node.
 Exact byte-identical files are **not** this feature. Those stay on
 Maintenance → Duplicates (SHA-256 in `src/core/dedup.js`).
 
-> **Status.** Phase 1 (schema + this doc) is in the tree. Scan / Analyze /
-> UI land in later phases. This file is the living spec (same role as
-> [docs/AI.md](AI.md) for faces).
+> **Status.** Phases 1–2 (schema + dual-output seekbar) are in the tree.
+> Scan / Analyze / UI land in later phases. This file is the living spec
+> (same role as [docs/AI.md](AI.md) for faces).
 
 **Out of scope:** similar still images, heavy crop / mirror / speed
 change, DINOv2, the faces sidecar, a second SQLite file, hashing old
@@ -204,7 +204,7 @@ copies. Remove them there; similar-clips is for re-encodes and excerpts.
 | Phase | Status | What |
 |---|---|---|
 | 1. Schema + this doc | **done** | Tables, accessors, soft-delete purge |
-| 2. Seekbar dual output | pending | ffmpeg `split`, pHash helper |
+| 2. Seekbar dual output | **done** | ffmpeg `split`, pHash helper |
 | 3. Scan JobTracker | pending | regenerate / skip by `file_hash` |
 | 4. Similar matcher | pending | groups + APIs |
 | 5. Partial matcher | pending | duration buckets, ignore, resume |

@@ -1,18 +1,19 @@
 // Package api exposes the seekbar service over HTTP.
 //
 // Endpoints (admin / authenticated callers):
-//   POST   /v1/sprite            — submit a single video (sync or async)
-//   POST   /v1/batch             — submit many at once
-//   GET    /v1/jobs/:id          — job status
-//   GET    /v1/jobs              — list recent jobs
-//   POST   /v1/jobs/:id/cancel   — request cancel (best-effort)
-//   GET    /v1/config            — current effective config (for parent health checks)
-//   GET    /sprite/:video_id     — serve the WebP/JPEG sprite bytes
-//   GET    /meta/:video_id       — serve the JSON sidecar
-//   DELETE /v1/sprite/:video_id  — remove sprite + meta from disk
-//   GET    /health               — liveness probe (always open)
-//   GET    /v1/hwaccel           — probe what backends work on this host
-//   GET    /v1/stats             — pool counters
+//
+//	POST   /v1/sprite            — submit a single video (sync or async)
+//	POST   /v1/batch             — submit many at once
+//	GET    /v1/jobs/:id          — job status
+//	GET    /v1/jobs              — list recent jobs
+//	POST   /v1/jobs/:id/cancel   — request cancel (best-effort)
+//	GET    /v1/config            — current effective config (for parent health checks)
+//	GET    /sprite/:video_id     — serve the WebP/JPEG sprite bytes
+//	GET    /meta/:video_id       — serve the JSON sidecar
+//	DELETE /v1/sprite/:video_id  — remove sprite + meta from disk
+//	GET    /health               — liveness probe (always open)
+//	GET    /v1/hwaccel           — probe what backends work on this host
+//	GET    /v1/stats             — pool counters
 //
 // The token (if HTTP.APIToken is set) is checked once via middleware so
 // every mutating route is gated. /health is always open so a Docker
@@ -267,11 +268,14 @@ func (s *Server) findSprite(id string) (string, bool) {
 // ---- Submission ----
 
 type submitOneReq struct {
-	VideoID   string `json:"video_id"`
-	Path      string `json:"path"`
-	Priority  int    `json:"priority"`
-	Overwrite string `json:"overwrite,omitempty"`
-	Async     bool   `json:"async"`
+	VideoID              string  `json:"video_id"`
+	Path                 string  `json:"path"`
+	Priority             int     `json:"priority"`
+	Overwrite            string  `json:"overwrite,omitempty"`
+	Async                bool    `json:"async"`
+	FingerprintFps       float64 `json:"fingerprint_fps"`
+	FingerprintMaxFrames int     `json:"fingerprint_max_frames"`
+	FingerprintTilePx    int     `json:"fingerprint_tile_px"`
 }
 
 func (s *Server) handleSubmitOne(w http.ResponseWriter, r *http.Request) {
@@ -293,10 +297,13 @@ func (s *Server) handleSubmitOne(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	j := &worker.Job{
-		ID:       uuid.NewString(),
-		VideoID:  req.VideoID,
-		SrcPath:  req.Path,
-		Priority: req.Priority,
+		ID:          uuid.NewString(),
+		VideoID:     req.VideoID,
+		SrcPath:     req.Path,
+		Priority:    req.Priority,
+		FpFps:       req.FingerprintFps,
+		FpMaxFrames: req.FingerprintMaxFrames,
+		FpTilePx:    req.FingerprintTilePx,
 	}
 	s.trackJob(j)
 	s.pool.Submit(j)
@@ -351,10 +358,13 @@ func (s *Server) handleSubmitBatch(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		j := &worker.Job{
-			ID:       uuid.NewString(),
-			VideoID:  item.VideoID,
-			SrcPath:  item.Path,
-			Priority: item.Priority,
+			ID:          uuid.NewString(),
+			VideoID:     item.VideoID,
+			SrcPath:     item.Path,
+			Priority:    item.Priority,
+			FpFps:       item.FingerprintFps,
+			FpMaxFrames: item.FingerprintMaxFrames,
+			FpTilePx:    item.FingerprintTilePx,
 		}
 		s.trackJob(j)
 		s.pool.Submit(j)
@@ -420,7 +430,7 @@ func (s *Server) handleDeleteSprite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	removed := 0
-	for _, ext := range []string{".webp", ".jpg", ".json"} {
+	for _, ext := range []string{".webp", ".jpg", ".json", ".fp.raw"} {
 		p := filepath.Join(s.cfg.Storage.OutputDir, id+ext)
 		if err := os.Remove(p); err == nil {
 			removed++

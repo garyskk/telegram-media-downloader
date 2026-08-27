@@ -42,6 +42,10 @@ type Job struct {
 	TileH       int     `json:"tile_h,omitempty"`
 	IntervalSec float64 `json:"interval_sec,omitempty"`
 	Bytes       int64   `json:"bytes,omitempty"`
+	FpFps       float64 `json:"fp_fps,omitempty"`
+	FpMaxFrames int     `json:"fp_max_frames,omitempty"`
+	FpTilePx    int     `json:"fp_tile_px,omitempty"`
+	FpRawPath   string  `json:"fp_raw_path,omitempty"`
 	CreatedAt   int64   `json:"created_at"`
 	StartedAt   int64   `json:"started_at,omitempty"`
 	FinishedAt  int64   `json:"finished_at,omitempty"`
@@ -331,8 +335,11 @@ func (p *Pool) processJob(ctx context.Context, j *Job) {
 		threadsPerJob = 2
 	}
 	tmpPath := ffmpeg.TempPath(dstPath)
-	args := ffmpeg.BuildArgs(j.SrcPath, tmpPath, plan, cfg.Thumb.Format, cfg.Thumb.Quality, p.hwArgs, cfg.FFmpeg.ExtraArgs, p.hwBackend, threadsPerJob)
-	cpuArgs := ffmpeg.BuildArgs(j.SrcPath, tmpPath, plan, cfg.Thumb.Format, cfg.Thumb.Quality, nil, cfg.FFmpeg.ExtraArgs, "", threadsPerJob)
+	fpDst := filepath.Join(outDir, j.VideoID+".fp.raw")
+	fpTmp := ffmpeg.TempPath(fpDst)
+	fpPlan := ffmpeg.PlanFingerprint(dur, j.FpFps, j.FpMaxFrames, j.FpTilePx)
+	args := ffmpeg.BuildArgs(j.SrcPath, tmpPath, plan, cfg.Thumb.Format, cfg.Thumb.Quality, p.hwArgs, cfg.FFmpeg.ExtraArgs, p.hwBackend, threadsPerJob, fpTmp, &fpPlan)
+	cpuArgs := ffmpeg.BuildArgs(j.SrcPath, tmpPath, plan, cfg.Thumb.Format, cfg.Thumb.Quality, nil, cfg.FFmpeg.ExtraArgs, "", threadsPerJob, fpTmp, &fpPlan)
 
 	var lastErr error
 	maxAttempts := cfg.Jobs.MaxRetries + 1
@@ -355,6 +362,7 @@ func (p *Pool) processJob(ctx context.Context, j *Job) {
 			select {
 			case <-ctx.Done():
 				_ = os.Remove(tmpPath)
+				_ = os.Remove(fpTmp)
 				j.Status = "cancelled"
 				j.FinishedAt = time.Now().UnixMilli()
 				return
@@ -367,12 +375,20 @@ func (p *Pool) processJob(ctx context.Context, j *Job) {
 	}
 	if lastErr != nil {
 		_ = os.Remove(tmpPath)
+		_ = os.Remove(fpTmp)
 		p.fail(j, fmt.Sprintf("ffmpeg: %v", lastErr))
 		return
 	}
 	if err := ffmpeg.AtomicRename(tmpPath, dstPath); err != nil {
+		_ = os.Remove(fpTmp)
 		p.fail(j, fmt.Sprintf("rename: %v", err))
 		return
+	}
+	if err := ffmpeg.AtomicRename(fpTmp, fpDst); err != nil {
+		p.log.Warn("fingerprint raw rename failed", "video_id", j.VideoID, "err", err)
+		_ = os.Remove(fpTmp)
+	} else {
+		j.FpRawPath = fpDst
 	}
 
 	// Probe actual sprite dimensions to derive tile_h.

@@ -28,6 +28,14 @@ type SpritePlan struct {
 	TileH       int // 0 = unknown (computed from final image dims)
 }
 
+// FingerprintPlan is the 1 fps (by default) hash-branch layout. Independent
+// of hover maxTiles so a 2-hour file still gets ~7200 hashes, not 240.
+type FingerprintPlan struct {
+	Frames      int
+	IntervalSec float64
+	TilePx      int
+}
+
 // durationTier maps a duration ceiling to a target frame density and
 // absolute frame budget. Longer clips get more frames automatically so
 // the seekbar is never sparse, while very short clips stay dense too.
@@ -104,62 +112,76 @@ func Plan(durationSec float64, targetIntervalSec float64, columns, maxTiles, til
 	}
 }
 
-// BuildArgs returns the full ffmpeg argv (excluding the binary itself)
-// for a single sprite encode. The encoder choice depends on `format`:
-//   - "webp" / "" → -c:v libwebp
-//   - "jpeg" / "jpg" → -q:v <derived from quality>
-//
-// hwBackend is used to inject the appropriate pixel-format download step
-// when hardware-accelerated decoding is active:
-//   - VAAPI: hwdownload,format=nv12 (explicit format required)
-//   - CUDA / D3D11VA: hwdownload (ffmpeg converts format automatically)
-//   - Others: no download step needed
-func BuildArgs(srcAbs, dstTmp string, plan SpritePlan, format string, quality int, hwArgs []string, extraArgs string, hwBackend HWAccelBackend, threads int) []string {
-	if quality <= 0 {
-		quality = 70
+// PlanFingerprint picks the hash-branch sample count. fps defaults to 1;
+// maxFrames is a runaway cap (default 7200 ≈ 2 h at 1 fps), not a sparse
+// hover budget. Interval is recomputed so samples still span the clip.
+func PlanFingerprint(durationSec, fps float64, maxFrames, tilePx int) FingerprintPlan {
+	if fps < 0.25 {
+		fps = 1
 	}
-	if quality > 100 {
-		quality = 100
+	if maxFrames < 1 {
+		maxFrames = 7200
 	}
+	if tilePx < 8 {
+		tilePx = 32
+	}
+	if tilePx > 64 {
+		tilePx = 64
+	}
+	frames := int(math.Ceil(durationSec * fps))
+	if frames < 1 {
+		frames = 1
+	}
+	if frames > maxFrames {
+		frames = maxFrames
+	}
+	interval := durationSec / float64(frames)
+	if interval <= 0 {
+		interval = 1
+	}
+	return FingerprintPlan{Frames: frames, IntervalSec: interval, TilePx: tilePx}
+}
 
-	// Build the filter chain. When a GPU backend is active, prefer the
-	// hardware scaler (scale_vaapi / scale_cuda) so the resize happens on
-	// the GPU surface before the frame is downloaded to CPU memory. This
-	// cuts the PCIe transfer from full-resolution (e.g. 1080p) to the
-	// tile width (e.g. 160px) — ~45x less data per frame.
-	//
-	// Backends without a hardware scaler (D3D11VA, VideoToolbox, V4L2M2M)
-	// fall back to hwdownload + software scale.
+func hoverFilter(plan SpritePlan, hwBackend HWAccelBackend) string {
 	fps := "fps=1/" + strconv.FormatFloat(plan.IntervalSec, 'f', 6, 64)
 	tile := fmt.Sprintf("tile=%dx%d", plan.Cols, plan.Rows)
 	swScale := fmt.Sprintf("scale=%d:-2:flags=fast_bilinear", plan.TileW)
-
-	var filter string
 	switch hwBackend {
 	case HWVAAPI:
-		filter = fmt.Sprintf("scale_vaapi=w=%d:h=-2,hwdownload,format=yuv420p,%s,%s", plan.TileW, fps, tile)
+		return fmt.Sprintf("scale_vaapi=w=%d:h=-2,hwdownload,format=yuv420p,%s,%s", plan.TileW, fps, tile)
 	case HWCUDA:
-		filter = fmt.Sprintf("scale_cuda=w=%d:h=-2,hwdownload,%s,%s", plan.TileW, fps, tile)
+		return fmt.Sprintf("scale_cuda=w=%d:h=-2,hwdownload,%s,%s", plan.TileW, fps, tile)
 	case HWD3D11:
-		filter = fmt.Sprintf("hwdownload,%s,%s,%s", fps, swScale, tile)
+		return fmt.Sprintf("hwdownload,%s,%s,%s", fps, swScale, tile)
 	default:
-		filter = fmt.Sprintf("%s,%s,%s", fps, swScale, tile)
+		return fmt.Sprintf("%s,%s,%s", fps, swScale, tile)
 	}
-	args := []string{"-hide_banner", "-loglevel", "error"}
-	args = append(args, hwArgs...)
-	args = append(args,
-		"-i", srcAbs,
-		"-frames:v", "1",
-		"-an",
-		// Use all available CPU threads for the decode+scale pipeline.
-		// ffmpeg interprets 0 as "auto" (one thread per logical CPU up
-		// to the internal cap).
-		"-threads", strconv.Itoa(threads),
-		"-vf", filter,
+}
+
+func dualFilterComplex(plan SpritePlan, fp FingerprintPlan, hwBackend HWAccelBackend) string {
+	px := fp.TilePx
+	hover := fmt.Sprintf(
+		"fps=1/%s,scale=%d:-2:flags=fast_bilinear,tile=%dx%d",
+		strconv.FormatFloat(plan.IntervalSec, 'f', 6, 64),
+		plan.TileW, plan.Cols, plan.Rows,
 	)
+	fpBranch := fmt.Sprintf(
+		"fps=1/%s,scale=%d:%d:force_original_aspect_ratio=decrease:flags=fast_bilinear,pad=%d:%d:(ow-iw)/2:(oh-ih)/2:black,format=rgb24",
+		strconv.FormatFloat(fp.IntervalSec, 'f', 6, 64), px, px, px, px,
+	)
+	switch hwBackend {
+	case HWVAAPI:
+		return fmt.Sprintf("[0:v]hwdownload,format=yuv420p,split=2[h][f];[h]%s[hout];[f]%s[fout]", hover, fpBranch)
+	case HWCUDA, HWD3D11:
+		return fmt.Sprintf("[0:v]hwdownload,split=2[h][f];[h]%s[hout];[f]%s[fout]", hover, fpBranch)
+	default:
+		return fmt.Sprintf("[0:v]split=2[h][f];[h]%s[hout];[f]%s[fout]", hover, fpBranch)
+	}
+}
+
+func appendHoverEncoder(args []string, format string, quality int) []string {
 	switch strings.ToLower(format) {
 	case "jpeg", "jpg":
-		// Map quality 1..100 to ffmpeg -q:v 31..2 (lower is better).
 		qv := 31 - (quality * 29 / 100)
 		if qv < 2 {
 			qv = 2
@@ -167,14 +189,9 @@ func BuildArgs(srcAbs, dstTmp string, plan SpritePlan, format string, quality in
 		if qv > 31 {
 			qv = 31
 		}
-		args = append(args, "-q:v", strconv.Itoa(qv))
+		return append(args, "-q:v", strconv.Itoa(qv))
 	default:
-		// libwebp encoder flags:
-		//   -deadline realtime -cpu-used 8 → fastest encode path; the
-		//   quality/compression_level pair still controls output fidelity.
-		//   For sprite sheets where speed matters more than last-drop
-		//   compression efficiency this is a significant throughput win.
-		args = append(args,
+		return append(args,
 			"-c:v", "libwebp",
 			"-quality", strconv.Itoa(quality),
 			"-compression_level", "6",
@@ -183,11 +200,11 @@ func BuildArgs(srcAbs, dstTmp string, plan SpritePlan, format string, quality in
 			"-f", "webp",
 		)
 	}
+}
+
+func appendSafeExtraArgs(args []string, extraArgs string) []string {
 	if extra := strings.TrimSpace(extraArgs); extra != "" {
 		for _, a := range strings.Fields(extra) {
-			// Reject flags that could read/write arbitrary files or
-			// alter I/O in dangerous ways.  Only output-tuning flags
-			// like -preset, -crf, -q:v, -b:v should reach here.
 			lower := strings.ToLower(a)
 			if lower == "-i" || lower == "-f" ||
 				strings.HasPrefix(lower, "-filter") ||
@@ -201,6 +218,61 @@ func BuildArgs(srcAbs, dstTmp string, plan SpritePlan, format string, quality in
 			args = append(args, a)
 		}
 	}
+	return args
+}
+
+// BuildArgs returns the full ffmpeg argv (excluding the binary itself)
+// for a sprite encode. When fpTmp is set and fpPlan is non-nil the graph
+// is a single-decode split: hover WebP/JPEG on one map, packed RGB24
+// fingerprint frames on the other. Hover-only (fpPlan == nil) keeps the
+// historical `-vf` pipeline.
+//
+// The encoder choice depends on `format`:
+//   - "webp" / "" → -c:v libwebp
+//   - "jpeg" / "jpg" → -q:v <derived from quality>
+//
+// hwBackend is used to inject the appropriate pixel-format download step
+// when hardware-accelerated decoding is active:
+//   - VAAPI: hwdownload,format=nv12 (explicit format required)
+//   - CUDA / D3D11VA: hwdownload (ffmpeg converts format automatically)
+//   - Others: no download step needed
+func BuildArgs(srcAbs, dstTmp string, plan SpritePlan, format string, quality int, hwArgs []string, extraArgs string, hwBackend HWAccelBackend, threads int, fpTmp string, fpPlan *FingerprintPlan) []string {
+	if quality <= 0 {
+		quality = 70
+	}
+	if quality > 100 {
+		quality = 100
+	}
+
+	if fpPlan != nil && fpTmp != "" {
+		args := []string{"-hide_banner", "-loglevel", "error", "-y"}
+		args = append(args, hwArgs...)
+		args = append(args,
+			"-i", srcAbs,
+			"-an",
+			"-threads", strconv.Itoa(threads),
+			"-filter_complex", dualFilterComplex(plan, *fpPlan, hwBackend),
+			"-map", "[hout]",
+			"-frames:v", "1",
+		)
+		args = appendHoverEncoder(args, format, quality)
+		args = appendSafeExtraArgs(args, extraArgs)
+		args = append(args, dstTmp, "-map", "[fout]", "-f", "rawvideo", "-pix_fmt", "rgb24", fpTmp)
+		return args
+	}
+
+	filter := hoverFilter(plan, hwBackend)
+	args := []string{"-hide_banner", "-loglevel", "error"}
+	args = append(args, hwArgs...)
+	args = append(args,
+		"-i", srcAbs,
+		"-frames:v", "1",
+		"-an",
+		"-threads", strconv.Itoa(threads),
+		"-vf", filter,
+	)
+	args = appendHoverEncoder(args, format, quality)
+	args = appendSafeExtraArgs(args, extraArgs)
 	args = append(args, "-y", dstTmp)
 	return args
 }
