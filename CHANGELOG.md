@@ -5,6 +5,7 @@ All notable changes to this project are documented here. The format is based on 
 ## [Unreleased]
 
 ### Added
+- **Similar clips** (Maintenance hub card + `#/maintenance/similar`). Near-duplicate **videos** and shorter clips inside longer ones — not byte-identical files (those stay on Duplicates / SHA-256). Scan regenerates 1 fps perceptual hashes through the existing seekbar ffmpeg pass (one decode writes hover WebP + hashes into `data/db.sqlite`); Analyze groups similar whole-videos, optionally finds partial clips, and lets you keep the larger/longer file, ignore a pair, or delete the extras. Matching knobs live on the page and autosave into `advanced.similarClips` (`TGDL_SIMILAR_*` env overrides). Partial-clip search is a checkbox, off by default. See [docs/SIMILAR-CLIPS.md](docs/SIMILAR-CLIPS.md).
 - **People grid Asc/Desc sort.** Shared direction toggle next to Faces / Quality / Name (persists across field changes; re-clicking the active field also flips direction). `GET /api/ai/people` accepts `sortBy`/`sort` (`face_count` \| `avg_quality` \| `name`) and `sortDir`/`dir` (`asc` \| `desc`); default remains `face_count` + `desc`. Name sort includes unlabeled: they lead on Asc and trail on Desc (sorted by id among themselves); labeled names sort A–Z / Z–A.
 - **Gallery shuffle mode (synced with player).** Media-tabs Shuffle chip + player button share one session. Enabling from the grid shuffles the full filtered ID set into the gallery without opening the lightbox; closing the player keeps the shuffled order. Infinite scroll hydrates the next shuffle window (not chronological pages). Time-section headers (Today / Yesterday / Older) are suppressed while shuffled. Filter/group/scope reloads clear the session.
 - **Player shuffle (full library).** Builds a no-repeat playlist from every file matching the current gallery filters (group / All Media, type chip, pinned chip, federation scope) — not just the ~100-item loaded page. Current item stays first when enabling from the player; continuous play reshuffles when the playlist wraps. New `GET /api/downloads/ids` + `POST /api/downloads/by-ids` (guest-allowed hydrate).
@@ -14,6 +15,7 @@ All notable changes to this project are documented here. The format is based on 
 - **Backup coverage tip** on Maintenance → Backup — one destination is one mode; full recovery needs both continuous mirror (media) and scheduled/manual snapshot (DB incl. faces, config, sessions). Snapshots use `snapshots/` under the same root — no separate path setting.
 
 ### Changed
+- **Seekbar generate is dual-output.** The same ffmpeg decode now also emits 32×32 1 fps RGB for similar-clips fingerprints (hover sprite density unchanged). The main image compiles the Go sidecar in a build stage and ships it at `SEEKBAR_BIN` so `docker compose build` is enough when `SEEKBAR_SIDECAR_URL` is unset.
 - **Video face detection redesign** — replaced uniform evenly-spaced frame sampling (which missed faces on-screen for less time than the sampling interval) and greedy single-best-frame dedup (which discarded pose diversity and never corroborated detections) with a duration-independent, content-adaptive pipeline:
   - The sidecar (`faces-service`) now walks every video with a single sequential `cv2.VideoCapture` decode — no more `CAP_PROP_POS_FRAMES` seeking, which was unreliable on long-GOP H.264/HEVC. A fixed-size window (`videoWindowSec`, default 0.4s) plus a motion trigger catch brief appearances; a fixed floor interval (`videoFloorIntervalSec`, default 3.0s) backstops static scenes. Sampling density no longer scales with video length — a 10s clip and a 4-hour video get identical treatment.
   - Detection now streams: frames are detected and discarded immediately (bounded in-flight concurrency), so memory no longer scales with sample count on long videos.
@@ -42,7 +44,7 @@ All notable changes to this project are documented here. The format is based on 
 - **Seekbar sprites for 1h+ videos died at 120s with a fake "does not contain any stream" error.** Sprite encodes walk the whole file, but they reused the thumbnail ffmpeg kill (120s) and treated a sidecar 60s sync wait as a miss — which started a second ffmpeg. Node now submits async, polls the sidecar job, and uses a duration-scaled budget (`clamp(5 min, 1× realtime, 60 min)`). Timeouts stay retryable; gallery thumbs stay at 120s.
 
 ### Service worker
-- `VERSION = 'v2245-20'`
+- `VERSION = 'v2245-21'`
 
 ## [2.24.5] — 2026-05-31
 
