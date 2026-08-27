@@ -24,6 +24,7 @@ import {
     getOldestDownloads,
     deleteDownloadsBy,
     purgeOrphanPeople,
+    liveIdsSharingFilePath,
 } from './db.js';
 import { purgeThumbsForDownload } from './thumbs.js';
 import { purgeSeekbarForDownload, collectSeekbarPaths } from './seekbar/index.js';
@@ -68,6 +69,7 @@ export function parseSize(input) {
  */
 async function tryUnlink(row) {
     if (!row.file_path) return;
+    if (liveIdsSharingFilePath(row.file_path, { exceptIds: [row.id] }).length > 0) return;
     const normalized = path.normalize(String(row.file_path));
     if (path.isAbsolute(normalized) || normalized.includes('..')) return;
     const target = path.join(DOWNLOADS_DIR, normalized);

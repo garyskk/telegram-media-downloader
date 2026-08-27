@@ -74,4 +74,29 @@ describe('integrity.sweep', () => {
         expect(r.scanned).toBe(5);
         expect(r.pruned).toBe(5);
     });
+
+    it('wipes faces when the source file is missing on disk', async () => {
+        insertRow(1);
+        const id = db.prepare('SELECT id FROM downloads WHERE message_id = 1').get().id;
+        dbApi.insertFace({
+            downloadId: id,
+            x: 0,
+            y: 0,
+            w: 1,
+            h: 1,
+            embeddingBlob: Buffer.alloc(8, 9),
+        });
+        expect(db.prepare('SELECT COUNT(*) AS n FROM faces WHERE download_id = ?').get(id).n).toBe(
+            1,
+        );
+
+        const r = await integrity.sweep();
+        expect(r.pruned).toBe(1);
+        expect(db.prepare('SELECT user_deleted FROM downloads WHERE id = ?').get(id).user_deleted).toBe(
+            1,
+        );
+        expect(db.prepare('SELECT COUNT(*) AS n FROM faces WHERE download_id = ?').get(id).n).toBe(
+            0,
+        );
+    });
 });

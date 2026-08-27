@@ -146,4 +146,73 @@ describe('deleteDownloadsBy soft-delete cleanup', () => {
             0,
         );
     });
+
+    it('deleteDownloadsBy({ filePaths }) tombstones every row sharing that path', () => {
+        const p = 'SoftDel/videos/shared-path.mp4';
+        const a = seedDownload(3, p);
+        const b = seedDownload(4, p);
+        api.insertFace({
+            downloadId: a,
+            x: 0,
+            y: 0,
+            w: 1,
+            h: 1,
+            embeddingBlob: Buffer.alloc(8, 3),
+        });
+        api.insertFace({
+            downloadId: b,
+            x: 0,
+            y: 0,
+            w: 1,
+            h: 1,
+            embeddingBlob: Buffer.alloc(8, 4),
+        });
+
+        const removed = api.deleteDownloadsBy({ filePaths: [p] });
+        expect(removed).toBe(2);
+        expect(db.prepare('SELECT user_deleted FROM downloads WHERE id = ?').get(a).user_deleted).toBe(
+            1,
+        );
+        expect(db.prepare('SELECT user_deleted FROM downloads WHERE id = ?').get(b).user_deleted).toBe(
+            1,
+        );
+        expect(
+            db.prepare('SELECT COUNT(*) AS n FROM faces WHERE download_id IN (?, ?)').get(a, b).n,
+        ).toBe(0);
+    });
+
+    it('pruneDownloadsForMissingPath wipes faces on every live row for that file', () => {
+        const p = 'SoftDel/videos/gone.mp4';
+        const keeper = seedDownload(5, p);
+        const dupe = seedDownload(6, p);
+        api.insertFace({
+            downloadId: keeper,
+            x: 0,
+            y: 0,
+            w: 1,
+            h: 1,
+            embeddingBlob: Buffer.alloc(8, 5),
+        });
+        // Duplicate already tombstoned (hash-dedup sibling deleted by id)
+        // must not protect the keeper's faces once the bytes are gone.
+        db.prepare('UPDATE downloads SET user_deleted = 1 WHERE id = ?').run(dupe);
+
+        const n = api.pruneDownloadsForMissingPath(p);
+        expect(n).toBe(1);
+        expect(
+            db.prepare('SELECT user_deleted FROM downloads WHERE id = ?').get(keeper).user_deleted,
+        ).toBe(1);
+        expect(
+            db.prepare('SELECT COUNT(*) AS n FROM faces WHERE download_id = ?').get(keeper).n,
+        ).toBe(0);
+    });
+
+    it('liveIdsSharingFilePath skips exceptIds (refcount for keep-one deletes)', () => {
+        const p = 'SoftDel/videos/refcount.mp4';
+        const keeper = seedDownload(7, p);
+        const dupe = seedDownload(8, p);
+        expect(api.liveIdsSharingFilePath(p).sort()).toEqual([keeper, dupe].sort());
+        expect(api.liveIdsSharingFilePath(p, { exceptIds: [dupe] })).toEqual([keeper]);
+        expect(api.liveIdsSharingFilePath(p, { exceptIds: [keeper, dupe] })).toEqual([]);
+    });
 });
