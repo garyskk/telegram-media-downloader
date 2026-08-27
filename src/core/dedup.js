@@ -20,7 +20,7 @@
 
 import fs from 'fs';
 import path from 'path';
-import { getDb, deleteDownloadsBy } from './db.js';
+import { getDb, deleteDownloadsBy, liveIdsSharingFilePath } from './db.js';
 import { sha256OfFile, sha256OfFileViaPool } from './checksum.js';
 import { getDownloadsDir } from './paths.js';
 import { deferDelete } from './deferred-delete.js';
@@ -403,13 +403,28 @@ export function deleteByIds(ids) {
     let freed = 0;
     let missing = 0;
     const idsToDrop = [];
+    const deleting = new Set(rows.map((r) => r.id));
+    const unlinkedPaths = new Set();
     for (const r of rows) {
+        const others = liveIdsSharingFilePath(r.file_path, { exceptIds: [...deleting] });
+        if (others.length > 0) {
+            // Hash-dedup stored two rows against one file. Keep the bytes
+            // for the remaining live row; only tombstone this id.
+            idsToDrop.push(r.id);
+            continue;
+        }
+        const pathKey = String(r.file_path || '').replace(/\\/g, '/');
+        if (pathKey && unlinkedPaths.has(pathKey)) {
+            idsToDrop.push(r.id);
+            continue;
+        }
         const abs = resolveStoredPath(r.file_path);
         if (abs) {
             try {
                 const moved = deferDelete(abs);
                 freed += Number(r.file_size) || 0;
                 idsToDrop.push(r.id);
+                if (pathKey) unlinkedPaths.add(pathKey);
                 if (!moved) missing++;
             } catch {
                 // EPERM etc. — skip the row so user can retry.

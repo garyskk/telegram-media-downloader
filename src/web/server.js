@@ -43,6 +43,8 @@ import {
     backfillGroupNames,
     searchDownloads,
     deleteDownloadsBy,
+    liveIdsSharingFilePath,
+    pruneDownloadsForMissingPath,
     purgeOrphanPeople,
     createShareLink,
     getShareLinkForServe,
@@ -4845,6 +4847,36 @@ async function safeResolveDownload(userPath) {
     return { ok: true, real };
 }
 
+/**
+ * On-disk file is gone: tombstone every live download on that path and wipe
+ * faces / thumbs / seekbar so missing crop tiles do not linger until the
+ * next hourly integrity sweep.
+ */
+function autoPruneMissingPath(filePath) {
+    if (!filePath) return;
+    queueMicrotask(() => {
+        try {
+            const ids = liveIdsSharingFilePath(filePath);
+            if (!ids.length) return;
+            const seekbarMap = collectSeekbarPaths(ids);
+            const changes = pruneDownloadsForMissingPath(filePath);
+            if (changes > 0) {
+                for (const id of ids) {
+                    purgeThumbsForDownload(id).catch(() => {});
+                    purgeSeekbarForDownload(id, seekbarMap.get(id)).catch(() => {});
+                }
+                broadcast({
+                    type: 'file_deleted',
+                    path: String(filePath).replace(/\\/g, '/'),
+                    autoPruned: true,
+                });
+            }
+        } catch {
+            /* never let a stray request crash the server */
+        }
+    });
+}
+
 // Search across all downloads (filename + group name). Federated when the
 // caller passes ?include=peers — UNIONs filename / group_name LIKE matches
 // from peer_downloads on top of the local rows. Default is local-only so
@@ -4971,6 +5003,7 @@ app.post('/api/downloads/bulk-delete', async (req, res) => {
         let unlinked = 0;
         onProgress({ processed: 0, total, stage: 'deleting_files' });
         for (const p of pathList) {
+            for (const extraId of liveIdsSharingFilePath(p)) resolvedIdsFromPaths.push(extraId);
             const sr = await safeResolveDownload(p);
             if (sr.ok) {
                 try {
@@ -4991,6 +5024,7 @@ app.post('/api/downloads/bulk-delete', async (req, res) => {
                 onProgress({ processed, total, stage: 'deleting_files' });
             }
         }
+        const pendingIds = Array.from(new Set([...idList, ...resolvedIdsFromPaths]));
         if (idList.length) {
             const db = getDb();
             // SELECT `file_path` so we use the same on-disk path the
@@ -5035,16 +5069,19 @@ app.post('/api/downloads/bulk-delete', async (req, res) => {
                 }
                 const sr = await safeResolveDownload(candidate);
                 if (sr.ok) {
-                    try {
-                        const { deferDelete } = await import('../core/deferred-delete.js');
-                        deferDelete(sr.real);
-                        unlinked++;
-                    } catch {
+                    const keepers = liveIdsSharingFilePath(candidate, { exceptIds: pendingIds });
+                    if (keepers.length === 0) {
                         try {
-                            await fs.unlink(sr.real);
+                            const { deferDelete } = await import('../core/deferred-delete.js');
+                            deferDelete(sr.real);
                             unlinked++;
-                        } catch (e2) {
-                            if (e2.code !== 'ENOENT') throw e2;
+                        } catch {
+                            try {
+                                await fs.unlink(sr.real);
+                                unlinked++;
+                            } catch (e2) {
+                                if (e2.code !== 'ENOENT') throw e2;
+                            }
                         }
                     }
                 }
@@ -5277,7 +5314,9 @@ app.delete('/api/file', async (req, res) => {
         const matchingRows = db
             .prepare('SELECT id, file_size FROM downloads WHERE file_name = ?')
             .all(fileName);
-        const matchingIds = matchingRows.map((row) => row.id);
+        const matchingIds = Array.from(
+            new Set([...matchingRows.map((row) => row.id), ...liveIdsSharingFilePath(filePath)]),
+        );
         const freedBytes = matchingRows.reduce((s, row) => s + (Number(row.file_size) || 0), 0);
         const seekbarMap = collectSeekbarPaths(matchingIds);
         // Soft-delete via deleteDownloadsBy so faces / embeddings / pending
@@ -8850,10 +8889,12 @@ app.get('/api/ai/person/:id/face', async (req, res) => {
         if (!row) return res.status(404).json({ error: 'no face found' });
 
         const resolved = await safeResolveDownload(row.file_path);
-        if (!resolved.ok)
+        if (!resolved.ok) {
+            if (resolved.reason === 'missing') autoPruneMissingPath(row.file_path);
             return res
                 .status(resolved.reason === 'missing' ? 404 : 403)
                 .json({ error: resolved.reason });
+        }
 
         let buf;
         if (row.file_type === 'video') {
@@ -8971,10 +9012,12 @@ app.get('/api/ai/faces/:id/crop', async (req, res) => {
         if (!row) return res.status(404).json({ error: 'face not found' });
 
         const resolved = await safeResolveDownload(row.file_path);
-        if (!resolved.ok)
+        if (!resolved.ok) {
+            if (resolved.reason === 'missing') autoPruneMissingPath(row.file_path);
             return res
                 .status(resolved.reason === 'missing' ? 404 : 403)
                 .json({ error: resolved.reason });
+        }
 
         let buf;
         if (row.file_type === 'video') {
@@ -10957,7 +11000,8 @@ app.post('/api/cluster/files/delete', async (req, res) => {
         }
         const r = await safeResolveDownload(row.file_path);
         let freedBytes = 0;
-        if (r.ok) {
+        const keepers = liveIdsSharingFilePath(row.file_path, { exceptIds: [Number(row.id)] });
+        if (r.ok && keepers.length === 0) {
             try {
                 const { deferDelete } = await import('../core/deferred-delete.js');
                 deferDelete(r.real);
@@ -12749,33 +12793,7 @@ app.use('/files', async (req, res, next) => {
             // rows. Done in the background so the HTTP response isn't
             // blocked by the DB write.
             if (r.reason === 'missing') {
-                queueMicrotask(() => {
-                    try {
-                        const fwd = reqPath.replace(/\\/g, '/');
-                        const bwd = fwd.replace(/\//g, '\\');
-                        const db = getDb();
-                        const matchIds = db
-                            .prepare(
-                                'SELECT id FROM downloads WHERE file_path = ? OR file_path = ?',
-                            )
-                            .all(fwd, bwd)
-                            .map((r) => r.id);
-                        if (!matchIds.length) return;
-                        const seekbarMap = collectSeekbarPaths(matchIds);
-                        // Soft-delete via deleteDownloadsBy so faces /
-                        // embeddings / pending backup jobs are wiped.
-                        const changes = deleteDownloadsBy({ ids: matchIds });
-                        if (changes > 0) {
-                            for (const id of matchIds) {
-                                purgeThumbsForDownload(id).catch(() => {});
-                                purgeSeekbarForDownload(id, seekbarMap.get(id)).catch(() => {});
-                            }
-                            broadcast({ type: 'file_deleted', path: fwd, autoPruned: true });
-                        }
-                    } catch {
-                        /* never let a stray request crash the server */
-                    }
-                });
+                autoPruneMissingPath(reqPath);
             }
             return res.status(status).send(r.reason === 'missing' ? 'File not found' : 'Forbidden');
         }

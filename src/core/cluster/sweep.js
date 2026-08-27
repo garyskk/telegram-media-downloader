@@ -23,6 +23,7 @@ import {
     kvSet,
     getDb,
     deleteDownloadsBy,
+    liveIdsSharingFilePath,
 } from '../db.js';
 import { createJobTracker } from '../job-tracker.js';
 import { getSelfPeerId } from './identity.js';
@@ -181,10 +182,14 @@ export async function resolveConflict(conflictId, keep) {
                     )
                     .get(id);
                 try {
-                    const { deferDelete } = await import('../deferred-delete.js');
-                    deferDelete(abs);
+                    if (liveIdsSharingFilePath(loser.filePath, { exceptIds: [id] }).length === 0) {
+                        const { deferDelete } = await import('../deferred-delete.js');
+                        deferDelete(abs);
+                    }
                 } catch {
-                    await fs.unlink(abs).catch(() => {});
+                    if (liveIdsSharingFilePath(loser.filePath, { exceptIds: [id] }).length === 0) {
+                        await fs.unlink(abs).catch(() => {});
+                    }
                 }
                 // Soft-delete via deleteDownloadsBy so faces / embeddings /
                 // pending backup jobs are wiped. Tombstone keeps

@@ -27,6 +27,7 @@ All notable changes to this project are documented here. The format is based on 
 - **Mirror destination cards no longer show a cron schedule** — cron only applies to snapshot mode; saving a non-snapshot destination clears any leftover cron.
 
 ### Fixed
+- **Stale face tiles after a shared-file delete.** Hash-dedup can store two download rows against one on-disk path; deleting the duplicate unlinked the file while the keeper row (and its faces) stayed live, so crop URLs returned `{ error: "missing" }`. Deleting the last live reference now unlinks and wipes faces; deleting a duplicate keeps the file when another live row still points at it. A crop or `/files` 404 for a missing source tombstones every live row on that path and deletes their faces immediately (integrity sweep still catches stragglers).
 - **People Name sort ignored unlabeled clusters.** Asc/Desc only reordered labeled people while `Person #N` stayed pinned at the bottom. Unlabeled now lead on Asc and trail on Desc (by id); labeled still sort A–Z / Z–A.
 - **Backup destination Error pill stuck after a successful run.** A per-file `local file missing` failure set `last_error` on the destination; a later mirror Run now with 0 new uploads never cleared it, so the card stayed red. Missing/unreadable local files now fail only the job (not the destination), and a successful mirror Run now clears `last_error` / bumps `last_success_at`.
 - **Snapshot destination Files/Size counters never shrank after retention.** Upload always bumped `total_files`/`total_bytes`; prune never reconciled them, so the card kept climbing (e.g. 38) even when only `retain_count` archives remained. Retention now resets those counters from the kept remotes, logs `listed/keep/pruned`, and re-runs on boot for snapshot/manual destinations so a backlog is cleared without waiting for the next upload.
@@ -41,7 +42,7 @@ All notable changes to this project are documented here. The format is based on 
 - **Seekbar sprites for 1h+ videos died at 120s with a fake "does not contain any stream" error.** Sprite encodes walk the whole file, but they reused the thumbnail ffmpeg kill (120s) and treated a sidecar 60s sync wait as a miss — which started a second ffmpeg. Node now submits async, polls the sidecar job, and uses a duration-scaled budget (`clamp(5 min, 1× realtime, 60 min)`). Timeouts stay retryable; gallery thumbs stay at 120s.
 
 ### Service worker
-- `VERSION = 'v2245-19'`
+- `VERSION = 'v2245-20'`
 
 ## [2.24.5] — 2026-05-31
 

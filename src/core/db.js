@@ -1895,14 +1895,54 @@ function _resolveSoftDeleteIds(db, opts) {
         for (const id of opts.ids) push(id);
     }
     if (Array.isArray(opts?.filePaths) && opts.filePaths.length) {
-        const stmt = db.prepare('SELECT id FROM downloads WHERE file_path = ?');
+        const stmt = db.prepare(
+            `SELECT id FROM downloads
+              WHERE file_path = ?
+                 OR REPLACE(file_path, char(92), '/') = ?`,
+        );
         for (const p of opts.filePaths) {
             if (p == null || p === '') continue;
-            const row = stmt.get(String(p));
-            if (row) push(row.id);
+            const fwd = String(p).replace(/\\/g, '/');
+            for (const row of stmt.all(String(p), fwd)) push(row.id);
         }
     }
     return out;
+}
+
+/**
+ * Live download ids that still point at the same stored path (slash-insensitive).
+ * Used as a refcount so unlinking a shared file does not strand sibling rows.
+ */
+export function liveIdsSharingFilePath(filePath, { exceptIds = [] } = {}) {
+    const fwd = String(filePath || '').replace(/\\/g, '/');
+    if (!fwd) return [];
+    const except = new Set((exceptIds || []).map(Number).filter((n) => Number.isFinite(n) && n > 0));
+    const bwd = fwd.replace(/\//g, '\\');
+    const rows = getDb()
+        .prepare(
+            `SELECT id FROM downloads
+              WHERE (user_deleted IS NULL OR user_deleted = 0)
+                AND (
+                      file_path = ?
+                   OR file_path = ?
+                   OR REPLACE(file_path, char(92), '/') = ?
+                )`,
+        )
+        .all(fwd, bwd, fwd);
+    return rows.map((r) => r.id).filter((id) => !except.has(id));
+}
+
+/**
+ * Tombstone every live download that points at this path and wipe faces /
+ * embeddings / tags / seekbar / pending backup jobs. Used when the on-disk
+ * file is already gone (crop 404, /files 404) so missing tiles do not linger.
+ *
+ * Returns the number of downloads rows updated.
+ */
+export function pruneDownloadsForMissingPath(filePath) {
+    const ids = liveIdsSharingFilePath(filePath);
+    if (!ids.length) return 0;
+    return deleteDownloadsBy({ ids });
 }
 
 /** Wipe AI / seekbar / pending-backup side effects for soft-deleted ids. */
