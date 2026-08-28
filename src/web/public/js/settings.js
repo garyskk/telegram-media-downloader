@@ -1039,12 +1039,12 @@ export function loadAdvanced(config) {
     _setIfFloat('setting-adv-similarClips-partialMatchRatio', sc.partialMatchRatio, 0.5);
     _setIfNum('setting-adv-similarClips-partialFrameThreshold', sc.partialFrameThreshold, 90);
     _setIfNum('setting-adv-similarClips-partialShortClipSec', sc.partialShortClipSec, 300);
-    _setIfFloat('setting-adv-similarClips-partialShortMatchRatio', sc.partialShortMatchRatio, 0.35);
-    _setIfFloat('setting-adv-similarClips-partialReviewMatchRatio', sc.partialReviewMatchRatio, 0.1);
+    _setIfFloat('setting-adv-similarClips-partialShortMatchRatio', sc.partialShortMatchRatio, 0.5);
+    _setIfFloat('setting-adv-similarClips-partialReviewMatchRatio', sc.partialReviewMatchRatio, 0.35);
     _setIfNum(
         'setting-adv-similarClips-partialReviewMinMatchedFrames',
         sc.partialReviewMinMatchedFrames,
-        2,
+        4,
     );
 
     // Probe button — fetch /thumbs/hwaccel-probe and render available
@@ -1556,15 +1556,15 @@ function _gatherScopedPayload(page) {
                     partialShortClipSec: num('setting-adv-similarClips-partialShortClipSec', 300),
                     partialShortMatchRatio: flt(
                         'setting-adv-similarClips-partialShortMatchRatio',
-                        0.35,
+                        0.5,
                     ),
                     partialReviewMatchRatio: flt(
                         'setting-adv-similarClips-partialReviewMatchRatio',
-                        0.1,
+                        0.35,
                     ),
                     partialReviewMinMatchedFrames: num(
                         'setting-adv-similarClips-partialReviewMinMatchedFrames',
-                        2,
+                        4,
                     ),
                 },
             },

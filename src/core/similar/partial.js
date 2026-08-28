@@ -12,10 +12,11 @@ import { alignHashSequences } from './align.js';
 import { durationBucket, durationsWithinTolerance, similarPairKey } from './matcher.js';
 
 const YIELD_EVERY_PARENTS = 50;
+export const PARTIAL_MIN_CLIP_FRAMES = 4;
 
 export function effectivePartialMatchRatio(
     clipDurationSec,
-    { matchRatio = 0.5, shortClipSec = 300, shortMatchRatio = 0.35 } = {},
+    { matchRatio = 0.5, shortClipSec = 300, shortMatchRatio = 0.5 } = {},
 ) {
     const d = Number(clipDurationSec);
     if (Number.isFinite(d) && d <= Number(shortClipSec)) return Number(shortMatchRatio);
@@ -117,10 +118,12 @@ export async function findPartialClipGroups(videos, opts = {}) {
     const matchRatio = opts.matchRatio ?? 0.5;
     const frameThreshold = opts.frameThreshold ?? 90;
     const durationBucketSec = Number(opts.durationBucketSec) || 120;
+    const durationTolerance = opts.durationTolerance ?? 0.1;
     const shortClipSec = opts.shortClipSec ?? 300;
-    const shortMatchRatio = opts.shortMatchRatio ?? 0.35;
-    const reviewMatchRatio = opts.reviewMatchRatio ?? 0.1;
-    const reviewMinMatchedFrames = opts.reviewMinMatchedFrames ?? 2;
+    const shortMatchRatio = opts.shortMatchRatio ?? 0.5;
+    const reviewMatchRatio = opts.reviewMatchRatio ?? 0.35;
+    const reviewMinMatchedFrames = opts.reviewMinMatchedFrames ?? 4;
+    const minClipFrames = Math.max(2, Number(opts.minClipFrames) || PARTIAL_MIN_CLIP_FRAMES);
     const minParentRatio = opts.minParentRatio ?? 1;
     const ignored = new Set(opts.ignoredPairs || []);
     const skipClipIds = new Set([...(opts.skipClipIds || [])].map(Number));
@@ -136,19 +139,30 @@ export async function findPartialClipGroups(videos, opts = {}) {
     const sortedVideos = [...list].sort(
         (a, b) => Number(a.durationSec) - Number(b.durationSec) || Number(a.id) - Number(b.id),
     );
-    const clips = list.filter((v) => (framesById.get(v.id) || []).length >= 2);
+    const clips = list.filter(
+        (v) => (framesById.get(v.id) || []).length >= minClipFrames,
+    );
 
     const groups = [];
     let clipsScanned = 0;
     let processed = 0;
+    const pending = clips.filter((v) => !skipClipIds.has(Number(v.id)));
+    const skipped = skipClipIds.size;
+    try {
+        onProgress?.({
+            stage: 'partial',
+            processed: 0,
+            total: pending.length,
+            skipped,
+            groups: 0,
+        });
+    } catch {
+        /* progress must not abort matching */
+    }
 
-    for (const clip of clips) {
+    for (const clip of pending) {
         if (signal?.aborted) {
             return { groups, clipsScanned, cancelled: true };
-        }
-        if (skipClipIds.has(Number(clip.id))) {
-            processed++;
-            continue;
         }
         const clipFrames = framesById.get(clip.id) || [];
         const requiredRatio = effectivePartialMatchRatio(clip.durationSec, {
@@ -170,6 +184,9 @@ export async function findPartialClipGroups(videos, opts = {}) {
             const hashA = clip.fileHash;
             const hashB = parent.fileHash;
             if (hashA && hashB && String(hashA) === String(hashB)) continue;
+            if (durationsWithinTolerance(clip.durationSec, parent.durationSec, durationTolerance)) {
+                continue;
+            }
 
             compared++;
             if (compared % YIELD_EVERY_PARENTS === 0) {
@@ -190,6 +207,7 @@ export async function findPartialClipGroups(videos, opts = {}) {
             const offsetSec = Number.isFinite(alignedOffset)
                 ? alignedOffset
                 : parentFrames[startIndex]?.tSec ?? startIndex;
+            if (matched < reviewMinMatchedFrames) continue;
             if (ratio >= requiredRatio) {
                 const g = _proposal({
                     clip,
@@ -204,7 +222,7 @@ export async function findPartialClipGroups(videos, opts = {}) {
                 blocked.add(key);
                 continue;
             }
-            if (ratio < reviewMatchRatio || matched < reviewMinMatchedFrames) continue;
+            if (ratio < reviewMatchRatio) continue;
             if (!bestReview || ratio > bestReview.ratio) {
                 bestReview = { parent, ratio, startIndex, matched, offsetSec };
             }
@@ -242,7 +260,8 @@ export async function findPartialClipGroups(videos, opts = {}) {
             onProgress?.({
                 stage: 'partial',
                 processed,
-                total: clips.length,
+                total: pending.length,
+                skipped,
                 clipsScanned,
                 groups: groups.length,
             });

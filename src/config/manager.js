@@ -165,9 +165,9 @@ const DEFAULT_CONFIG = {
             partialMatchRatio: 0.5,
             partialFrameThreshold: 90,
             partialShortClipSec: 300,
-            partialShortMatchRatio: 0.35,
-            partialReviewMatchRatio: 0.1,
-            partialReviewMinMatchedFrames: 2,
+            partialShortMatchRatio: 0.5,
+            partialReviewMatchRatio: 0.35,
+            partialReviewMinMatchedFrames: 4,
             fingerprintMaxFrames: 7200,
             fingerprintTilePx: 64,
             durationBucketSec: 120,
@@ -695,9 +695,6 @@ function mergeConfig(userConfig) {
 function _mergeSimilarClips(userSc) {
     const user = userSc && typeof userSc === 'object' ? { ...userSc } : {};
     delete user.fingerprintFps;
-    // First-ship PDQ default (70) misses recoded excerpts whose aligned
-    // scene Hamming sits ~80–90. Keep any other operator-set value.
-    if (Number(user.partialFrameThreshold) === 70) user.partialFrameThreshold = 90;
     return { ...DEFAULT_CONFIG.advanced.similarClips, ...user };
 }
 

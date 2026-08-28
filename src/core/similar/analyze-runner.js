@@ -25,7 +25,7 @@ import {
 } from '../db.js';
 import { FINGERPRINT_ALGO, getSimilarClipsConfig, similarAnalyzeConfigKey } from './config.js';
 import { durationBucket, findSimilarVideoGroups, similarPairKey } from './matcher.js';
-import { findPartialClipGroups } from './partial.js';
+import { findPartialClipGroups, PARTIAL_MIN_CLIP_FRAMES } from './partial.js';
 
 function _framesById(rows) {
     const map = new Map();
@@ -309,14 +309,17 @@ export async function analyzeSimilarClips({ onProgress, signal, checkPartialClip
     }
 
     const skipClipIds = new Set([...skipDetected, ...skipScanned]);
-    const pendingPartial = videos.filter((v) => !skipClipIds.has(Number(v.id))).length;
+    const skippedPartial = skipClipIds.size;
+    const pendingPartial = videos.filter(
+        (v) => !skipClipIds.has(Number(v.id)) && Number(v.frameCount) >= PARTIAL_MIN_CLIP_FRAMES,
+    ).length;
     let partialGroups = 0;
     let partialReviewGroups = 0;
 
     emit('partial', {
         processed: 0,
         total: pendingPartial,
-        skipped: skipClipIds.size,
+        skipped: skippedPartial,
         groups: existingPartial.length,
     });
     await _yield();
@@ -336,6 +339,7 @@ export async function analyzeSimilarClips({ onProgress, signal, checkPartialClip
         matchRatio: cfg.partialMatchRatio,
         frameThreshold: cfg.partialFrameThreshold,
         durationBucketSec: cfg.durationBucketSec,
+        durationTolerance: cfg.durationTolerance,
         shortClipSec: cfg.partialShortClipSec,
         shortMatchRatio: cfg.partialShortMatchRatio,
         reviewMatchRatio: cfg.partialReviewMatchRatio,
@@ -345,7 +349,7 @@ export async function analyzeSimilarClips({ onProgress, signal, checkPartialClip
         skipClipIds,
         framesById,
         signal,
-        onProgress: (p) => emit(p.stage || 'partial', { skipped: skipClipIds.size, ...p }),
+        onProgress: (p) => emit(p.stage || 'partial', { skipped: skippedPartial, ...p }),
         onClipComplete: (clip, clipGroups, frameCount) => {
             for (const g of clipGroups) {
                 insertSimilarGroup({

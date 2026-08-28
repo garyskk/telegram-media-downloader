@@ -15,7 +15,7 @@ All notable changes to this project are documented here. The format is based on 
 - **Backup coverage tip** on Maintenance → Backup — one destination is one mode; full recovery needs both continuous mirror (media) and scheduled/manual snapshot (DB incl. faces, config, sessions). Snapshots use `snapshots/` under the same root — no separate path setting.
 
 ### Changed
-- **Similar-clips Scan is no longer a Seekbar rebuild.** Hover sprites stay a uniform fps+tile WebP on the Seekbar page / Go sidecar. Similar fingerprints are a separate Node ffmpeg walk (`pdq-scene-v1`). Hamming defaults are PDQ-256 space (50 / 90; clamp 0–128). Leftover stored Frame Hamming 70 is rewritten to 90. The main image still compiles the Go sidecar in a build stage and ships it at `SEEKBAR_BIN` for hover-only sprites when `SEEKBAR_SIDECAR_URL` is unset.
+- **Similar-clips Scan is no longer a Seekbar rebuild.** Hover sprites stay a uniform fps+tile WebP on the Seekbar page / Go sidecar. Similar fingerprints are a separate Node ffmpeg walk (`pdq-scene-v1`). Hamming defaults are PDQ-256 space (50 / 90; clamp 0–128). Partial auto-confirm defaults to ≥4 matched scenes and ≥50% coverage of the clip; same-length pairs are Similar-only. Saved similar-clip knobs are not rewritten — change them in Settings. The main image still compiles the Go sidecar in a build stage and ships it at `SEEKBAR_BIN` for hover-only sprites when `SEEKBAR_SIDECAR_URL` is unset. Analyze Smith-Waterman runs on a `worker_threads` worker in this image (not a sidecar) so HTTP stays responsive; SQLite, incremental `similar_video_scans`, Stop, and WebSocket progress stay on the main thread.
 - **Video face detection redesign** — replaced uniform evenly-spaced frame sampling (which missed faces on-screen for less time than the sampling interval) and greedy single-best-frame dedup (which discarded pose diversity and never corroborated detections) with a duration-independent, content-adaptive pipeline:
   - The sidecar (`faces-service`) now walks every video with a single sequential `cv2.VideoCapture` decode — no more `CAP_PROP_POS_FRAMES` seeking, which was unreliable on long-GOP H.264/HEVC. A fixed-size window (`videoWindowSec`, default 0.4s) plus a motion trigger catch brief appearances; a fixed floor interval (`videoFloorIntervalSec`, default 3.0s) backstops static scenes. Sampling density no longer scales with video length — a 10s clip and a 4-hour video get identical treatment.
   - Detection now streams: frames are detected and discarded immediately (bounded in-flight concurrency), so memory no longer scales with sample count on long videos.
@@ -44,7 +44,7 @@ All notable changes to this project are documented here. The format is based on 
 - **Seekbar sprites for 1h+ videos died at 120s with a fake "does not contain any stream" error.** Sprite encodes walk the whole file, but they reused the thumbnail ffmpeg kill (120s) and treated a sidecar 60s sync wait as a miss — which started a second ffmpeg. Node now submits async, polls the sidecar job, and uses a duration-scaled budget (`clamp(5 min, 1× realtime, 60 min)`). Timeouts stay retryable; gallery thumbs stay at 120s.
 
 ### Service worker
-- `VERSION = 'v2245-22'`
+- `VERSION = 'v2.24.5-23'` (served from `package.json` so a version bump always busts the PWA caches)
 
 ## [2.24.5] — 2026-05-31
 

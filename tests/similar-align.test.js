@@ -1,5 +1,9 @@
-import { describe, expect, it } from 'vitest';
-import { alignHashSequences } from '../src/core/similar/align.js';
+import { afterAll, describe, expect, it } from 'vitest';
+import {
+    alignHashSequences,
+    alignHashSequencesSync,
+    shutdownAlignPool,
+} from '../src/core/similar/align.js';
 
 /** 64-hex tags: same letter = Hamming 0; different letters are far. */
 function hx(ch) {
@@ -87,4 +91,48 @@ describe('alignHashSequences', () => {
         expect(r.cancelled).toBe(true);
         expect(r.matched).toBe(0);
     });
+
+    it('worker result matches the sync Smith-Waterman', async () => {
+        const parent = seq(['b', '1', '2', '3', '4']);
+        const clip = seq(['1', '2', '3', '4']);
+        const opts = { matchHamming: 50 };
+        const [w, s] = await Promise.all([
+            alignHashSequences(parent, clip, opts),
+            Promise.resolve(alignHashSequencesSync(parent, clip, opts)),
+        ]);
+        expect(w.cancelled).toBe(false);
+        expect(w.matched).toBe(s.matched);
+        expect(w.coverageA).toBe(s.coverageA);
+        expect(w.coverageB).toBe(s.coverageB);
+        expect(w.meanHamming).toBe(s.meanHamming);
+        expect(w.offsetASec).toBe(s.offsetASec);
+        expect(w.offsetBSec).toBe(s.offsetBSec);
+    });
+
+    it('runs SW off the main thread so queued immediates flush', async () => {
+        const tags = Array.from({ length: 48 }, (_, i) => String(i % 8));
+        let n = 0;
+        const pump = () => {
+            n += 1;
+            if (n < 25) setImmediate(pump);
+        };
+        setImmediate(pump);
+        await alignHashSequences(seq(tags), seq(tags));
+        expect(n).toBeGreaterThan(1);
+    });
+
+    it('abort during an in-flight worker align returns cancelled', async () => {
+        const tags = Array.from({ length: 160 }, (_, i) => String(i % 8));
+        const c = new AbortController();
+        const p = alignHashSequences(seq(tags), seq(tags), { signal: c.signal });
+        await new Promise((r) => setImmediate(r));
+        c.abort();
+        const r = await p;
+        expect(r.cancelled).toBe(true);
+        expect(r.matched).toBe(0);
+    });
+});
+
+afterAll(async () => {
+    await shutdownAlignPool();
 });

@@ -1,5 +1,5 @@
 export { FINGERPRINT_ALGO, SIMILAR_CLIPS_DEFAULTS, getSimilarClipsConfig, similarAnalyzeConfigKey } from './config.js';
-export { alignHashSequences } from './align.js';
+export { alignHashSequences, shutdownAlignPool } from './align.js';
 export {
     generateFingerprintForDownload,
     pregenerateFingerprint,
@@ -17,5 +17,6 @@ export {
     bestSubsequenceMatch,
     iterParentCandidates,
     findPartialClipGroups,
+    PARTIAL_MIN_CLIP_FRAMES,
 } from './partial.js';
 export { analyzeSimilarClips } from './analyze-runner.js';

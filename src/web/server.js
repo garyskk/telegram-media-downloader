@@ -136,6 +136,7 @@ import {
     scanSimilarClips,
     analyzeSimilarClips,
     unlinkLeftoverFingerprintRaws,
+    shutdownAlignPool,
     SIMILAR_CLIPS_DEFAULTS,
 } from '../core/similar/index.js';
 import {
@@ -1889,7 +1890,14 @@ app.get('/sw.js', (req, res) => {
     // Don't let intermediaries cache an old SW — the SW is the thing that
     // controls cache behaviour for everything else, so it must update fast.
     res.set('Cache-Control', 'no-cache, no-store, must-revalidate');
-    res.sendFile(path.join(__dirname, 'public', 'sw.js'));
+    let src = fsSync.readFileSync(path.join(__dirname, 'public', 'sw.js'), 'utf8');
+    // Cache names must change when the package version changes, otherwise
+    // a rebuild that only touches HTML/JS keeps serving the previous
+    // shell/CSS from Cache Storage until someone remembers to bump the
+    // hardcoded VERSION in sw.js.
+    const ver = String(_readCurrentVersion()).replace(/[^0-9A-Za-z.+-]/g, '') || 'dev';
+    src = src.replace(/const VERSION = '[^']*'/, `const VERSION = '${ver}'`);
+    res.send(src);
 });
 
 app.get('/manifest.webmanifest', (req, res) => {
@@ -14015,6 +14023,11 @@ async function gracefulShutdown(signal) {
         getDiskRotator()?.stop();
     } catch (e) {
         console.warn('[shutdown] rotator.stop:', e.message);
+    }
+    try {
+        await shutdownAlignPool();
+    } catch (e) {
+        console.warn('[shutdown] align worker:', e.message);
     }
 
     // Stop the monitor + its keep-alive ping.

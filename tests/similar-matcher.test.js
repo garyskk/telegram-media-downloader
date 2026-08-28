@@ -34,7 +34,11 @@ beforeAll(async () => {
     ({ createJobTracker } = await import('../src/core/job-tracker.js'));
 });
 
-afterAll(() => {
+afterAll(async () => {
+    try {
+        const { shutdownAlignPool } = await import('../src/core/similar/align.js');
+        await shutdownAlignPool();
+    } catch {}
     try {
         db.close();
     } catch {}

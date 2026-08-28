@@ -26,9 +26,10 @@ video ──► Seekbar ffmpeg          → data/seekbar/{id}.webp  (player hove
               select scene|floor      video_frame_hashes     (same data/db.sqlite)
               64×64 PDQ-256 + pts
 
-Analyze (Node, Smith-Waterman)
-              ├─ similar          (coverage of both ≥ ~0.7, duration ±10%)
-              └─ partial          (coverage of the shorter sequence)
+Analyze (Node parent: SQLite / scans / Stop / WS)
+              └─ worker_threads  Smith-Waterman
+                    ├─ similar   (coverage of both ≥ ~0.7, duration ±10%)
+                    └─ partial   (coverage of the shorter sequence)
 Ignore        → similar_ignores   (kept across Purge records)
 Partial resume → similar_partial_scans
 Delete        → existing dedup.deleteByIds
@@ -62,9 +63,9 @@ default. Scan reads these through `src/core/similar/config.js`.
 | `partialMatchRatio` | `TGDL_SIMILAR_PARTIAL_MATCH_RATIO` | `0.5` | Min coverage of the shorter sequence for a confirmed partial |
 | `partialFrameThreshold` | `TGDL_SIMILAR_PARTIAL_FRAME_THRESHOLD` | `90` | Max per-scene Hamming for a SW match. Clamp 0–128. 70 was too tight for recoded excerpts (aligned Hamming often ~80–90). |
 | `partialShortClipSec` | `TGDL_SIMILAR_PARTIAL_SHORT_CLIP_SEC` | `300` | Clips ≤ this duration use the short-clip ratio |
-| `partialShortMatchRatio` | `TGDL_SIMILAR_PARTIAL_SHORT_MATCH_RATIO` | `0.35` | Match ratio for short clips |
-| `partialReviewMatchRatio` | `TGDL_SIMILAR_PARTIAL_REVIEW_MATCH_RATIO` | `0.1` | Weak hits land in `partial_review` |
-| `partialReviewMinMatchedFrames` | `TGDL_SIMILAR_PARTIAL_REVIEW_MIN_MATCHED_FRAMES` | `2` | Min matched scenes for a review candidate |
+| `partialShortMatchRatio` | `TGDL_SIMILAR_PARTIAL_SHORT_MATCH_RATIO` | `0.5` | Same bar as `partialMatchRatio` when the key is unset. Saved values are kept — change them in Settings. |
+| `partialReviewMatchRatio` | `TGDL_SIMILAR_PARTIAL_REVIEW_MATCH_RATIO` | `0.35` | Weak hits land in `partial_review`. Saved values are kept. |
+| `partialReviewMinMatchedFrames` | `TGDL_SIMILAR_PARTIAL_REVIEW_MIN_MATCHED_FRAMES` | `4` | Min matched scenes for confirm or review. Clips with fewer than 4 fingerprint frames are skipped. Saved values are kept. |
 | `sceneThreshold` | `TGDL_SIMILAR_SCENE_THRESHOLD` | `0.1` | ffmpeg `scene` score; sample when exceeded (or floor) |
 | `floorIntervalSec` | `TGDL_SIMILAR_FLOOR_INTERVAL_SEC` | `3` | Minimum seconds between samples |
 | `fingerprintMaxFrames` | `TGDL_SIMILAR_FINGERPRINT_MAX_FRAMES` | `7200` | Runaway cap on packed RGB frames |
@@ -111,13 +112,16 @@ left to the Duplicates page and are not re-checked here.
   `partial_review` rows stay. Last-run summary in
   `kv['similar_last_analyze']`. JobTracker + WS
   `similar_analyze_progress` / `similar_analyze_done`.
+  Smith-Waterman runs on a `worker_threads` worker so HTTP/WS stay
+  responsive; Stop terminates the in-flight worker. `SIMILAR_ALIGN_WORKER_DISABLE=1`
+  falls back to the main thread.
 - **Partial** (checkbox, **on** by default) — high coverage of the
-  **shorter** sequence inside a same-or-longer parent. `offset_sec` is
-  the parent’s real `t_sec` at the alignment start (not a 1 fps index).
-  Confirmed vs `partial_review` bands. Keep the **longer** video (or
-  the larger file when durations match). Interrupt-safe via
-  `similar_partial_scans`. Exact SHA-256 pairs and `similar_ignores`
-  are skipped.
+  **shorter** sequence inside a **longer** parent (same-length pairs stay
+  on Similar). Clip must have ≥4 scenes and ≥4 matched scenes; coverage
+  ≥ 0.5. `offset_sec` is the parent’s real `t_sec` at the alignment start.
+  Confirmed vs `partial_review` (coverage ≥ 0.35). Keep the **longer**
+  video. Interrupt-safe via `similar_partial_scans`. Exact SHA-256 pairs
+  and `similar_ignores` are skipped.
 
 False-positive pairs go to `similar_ignores` (canonical `a_id < b_id`)
 and survive re-analyze **and** Purge records.

@@ -92,17 +92,23 @@ describe('config manager (kv-backed)', () => {
         expect(cfg.advanced.similarClips.floorIntervalSec).toBe(3);
     });
 
-    it('rewrites leftover partial Frame Hamming 70 to 90', () => {
+    it('keeps operator-saved similar-clip knobs (no leftover rewrite)', () => {
         dbApi.kvSet('config', {
             advanced: {
                 similarClips: {
                     similarThreshold: 50,
                     partialFrameThreshold: 70,
+                    partialShortMatchRatio: 0.35,
+                    partialReviewMatchRatio: 0.1,
+                    partialReviewMinMatchedFrames: 2,
                 },
             },
         });
         const cfg = manager.loadConfig();
-        expect(cfg.advanced.similarClips.partialFrameThreshold).toBe(90);
+        expect(cfg.advanced.similarClips.partialFrameThreshold).toBe(70);
+        expect(cfg.advanced.similarClips.partialShortMatchRatio).toBe(0.35);
+        expect(cfg.advanced.similarClips.partialReviewMatchRatio).toBe(0.1);
+        expect(cfg.advanced.similarClips.partialReviewMinMatchedFrames).toBe(2);
     });
 
     it('self-heals (writes back) when merge surfaced new keys', () => {
