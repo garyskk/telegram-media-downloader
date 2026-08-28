@@ -59,10 +59,14 @@ describe('zipRawFramesWithPts', () => {
         expect(frames[0].phash).not.toBe(frames[1].phash);
     });
 
-    it('returns empty when pts count disagrees with packed frames', () => {
+    it('pairs the overlapping prefix when packed count and pts disagree', () => {
         const buf = Buffer.alloc(FRAME * 2, 10);
-        expect(zipRawFramesWithPts(buf, [0])).toEqual([]);
-        expect(zipRawFramesWithPts(buf, [0, 3, 6])).toEqual([]);
+        const extraPts = zipRawFramesWithPts(buf, [0]);
+        expect(extraPts).toHaveLength(1);
+        expect(extraPts[0].tSec).toBe(0);
+        const extraPacked = zipRawFramesWithPts(buf, [0, 3, 6]);
+        expect(extraPacked).toHaveLength(2);
+        expect(extraPacked[1].tSec).toBe(3);
         expect(zipRawFramesWithPts(Buffer.alloc(10), [0])).toEqual([]);
     });
 });

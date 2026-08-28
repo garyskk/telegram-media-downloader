@@ -27,14 +27,17 @@ export function effectivePartialMatchRatio(
  * `ratio` is coverage of the clip (shorter) sequence.
  * @returns {{ ratio: number, startIndex: number, matched: number, offsetSec: number }}
  */
-export function bestSubsequenceMatch(clipHashes, parentHashes, { frameThreshold = 70 } = {}) {
+export async function bestSubsequenceMatch(clipHashes, parentHashes, { frameThreshold = 90, signal } = {}) {
     const clip = Array.isArray(clipHashes) ? clipHashes : [];
     const parent = Array.isArray(parentHashes) ? parentHashes : [];
     if (!clip.length || !parent.length || clip.length > parent.length) {
         return { ratio: 0, startIndex: 0, matched: 0, offsetSec: 0 };
     }
-    const cap = Number.isFinite(Number(frameThreshold)) ? Number(frameThreshold) : 70;
-    const r = alignHashSequences(clip, parent, { matchHamming: cap });
+    const cap = Number.isFinite(Number(frameThreshold)) ? Number(frameThreshold) : 90;
+    const r = await alignHashSequences(clip, parent, { matchHamming: cap, signal });
+    if (r.cancelled) {
+        return { ratio: 0, startIndex: 0, matched: 0, offsetSec: 0, cancelled: true };
+    }
     return {
         ratio: r.coverageA,
         startIndex: Math.max(0, r.startIndexB),
@@ -112,7 +115,7 @@ function _proposal({ clip, parent, kind, ratio, matched, clipFrameCount, offsetS
  */
 export async function findPartialClipGroups(videos, opts = {}) {
     const matchRatio = opts.matchRatio ?? 0.5;
-    const frameThreshold = opts.frameThreshold ?? 70;
+    const frameThreshold = opts.frameThreshold ?? 90;
     const durationBucketSec = Number(opts.durationBucketSec) || 120;
     const shortClipSec = opts.shortClipSec ?? 300;
     const shortMatchRatio = opts.shortMatchRatio ?? 0.35;
@@ -179,11 +182,11 @@ export async function findPartialClipGroups(videos, opts = {}) {
             const parentFrames = framesById.get(parent.id) || [];
             if (clipFrames.length > parentFrames.length) continue;
 
-            const { ratio, startIndex, matched, offsetSec: alignedOffset } = bestSubsequenceMatch(
-                clipFrames,
-                parentFrames,
-                { frameThreshold },
-            );
+            const { ratio, startIndex, matched, offsetSec: alignedOffset, cancelled: alignCancelled } =
+                await bestSubsequenceMatch(clipFrames, parentFrames, { frameThreshold, signal });
+            if (alignCancelled || signal?.aborted) {
+                return { groups, clipsScanned, cancelled: true };
+            }
             const offsetSec = Number.isFinite(alignedOffset)
                 ? alignedOffset
                 : parentFrames[startIndex]?.tSec ?? startIndex;

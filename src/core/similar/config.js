@@ -12,7 +12,7 @@ export const SIMILAR_CLIPS_DEFAULTS = Object.freeze({
     similarThreshold: 50,
     durationTolerance: 0.1,
     partialMatchRatio: 0.5,
-    partialFrameThreshold: 70,
+    partialFrameThreshold: 90,
     partialShortClipSec: 300,
     partialShortMatchRatio: 0.35,
     partialReviewMatchRatio: 0.1,
@@ -58,6 +58,16 @@ function _parseEnv(key, raw) {
     }
     const n = Number.parseFloat(s);
     return Number.isFinite(n) ? n : undefined;
+}
+
+export function similarAnalyzeConfigKey(cfg = SIMILAR_CLIPS_DEFAULTS) {
+    return [
+        FINGERPRINT_ALGO,
+        Number(cfg.similarThreshold),
+        Number(cfg.durationTolerance),
+        Number(cfg.durationBucketSec),
+        'cov0.7',
+    ].join('|');
 }
 
 export function getSimilarClipsConfig() {

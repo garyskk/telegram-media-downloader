@@ -48,6 +48,7 @@ function _empty() {
         startIndexB: -1,
         offsetASec: null,
         offsetBSec: null,
+        cancelled: false,
     };
 }
 
@@ -56,17 +57,19 @@ function _empty() {
  * @param {Array<{ tSec?: number, phash: string }|string>} seqB
  * @param {{ matchHamming?: number, matchScore?: number, mismatchScore?: number, gapScore?: number }} [opts]
  */
-export function alignHashSequences(seqA, seqB, opts = {}) {
+export async function alignHashSequences(seqA, seqB, opts = {}) {
     const matchHamming = Number.isFinite(Number(opts.matchHamming)) ? Number(opts.matchHamming) : 50;
     const matchScore = Number.isFinite(Number(opts.matchScore)) ? Number(opts.matchScore) : 2;
     const mismatchScore = Number.isFinite(Number(opts.mismatchScore)) ? Number(opts.mismatchScore) : -1;
     const gapScore = Number.isFinite(Number(opts.gapScore)) ? Number(opts.gapScore) : -1;
+    const signal = opts.signal;
 
     const a = _norm(seqA);
     const b = _norm(seqB);
     const n = a.length;
     const m = b.length;
     if (!n || !m) return _empty();
+    if (signal?.aborted) return { ..._empty(), cancelled: true };
 
     const cols = m + 1;
     const H = new Float64Array((n + 1) * cols);
@@ -74,8 +77,13 @@ export function alignHashSequences(seqA, seqB, opts = {}) {
     let best = 0;
     let bestI = 0;
     let bestJ = 0;
+    const yieldEvery = Math.max(8, Number(opts.yieldEveryRows) || 24);
 
     for (let i = 1; i <= n; i++) {
+        if (signal && (i === 1 || i % yieldEvery === 0)) {
+            if (signal.aborted) return { ..._empty(), cancelled: true };
+            await new Promise((r) => setImmediate(r));
+        }
         const row = i * cols;
         const prev = (i - 1) * cols;
         for (let j = 1; j <= m; j++) {
@@ -159,5 +167,6 @@ export function alignHashSequences(seqA, seqB, opts = {}) {
         startIndexB: startB,
         offsetASec: a[startA].tSec,
         offsetBSec: b[startB].tSec,
+        cancelled: false,
     };
 }

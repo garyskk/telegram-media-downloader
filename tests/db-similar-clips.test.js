@@ -57,6 +57,7 @@ describe('similar-clips schema', () => {
                 'similar_group_members',
                 'similar_ignores',
                 'similar_partial_scans',
+                'similar_video_scans',
             ]),
         );
     });
@@ -115,6 +116,29 @@ describe('video fingerprint accessors', () => {
         api.replaceVideoFrameHashes(id, [{ tSec: 0, phash: 'cccccccccccccccc' }]);
         expect(api.getVideoFrameHashes(id)).toHaveLength(1);
         expect(api.getVideoFrameHashes(id)[0].phash).toBe('cccccccccccccccc');
+    });
+
+    it('loads a large hash page without spreading onto the call stack', () => {
+        const id = seedVideo('stack-n');
+        api.upsertVideoFingerprint({
+            downloadId: id,
+            durationSec: 1,
+            aggregateHash: 'a'.repeat(64),
+            frameCount: 20000,
+            algo: 'pdq-scene-v1',
+            fileHash: 'stack-n',
+        });
+        const ins = db.prepare(
+            'INSERT INTO video_frame_hashes (download_id, t_sec, phash) VALUES (?, ?, ?)',
+        );
+        const phash = 'b'.repeat(64);
+        db.transaction(() => {
+            for (let i = 0; i < 20000; i++) ins.run(id, i, phash);
+        })();
+        const rows = api.getVideoFrameHashesForIds([id]);
+        expect(rows).toHaveLength(20000);
+        expect(rows[0].download_id).toBe(id);
+        expect(rows[19999].t_sec).toBe(19999);
     });
 });
 
@@ -204,8 +228,25 @@ describe('similar-clips cleanup', () => {
         expect(api.getVideoFrameHashes(gone)).toEqual([]);
         expect(api.getSimilarPartialScan(gone)).toBeNull();
         expect(api.isSimilarPairIgnored(keep, gone, 'partial')).toBe(false);
+        expect(api.listSimilarGroupMembers(groupId)).toEqual([]);
+        expect(api.listSimilarGroups().some((g) => g.id === groupId)).toBe(false);
+    });
+
+    it('drops leftover one-member groups when listing', () => {
+        const keep = seedVideo('orphan-keep');
+        const gone = seedVideo('orphan-gone');
+        const groupId = api.insertSimilarGroup({
+            kind: 'similar',
+            confidence: 0.9,
+            members: [
+                { downloadId: keep, role: 'keep' },
+                { downloadId: gone, role: 'remove' },
+            ],
+        });
+        db.prepare('DELETE FROM similar_group_members WHERE download_id = ?').run(gone);
         expect(api.listSimilarGroupMembers(groupId)).toHaveLength(1);
-        expect(api.listSimilarGroupMembers(groupId)[0].download_id).toBe(keep);
+        expect(api.listSimilarGroups().some((g) => g.id === groupId)).toBe(false);
+        expect(db.prepare('SELECT id FROM similar_groups WHERE id = ?').get(groupId)).toBeUndefined();
     });
 });
 

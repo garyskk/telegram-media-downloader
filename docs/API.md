@@ -184,6 +184,7 @@ Near-duplicate videos and partial clips (a shorter video inside a longer one). E
 | `POST` | `/api/maintenance/similar/ignore` | `{aId, bId, kind?}` — false-positive pair (`kind` defaults to `similar`). |
 | `GET`  | `/api/maintenance/similar/ignore` | List ignored pairs. `?kind=`. |
 | `DELETE` | `/api/maintenance/similar/ignore/:id` | Un-ignore. |
+| `POST` | `/api/maintenance/similar/analyze/purge` | Wipe similar/partial groups and Analyze resume cursors. Keeps fingerprints, `similar_ignores`, and hover sprites. `409` `{code:'ALREADY_RUNNING'}` if Scan or Analyze is running. Broadcasts `similar_purged` `{scope:'analyze'}`. Does not start Analyze. |
 | `POST` | `/api/maintenance/similar/purge` | Wipe fingerprints, groups, and partial-resume cursors. Keeps `similar_ignores` and hover sprites. `409` `{code:'ALREADY_RUNNING'}` if Scan or Analyze is running. Broadcasts `similar_purged`. Does not start Scan. |
 
 Scan + Analyze (similar and optional partial) and the Maintenance hub card (`#/maintenance/similar`) are live. Schema is in `data/db.sqlite` already.

@@ -60,7 +60,7 @@ default. Scan reads these through `src/core/similar/config.js`.
 | `similarThreshold` | `TGDL_SIMILAR_THRESHOLD` | `50` | Max mean aligned Hamming (PDQ-256 bits) for similar whole videos. Clamp 0–128 |
 | `durationTolerance` | `TGDL_SIMILAR_DURATION_TOLERANCE` | `0.1` | Similar pair: durations within ± this fraction |
 | `partialMatchRatio` | `TGDL_SIMILAR_PARTIAL_MATCH_RATIO` | `0.5` | Min coverage of the shorter sequence for a confirmed partial |
-| `partialFrameThreshold` | `TGDL_SIMILAR_PARTIAL_FRAME_THRESHOLD` | `70` | Max per-scene Hamming for a SW match. Clamp 0–128 |
+| `partialFrameThreshold` | `TGDL_SIMILAR_PARTIAL_FRAME_THRESHOLD` | `90` | Max per-scene Hamming for a SW match. Clamp 0–128. 70 was too tight for recoded excerpts (aligned Hamming often ~80–90). |
 | `partialShortClipSec` | `TGDL_SIMILAR_PARTIAL_SHORT_CLIP_SEC` | `300` | Clips ≤ this duration use the short-clip ratio |
 | `partialShortMatchRatio` | `TGDL_SIMILAR_PARTIAL_SHORT_MATCH_RATIO` | `0.35` | Match ratio for short clips |
 | `partialReviewMatchRatio` | `TGDL_SIMILAR_PARTIAL_REVIEW_MATCH_RATIO` | `0.1` | Weak hits land in `partial_review` |
@@ -103,11 +103,15 @@ left to the Duplicates page and are not re-checked here.
   `similarThreshold`. Extra intro/bumper frames are gaps, not a t=0
   prefix compare. Cheap filter: duration buckets (±1 neighbour) plus a
   loose `aggregate_hash` XOR gate (only when both sequences have the
-  same length). Keep the **larger** file. Re-analyze replaces
-  `kind='similar'` groups; `partial` / `partial_review` rows stay.
-  Last-run summary in `kv['similar_last_analyze']`. JobTracker + WS
+  same length). Keep the **larger** file. Matching is incremental:
+  video N is compared only to earlier ids (2 vs 1, 3 vs 1–2, …).
+  Finished videos are stored in `similar_video_scans`; Stop keeps those
+  cursors and groups already written. Changing Hamming / duration knobs
+  resets the cursor and rebuilds `kind='similar'` groups. `partial` /
+  `partial_review` rows stay. Last-run summary in
+  `kv['similar_last_analyze']`. JobTracker + WS
   `similar_analyze_progress` / `similar_analyze_done`.
-- **Partial** (checkbox, off by default) — high coverage of the
+- **Partial** (checkbox, **on** by default) — high coverage of the
   **shorter** sequence inside a same-or-longer parent. `offset_sec` is
   the parent’s real `t_sec` at the alignment start (not a 1 fps index).
   Confirmed vs `partial_review` bands. Keep the **longer** video (or
@@ -125,11 +129,22 @@ Confirm-gated overflow control on the similar page.
 
 - `409` `ALREADY_RUNNING` if Scan or Analyze is running
 - Deletes fingerprints, frame hashes, groups (CASCADE members), and
-  partial-resume cursors
+  similar/partial resume cursors
 - Keeps `similar_ignores` and hover `seekbar_sprites`
 - Best-effort unlink of leftover `{id}.fp.raw` under `data/seekbar/`
 - Does **not** start a Scan. Operator hits Scan afterwards.
 - Broadcasts `similar_purged`
+
+### Purge Analyze
+
+Confirm-gated overflow control on the similar page.
+`POST /api/maintenance/similar/analyze/purge`:
+
+- `409` `ALREADY_RUNNING` if Scan or Analyze is running
+- Deletes similar/partial groups and similar/partial resume cursors
+- Keeps fingerprints, `similar_ignores`, hover sprites, and last Scan summary
+- Does **not** start Analyze. Operator hits Analyze afterwards.
+- Broadcasts `similar_purged` with `scope: 'analyze'`
 
 ### Delete
 
@@ -137,7 +152,8 @@ Selected `remove` / `review` members go through
 `dedup.deleteByIds` so thumbs, faces, seekbar files, and these
 fingerprint rows stay consistent. Soft-delete also purges similar-clips
 artifacts (the downloads tombstone is kept so Telegram does not
-re-fetch).
+re-fetch). Groups with fewer than two live members are dropped so a
+deleted extra does not leave a keep-only card.
 
 ## Schema
 
@@ -174,6 +190,7 @@ All endpoints are admin-only. See [docs/API.md](API.md#similar-clips).
 | `POST` | `/api/maintenance/similar/ignore` | `{ aId, bId, kind }` |
 | `GET`  | `/api/maintenance/similar/ignore` | List |
 | `DELETE` | `/api/maintenance/similar/ignore/:id` | Un-ignore |
+| `POST` | `/api/maintenance/similar/analyze/purge` | Wipe groups + Analyze cursors; keep fingerprints/ignores; `409` if busy |
 | `POST` | `/api/maintenance/similar/purge` | Wipe hashes/groups/resume; keep ignores; `409` if busy |
 
 WS: `similar_progress` / `similar_done` (Scan),
@@ -209,9 +226,11 @@ already-written fingerprints are kept.
 `pdq-scene-v1`). Photos are ignored. Peer `_clusterref` rows have no
 local file.
 
-**Short clip not found inside a long video.** Partial is off by default.
-Turn on `checkPartialClips`. The parent must have scene+PDQ
-fingerprints, not a leftover `phash-v1` row.
+**Short clip not found inside a long video.** Partial search is on by
+default. If the checkbox was turned off, turn it back on. Frame Hamming must be high enough for
+re-encodes (default **90**; 70 misses clips whose aligned PDQ sits
+~80–90). The parent must have scene+PDQ fingerprints, not a leftover
+`phash-v1` row. Changing Frame Hamming does not require a re-Scan.
 
 **Stale `phash-v1` rows skipped forever?** Skip requires current algo.
 Purge records (or sqlite3 delete of fingerprint tables) then Scan.

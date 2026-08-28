@@ -12,8 +12,8 @@ import { api } from './api.js';
 import { showToast, escapeHtml, formatBytes } from './utils.js';
 import { confirmSheet } from './sheet.js';
 import { t as i18nT, tf as i18nTf } from './i18n.js';
-import { fileTokenQuery } from './media-url.js';
 import { loadAdvanced, setupAutoSave } from './settings.js';
+import { openMediaViewerForReview } from './viewer.js';
 
 const $ = (id) => document.getElementById(id);
 const PARTIAL_LS = 'tgdl.similar.checkPartialClips';
@@ -72,9 +72,11 @@ function _setBusyButtons() {
     const anBtn = $('sim-analyze-btn');
     const anStop = $('sim-analyze-stop-btn');
     const purgeBtn = $('sim-purge-btn');
+    const purgeAnalyzeBtn = $('sim-purge-analyze-btn');
     if (scanBtn) scanBtn.disabled = busy;
     if (anBtn) anBtn.disabled = busy;
     if (purgeBtn) purgeBtn.disabled = busy;
+    if (purgeAnalyzeBtn) purgeAnalyzeBtn.disabled = busy;
     if (scanStop) {
         scanStop.classList.toggle('hidden', !_scanRunning);
         scanStop.disabled = !_scanRunning;
@@ -94,23 +96,48 @@ function _setProgress(prefix, running, p = {}) {
     wrap.classList.toggle('hidden', !running);
     const processed = Number(p.processed) || 0;
     const total = Number(p.total) || 0;
-    const pct = total > 0 ? Math.min(100, Math.round((processed / total) * 100)) : running ? 5 : 0;
+    const skipped = Number(p.skipped) || 0;
+    const pct =
+        total > 0
+            ? Math.min(100, Math.round((processed / total) * 100))
+            : skipped > 0
+              ? 100
+              : running
+                ? 5
+                : 0;
     if (bar) bar.style.width = `${pct}%`;
     if (stage) {
-        const label = p.stage
-            ? String(p.stage)
-            : prefix === 'sim-scan'
-              ? i18nT('maintenance.similar.progress.scanning', 'Scanning…')
-              : i18nT('maintenance.similar.progress.analyzing', 'Analyzing…');
-        stage.textContent =
-            total > 0
-                ? `${label} · ${processed.toLocaleString()} / ${total.toLocaleString()}`
-                : label;
+        const stageKey = String(p.stage || '').toLowerCase();
+        const label =
+            stageKey === 'starting' || stageKey === 'load'
+                ? i18nT('maintenance.similar.progress.checking', 'Checking…')
+                : stageKey === 'matching'
+                  ? i18nT('maintenance.similar.progress.matching', 'Matching')
+                  : stageKey === 'partial'
+                    ? i18nT('maintenance.similar.progress.partial', 'Partial')
+                    : stageKey === 'persist'
+                      ? i18nT('maintenance.similar.progress.saving', 'Saving')
+                      : p.stage
+                        ? String(p.stage)
+                        : prefix === 'sim-scan'
+                          ? i18nT('maintenance.similar.progress.scanning', 'Scanning…')
+                          : i18nT('maintenance.similar.progress.analyzing', 'Analyzing…');
+        if (total > 0) {
+            stage.textContent = `${label} · ${processed.toLocaleString()} / ${total.toLocaleString()}`;
+        } else if (skipped > 0) {
+            stage.textContent = i18nTf(
+                'maintenance.similar.progress.up_to_date',
+                { n: skipped },
+                `Up to date · ${skipped.toLocaleString()} already matched`,
+            );
+        } else {
+            stage.textContent = label;
+        }
     }
     if (pctEl) {
         const extra = [];
         if (p.generated != null) extra.push(`${p.generated} gen`);
-        if (p.skipped != null) extra.push(`${p.skipped} skip`);
+        if (skipped > 0 && total > 0) extra.push(`${skipped} skip`);
         if (p.comparedPairs != null) extra.push(`${p.comparedPairs} pairs`);
         if (p.groups != null) extra.push(`${p.groups} groups`);
         pctEl.textContent = extra.length ? `${pct}% · ${extra.join(' · ')}` : `${pct}%`;
@@ -206,11 +233,45 @@ function _visibleGroups() {
     return _groups.filter((g) => !_ignores.has(_groupPairKey(g)));
 }
 
-function _renderRow(m) {
+function _memberToViewerFile(m) {
+    const fileType = String(m.file_type || 'video');
+    const filePath = String(m.file_path || '').replace(/\\/g, '/');
+    const type =
+        fileType === 'photo' || fileType === 'image' || fileType === 'sticker'
+            ? 'images'
+            : fileType === 'video'
+              ? 'videos'
+              : fileType === 'audio'
+                ? 'audio'
+                : 'files';
+    return {
+        id: Number(m.download_id) || 0,
+        name: m.file_name || '',
+        path: filePath,
+        fullPath: filePath,
+        type,
+        file_type: fileType,
+        size: Number(m.file_size) || 0,
+        sizeFormatted: formatBytes(Number(m.file_size) || 0),
+        modified: null,
+        peer_id: 'self',
+    };
+}
+
+function _openMemberInPlayer(el) {
+    const groupId = Number(el.dataset.groupId);
+    const downloadId = Number(el.dataset.downloadId);
+    const group = _groups.find((g) => Number(g.id) === groupId);
+    if (!group) return;
+    const files = (group.members || []).map(_memberToViewerFile).filter((f) => f.fullPath);
+    if (!files.length) return;
+    const idx = files.findIndex((f) => f.id === downloadId);
+    openMediaViewerForReview(files, Math.max(0, idx));
+}
+
+function _renderRow(m, groupId) {
     const id = Number(m.download_id);
     const thumbUrl = `/api/thumbs/${encodeURIComponent(id)}?w=320`;
-    const ftq = fileTokenQuery();
-    const fileUrl = `/files/${encodeURIComponent(m.file_path || '')}?inline=1${ftq ? '&' + ftq : ''}`;
     const sizeStr = m.file_size ? formatBytes(m.file_size) : '';
     const dur =
         m.duration_sec != null
@@ -224,19 +285,23 @@ function _renderRow(m) {
             : m.role === 'review'
               ? 'bg-yellow-500/15 text-yellow-300'
               : 'bg-red-500/15 text-red-300';
+    const openAttrs = `data-open-player data-group-id="${groupId}" data-download-id="${id}"`;
     return `
-        <label class="sim-row group flex items-center gap-3 p-2 rounded-lg hover:bg-tg-hover/40 ${deletable ? 'cursor-pointer' : ''} border-l-2 ${accent} transition-colors" data-file-row="${id}">
+        <div class="sim-row group flex items-center gap-3 p-2 rounded-lg hover:bg-tg-hover/40 border-l-2 ${accent} transition-colors" data-file-row="${id}">
             ${
                 deletable
-                    ? `<input type="checkbox" class="sim-del shrink-0" data-id="${id}" checked>`
+                    ? `<input type="checkbox" class="sim-del shrink-0 cursor-pointer" data-id="${id}" checked>`
                     : `<span class="w-4 shrink-0"></span>`
             }
-            <img loading="lazy" decoding="async"
-                 class="w-14 h-14 object-cover rounded-md bg-tg-bg/40 shrink-0 ring-1 ring-tg-border/40"
+            <img loading="lazy" decoding="async" ${openAttrs}
+                 class="w-14 h-14 object-cover rounded-md bg-tg-bg/40 shrink-0 ring-1 ring-tg-border/40 cursor-pointer"
                  src="${escapeHtml(thumbUrl)}" alt=""
                  onerror="this.style.display='none'">
             <div class="min-w-0 flex-1">
-                <div class="text-sm text-tg-text truncate font-medium">${escapeHtml(m.file_name || '(unnamed)')}</div>
+                <button type="button" ${openAttrs}
+                        class="block w-full text-left text-sm text-tg-text truncate font-medium hover:text-tg-blue cursor-pointer">
+                    ${escapeHtml(m.file_name || '(unnamed)')}
+                </button>
                 <div class="text-[11px] text-tg-textSecondary truncate flex items-center gap-1.5 flex-wrap">
                     <span class="inline-flex items-center gap-1 px-1.5 py-0 rounded ${roleCls}">${escapeHtml(_roleLabel(m.role))}</span>
                     ${sizeStr ? `<span class="tabular-nums">${escapeHtml(sizeStr)}</span>` : ''}
@@ -244,13 +309,7 @@ function _renderRow(m) {
                 </div>
                 ${m.reason ? `<div class="text-[10px] text-tg-textSecondary/80 truncate mt-0.5">${escapeHtml(m.reason)}</div>` : ''}
             </div>
-            <a href="${escapeHtml(fileUrl)}" target="_blank" rel="noopener"
-               class="opacity-0 group-hover:opacity-100 text-xs px-2 py-1 rounded-md border border-tg-border text-tg-textSecondary hover:text-tg-blue hover:border-tg-blue transition-opacity shrink-0"
-               title="${escapeHtml(i18nT('maintenance.similar.view', 'Open'))}"
-               onclick="event.stopPropagation()">
-                <i class="ri-external-link-line"></i>
-            </a>
-        </label>`;
+        </div>`;
 }
 
 function _renderGroup(g) {
@@ -285,7 +344,7 @@ function _renderGroup(g) {
                 </button>
             </div>
             <div class="space-y-1">
-                ${(g.members || []).map(_renderRow).join('')}
+                ${(g.members || []).map((m) => _renderRow(m, g.id)).join('')}
             </div>
         </div>`;
 }
@@ -333,8 +392,11 @@ function _restorePartialFlag() {
     const el = $('sim-partial-check');
     if (!el) return;
     try {
-        el.checked = localStorage.getItem(PARTIAL_LS) === '1';
-    } catch {}
+        const stored = localStorage.getItem(PARTIAL_LS);
+        el.checked = stored !== '0';
+    } catch {
+        el.checked = true;
+    }
 }
 
 async function _startScan() {
@@ -367,6 +429,12 @@ async function _stopScan() {
     }
 }
 
+function _analyzeProgressFrom(snapshot, extra = {}) {
+    const snap = snapshot && typeof snapshot === 'object' ? snapshot : {};
+    const nested = snap.progress && typeof snap.progress === 'object' ? snap.progress : {};
+    return { stage: snap.stage || 'starting', ...nested, ...extra };
+}
+
 async function _startAnalyze() {
     try {
         const r = await api.post('/api/maintenance/similar/analyze', {
@@ -375,14 +443,18 @@ async function _startAnalyze() {
         if (r?.started || r?.code === 'ALREADY_RUNNING') {
             _analyzeRunning = true;
             _setBusyButtons();
-            _setProgress('sim-analyze', true, r?.snapshot?.progress || {});
-            showToast(i18nT('maintenance.similar.analyze_started', 'Analyze started'));
+            _setProgress('sim-analyze', true, _analyzeProgressFrom(r?.snapshot));
+            showToast(i18nT('maintenance.similar.analyze_started', 'Checking for new videos…'));
         }
     } catch (e) {
         if (e?.data?.code === 'ALREADY_RUNNING') {
             _analyzeRunning = true;
             _setBusyButtons();
-            _setProgress('sim-analyze', true, e.data?.snapshot?.analyze?.progress || e.data?.snapshot?.progress || {});
+            _setProgress(
+                'sim-analyze',
+                true,
+                _analyzeProgressFrom(e.data?.snapshot?.analyze || e.data?.snapshot),
+            );
             showToast(i18nT('maintenance.similar.already_running', 'Already running'));
             return;
         }
@@ -488,6 +560,45 @@ async function _purgeRecords() {
     }
 }
 
+async function _purgeAnalyzeRecords() {
+    $('sim-more-menu')?.removeAttribute('open');
+    const ok = await confirmSheet({
+        title: i18nT('maintenance.similar.purge_analyze_confirm_title', 'Purge Analyze records?'),
+        message: i18nT(
+            'maintenance.similar.purge_analyze_confirm_body',
+            'This wipes similar/partial groups and Analyze resume cursors. Fingerprints stay. Ignored pairs stay. Next Analyze rebuilds groups from existing hashes.',
+        ),
+        confirmLabel: i18nT('maintenance.similar.purge_analyze_confirm_btn', 'Purge Analyze'),
+        danger: true,
+    });
+    if (!ok) return;
+    try {
+        const r = await api.post('/api/maintenance/similar/analyze/purge', {});
+        if (!r?.success) throw new Error(r?.error || 'purge failed');
+        showToast(
+            i18nT(
+                'maintenance.similar.purge_analyze_done',
+                'Analyze records purged — run Analyze to rebuild groups',
+            ),
+            'success',
+        );
+        await Promise.all([_refreshGroups(), _refreshStats()]);
+    } catch (e) {
+        if (e?.status === 409 || e?.data?.code === 'ALREADY_RUNNING') {
+            showToast(
+                i18nT(
+                    'maintenance.similar.purge_busy',
+                    'Scan or Analyze is running. Cancel it first.',
+                ),
+                'error',
+            );
+            return;
+        }
+        const msg = e?.data?.error || e?.message || 'unknown';
+        showToast(`${i18nT('maintenance.similar.purge_failed', 'Purge failed')}: ${msg}`, 'error');
+    }
+}
+
 function _onScanProgress(m) {
     _scanRunning = true;
     _setBusyButtons();
@@ -520,7 +631,7 @@ async function _onScanDone(m) {
 function _onAnalyzeProgress(m) {
     _analyzeRunning = true;
     _setBusyButtons();
-    _setProgress('sim-analyze', true, m);
+    _setProgress('sim-analyze', true, _analyzeProgressFrom(m));
 }
 
 async function _onAnalyzeDone(m) {
@@ -534,6 +645,19 @@ async function _onAnalyzeDone(m) {
     }
     if (m?.cancelled) {
         showToast(i18nT('maintenance.similar.cancelled', 'Cancelled'));
+        return;
+    }
+    if (
+        m?.upToDate ||
+        (!(m?.similarGroups || 0) &&
+            !(m?.partialGroups || 0) &&
+            !(m?.partialReviewGroups || 0) &&
+            !(m?.comparedPairs || 0))
+    ) {
+        showToast(
+            i18nT('maintenance.similar.analyze_up_to_date', 'Analyze up to date — no new videos'),
+            'success',
+        );
         return;
     }
     showToast(
@@ -588,6 +712,7 @@ function _wirePage() {
     $('sim-analyze-stop-btn')?.addEventListener('click', _stopAnalyze);
     $('sim-delete-btn')?.addEventListener('click', _deleteSelected);
     $('sim-purge-btn')?.addEventListener('click', _purgeRecords);
+    $('sim-purge-analyze-btn')?.addEventListener('click', _purgeAnalyzeRecords);
     $('sim-partial-check')?.addEventListener('change', _persistPartialFlag);
     document.querySelectorAll('[data-sim-kind]').forEach((btn) => {
         btn.addEventListener('click', () => _setKindFilter(btn.dataset.simKind || ''));
@@ -605,6 +730,13 @@ function _wirePage() {
             _refreshSummary();
         });
         list.addEventListener('click', (e) => {
+            const openEl = e.target.closest('[data-open-player]');
+            if (openEl) {
+                e.preventDefault();
+                e.stopPropagation();
+                _openMemberInPlayer(openEl);
+                return;
+            }
             const btn = e.target.closest('[data-ignore]');
             if (btn) _ignorePair(btn);
         });

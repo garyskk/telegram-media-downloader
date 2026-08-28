@@ -138,6 +138,7 @@ export function createJobTracker({ kind, broadcast, log, eventPrefix } = {}) {
         // contract. Errors are captured into state, never thrown out here.
         (async () => {
             try {
+                let logFirstProgress = true;
                 const onProgress = (p) => {
                     if (!_running) return; // post-cancel suppress
                     const merged = p && typeof p === 'object' ? p : {};
@@ -153,7 +154,8 @@ export function createJobTracker({ kind, broadcast, log, eventPrefix } = {}) {
                         ...merged, // expose flat fields for legacy WS subs
                     });
                     const now = Date.now();
-                    if (now - _lastProgressLogAt > PROGRESS_LOG_INTERVAL_MS) {
+                    if (logFirstProgress || now - _lastProgressLogAt > PROGRESS_LOG_INTERVAL_MS) {
+                        logFirstProgress = false;
                         _lastProgressLogAt = now;
                         const desc = _shortProgress(merged);
                         _safeLog({

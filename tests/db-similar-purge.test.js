@@ -132,6 +132,77 @@ describe('purgeSimilarClipsRecords', () => {
     });
 });
 
+describe('purgeSimilarAnalyzeRecords', () => {
+    it('wipes groups and analyze cursors but keeps fingerprints and ignores', () => {
+        const keep = seedVideo('an-keep');
+        const gone = seedVideo('an-gone');
+        api.upsertVideoFingerprint({
+            downloadId: keep,
+            durationSec: 8,
+            aggregateHash: 'aaaaaaaaaaaaaaaa',
+            frameCount: 2,
+            algo: 'pdq-scene-v1',
+            fileHash: 'an-keep',
+        });
+        api.replaceVideoFrameHashes(keep, [
+            { tSec: 0, phash: '1111111111111111' },
+            { tSec: 1, phash: '2222222222222222' },
+        ]);
+        api.insertSimilarGroup({
+            kind: 'similar',
+            confidence: 0.9,
+            members: [
+                { downloadId: keep, role: 'keep' },
+                { downloadId: gone, role: 'remove' },
+            ],
+        });
+        api.insertSimilarGroup({
+            kind: 'partial',
+            confidence: 0.6,
+            offsetSec: 2,
+            members: [
+                { downloadId: keep, role: 'keep' },
+                { downloadId: gone, role: 'remove' },
+            ],
+        });
+        api.addSimilarIgnore({ aId: keep, bId: gone, kind: 'similar', note: 'keep-me' });
+        api.upsertSimilarPartialScan({ downloadId: gone, frameCount: 4, scannedAt: 99 });
+        api.upsertSimilarVideoScan({
+            downloadId: keep,
+            fileHash: 'an-keep',
+            frameCount: 2,
+            algo: 'pdq-scene-v1',
+            configKey: 'pdq-scene-v1|50|0.1|120|cov0.7',
+            scannedAt: 50,
+        });
+        api.kvSet('similar_last_scan', { finishedAt: 1, generated: 2 });
+        api.kvSet('similar_last_analyze', { finishedAt: 2, similarGroups: 1 });
+        api.kvSet('pending_job_similarAnalyze', { startedAt: 4 });
+
+        const r = api.purgeSimilarAnalyzeRecords();
+        expect(r).toEqual({ groups: 2, videoScans: 1, partialScans: 1 });
+
+        expect(api.getVideoFingerprint(keep)).toBeTruthy();
+        expect(api.getVideoFrameHashes(keep)).toHaveLength(2);
+        expect(api.listSimilarGroups()).toEqual([]);
+        expect(api.getSimilarPartialScan(gone)).toBeNull();
+        expect(api.listSimilarVideoScans()).toEqual([]);
+        expect(api.kvGet('similar_last_analyze')).toBeNull();
+        expect(api.kvGet('pending_job_similarAnalyze')).toBeNull();
+        expect(api.kvGet('similar_last_scan')).toEqual({ finishedAt: 1, generated: 2 });
+        expect(api.listSimilarIgnores().some((r) => r.note === 'keep-me')).toBe(true);
+        expect(api.isSimilarPairIgnored(keep, gone, 'similar')).toBe(true);
+    });
+
+    it('returns zeros when there is nothing to wipe', () => {
+        expect(api.purgeSimilarAnalyzeRecords()).toEqual({
+            groups: 0,
+            videoScans: 0,
+            partialScans: 0,
+        });
+    });
+});
+
 describe('unlinkLeftoverFingerprintRaws', () => {
     it('unlinks only leftover {id}.fp.raw files, not hover WebP/JSON', async () => {
         const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tgdl-fp-raw-'));

@@ -44,6 +44,11 @@ afterAll(() => {
 
 afterEach(() => {
     delete process.env.TGDL_SIMILAR_THRESHOLD;
+    db.prepare('DELETE FROM similar_groups').run();
+    db.prepare('DELETE FROM similar_ignores').run();
+    db.prepare('DELETE FROM similar_video_scans').run();
+    db.prepare('DELETE FROM similar_partial_scans').run();
+    db.prepare('DELETE FROM downloads').run();
 });
 
 function flipBits(hex, n) {
@@ -169,6 +174,28 @@ describe('findSimilarVideoGroups', () => {
         expect(groups).toHaveLength(0);
     });
 
+    it('compares each video only to earlier ids', async () => {
+        const hashes = [HASH_A, HASH_A, HASH_A];
+        const v1 = video({ id: 1, durationSec: 10, fileHash: 'a', fileSize: 3, hashes });
+        const v2 = video({ id: 2, durationSec: 10, fileHash: 'b', fileSize: 2, hashes });
+        const v3 = video({ id: 3, durationSec: 10, fileHash: 'c', fileSize: 1, hashes });
+        const framesById = new Map([
+            [1, framesOf(hashes)],
+            [2, framesOf(hashes)],
+            [3, framesOf(hashes)],
+        ]);
+        const all = await findSimilarVideoGroups([v1, v2, v3], { ...opts, framesById });
+        expect(all.comparedPairs).toBe(3);
+        expect(all.groups).toHaveLength(3);
+        const resume = await findSimilarVideoGroups([v1, v2, v3], {
+            ...opts,
+            framesById,
+            skipLeftIds: [1, 2],
+        });
+        expect(resume.comparedPairs).toBe(2);
+        expect(resume.groups).toHaveLength(2);
+    });
+
     it('does not compare videos more than one duration bucket apart', async () => {
         const hashes = [HASH_A, HASH_A];
         const { groups } = await findSimilarVideoGroups(
@@ -269,21 +296,13 @@ function seedFingerprint(id, { durationSec, fileHash, hashes }) {
 }
 
 describe('analyzeSimilarClips', () => {
-    it('persists similar groups and replaces previous similar rows, not partial', async () => {
+    it('persists similar groups without dropping partial rows', async () => {
         const hashes = [HASH_A, HASH_A, HASH_A];
         const keep = seedVideo({ fileHash: 'sha-keep', fileSize: 5000 });
         const remove = seedVideo({ fileHash: 'sha-rm', fileSize: 800 });
         seedFingerprint(keep, { durationSec: 8, fileHash: 'sha-keep', hashes });
         seedFingerprint(remove, { durationSec: 8.2, fileHash: 'sha-rm', hashes });
 
-        const staleSimilar = api.insertSimilarGroup({
-            kind: 'similar',
-            confidence: 0.1,
-            members: [
-                { downloadId: keep, role: 'keep' },
-                { downloadId: remove, role: 'remove' },
-            ],
-        });
         const partialId = api.insertSimilarGroup({
             kind: 'partial',
             confidence: 0.5,
@@ -300,7 +319,6 @@ describe('analyzeSimilarClips', () => {
         expect(result.partialSkipped).toBe(true);
 
         const groups = api.listSimilarGroups();
-        expect(groups.some((g) => g.id === staleSimilar)).toBe(false);
         expect(groups.some((g) => g.id === partialId && g.kind === 'partial')).toBe(true);
         const fresh = groups.filter((g) => g.kind === 'similar');
         expect(fresh).toHaveLength(1);
@@ -308,6 +326,59 @@ describe('analyzeSimilarClips', () => {
         expect(roles.keep).toBe(keep);
         expect(roles.remove).toBe(remove);
         expect(fresh[0].members.find((m) => m.role === 'keep').file_size).toBe(5000);
+    });
+
+    it('only compares a newly fingerprinted video to earlier ones', async () => {
+        const hashes = [HASH_A, HASH_A, HASH_A];
+        const a = seedVideo({ fileHash: 'inc-a', fileSize: 3000 });
+        const b = seedVideo({ fileHash: 'inc-b', fileSize: 2000 });
+        seedFingerprint(a, { durationSec: 8, fileHash: 'inc-a', hashes });
+        seedFingerprint(b, { durationSec: 8, fileHash: 'inc-b', hashes });
+        const first = await analyzeSimilarClips();
+        expect(first.similarGroups).toBe(1);
+        expect(first.comparedPairs).toBe(1);
+
+        const again = await analyzeSimilarClips();
+        expect(again.similarGroups).toBe(0);
+        expect(again.comparedPairs).toBe(0);
+        expect(api.listSimilarGroups({ kind: 'similar' })).toHaveLength(1);
+
+        const c = seedVideo({ fileHash: 'inc-c', fileSize: 1000 });
+        seedFingerprint(c, { durationSec: 8, fileHash: 'inc-c', hashes });
+        const third = await analyzeSimilarClips();
+        expect(third.comparedPairs).toBe(2);
+        expect(third.similarGroups).toBe(2);
+        expect(api.listSimilarGroups({ kind: 'similar' })).toHaveLength(3);
+    });
+
+    it('reports skipped videos and stays up to date when nothing is new', async () => {
+        const hashes = [HASH_A, HASH_A, HASH_A];
+        const a = seedVideo({ fileHash: 'utd-a', fileSize: 3000 });
+        const b = seedVideo({ fileHash: 'utd-b', fileSize: 2000 });
+        seedFingerprint(a, { durationSec: 8, fileHash: 'utd-a', hashes });
+        seedFingerprint(b, { durationSec: 8, fileHash: 'utd-b', hashes });
+        await analyzeSimilarClips();
+        const progress = [];
+        const again = await analyzeSimilarClips({
+            onProgress: (p) => progress.push({ ...p }),
+        });
+        expect(again.comparedPairs).toBe(0);
+        expect(again.similarGroups).toBe(0);
+        expect(again.upToDate).toBe(true);
+        expect(again.skipped).toBeGreaterThanOrEqual(2);
+        expect(progress.some((p) => Number(p.skipped) >= 2 && Number(p.total) === 0)).toBe(true);
+    });
+
+    it('emits matching 0/N before the first pair compare', async () => {
+        const hashes = [HASH_A, HASH_A, HASH_A];
+        const a = seedVideo({ fileHash: 'tick-a', fileSize: 3000 });
+        const b = seedVideo({ fileHash: 'tick-b', fileSize: 2000 });
+        seedFingerprint(a, { durationSec: 8, fileHash: 'tick-a', hashes });
+        seedFingerprint(b, { durationSec: 8, fileHash: 'tick-b', hashes });
+        const progress = [];
+        await analyzeSimilarClips({ onProgress: (p) => progress.push({ ...p }) });
+        const first = progress.find((p) => p.stage === 'matching');
+        expect(first).toMatchObject({ processed: 0, total: 2, comparedPairs: 0 });
     });
 
     it('honours similar_ignores and skips exact SHA-256 pairs', async () => {

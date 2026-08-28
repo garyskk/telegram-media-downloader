@@ -2263,7 +2263,7 @@
                                     <i class="ri-stop-circle-line"></i><span data-i18n="maintenance.similar.stop">Stop</span>
                                 </button>
                                 <button id="sim-analyze-btn" type="button" class="tg-btn text-xs px-3 py-1.5 inline-flex items-center gap-1.5"
-                                        title="Group similar videos (and optional partial clips).">
+                                        title="Group similar videos and partial clips.">
                                     <i class="ri-search-line"></i><span data-i18n="maintenance.similar.analyze">Analyze</span>
                                 </button>
                                 <details id="sim-more-menu" class="relative">
@@ -2272,6 +2272,11 @@
                                         <i class="ri-more-2-fill"></i>
                                     </summary>
                                     <div class="absolute right-0 top-full mt-1 z-30 w-56 bg-tg-panel border border-tg-border rounded-lg shadow-xl py-1" role="menu">
+                                        <button id="sim-purge-analyze-btn" type="button" class="w-full text-left px-3 py-2 text-xs text-tg-text hover:bg-tg-bg/40 inline-flex items-center gap-2"
+                                                data-i18n-title="maintenance.similar.purge_analyze_tooltip"
+                                                title="Wipe similar/partial groups and Analyze resume cursors. Fingerprints stay. Next Analyze rebuilds groups.">
+                                            <i class="ri-eraser-line text-yellow-300"></i><span data-i18n="maintenance.similar.purge_analyze">Purge Analyze</span>
+                                        </button>
                                         <button id="sim-purge-btn" type="button" class="w-full text-left px-3 py-2 text-xs text-tg-text hover:bg-tg-bg/40 inline-flex items-center gap-2"
                                                 data-i18n-title="maintenance.similar.purge_tooltip"
                                                 title="Wipe fingerprints, similar/partial groups, and resume cursors. Hover sprites and ignored pairs stay. Next Scan regenerates hashes.">
@@ -2282,7 +2287,7 @@
                             </div>
                         </div>
                         <label class="mt-3 inline-flex items-center gap-2 text-xs text-tg-text cursor-pointer">
-                            <input id="sim-partial-check" type="checkbox" class="shrink-0">
+                            <input id="sim-partial-check" type="checkbox" class="shrink-0" checked>
                             <span data-i18n="maintenance.similar.check_partial">Also find shorter clips inside longer videos</span>
                         </label>
 
@@ -2364,7 +2369,7 @@
                                 </div>
                                 <div>
                                     <label for="setting-adv-similarClips-partialFrameThreshold" class="text-tg-text text-xs block mb-1" data-i18n="maintenance.similar.settings.partial_frame">Frame Hamming</label>
-                                    <input id="setting-adv-similarClips-partialFrameThreshold" type="number" min="0" max="128" step="1" class="tg-input w-full text-sm" value="70">
+                                    <input id="setting-adv-similarClips-partialFrameThreshold" type="number" min="0" max="128" step="1" class="tg-input w-full text-sm" value="90">
                                 </div>
                                 <div>
                                     <label for="setting-adv-similarClips-partialShortClipSec" class="text-tg-text text-xs block mb-1" data-i18n="maintenance.similar.settings.short_sec">Short clip (s)</label>

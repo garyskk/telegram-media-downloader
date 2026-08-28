@@ -89,8 +89,8 @@ export function zipRawFramesWithPts(buf, pts, tilePx = PDQ_TILE_PX) {
     const frameSize = px * px * 3;
     const times = Array.isArray(pts) ? pts : [];
     if (!buf?.length || frameSize <= 0 || !times.length) return [];
-    const n = Math.floor(buf.length / frameSize);
-    if (n !== times.length) return [];
+    const n = Math.min(Math.floor(buf.length / frameSize), times.length);
+    if (n <= 0) return [];
     const frames = [];
     for (let i = 0; i < n; i++) {
         const slice = buf.subarray(i * frameSize, (i + 1) * frameSize);
@@ -148,6 +148,7 @@ function _runFingerprintFfmpeg(srcAbs, args, { timeoutMs, signal, maxBytes } = {
         let stdoutBytes = 0;
         let timedOut = false;
         let aborted = false;
+        let capped = false;
         const onAbort = () => {
             aborted = true;
             try {
@@ -175,8 +176,12 @@ function _runFingerprintFfmpeg(srcAbs, args, { timeoutMs, signal, maxBytes } = {
                   }, timeoutMs)
                 : null;
         proc.stdout.on('data', (c) => {
-            stdoutBytes += c.length;
-            if (Number.isFinite(maxBytes) && stdoutBytes > maxBytes) {
+            if (capped) return;
+            if (Number.isFinite(maxBytes) && stdoutBytes + c.length > maxBytes) {
+                const keep = Math.max(0, maxBytes - stdoutBytes);
+                if (keep > 0) stdoutChunks.push(c.subarray(0, keep));
+                stdoutBytes += keep;
+                capped = true;
                 try {
                     proc.kill('SIGKILL');
                 } catch {
@@ -184,6 +189,7 @@ function _runFingerprintFfmpeg(srcAbs, args, { timeoutMs, signal, maxBytes } = {
                 }
                 return;
             }
+            stdoutBytes += c.length;
             stdoutChunks.push(c);
         });
         proc.stderr.on('data', (c) => stderrChunks.push(c));
@@ -197,19 +203,19 @@ function _runFingerprintFfmpeg(srcAbs, args, { timeoutMs, signal, maxBytes } = {
             signal?.removeEventListener?.('abort', onAbort);
             const stderr = Buffer.concat(stderrChunks).toString('utf8');
             const stdout = Buffer.concat(stdoutChunks);
-            if (aborted) {
+            if (aborted && !capped) {
                 reject(Object.assign(new Error('aborted'), { aborted: true }));
                 return;
             }
-            if (timedOut) {
+            if (timedOut && !capped) {
                 reject(new Error(`ffmpeg timeout ${Math.round((timeoutMs || 0) / 1000)}s`));
                 return;
             }
-            if (code !== 0) {
+            if (!capped && code !== 0 && code != null) {
                 reject(new Error(`ffmpeg: exit ${code} (stderr: ${stderr.slice(-400)})`));
                 return;
             }
-            resolve({ stdout, stderr });
+            resolve({ stdout, stderr, capped });
         });
     });
 }

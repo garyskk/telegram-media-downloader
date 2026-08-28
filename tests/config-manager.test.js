@@ -65,6 +65,7 @@ describe('config manager (kv-backed)', () => {
         expect(cfg.advanced.downloader.maxConcurrency).toBe(20);
         expect(cfg.advanced.history.shortBreakEveryN).toBe(100);
         expect(cfg.advanced.similarClips.similarThreshold).toBe(50);
+        expect(cfg.advanced.similarClips.partialFrameThreshold).toBe(90);
         expect(cfg.advanced.similarClips.sceneThreshold).toBe(0.1);
         expect(cfg.advanced.similarClips.fingerprintFps).toBeUndefined();
         expect(cfg.rescue.retentionHours).toBe(48);
@@ -89,6 +90,19 @@ describe('config manager (kv-backed)', () => {
         expect(cfg.advanced.similarClips.fingerprintFps).toBeUndefined();
         expect(cfg.advanced.similarClips.sceneThreshold).toBe(0.1);
         expect(cfg.advanced.similarClips.floorIntervalSec).toBe(3);
+    });
+
+    it('rewrites leftover partial Frame Hamming 70 to 90', () => {
+        dbApi.kvSet('config', {
+            advanced: {
+                similarClips: {
+                    similarThreshold: 50,
+                    partialFrameThreshold: 70,
+                },
+            },
+        });
+        const cfg = manager.loadConfig();
+        expect(cfg.advanced.similarClips.partialFrameThreshold).toBe(90);
     });
 
     it('self-heals (writes back) when merge surfaced new keys', () => {

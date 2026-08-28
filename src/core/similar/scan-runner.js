@@ -66,8 +66,14 @@ export async function scanSimilarClips({ onProgress, signal } = {}) {
             const meta = await generateFingerprintForDownload(row, { signal });
             if (meta && !meta.skipped) generated++;
             else skipped++;
-        } catch {
+        } catch (e) {
             errored++;
+            console.warn(
+                '[similar-scan] fingerprint failed',
+                row.id,
+                row.file_name || row.file_path,
+                String(e?.message || e),
+            );
         }
         processed++;
     };

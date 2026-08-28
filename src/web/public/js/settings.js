@@ -1037,7 +1037,7 @@ export function loadAdvanced(config) {
     _setIfFloat('setting-adv-similarClips-sceneThreshold', sc.sceneThreshold, 0.1);
     _setIfFloat('setting-adv-similarClips-floorIntervalSec', sc.floorIntervalSec, 3);
     _setIfFloat('setting-adv-similarClips-partialMatchRatio', sc.partialMatchRatio, 0.5);
-    _setIfNum('setting-adv-similarClips-partialFrameThreshold', sc.partialFrameThreshold, 70);
+    _setIfNum('setting-adv-similarClips-partialFrameThreshold', sc.partialFrameThreshold, 90);
     _setIfNum('setting-adv-similarClips-partialShortClipSec', sc.partialShortClipSec, 300);
     _setIfFloat('setting-adv-similarClips-partialShortMatchRatio', sc.partialShortMatchRatio, 0.35);
     _setIfFloat('setting-adv-similarClips-partialReviewMatchRatio', sc.partialReviewMatchRatio, 0.1);
@@ -1551,7 +1551,7 @@ function _gatherScopedPayload(page) {
                     partialMatchRatio: flt('setting-adv-similarClips-partialMatchRatio', 0.5),
                     partialFrameThreshold: num(
                         'setting-adv-similarClips-partialFrameThreshold',
-                        70,
+                        90,
                     ),
                     partialShortClipSec: num('setting-adv-similarClips-partialShortClipSec', 300),
                     partialShortMatchRatio: flt(

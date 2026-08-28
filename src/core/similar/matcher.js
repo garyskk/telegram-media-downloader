@@ -11,7 +11,6 @@
 import { hammingHex } from '../phash.js';
 import { alignHashSequences } from './align.js';
 
-const YIELD_EVERY_PAIRS = 200;
 const AGGREGATE_GATE_MIN = 64;
 const DEFAULT_MIN_COVERAGE = 0.7;
 
@@ -61,8 +60,10 @@ function _pickKeep(left, right) {
 }
 
 /**
- * Pairwise similar-video groups. `ignoredPairs` is `"minId:maxId"` strings.
- * `framesById` maps download id → `{ tSec, phash }[]` sorted by tSec.
+ * Pairwise similar-video groups. Each video is compared only to
+ * earlier ids (2 vs 1, 3 vs 1–2, …). `skipLeftIds` resumes by not
+ * re-comparing videos that already finished that pass.
+ * `ignoredPairs` / `existingPairKeys` are `"minId:maxId"` strings.
  */
 export async function findSimilarVideoGroups(videos, opts = {}) {
     const threshold = Number(opts.threshold);
@@ -77,7 +78,12 @@ export async function findSimilarVideoGroups(videos, opts = {}) {
     const signal = opts.signal;
     const onProgress = opts.onProgress;
 
-    const list = (Array.isArray(videos) ? videos : []).filter((v) => v && v.id != null);
+    const list = (Array.isArray(videos) ? videos : [])
+        .filter((v) => v && v.id != null)
+        .sort((a, b) => Number(a.id) - Number(b.id) || 0);
+    const skipLeft = new Set([...(opts.skipLeftIds || [])].map(Number));
+    const existingPairs = new Set(opts.existingPairKeys || []);
+    const onLeftComplete = opts.onLeftComplete;
     const buckets = new Map();
     for (const v of list) {
         const b = durationBucket(v.durationSec, durationBucketSec);
@@ -88,8 +94,21 @@ export async function findSimilarVideoGroups(videos, opts = {}) {
     const groups = [];
     let comparedPairs = 0;
     let processed = 0;
+    const pending = list.filter((v) => !skipLeft.has(Number(v.id)));
+    try {
+        onProgress?.({
+            stage: 'matching',
+            processed: 0,
+            total: pending.length,
+            skipped: skipLeft.size,
+            comparedPairs: 0,
+            groups: 0,
+        });
+    } catch {
+        /* progress must not abort matching */
+    }
 
-    for (const left of list) {
+    for (const left of pending) {
         if (signal?.aborted) {
             return { groups, comparedPairs, cancelled: true };
         }
@@ -99,17 +118,16 @@ export async function findSimilarVideoGroups(videos, opts = {}) {
             ...(buckets.get(b0) || []),
             ...(buckets.get(b0 + 1) || []),
         ];
+        const newGroups = [];
         for (const right of neighbors) {
-            if (Number(right.id) <= Number(left.id)) continue;
+            if (Number(right.id) >= Number(left.id)) continue;
             const key = similarPairKey(left.id, right.id);
-            if (ignored.has(key)) continue;
+            if (ignored.has(key) || existingPairs.has(key)) continue;
             comparedPairs++;
-            if (comparedPairs % YIELD_EVERY_PAIRS === 0) {
-                if (signal?.aborted) {
-                    return { groups, comparedPairs, cancelled: true };
-                }
-                await new Promise((r) => setImmediate(r));
+            if (signal?.aborted) {
+                return { groups, comparedPairs, cancelled: true };
             }
+            await new Promise((r) => setImmediate(r));
 
             const hashA = left.fileHash;
             const hashB = right.fileHash;
@@ -130,7 +148,13 @@ export async function findSimilarVideoGroups(videos, opts = {}) {
                 continue;
             }
 
-            const aligned = alignHashSequences(framesA, framesB, { matchHamming: maxHamming });
+            const aligned = await alignHashSequences(framesA, framesB, {
+                matchHamming: maxHamming,
+                signal,
+            });
+            if (aligned.cancelled || signal?.aborted) {
+                return { groups, comparedPairs, cancelled: true };
+            }
             if (aligned.coverageA < minCoverage || aligned.coverageB < minCoverage) continue;
             const mean = aligned.meanHamming;
             if (!Number.isFinite(mean) || mean > maxHamming) continue;
@@ -138,7 +162,7 @@ export async function findSimilarVideoGroups(videos, opts = {}) {
             const keep = _pickKeep(left, right);
             const remove = keep === left ? right : left;
             const bits = _hashBits(framesA || framesB);
-            groups.push({
+            const group = {
                 kind: 'similar',
                 confidence: Math.max(0, 1 - mean / bits),
                 meanHamming: mean,
@@ -154,14 +178,23 @@ export async function findSimilarVideoGroups(videos, opts = {}) {
                         reason: `similar video; mean hamming ${mean.toFixed(2)}; smaller file (${Number(remove.fileSize) || 0} bytes)`,
                     },
                 ],
-            });
+            };
+            newGroups.push(group);
+            groups.push(group);
+            existingPairs.add(key);
         }
         processed++;
+        try {
+            await onLeftComplete?.(left, newGroups);
+        } catch {
+            /* persist must not abort matching */
+        }
         try {
             onProgress?.({
                 stage: 'matching',
                 processed,
-                total: list.length,
+                total: pending.length,
+                skipped: skipLeft.size,
                 comparedPairs,
                 groups: groups.length,
             });

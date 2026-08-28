@@ -571,6 +571,16 @@ function initSchema() {
             scanned_at  INTEGER NOT NULL,
             FOREIGN KEY (download_id) REFERENCES downloads(id) ON DELETE CASCADE
         );
+
+        CREATE TABLE IF NOT EXISTS similar_video_scans (
+            download_id INTEGER PRIMARY KEY,
+            file_hash   TEXT,
+            frame_count INTEGER NOT NULL,
+            algo        TEXT    NOT NULL,
+            config_key  TEXT    NOT NULL,
+            scanned_at  INTEGER NOT NULL,
+            FOREIGN KEY (download_id) REFERENCES downloads(id) ON DELETE CASCADE
+        );
     `);
 
     // Smoke-test every column the rest of the code path depends on. The
@@ -1958,10 +1968,11 @@ export function purgeSoftDeletedArtifacts() {
             )`,
         ).run();
         db.prepare(
-            `DELETE FROM similar_groups WHERE id NOT IN (
-                SELECT DISTINCT group_id FROM similar_group_members
+            `DELETE FROM similar_video_scans WHERE download_id IN (
+                SELECT id FROM downloads WHERE user_deleted = 1
             )`,
         ).run();
+        _pruneIncompleteSimilarGroups(db);
         const backupJobs = db
             .prepare(
                 `UPDATE backup_jobs
@@ -2062,11 +2073,8 @@ function _purgeArtifactsForDownloadIds(db, ids) {
             `DELETE FROM similar_ignores WHERE a_id IN (${ph}) OR b_id IN (${ph})`,
         ).run(...slice, ...slice);
         db.prepare(`DELETE FROM similar_partial_scans WHERE download_id IN (${ph})`).run(...slice);
-        db.prepare(
-            `DELETE FROM similar_groups WHERE id NOT IN (
-                SELECT DISTINCT group_id FROM similar_group_members
-            )`,
-        ).run();
+        db.prepare(`DELETE FROM similar_video_scans WHERE download_id IN (${ph})`).run(...slice);
+        _pruneIncompleteSimilarGroups(db);
         db.prepare(
             `UPDATE backup_jobs
                 SET status = 'failed',
@@ -5584,6 +5592,7 @@ export function listFingerprintsForAnalyze() {
                     vf.duration_sec,
                     vf.aggregate_hash,
                     vf.frame_count,
+                    vf.algo,
                     d.file_hash,
                     d.file_size,
                     d.file_name
@@ -5610,16 +5619,17 @@ export function getVideoFrameHashesForIds(ids) {
     for (let i = 0; i < list.length; i += _SQL_IN_CHUNK) {
         const slice = list.slice(i, i + _SQL_IN_CHUNK);
         const ph = slice.map(() => '?').join(',');
-        out.push(
-            ...db
-                .prepare(
-                    `SELECT download_id, t_sec, phash
-                       FROM video_frame_hashes
-                      WHERE download_id IN (${ph})
-                      ORDER BY download_id, t_sec`,
-                )
-                .all(...slice),
-        );
+        const rows = db
+            .prepare(
+                `SELECT download_id, t_sec, phash
+                   FROM video_frame_hashes
+                  WHERE download_id IN (${ph})
+                  ORDER BY download_id, t_sec`,
+            )
+            .all(...slice);
+        // Do not `out.push(...rows)` — a 500-id chunk can be tens of
+        // thousands of frames and overflows the call stack.
+        for (let r = 0; r < rows.length; r++) out.push(rows[r]);
     }
     return out;
 }
@@ -5651,6 +5661,25 @@ export function insertSimilarGroup({ kind, confidence, offsetSec, members, creat
         }
         return groupId;
     })();
+}
+
+function _pruneIncompleteSimilarGroups(db) {
+    const ids = db
+        .prepare(
+            `SELECT g.id AS id
+               FROM similar_groups g
+               LEFT JOIN similar_group_members m ON m.group_id = g.id
+               LEFT JOIN downloads d
+                 ON d.id = m.download_id
+                AND (d.user_deleted IS NULL OR d.user_deleted = 0)
+              GROUP BY g.id
+             HAVING COUNT(d.id) < 2`,
+        )
+        .all()
+        .map((r) => Number(r.id));
+    if (!ids.length) return 0;
+    const ph = ids.map(() => '?').join(',');
+    return db.prepare(`DELETE FROM similar_groups WHERE id IN (${ph})`).run(...ids).changes;
 }
 
 export function listSimilarGroupMembers(groupId) {
@@ -5705,6 +5734,7 @@ export function deleteSimilarGroupsByKind(kind) {
 
 export function listSimilarGroups({ kind } = {}) {
     const db = getDb();
+    _pruneIncompleteSimilarGroups(db);
     const groups = kind
         ? !_SIMILAR_KINDS.has(kind)
             ? []
@@ -5718,13 +5748,16 @@ export function listSimilarGroups({ kind } = {}) {
            JOIN downloads d ON d.id = m.download_id
            LEFT JOIN video_fingerprints vf ON vf.download_id = d.id
           WHERE m.group_id = ?
+            AND (d.user_deleted IS NULL OR d.user_deleted = 0)
           ORDER BY CASE m.role WHEN 'keep' THEN 0 WHEN 'remove' THEN 1 ELSE 2 END,
                    m.download_id`,
     );
-    return groups.map((g) => ({
-        ...g,
-        members: membersStmt.all(g.id),
-    }));
+    return groups
+        .map((g) => ({
+            ...g,
+            members: membersStmt.all(g.id),
+        }))
+        .filter((g) => (g.members || []).length >= 2);
 }
 
 export function isSimilarPairIgnored(aId, bId, kind) {
@@ -5772,6 +5805,60 @@ export function listSimilarPartialScans() {
         .all();
 }
 
+export function upsertSimilarVideoScan({
+    downloadId,
+    fileHash,
+    frameCount,
+    algo,
+    configKey,
+    scannedAt,
+} = {}) {
+    return getDb()
+        .prepare(
+            `INSERT INTO similar_video_scans
+                (download_id, file_hash, frame_count, algo, config_key, scanned_at)
+             VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT(download_id) DO UPDATE SET
+                file_hash   = excluded.file_hash,
+                frame_count = excluded.frame_count,
+                algo        = excluded.algo,
+                config_key  = excluded.config_key,
+                scanned_at  = excluded.scanned_at`,
+        )
+        .run(
+            Number(downloadId),
+            fileHash == null ? null : String(fileHash),
+            Math.max(0, Number(frameCount) || 0),
+            String(algo || 'pdq-scene-v1'),
+            String(configKey || ''),
+            Math.floor(scannedAt || Date.now()),
+        ).changes;
+}
+
+export function listSimilarVideoScans() {
+    return getDb()
+        .prepare(
+            `SELECT download_id, file_hash, frame_count, algo, config_key, scanned_at
+               FROM similar_video_scans
+              ORDER BY download_id`,
+        )
+        .all();
+}
+
+export function deleteSimilarVideoScans() {
+    return getDb().prepare('DELETE FROM similar_video_scans').run().changes;
+}
+
+export function deleteSimilarGroupsForDownload(downloadId) {
+    const id = Number(downloadId);
+    if (!Number.isInteger(id) || id <= 0) return 0;
+    const db = getDb();
+    return db.transaction(() => {
+        db.prepare('DELETE FROM similar_group_members WHERE download_id = ?').run(id);
+        return _pruneIncompleteSimilarGroups(db);
+    })();
+}
+
 /**
  * Wipe similar-clips fingerprints, groups, and partial-resume cursors.
  * Keeps `similar_ignores` (download-id pairs) and hover `seekbar_sprites`.
@@ -5789,6 +5876,7 @@ export function purgeSimilarClipsRecords() {
         db.prepare('DELETE FROM video_fingerprints').run();
         db.prepare('DELETE FROM similar_groups').run();
         db.prepare('DELETE FROM similar_partial_scans').run();
+        db.prepare('DELETE FROM similar_video_scans').run();
         const now = Date.now();
         const kv = db.prepare(
             `INSERT INTO kv (key, value, updated_at) VALUES (?, ?, ?)
@@ -5803,5 +5891,33 @@ export function purgeSimilarClipsRecords() {
             kv.run(key, 'null', now);
         }
         return { fingerprints, groups, partialScans };
+    })();
+}
+
+/**
+ * Wipe Analyze results only: groups and similar/partial resume cursors.
+ * Fingerprints, ignores, hover sprites, and last Scan summary stay.
+ * Next Analyze rebuilds groups from existing hashes.
+ */
+export function purgeSimilarAnalyzeRecords() {
+    const db = getDb();
+    return db.transaction(() => {
+        const groups = Number(db.prepare('SELECT COUNT(*) AS n FROM similar_groups').get()?.n) || 0;
+        const videoScans =
+            Number(db.prepare('SELECT COUNT(*) AS n FROM similar_video_scans').get()?.n) || 0;
+        const partialScans =
+            Number(db.prepare('SELECT COUNT(*) AS n FROM similar_partial_scans').get()?.n) || 0;
+        db.prepare('DELETE FROM similar_groups').run();
+        db.prepare('DELETE FROM similar_partial_scans').run();
+        db.prepare('DELETE FROM similar_video_scans').run();
+        const now = Date.now();
+        const kv = db.prepare(
+            `INSERT INTO kv (key, value, updated_at) VALUES (?, ?, ?)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+        );
+        for (const key of ['similar_last_analyze', 'pending_job_similarAnalyze']) {
+            kv.run(key, 'null', now);
+        }
+        return { groups, videoScans, partialScans };
     })();
 }

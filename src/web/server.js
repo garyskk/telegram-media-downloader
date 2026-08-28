@@ -148,6 +148,7 @@ import {
     addSimilarIgnore,
     deleteSimilarIgnore,
     purgeSimilarClipsRecords,
+    purgeSimilarAnalyzeRecords,
 } from '../core/db.js';
 import {
     startScan as nsfwStartScan,
@@ -7268,6 +7269,25 @@ app.post('/api/maintenance/similar/purge', async (req, res) => {
         }
         broadcast({ type: 'similar_purged', ts: Date.now() });
         res.json({ success: true, leftoverRaws, ...counts });
+    } catch (e) {
+        res.status(500).json({ error: e?.message || String(e) });
+    }
+});
+
+app.post('/api/maintenance/similar/analyze/purge', (req, res) => {
+    try {
+        if (
+            _jobTrackers.similarScan.getStatus().running ||
+            _jobTrackers.similarAnalyze.getStatus().running
+        ) {
+            return res.status(409).json({
+                error: 'A similar Scan or Analyze is already running. Cancel it before purging Analyze records.',
+                code: 'ALREADY_RUNNING',
+            });
+        }
+        const counts = purgeSimilarAnalyzeRecords();
+        broadcast({ type: 'similar_purged', ts: Date.now(), scope: 'analyze' });
+        res.json({ success: true, ...counts });
     } catch (e) {
         res.status(500).json({ error: e?.message || String(e) });
     }

@@ -163,7 +163,7 @@ const DEFAULT_CONFIG = {
             similarThreshold: 50,
             durationTolerance: 0.1,
             partialMatchRatio: 0.5,
-            partialFrameThreshold: 70,
+            partialFrameThreshold: 90,
             partialShortClipSec: 300,
             partialShortMatchRatio: 0.35,
             partialReviewMatchRatio: 0.1,
@@ -695,6 +695,9 @@ function mergeConfig(userConfig) {
 function _mergeSimilarClips(userSc) {
     const user = userSc && typeof userSc === 'object' ? { ...userSc } : {};
     delete user.fingerprintFps;
+    // First-ship PDQ default (70) misses recoded excerpts whose aligned
+    // scene Hamming sits ~80–90. Keep any other operator-set value.
+    if (Number(user.partialFrameThreshold) === 70) user.partialFrameThreshold = 90;
     return { ...DEFAULT_CONFIG.advanced.similarClips, ...user };
 }
 

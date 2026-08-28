@@ -84,8 +84,8 @@ describe('effectivePartialMatchRatio', () => {
 });
 
 describe('bestSubsequenceMatch', () => {
-    it('finds the local alignment and parent offset', () => {
-        const { ratio, startIndex, matched, offsetSec } = bestSubsequenceMatch(
+    it('finds the local alignment and parent offset', async () => {
+        const { ratio, startIndex, matched, offsetSec } = await bestSubsequenceMatch(
             [H0, H1, H2],
             [HA, H0, H1, H2, HF],
             { frameThreshold: 0 },
@@ -96,25 +96,41 @@ describe('bestSubsequenceMatch', () => {
         expect(offsetSec).toBe(1);
     });
 
-    it('rejects a clip longer than the parent', () => {
-        const { ratio, matched } = bestSubsequenceMatch([H0, H1, H2], [H0, H1], { frameThreshold: 0 });
+    it('rejects a clip longer than the parent', async () => {
+        const { ratio, matched } = await bestSubsequenceMatch([H0, H1, H2], [H0, H1], { frameThreshold: 0 });
         expect(ratio).toBe(0);
         expect(matched).toBe(0);
     });
 
-    it('counts per-frame Hamming within the threshold', () => {
-        const { ratio, matched } = bestSubsequenceMatch([H0, H1], [H0, HF], { frameThreshold: 0 });
+    it('counts per-frame Hamming within the threshold', async () => {
+        const { ratio, matched } = await bestSubsequenceMatch([H0, H1], [H0, HF], { frameThreshold: 0 });
         expect(matched).toBe(1);
         expect(ratio).toBe(0.5);
     });
 
-    it('covers a clip that skipped a parent scene', () => {
-        const { ratio, matched, startIndex } = bestSubsequenceMatch([H0, H2], [H0, H1, H2], {
+    it('covers a clip that skipped a parent scene', async () => {
+        const { ratio, matched, startIndex } = await bestSubsequenceMatch([H0, H2], [H0, H1, H2], {
             frameThreshold: 0,
         });
         expect(ratio).toBe(1);
         expect(matched).toBe(2);
         expect(startIndex).toBe(0);
+    });
+
+    it('detects a recoded excerpt when per-frame Hamming is ~80 (threshold 90)', async () => {
+        const base = '0'.repeat(64);
+        let noisy = BigInt(`0x${base}`);
+        for (let i = 0; i < 80; i++) noisy ^= 1n << BigInt(i);
+        const recode = noisy.toString(16).padStart(64, '0');
+        const filler = 'f'.repeat(64);
+        const clip = [base, base, base, base];
+        const parent = [filler, filler, recode, recode, recode, recode, filler];
+        const tight = await bestSubsequenceMatch(clip, parent, { frameThreshold: 70 });
+        expect(tight.ratio).toBe(0);
+        const loose = await bestSubsequenceMatch(clip, parent, { frameThreshold: 90 });
+        expect(loose.matched).toBe(4);
+        expect(loose.ratio).toBe(1);
+        expect(loose.startIndex).toBe(2);
     });
 });
 

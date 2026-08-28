@@ -39,7 +39,7 @@ describe('getSimilarClipsConfig', () => {
     it('uses PDQ-256 Hamming and scene-sample defaults when env is unset', () => {
         const cfg = getSimilarClipsConfig();
         expect(cfg.similarThreshold).toBe(50);
-        expect(cfg.partialFrameThreshold).toBe(70);
+        expect(cfg.partialFrameThreshold).toBe(90);
         expect(cfg.sceneThreshold).toBe(0.1);
         expect(cfg.floorIntervalSec).toBe(3);
         expect(cfg.fingerprintTilePx).toBe(64);

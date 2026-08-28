@@ -1,4 +1,4 @@
-export { FINGERPRINT_ALGO, SIMILAR_CLIPS_DEFAULTS, getSimilarClipsConfig } from './config.js';
+export { FINGERPRINT_ALGO, SIMILAR_CLIPS_DEFAULTS, getSimilarClipsConfig, similarAnalyzeConfigKey } from './config.js';
 export { alignHashSequences } from './align.js';
 export {
     generateFingerprintForDownload,
