@@ -1437,6 +1437,7 @@
     "maintenance.similar.already_running": "Already running",
     "maintenance.similar.cancelling": "Cancelling…",
     "maintenance.similar.cancelled": "Cancelled",
+    "maintenance.similar.scan_up_to_date": "Up to date — nothing to fingerprint",
     "maintenance.similar.scan_done": "Scan finished — {generated} generated, {skipped} skipped",
     "maintenance.similar.analyze_done": "Analyze finished — {similar} similar, {partial} partial, {review} review",
     "maintenance.similar.confirm_title": "Delete selected videos?",

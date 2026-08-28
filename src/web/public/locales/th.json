@@ -1427,6 +1427,7 @@
     "maintenance.similar.already_running": "กำลังทำงานอยู่แล้ว",
     "maintenance.similar.cancelling": "กำลังยกเลิก…",
     "maintenance.similar.cancelled": "ยกเลิกแล้ว",
+    "maintenance.similar.scan_up_to_date": "ครบแล้ว — ไม่มีไฟล์ต้องสร้างลายนิ้วมือ",
     "maintenance.similar.scan_done": "สแกนเสร็จ — สร้าง {generated} ข้าม {skipped}",
     "maintenance.similar.analyze_done": "วิเคราะห์เสร็จ — คล้าย {similar} คลิปย่อย {partial} ตรวจทาน {review}",
     "maintenance.similar.confirm_title": "ลบวิดีโอที่เลือก?",

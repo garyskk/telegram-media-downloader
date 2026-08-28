@@ -95,15 +95,19 @@ function _setProgress(prefix, running, p = {}) {
     if (!wrap) return;
     wrap.classList.toggle('hidden', !running);
     const processed = Number(p.processed) || 0;
-    const total = Number(p.total) || 0;
+    const hasTotal = p.total != null && Number.isFinite(Number(p.total));
+    const total = hasTotal ? Number(p.total) : 0;
     const skipped = Number(p.skipped) || 0;
+    // total === 0 is a finished no-op (nothing pending), not "unknown".
+    // An empty progress object used to fake 5%, which stuck on screen
+    // when Scan finished before the POST /scan response landed.
     const pct =
-        total > 0
+        hasTotal && total > 0
             ? Math.min(100, Math.round((processed / total) * 100))
-            : skipped > 0
+            : hasTotal && total === 0
               ? 100
-              : running
-                ? 5
+              : skipped > 0 || p.upToDate
+                ? 100
                 : 0;
     if (bar) bar.style.width = `${pct}%`;
     if (stage) {
@@ -122,8 +126,19 @@ function _setProgress(prefix, running, p = {}) {
                         : prefix === 'sim-scan'
                           ? i18nT('maintenance.similar.progress.scanning', 'Scanning…')
                           : i18nT('maintenance.similar.progress.analyzing', 'Analyzing…');
-        if (total > 0) {
+        if (hasTotal && total > 0) {
             stage.textContent = `${label} · ${processed.toLocaleString()} / ${total.toLocaleString()}`;
+        } else if (hasTotal && total === 0) {
+            stage.textContent =
+                prefix === 'sim-scan'
+                    ? i18nT(
+                          'maintenance.similar.scan_up_to_date',
+                          'Up to date — nothing to fingerprint',
+                      )
+                    : i18nT(
+                          'maintenance.similar.analyze_up_to_date',
+                          'Analyze up to date — no new videos',
+                      );
         } else if (skipped > 0) {
             stage.textContent = i18nTf(
                 'maintenance.similar.progress.up_to_date',
@@ -403,16 +418,14 @@ async function _startScan() {
     try {
         const r = await api.post('/api/maintenance/similar/scan', {});
         if (r?.started || r?.code === 'ALREADY_RUNNING') {
-            _scanRunning = true;
-            _setBusyButtons();
-            _setProgress('sim-scan', true, r?.snapshot?.progress || {});
-            showToast(i18nT('maintenance.similar.scan_started', 'Scan started'));
+            await _recoverStatus();
+            if (_scanRunning) {
+                showToast(i18nT('maintenance.similar.scan_started', 'Scan started'));
+            }
         }
     } catch (e) {
         if (e?.data?.code === 'ALREADY_RUNNING') {
-            _scanRunning = true;
-            _setBusyButtons();
-            _setProgress('sim-scan', true, e.data?.snapshot?.progress || {});
+            await _recoverStatus();
             showToast(i18nT('maintenance.similar.already_running', 'Already running'));
             return;
         }
@@ -441,20 +454,16 @@ async function _startAnalyze() {
             checkPartialClips: _wantPartial(),
         });
         if (r?.started || r?.code === 'ALREADY_RUNNING') {
-            _analyzeRunning = true;
-            _setBusyButtons();
-            _setProgress('sim-analyze', true, _analyzeProgressFrom(r?.snapshot));
-            showToast(i18nT('maintenance.similar.analyze_started', 'Checking for new videos…'));
+            await _recoverStatus();
+            if (_analyzeRunning) {
+                showToast(
+                    i18nT('maintenance.similar.analyze_started', 'Checking for new videos…'),
+                );
+            }
         }
     } catch (e) {
         if (e?.data?.code === 'ALREADY_RUNNING') {
-            _analyzeRunning = true;
-            _setBusyButtons();
-            _setProgress(
-                'sim-analyze',
-                true,
-                _analyzeProgressFrom(e.data?.snapshot?.analyze || e.data?.snapshot),
-            );
+            await _recoverStatus();
             showToast(i18nT('maintenance.similar.already_running', 'Already running'));
             return;
         }
@@ -616,6 +625,16 @@ async function _onScanDone(m) {
     }
     if (m?.cancelled) {
         showToast(i18nT('maintenance.similar.cancelled', 'Cancelled'));
+        return;
+    }
+    if (m?.upToDate || (!(m?.generated || 0) && !(m?.skipped || 0) && !(m?.errored || 0))) {
+        showToast(
+            i18nT(
+                'maintenance.similar.scan_up_to_date',
+                'Up to date — nothing to fingerprint',
+            ),
+            'success',
+        );
         return;
     }
     showToast(

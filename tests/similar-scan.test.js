@@ -157,6 +157,37 @@ describe('scanSimilarClips', () => {
         expect(api.getSeekbarSprite(bad.id)).toBeFalsy();
     });
 
+    it('is a no-op when every video already has a current fingerprint', async () => {
+        const current = seedVideo('already-fp');
+        api.upsertVideoFingerprint({
+            downloadId: current.id,
+            durationSec: 1,
+            aggregateHash: 'd'.repeat(64),
+            frameCount: 1,
+            algo: 'pdq-scene-v1',
+            fileHash: 'already-fp',
+        });
+        const ticks = [];
+        const result = await scanSimilarClips({
+            onProgress: (p) => ticks.push({ ...p }),
+        });
+        expect(generateFingerprintForDownload).not.toHaveBeenCalled();
+        expect(result).toEqual(
+            expect.objectContaining({
+                processed: 0,
+                generated: 0,
+                skipped: 0,
+                errored: 0,
+                cancelled: false,
+                upToDate: true,
+            }),
+        );
+        expect(ticks[0]).toEqual(
+            expect.objectContaining({ processed: 0, total: 0, generated: 0, skipped: 0 }),
+        );
+        expect(ticks.at(-1)?.stage).toBe('done');
+    });
+
     it('stops paging when aborted', async () => {
         seedVideo('abort-a');
         seedVideo('abort-b');

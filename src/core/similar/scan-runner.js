@@ -55,6 +55,18 @@ export async function scanSimilarClips({ onProgress, signal } = {}) {
     };
 
     emit('start');
+    if (total === 0) {
+        emit('done');
+        return {
+            processed: 0,
+            generated: 0,
+            skipped: 0,
+            errored: 0,
+            durationMs: Date.now() - started,
+            cancelled: !!signal?.aborted,
+            upToDate: true,
+        };
+    }
 
     const _processOne = async (row) => {
         if (fingerprintIsCurrent(row)) {
@@ -106,5 +118,6 @@ export async function scanSimilarClips({ onProgress, signal } = {}) {
         errored,
         durationMs: Date.now() - started,
         cancelled: !!signal?.aborted,
+        upToDate: processed === 0 && generated === 0,
     };
 }
