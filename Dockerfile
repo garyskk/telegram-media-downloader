@@ -3,9 +3,13 @@
 # Multi-stage build:
 #   - "deps" installs prod dependencies only (npm ci --omit=dev) so the runtime
 #     image stays small.
-#   - "runtime" copies node_modules from "deps" + the source, runs as the
-#     non-root `node` user, exposes 3000, and ships a healthcheck that hits
-#     the dashboard's /api/auth_check endpoint.
+#   - "seekbar" compiles the Go sidecar (static binary) so `docker compose build`
+#     ships it at /app/seekbar-service/bin/seekbar-server. Node auto-spawns
+#     that path when SEEKBAR_SIDECAR_URL is unset — no GitHub download and
+#     no extra compose service.
+#   - "runtime" copies node_modules from "deps", the sidecar binary, and the
+#     source; runs as the non-root `node` user; exposes 3000; healthchecks
+#     /api/auth_check.
 #
 # Pin a specific patch version. Floating tags drift; this image is reproducible.
 
@@ -20,6 +24,21 @@ RUN apt-get update \
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --no-audit --no-fund
 
+# Compile the seekbar sidecar for the image's target arch (BuildKit sets
+# TARGETOS/TARGETARCH). CGO off → static binary; ffmpeg stays in runtime.
+FROM --platform=$BUILDPLATFORM golang:1.22-bookworm AS seekbar
+ARG TARGETOS=linux
+ARG TARGETARCH
+WORKDIR /src
+COPY seekbar-service/go.mod seekbar-service/go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download
+COPY seekbar-service/ ./
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH:-$(go env GOARCH)} \
+        go build -trimpath -ldflags '-s -w' -o /out/seekbar-server ./cmd/server
+
 FROM node:24.16.0-bookworm-slim AS runtime
 
 # Build identity — passed in by CI (`docker build --build-arg GIT_SHA=…
@@ -30,7 +49,8 @@ ARG BUILT_AT=
 ENV NODE_ENV=production \
     PORT=3000 \
     GIT_SHA=${GIT_SHA} \
-    BUILT_AT=${BUILT_AT}
+    BUILT_AT=${BUILT_AT} \
+    SEEKBAR_BIN=/app/seekbar-service/bin/seekbar-server
 
 # tini    — proper PID 1 (signal handling + zombie reaping). Debian ships
 #           the binary at /usr/bin/tini.
@@ -66,6 +86,7 @@ COPY --from=deps /app/node_modules ./node_modules
 COPY src ./src
 COPY scripts ./scripts
 COPY runner.js config.example.json package.json LICENSE README.md SECURITY.md CHANGELOG.md ./
+COPY --from=seekbar /out/seekbar-server /app/seekbar-service/bin/seekbar-server
 
 # Persistent state (sessions, config, downloads) — mount this as a volume.
 # `chmod a+rX` guarantees files end up readable + dirs traversable even when
@@ -74,6 +95,7 @@ COPY runner.js config.example.json package.json LICENSE README.md SECURITY.md CH
 RUN mkdir -p /app/data /app/data/downloads /app/data/logs /app/data/sessions /app/data/backups /app/data/models \
     && chmod -R a+rX /app \
     && chmod +x /app/scripts/docker-entrypoint.sh \
+    && chmod +x /app/seekbar-service/bin/seekbar-server \
     && chown -R node:node /app
 
 # Pre-warm the AI model cache at build time so a first scan completes in

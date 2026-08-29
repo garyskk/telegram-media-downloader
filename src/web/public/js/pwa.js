@@ -122,6 +122,17 @@ if ('serviceWorker' in navigator) {
         navigator.serviceWorker
             .register('/sw.js', { scope: '/' })
             .then((reg) => {
+                const ping = () => {
+                    try {
+                        reg.update();
+                    } catch {
+                        /* best-effort */
+                    }
+                };
+                ping();
+                document.addEventListener('visibilitychange', () => {
+                    if (document.visibilityState === 'visible') ping();
+                });
                 // If a new worker is found, tell it to take over right
                 // away (matches the SW's skipWaiting handler).
                 reg.addEventListener('updatefound', () => {

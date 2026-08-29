@@ -1025,6 +1025,28 @@ export function loadAdvanced(config) {
     wireToggle('setting-adv-seekbar-enabled', sk.enabled !== false);
     wireToggle('setting-adv-seekbar-autoOnDownload', sk.autoOnDownload !== false);
 
+    const sc = adv.similarClips || {};
+    _setIfNum('setting-adv-similarClips-similarThreshold', sc.similarThreshold, 50);
+    const _setIfFloat = (id, val, def) => {
+        const el = document.getElementById(id);
+        if (!el) return;
+        el.value = Number.isFinite(Number(val)) ? String(val) : String(def);
+    };
+    _setIfFloat('setting-adv-similarClips-durationTolerance', sc.durationTolerance, 0.1);
+    _setIfNum('setting-adv-similarClips-durationBucketSec', sc.durationBucketSec, 120);
+    _setIfFloat('setting-adv-similarClips-sceneThreshold', sc.sceneThreshold, 0.1);
+    _setIfFloat('setting-adv-similarClips-floorIntervalSec', sc.floorIntervalSec, 3);
+    _setIfFloat('setting-adv-similarClips-partialMatchRatio', sc.partialMatchRatio, 0.5);
+    _setIfNum('setting-adv-similarClips-partialFrameThreshold', sc.partialFrameThreshold, 90);
+    _setIfNum('setting-adv-similarClips-partialShortClipSec', sc.partialShortClipSec, 300);
+    _setIfFloat('setting-adv-similarClips-partialShortMatchRatio', sc.partialShortMatchRatio, 0.5);
+    _setIfFloat('setting-adv-similarClips-partialReviewMatchRatio', sc.partialReviewMatchRatio, 0.35);
+    _setIfNum(
+        'setting-adv-similarClips-partialReviewMinMatchedFrames',
+        sc.partialReviewMinMatchedFrames,
+        4,
+    );
+
     // Probe button — fetch /thumbs/hwaccel-probe and render available
     // backends as small chips. Idempotent wire-up via `dataset.wired`.
     const probeBtn = document.getElementById('setting-adv-ffmpeg-hwaccel-probe');
@@ -1249,6 +1271,9 @@ function _autoSaveContextLabel() {
     }
     if (page === 'maintenance-ai') {
         return i18nT('settings.autosave.label.ai', 'AI settings');
+    }
+    if (page === 'maintenance-similar') {
+        return i18nT('settings.autosave.label.similar', 'Similar clips settings');
     }
     return i18nT('settings.autosave.label.default', 'Settings');
 }
@@ -1502,6 +1527,45 @@ function _gatherScopedPayload(page) {
                     hwaccel: String(get('setting-adv-seekbar-hwaccel') || '')
                         .toLowerCase()
                         .trim(),
+                },
+            },
+        };
+    }
+    if (page === 'maintenance-similar') {
+        const num = (id, def) => {
+            const v = parseInt(get(id), 10);
+            return Number.isFinite(v) ? v : def;
+        };
+        const flt = (id, def) => {
+            const v = parseFloat(get(id));
+            return Number.isFinite(v) ? v : def;
+        };
+        return {
+            advanced: {
+                similarClips: {
+                    similarThreshold: num('setting-adv-similarClips-similarThreshold', 50),
+                    durationTolerance: flt('setting-adv-similarClips-durationTolerance', 0.1),
+                    durationBucketSec: num('setting-adv-similarClips-durationBucketSec', 120),
+                    sceneThreshold: flt('setting-adv-similarClips-sceneThreshold', 0.1),
+                    floorIntervalSec: flt('setting-adv-similarClips-floorIntervalSec', 3),
+                    partialMatchRatio: flt('setting-adv-similarClips-partialMatchRatio', 0.5),
+                    partialFrameThreshold: num(
+                        'setting-adv-similarClips-partialFrameThreshold',
+                        90,
+                    ),
+                    partialShortClipSec: num('setting-adv-similarClips-partialShortClipSec', 300),
+                    partialShortMatchRatio: flt(
+                        'setting-adv-similarClips-partialShortMatchRatio',
+                        0.5,
+                    ),
+                    partialReviewMatchRatio: flt(
+                        'setting-adv-similarClips-partialReviewMatchRatio',
+                        0.35,
+                    ),
+                    partialReviewMinMatchedFrames: num(
+                        'setting-adv-similarClips-partialReviewMinMatchedFrames',
+                        4,
+                    ),
                 },
             },
         };

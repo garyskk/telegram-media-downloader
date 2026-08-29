@@ -85,9 +85,10 @@ services:
       # only when you mean it — see .env.example / docs/AI.md.
       # - TGDL_FACES_VIDEO_SCAN_LIMIT=${TGDL_FACES_VIDEO_SCAN_LIMIT}
       # - TGDL_FACES_VIDEO_NICE=${TGDL_FACES_VIDEO_NICE}
-      # Seekbar preview sidecar URL. Leave unset to let the dashboard
-      # auto-spawn the bundled Go binary on a random localhost port;
-      # set when running `seekbar-service/` as a separate compose
+      # Seekbar preview sidecar URL. Leave unset to auto-spawn the Go
+      # binary compiled into this image (`SEEKBAR_BIN`, from the
+      # Dockerfile `seekbar` stage) on a random localhost port. Set
+      # only when running `seekbar-service/` as a separate compose
       # service. See seekbar-service/README.md for the standalone setup.
       - SEEKBAR_SIDECAR_URL=${SEEKBAR_SIDECAR_URL:-}
       - SEEKBAR_API_TOKEN=${SEEKBAR_API_TOKEN:-}

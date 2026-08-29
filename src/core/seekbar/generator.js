@@ -1,19 +1,18 @@
 /**
  * Seekbar sprite generator. One ffmpeg call per video → WebP sprite
  * sheet + JSON sidecar. Deterministic: same source bytes + same config
- * always produce the same on-disk artefacts, so the cache-friendliness
- * promise in the spec holds.
+ * always produce the same on-disk artefacts.
  *
  * Algorithm (per-clip):
  *   1. ffprobe → duration.
- *   2. Pick a frame count: `clamp(ceil(duration / interval), 12, maxTiles)`.
+ *   2. Pick a frame count from duration tiers, capped by maxTiles.
  *      Recompute `interval = duration / frames` so the last sample lands
  *      on the clip's final second.
  *   3. Lay tiles out as `cols × ceil(frames / cols)`.
- *   4. ffmpeg `fps=1/interval, scale=W:-2, tile=COLS×ROWS` → single .webp.
- *      libwebp present → encode in-process. libwebp missing → render a
- *      tiled JPEG and let sharp re-encode to WebP (mirrors thumbs.js).
- *   5. Atomic .tmp → final rename for both the sprite and the JSON.
+ *   4. ffmpeg `-vf` fps=1/interval, scale=W:-2, tile → .webp
+ *      libwebp present → encode hover in-process. libwebp missing →
+ *      tiled JPEG then sharp WebP (mirrors thumbs.js).
+ *   5. Atomic .tmp → final rename for the sprite and the JSON.
  */
 
 import { spawn } from 'child_process';
@@ -24,7 +23,7 @@ import path from 'path';
 import sharp from 'sharp';
 
 import { loadConfig } from '../../config/manager.js';
-import { upsertSeekbarSprite } from '../db.js';
+import { resetNsfwVideoResult, upsertSeekbarSprite } from '../db.js';
 import {
     ffmpegHasLibwebp,
     hasFfmpeg,
@@ -37,7 +36,6 @@ import {
     submitOne as sidecarSubmitOne,
     waitForJob as sidecarWaitForJob,
 } from './client.js';
-import { resetNsfwVideoResult } from '../db.js';
 import { getDataDir, getDownloadsDir } from '../paths.js';
 
 const DATA_DIR = getDataDir();
@@ -210,6 +208,56 @@ export function planSprite(durationSec, cfg) {
     return { frames, intervalSec: interval, cols, rows, tileW };
 }
 
+/**
+ * ffmpeg argv for a hover-only sprite encode (binary not included).
+ */
+export function buildSpriteFilter(plan, scaleVf = null) {
+    const hoverScale = scaleVf ? scaleVf(plan.tileW) : `scale=${plan.tileW}:-2:flags=fast_bilinear`;
+    return `fps=1/${plan.intervalSec},${hoverScale},tile=${plan.cols}x${plan.rows}`;
+}
+
+export function buildSpriteFfmpegArgs({
+    srcAbs,
+    dstTmp,
+    plan,
+    useWebp,
+    quality,
+    hwArgs = [],
+    scaleVf = null,
+}) {
+    const q = Math.max(1, Math.min(100, Number(quality) || 70));
+    const args = [
+        '-hide_banner',
+        '-loglevel',
+        'error',
+        '-y',
+        ...hwArgs,
+        '-i',
+        srcAbs,
+        '-frames:v',
+        '1',
+        '-an',
+        '-vf',
+        buildSpriteFilter(plan, scaleVf),
+    ];
+    if (useWebp) {
+        args.push(
+            '-c:v',
+            'libwebp',
+            '-quality',
+            String(q),
+            '-compression_level',
+            '6',
+            '-f',
+            'webp',
+            dstTmp,
+        );
+    } else {
+        args.push('-q:v', String(Math.max(2, Math.min(31, Math.round(31 - q / 4)))), dstTmp);
+    }
+    return args;
+}
+
 async function _writeAtomic(absPath, body) {
     const tmp = absPath + '.tmp.' + crypto.randomBytes(4).toString('hex');
     await fs.writeFile(tmp, body);
@@ -219,72 +267,37 @@ async function _writeAtomic(absPath, body) {
 async function _runSpriteFfmpeg({ srcAbs, dstAbs, plan, cfg, timeoutMs }) {
     const useWebp =
         (cfg.format === 'webp' || !cfg.format) && ffmpegHasLibwebp() && dstAbs.endsWith('.webp');
-    // Upload pipeline: GPU accelerates decode (frames land on CPU for the fps
-    // SW filter), then each selected frame is uploaded to GPU for scale and
-    // downloaded before the tile SW filter. Falls back to pure SW scale when
-    // no GPU scaler is available for the configured backend.
     const { inputArgs: hwa, scaleVf } = hwaccelUploadPipeline(cfg.hwaccel ?? null);
-    const swScale = `scale=${plan.tileW}:-2:flags=fast_bilinear`;
     const tmp = dstAbs + '.tmp.' + crypto.randomBytes(4).toString('hex');
-    const filterChain = `fps=1/${plan.intervalSec},${scaleVf ? scaleVf(plan.tileW) : swScale},tile=${plan.cols}x${plan.rows}`;
-    if (useWebp) {
-        const args = [
-            '-hide_banner',
-            '-loglevel',
-            'error',
-            ...hwa,
-            '-i',
-            srcAbs,
-            '-frames:v',
-            '1',
-            '-an',
-            '-vf',
-            filterChain,
-            '-c:v',
-            'libwebp',
-            '-quality',
-            String(Math.max(1, Math.min(100, Number(cfg.quality) || 70))),
-            '-compression_level',
-            '6',
-            '-f',
-            'webp',
-            '-y',
-            tmp,
-        ];
+    const common = {
+        srcAbs,
+        plan,
+        quality: cfg.quality,
+        hwArgs: hwa,
+        scaleVf,
+    };
+    const _cleanupTmp = async () => {
         try {
-            await runFfmpegArgs(args, timeoutMs ? { timeoutMs } : {});
+            if (existsSync(tmp)) await fs.unlink(tmp);
+        } catch {}
+    };
+    if (useWebp) {
+        try {
+            await runFfmpegArgs(
+                buildSpriteFfmpegArgs({ ...common, dstTmp: tmp, useWebp: true }),
+                timeoutMs ? { timeoutMs } : {},
+            );
+            await fs.rename(tmp, dstAbs);
         } catch (e) {
-            try {
-                if (existsSync(tmp)) await fs.unlink(tmp);
-            } catch {}
+            await _cleanupTmp();
             throw e;
         }
-        await fs.rename(tmp, dstAbs);
         return;
     }
-    // JPEG fallback: render a tiled JPEG, optionally re-encode to WebP via
-    // sharp so callers asking for `format:'webp'` on a libwebp-less ffmpeg
-    // still get a WebP sprite.
     const jpgTmp = tmp + '.jpg';
     try {
         await runFfmpegArgs(
-            [
-                '-hide_banner',
-                '-loglevel',
-                'error',
-                ...hwa,
-                '-i',
-                srcAbs,
-                '-frames:v',
-                '1',
-                '-an',
-                '-vf',
-                filterChain,
-                '-q:v',
-                String(Math.max(2, Math.min(31, Math.round(31 - (Number(cfg.quality) || 70) / 4)))),
-                '-y',
-                jpgTmp,
-            ],
+            buildSpriteFfmpegArgs({ ...common, dstTmp: jpgTmp, useWebp: false }),
             timeoutMs ? { timeoutMs } : {},
         );
         if (!existsSync(jpgTmp)) throw new Error('ffmpeg produced no sprite');
@@ -303,9 +316,7 @@ async function _runSpriteFfmpeg({ srcAbs, dstAbs, plan, cfg, timeoutMs }) {
         try {
             if (existsSync(jpgTmp)) await fs.unlink(jpgTmp);
         } catch {}
-        try {
-            if (existsSync(tmp)) await fs.unlink(tmp);
-        } catch {}
+        await _cleanupTmp();
     }
 }
 
@@ -525,7 +536,13 @@ export async function generateForDownload(row, cfg = null, opts = {}) {
     let lastErr = null;
     for (let attempt = 0; attempt < Math.max(1, Number(conf.maxRetries) || 1) + 1; attempt++) {
         try {
-            await _runSpriteFfmpeg({ srcAbs, dstAbs, plan, cfg: conf, timeoutMs });
+            await _runSpriteFfmpeg({
+                srcAbs,
+                dstAbs,
+                plan,
+                cfg: conf,
+                timeoutMs,
+            });
             lastErr = null;
             break;
         } catch (e) {

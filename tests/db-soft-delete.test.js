@@ -71,6 +71,10 @@ describe('deleteDownloadsBy soft-delete cleanup', () => {
             `INSERT INTO seekbar_sprites (download_id, sprite_path, meta_path, bytes, generated_at)
              VALUES (?, '/tmp/x.webp', '/tmp/x.json', 10, ?)`,
         ).run(id, Date.now());
+        db.prepare(
+            `INSERT INTO video_fingerprints (download_id, duration_sec, aggregate_hash, frame_count, algo, indexed_at, file_hash)
+             VALUES (?, 1, '0123456789abcdef', 1, 'pdq-scene-v1', ?, 'soft-hash')`,
+        ).run(id, Date.now());
 
         db.prepare(`
             INSERT INTO backup_destinations (name, provider, config_blob, enabled, encryption, mode, created_at)
@@ -107,6 +111,10 @@ describe('deleteDownloadsBy soft-delete cleanup', () => {
         ).toBe(0);
         expect(
             db.prepare('SELECT COUNT(*) AS n FROM seekbar_sprites WHERE download_id = ?').get(id).n,
+        ).toBe(0);
+        expect(
+            db.prepare('SELECT COUNT(*) AS n FROM video_fingerprints WHERE download_id = ?').get(id)
+                .n,
         ).toBe(0);
 
         const pending = db

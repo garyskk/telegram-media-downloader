@@ -33,6 +33,23 @@ const TOOLS = [
         wsEvents: ['dedup_progress', 'dedup_done'],
     },
     {
+        slug: 'similar',
+        i18nTitle: 'maintenance.hub.similar.title',
+        defaultTitle: 'Similar clips',
+        i18nBody: 'maintenance.hub.similar.body',
+        defaultBody:
+            'Near-duplicate videos and shorter clips inside longer ones. Scan fingerprints, then Analyze.',
+        icon: 'ri-scissors-cut-line',
+        accent: 'violet',
+        statusUrl: '/api/maintenance/similar/status',
+        wsEvents: [
+            'similar_progress',
+            'similar_done',
+            'similar_analyze_progress',
+            'similar_analyze_done',
+        ],
+    },
+    {
         slug: 'thumbs',
         i18nTitle: 'maintenance.hub.thumbs.title',
         defaultTitle: 'Build thumbnails',
@@ -226,7 +243,7 @@ async function _refreshLive() {
                         count: Number(r?.total) || 0,
                     });
                 } else {
-                    _live.set(t.slug, { running: !!(r && r.running) });
+                    _live.set(t.slug, { running: !!(r && (r.running || r.analyze?.running)) });
                 }
             } catch {
                 /* status endpoint failures are non-fatal */

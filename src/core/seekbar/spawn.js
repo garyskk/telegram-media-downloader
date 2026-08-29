@@ -8,11 +8,13 @@
  *      `config.advanced.seekbar.sidecarUrl`. We record the URL and
  *      probe `/health`; if green, callers can immediately submit jobs.
  *   2. **Auto-spawn local binary** — when no URL is set, we look for
+ *      `SEEKBAR_BIN` (Docker image path) then
  *      `seekbar-service/bin/seekbar-server(.exe)` relative to the
- *      project root. If found, we spawn it on a free localhost port
- *      with every knob from `loadConfig().advanced.seekbar.*` forwarded
- *      as env vars (so the Maintenance → Seekbar page is the single
- *      source of truth — no one edits `seekbar-service/` directly).
+ *      project root. The main Dockerfile compiles that binary into the
+ *      image. If found, we spawn it on a free localhost port with every
+ *      knob from `loadConfig().advanced.seekbar.*` forwarded as env vars
+ *      (so the Maintenance → Seekbar page is the single source of truth
+ *      — no one edits `seekbar-service/` directly).
  *   3. **Disabled** — status flips to `{ok:false, error:'binary_missing'}`
  *      and the maintenance page renders a clear "Build the sidecar with
  *      `npm run build:seekbar`" message. The feature stays dormant

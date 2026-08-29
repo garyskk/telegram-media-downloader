@@ -24,3 +24,6 @@ eslint.config.js
 coverage
 .claude
 CLAUDE.md
+# Host-built sidecar artefacts — the image compiles its own binary.
+seekbar-service/bin
+seekbar-service/data

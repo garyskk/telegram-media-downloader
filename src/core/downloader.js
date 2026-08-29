@@ -26,6 +26,7 @@ import { optimizeDownloadInBackground as faststartInBackground } from './faststa
 import { pregenerateNsfw } from './nsfw.js';
 import { pregenerateAi } from './ai/index.js';
 import { pregenerateSeekbar } from './seekbar/index.js';
+import { pregenerateFingerprint } from './similar/fingerprint.js';
 import { getDataDir, getDownloadsDir, resolveConfigDownloadPath } from './paths.js';
 
 const DATA_DIR = getDataDir();
@@ -1145,6 +1146,7 @@ export class DownloadManager extends EventEmitter {
                 try {
                     const priority = job?.priority < 2 ? 'realtime' : 'backfill';
                     pregenerateSeekbar(newId, { priority });
+                    pregenerateFingerprint(newId);
                 } catch {}
             }
         } catch (e) {

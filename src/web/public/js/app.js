@@ -840,6 +840,18 @@ function renderPage(page, params = {}) {
         import('./maintenance-duplicates.js')
             .then((m) => m.init())
             .catch((e) => console.error('maintenance-duplicates', e));
+    } else if (page === 'maintenance-similar') {
+        document.getElementById('page-title').textContent = i18nT(
+            'maintenance.similar.page_title',
+            'Similar clips',
+        );
+        document.getElementById('page-subtitle').textContent = i18nT(
+            'maintenance.similar.subtitle',
+            'Near-duplicate videos and shorter clips inside longer ones',
+        );
+        import('./maintenance-similar.js')
+            .then((m) => m.init())
+            .catch((e) => console.error('maintenance-similar', e));
     } else if (page === 'maintenance-thumbs') {
         document.getElementById('page-title').textContent = i18nT(
             'maintenance.thumbs.page_title',
@@ -1041,6 +1053,7 @@ function registerRoutes() {
     });
     router.route('/maintenance', () => renderPage('maintenance'));
     router.route('/maintenance/duplicates', () => renderPage('maintenance-duplicates'));
+    router.route('/maintenance/similar', () => renderPage('maintenance-similar'));
     router.route('/maintenance/thumbs', () => renderPage('maintenance-thumbs'));
     router.route('/maintenance/seekbar', () => renderPage('maintenance-seekbar'));
     router.route('/maintenance/video', () => renderPage('maintenance-video'));
@@ -1441,6 +1454,7 @@ const PAGE_HEADER_ICON = {
     settings: 'ri-settings-3-line',
     maintenance: 'ri-tools-line',
     'maintenance-duplicates': 'ri-file-copy-2-line',
+    'maintenance-similar': 'ri-scissors-cut-line',
     'maintenance-thumbs': 'ri-image-line',
     'maintenance-seekbar': 'ri-movie-line',
     'maintenance-video': 'ri-film-line',

@@ -64,10 +64,51 @@ describe('config manager (kv-backed)', () => {
         expect(cfg.advanced).toBeTruthy();
         expect(cfg.advanced.downloader.maxConcurrency).toBe(20);
         expect(cfg.advanced.history.shortBreakEveryN).toBe(100);
+        expect(cfg.advanced.similarClips.similarThreshold).toBe(50);
+        expect(cfg.advanced.similarClips.partialFrameThreshold).toBe(90);
+        expect(cfg.advanced.similarClips.sceneThreshold).toBe(0.1);
+        expect(cfg.advanced.similarClips.fingerprintFps).toBeUndefined();
         expect(cfg.rescue.retentionHours).toBe(48);
         // User values preserved:
         expect(cfg.telegram.apiId).toBe('x');
         expect(cfg.telegram.apiHash).toBe('y');
+    });
+
+    it('strips leftover fingerprintFps and keeps stored Hamming', () => {
+        dbApi.kvSet('config', {
+            advanced: {
+                similarClips: {
+                    similarThreshold: 5,
+                    partialFrameThreshold: 10,
+                    fingerprintFps: 1,
+                },
+            },
+        });
+        const cfg = manager.loadConfig();
+        expect(cfg.advanced.similarClips.similarThreshold).toBe(5);
+        expect(cfg.advanced.similarClips.partialFrameThreshold).toBe(10);
+        expect(cfg.advanced.similarClips.fingerprintFps).toBeUndefined();
+        expect(cfg.advanced.similarClips.sceneThreshold).toBe(0.1);
+        expect(cfg.advanced.similarClips.floorIntervalSec).toBe(3);
+    });
+
+    it('keeps operator-saved similar-clip knobs (no leftover rewrite)', () => {
+        dbApi.kvSet('config', {
+            advanced: {
+                similarClips: {
+                    similarThreshold: 50,
+                    partialFrameThreshold: 70,
+                    partialShortMatchRatio: 0.35,
+                    partialReviewMatchRatio: 0.1,
+                    partialReviewMinMatchedFrames: 2,
+                },
+            },
+        });
+        const cfg = manager.loadConfig();
+        expect(cfg.advanced.similarClips.partialFrameThreshold).toBe(70);
+        expect(cfg.advanced.similarClips.partialShortMatchRatio).toBe(0.35);
+        expect(cfg.advanced.similarClips.partialReviewMatchRatio).toBe(0.1);
+        expect(cfg.advanced.similarClips.partialReviewMinMatchedFrames).toBe(2);
     });
 
     it('self-heals (writes back) when merge surfaced new keys', () => {

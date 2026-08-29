@@ -167,6 +167,28 @@ Opt-in feature — generates WebP sprite-sheet timeline thumbnails for video hov
 | `POST` | `/api/maintenance/seekbar/sidecar-test` | CORS proxy — test connection to an arbitrary seekbar sidecar URL. Body: `{url, token?}`. Returns `{ok, version}`. |
 | `POST` | `/api/maintenance/seekbar/sidecar/restart` | Tear down + respawn the Go sidecar. Use after changing hwaccel / concurrency / port range. Broadcasts `seekbar_sidecar_status`. |
 
+## Similar clips
+
+Near-duplicate videos and partial clips (a shorter video inside a longer one). Exact byte-identical files stay on Maintenance → Duplicates (SHA-256). See [docs/SIMILAR-CLIPS.md](SIMILAR-CLIPS.md).
+
+| Method | Path | Notes |
+|---|---|---|
+| `POST` | `/api/maintenance/similar/scan` | Similar-only ffmpeg: scene-or-floor `select`, 64×64 PDQ-256 + real pts. Skip when fingerprint `file_hash` matches and `algo` is `pdq-scene-v1`. Broadcasts `similar_progress`. |
+| `POST` | `/api/maintenance/similar/scan/stop` | Cancel the in-flight scan. |
+| `GET`  | `/api/maintenance/similar/status` | Scan JobTracker snapshot plus nested `analyze` snapshot. Hub running pill is Scan **or** Analyze. |
+| `GET`  | `/api/maintenance/similar/stats` | `{totalVideos, fingerprinted, missing, lastScan, lastAnalyze}`. Survives restart via `kv['similar_last_scan']` / `kv['similar_last_analyze']`. |
+| `POST` | `/api/maintenance/similar/analyze` | Rebuild `kind='similar'` groups (Smith-Waterman), then optional partial. Body: `{checkPartialClips?:bool}`. Broadcasts `similar_analyze_progress`. |
+| `POST` | `/api/maintenance/similar/analyze/stop` | Cancel the in-flight analyze. |
+| `GET`  | `/api/maintenance/similar/groups` | Persisted groups with keep/remove members. `?kind=similar\|partial\|partial_review`. |
+| `POST` | `/api/maintenance/similar/delete` | `{ids:[…]}` — same delete path as exact-dedup. |
+| `POST` | `/api/maintenance/similar/ignore` | `{aId, bId, kind?}` — false-positive pair (`kind` defaults to `similar`). |
+| `GET`  | `/api/maintenance/similar/ignore` | List ignored pairs. `?kind=`. |
+| `DELETE` | `/api/maintenance/similar/ignore/:id` | Un-ignore. |
+| `POST` | `/api/maintenance/similar/analyze/purge` | Wipe similar/partial groups and Analyze resume cursors. Keeps fingerprints, `similar_ignores`, and hover sprites. `409` `{code:'ALREADY_RUNNING'}` if Scan or Analyze is running. Broadcasts `similar_purged` `{scope:'analyze'}`. Does not start Analyze. |
+| `POST` | `/api/maintenance/similar/purge` | Wipe fingerprints, groups, and partial-resume cursors. Keeps `similar_ignores` and hover sprites. `409` `{code:'ALREADY_RUNNING'}` if Scan or Analyze is running. Broadcasts `similar_purged`. Does not start Scan. |
+
+Scan + Analyze (similar and optional partial) and the Maintenance hub card (`#/maintenance/similar`) are live. Schema is in `data/db.sqlite` already.
+
 ## AI / Face clustering (v2.16+)
 
 Opt-in face detection + clustering, backed by the Python sidecar in `faces-service/`. Off by default; flip `config.advanced.ai.enabled` + `config.advanced.ai.faceClustering`. All endpoints are admin-only. See [docs/AI.md](AI.md) for the deep dive.
@@ -261,6 +283,11 @@ The dashboard proxies these via `/api/ai/preload-model/…` above, but the sidec
 | `history_deleted` / `history_cleared`   | Cross-tab Recent-backfills sync. |
 | `history_stalled`      | `{pending, cap, stallSeconds}` |
 | `dedup_progress`       | `{stage, processed, total, hashed, errored}` |
+| `similar_progress`     | `{stage, processed, total, generated, skipped, errored}` |
+| `similar_done`         | `{processed, generated, skipped, errored, durationMs, cancelled}` |
+| `similar_analyze_progress` | `{stage, processed, total, comparedPairs, groups}` |
+| `similar_analyze_done` | `{similarGroups, comparedPairs, cancelled, durationMs, checkPartialClips, partialSkipped, partialGroups, partialReviewGroups, partialClipsScanned}` |
+| `similar_purged`       | `{ts}` — fingerprints/groups/resume wiped; ignores kept |
 | `thumbs_progress`      | `{stage, processed, total, built, skipped, errored}` |
 | `nsfw_progress`        | `{scanned, total, candidates, keep, running}` |
 | `nsfw_done`            | `{scanned, candidates, keep, durationMs}` |

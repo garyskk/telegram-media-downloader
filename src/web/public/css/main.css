@@ -3454,6 +3454,7 @@ body[data-page="settings"] {
    (`maintenance`) keeps the card-grid as the discovery surface, so we
    skip the tab strip there. */
 body[data-page="maintenance-duplicates"] #maintenance-tabs,
+body[data-page="maintenance-similar"] #maintenance-tabs,
 body[data-page="maintenance-thumbs"] #maintenance-tabs,
 body[data-page="maintenance-seekbar"] #maintenance-tabs,
 body[data-page="maintenance-video"] #maintenance-tabs,
@@ -3481,6 +3482,9 @@ body[data-page="maintenance"] {
 }
 body[data-page="maintenance-duplicates"] {
     --page-accent: var(--tg-orange, #ff9800);
+}
+body[data-page="maintenance-similar"] {
+    --page-accent: var(--tg-violet, #8b5cf6);
 }
 body[data-page="maintenance-thumbs"] {
     --page-accent: var(--tg-blue, #2aabee);

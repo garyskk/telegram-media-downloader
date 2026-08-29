@@ -1,18 +1,19 @@
 // Package api exposes the seekbar service over HTTP.
 //
 // Endpoints (admin / authenticated callers):
-//   POST   /v1/sprite            — submit a single video (sync or async)
-//   POST   /v1/batch             — submit many at once
-//   GET    /v1/jobs/:id          — job status
-//   GET    /v1/jobs              — list recent jobs
-//   POST   /v1/jobs/:id/cancel   — request cancel (best-effort)
-//   GET    /v1/config            — current effective config (for parent health checks)
-//   GET    /sprite/:video_id     — serve the WebP/JPEG sprite bytes
-//   GET    /meta/:video_id       — serve the JSON sidecar
-//   DELETE /v1/sprite/:video_id  — remove sprite + meta from disk
-//   GET    /health               — liveness probe (always open)
-//   GET    /v1/hwaccel           — probe what backends work on this host
-//   GET    /v1/stats             — pool counters
+//
+//	POST   /v1/sprite            — submit a single video (sync or async)
+//	POST   /v1/batch             — submit many at once
+//	GET    /v1/jobs/:id          — job status
+//	GET    /v1/jobs              — list recent jobs
+//	POST   /v1/jobs/:id/cancel   — request cancel (best-effort)
+//	GET    /v1/config            — current effective config (for parent health checks)
+//	GET    /sprite/:video_id     — serve the WebP/JPEG sprite bytes
+//	GET    /meta/:video_id       — serve the JSON sidecar
+//	DELETE /v1/sprite/:video_id  — remove sprite + meta from disk
+//	GET    /health               — liveness probe (always open)
+//	GET    /v1/hwaccel           — probe what backends work on this host
+//	GET    /v1/stats             — pool counters
 //
 // The token (if HTTP.APIToken is set) is checked once via middleware so
 // every mutating route is gated. /health is always open so a Docker
@@ -420,7 +421,7 @@ func (s *Server) handleDeleteSprite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	removed := 0
-	for _, ext := range []string{".webp", ".jpg", ".json"} {
+	for _, ext := range []string{".webp", ".jpg", ".json", ".fp.raw"} {
 		p := filepath.Join(s.cfg.Storage.OutputDir, id+ext)
 		if err := os.Remove(p); err == nil {
 			removed++
