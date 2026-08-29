@@ -9075,6 +9075,78 @@ async function _cropFace(source, row, size) {
         .toBuffer();
 }
 
+// Unclassified / face-review grids used to request every crop at once.
+// Each miss decodes a full photo or ffmpeg-extracts a video frame, so a
+// burst of 50–100 hangs the event loop until nginx/Cloudflare time out.
+// Cap in-flight generation; extra requests wait for a slot.
+const FACE_CROP_CONCURRENCY = Math.max(
+    1,
+    Math.min(8, Number(process.env.TGDL_FACE_CROP_CONCURRENCY) || 4),
+);
+
+function _makeFaceCropSemaphore(max) {
+    let active = 0;
+    const queue = [];
+    return {
+        acquire() {
+            return new Promise((resolve) => {
+                if (active < max) {
+                    active++;
+                    resolve();
+                    return;
+                }
+                queue.push(resolve);
+            });
+        },
+        release() {
+            active--;
+            const next = queue.shift();
+            if (next) {
+                active++;
+                next();
+            }
+        },
+    };
+}
+const _faceCropSem = _makeFaceCropSemaphore(FACE_CROP_CONCURRENCY);
+const _faceCropInflight = new Map();
+
+async function _generateFaceCrop(sourcePathOrBuf, row, size) {
+    if (row.file_type === 'video') {
+        const frameBuf = await _extractBestVideoFrameForCrop(sourcePathOrBuf, row);
+        try {
+            return await _cropFace(frameBuf, row, size);
+        } catch {
+            return await sharp(frameBuf, { failOn: 'none' })
+                .rotate()
+                .resize(size, size, { fit: 'cover', position: 'attention' })
+                .jpeg({ quality: 82, progressive: true })
+                .toBuffer();
+        }
+    }
+    return _cropFace(sourcePathOrBuf, row, size);
+}
+
+async function _generateFaceCropLimited(sourcePathOrBuf, row, size) {
+    const key = `${sourcePathOrBuf}|${row.x}|${row.y}|${row.w}|${row.h}|${row.frame_time_sec}|${size}|${row.file_type}`;
+    const hit = _faceCropInflight.get(key);
+    if (hit) return hit;
+    const job = (async () => {
+        await _faceCropSem.acquire();
+        try {
+            return await _generateFaceCrop(sourcePathOrBuf, row, size);
+        } finally {
+            _faceCropSem.release();
+        }
+    })();
+    _faceCropInflight.set(key, job);
+    try {
+        return await job;
+    } finally {
+        _faceCropInflight.delete(key);
+    }
+}
+
 // Face crop for person avatar — pinned cover_face_id when set and still
 // belonging to this person; otherwise best (highest-quality/largest) face.
 // Used by the People grid as the circle avatar. Sharp-crops with 40% padding so the
@@ -9111,21 +9183,7 @@ app.get('/api/ai/person/:id/face', async (req, res) => {
                 .json({ error: resolved.reason });
         }
 
-        let buf;
-        if (row.file_type === 'video') {
-            const frameBuf = await _extractBestVideoFrameForCrop(resolved.real, row);
-            try {
-                buf = await _cropFace(frameBuf, row, size);
-            } catch {
-                buf = await sharp(frameBuf, { failOn: 'none' })
-                    .rotate()
-                    .resize(size, size, { fit: 'cover', position: 'attention' })
-                    .jpeg({ quality: 82, progressive: true })
-                    .toBuffer();
-            }
-        } else {
-            buf = await _cropFace(resolved.real, row, size);
-        }
+        const buf = await _generateFaceCropLimited(resolved.real, row, size);
 
         res.set('content-type', 'image/jpeg');
         res.set('cache-control', 'public, max-age=604800, immutable');
@@ -9234,21 +9292,7 @@ app.get('/api/ai/faces/:id/crop', async (req, res) => {
                 .json({ error: resolved.reason });
         }
 
-        let buf;
-        if (row.file_type === 'video') {
-            const frameBuf = await _extractBestVideoFrameForCrop(resolved.real, row);
-            try {
-                buf = await _cropFace(frameBuf, row, size);
-            } catch {
-                buf = await sharp(frameBuf, { failOn: 'none' })
-                    .rotate()
-                    .resize(size, size, { fit: 'cover', position: 'attention' })
-                    .jpeg({ quality: 82, progressive: true })
-                    .toBuffer();
-            }
-        } else {
-            buf = await _cropFace(resolved.real, row, size);
-        }
+        const buf = await _generateFaceCropLimited(resolved.real, row, size);
 
         res.set('content-type', 'image/jpeg');
         res.set('cache-control', 'public, max-age=604800, immutable');

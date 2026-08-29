@@ -1111,6 +1111,8 @@
     "maintenance.ai.unclassified.select": "แตะเพื่อเลือก",
     "maintenance.ai.unclassified.sel_hint": "แตะใบหน้าเพื่อเลือก",
     "maintenance.ai.unclassified.sel_n": "เลือกแล้ว {n}",
+    "maintenance.ai.unclassified.sel_all": "เลือกทั้งหมด",
+    "maintenance.ai.unclassified.sel_all_title": "เลือกใบหน้าที่โหลดแล้วทั้งหมด (ไม่รวมหน้าที่ยังไม่เปิด)",
     "maintenance.ai.unclassified.suggest_applies_n": "ใช้กับที่เลือกทั้ง {n}",
     "maintenance.ai.unclassified.assign": "ย้ายไปยังบุคคล…",
     "maintenance.ai.unclassified.assign_n": "ย้าย {n} ใบหน้า…",

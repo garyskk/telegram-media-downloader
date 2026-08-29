@@ -16,6 +16,7 @@ import { showToast, escapeHtml, formatBytes } from './utils.js';
 import { ws } from './ws.js';
 import { confirmSheet, promptSheet, openSheet } from './sheet.js';
 import { openMediaViewerForReview } from './viewer.js';
+import { createCropLoadQueue } from './face-crop-queue.js';
 
 const $ = (sel) => document.querySelector(sel);
 
@@ -102,7 +103,7 @@ let _faceReviewOffset = 0;
 let _faceReviewTotal = 0;
 let _faceReviewToken = 0;
 let _faceReviewGridClickHandler = null;
-const _FACE_REVIEW_PAGE_SIZE = 100;
+const _FACE_REVIEW_PAGE_SIZE = 24;
 
 // Unclassified faces review — opened from the Unclassified KPI tile.
 let _unclassifiedReviewActive = false;
@@ -113,7 +114,13 @@ const _unclassifiedSelectedIds = new Set(); // multi-select face ids
 let _unclassifiedFocusFaceId = null; // last toggled — drives suggestions
 let _unclassifiedSuggestions = [];
 let _unclassifiedGridClickHandler = null;
-const _UNCLASSIFIED_PAGE_SIZE = 100;
+const _UNCLASSIFIED_PAGE_SIZE = 24;
+
+// Face-crop tiles decode a full photo / ffmpeg frame per request. Native
+// `loading=lazy` still prefetches a whole page of in-flow thumbs and
+// stampedes the server. Bound in-flight crops to a small batch instead.
+const _faceCropQueue = createCropLoadQueue();
+let _faceCropObserver = null;
 
 // Person merge suggestions (centroid-nearest other clusters).
 let _personMergeSuggestions = [];
@@ -329,6 +336,7 @@ function _bindOnce() {
         _unclassifiedFocusFaceId = null;
         _syncUnclassifiedSelectionUi();
     });
+    $('#ai-unclassified-sel-all-btn')?.addEventListener('click', _selectAllLoadedUnclassifiedFaces);
     $('#ai-unclassified-sel-assign-btn')?.addEventListener('click', () => {
         const ids = [..._unclassifiedSelectedIds];
         if (!ids.length) return;
@@ -2204,6 +2212,31 @@ function _toggleFaceReview() {
     }
 }
 
+function _ensureFaceCropObserver() {
+    if (_faceCropObserver) return _faceCropObserver;
+    _faceCropObserver = new IntersectionObserver(
+        (entries) => {
+            for (const e of entries) {
+                if (!e.isIntersecting) continue;
+                _faceCropObserver.unobserve(e.target);
+                _faceCropQueue.enqueue(e.target);
+            }
+        },
+        { root: null, rootMargin: '80px 0px', threshold: 0.01 },
+    );
+    return _faceCropObserver;
+}
+
+function _observeFaceCropImgs(root) {
+    if (!root) return;
+    const obs = _ensureFaceCropObserver();
+    root.querySelectorAll('img[data-src]').forEach((img) => obs.observe(img));
+}
+
+function _resetFaceCropLoads() {
+    _faceCropQueue.clear();
+}
+
 function _openFaceReview() {
     if (!_selectedPerson) return;
     if (_splitModeActive) _exitSplitMode();
@@ -2226,6 +2259,7 @@ function _openFaceReview() {
 
 function _closeFaceReview() {
     _faceReviewActive = false;
+    _resetFaceCropLoads();
     const btn = $('#ai-person-review-faces-btn');
     if (btn) btn.classList.remove('ring-2', 'ring-tg-blue/50', 'bg-tg-blue/10');
     $('#ai-face-review')?.classList.add('hidden');
@@ -2240,6 +2274,7 @@ async function _loadFaceReview({ append = false } = {}) {
     const token = ++_faceReviewToken;
 
     if (!append) {
+        _resetFaceCropLoads();
         grid.innerHTML = `<div class="col-span-full text-center text-xs text-tg-textSecondary py-8">${escapeHtml(i18nT('common.loading', 'Loading…'))}</div>`;
         if (countEl) countEl.textContent = '';
     }
@@ -2272,6 +2307,7 @@ async function _loadFaceReview({ append = false } = {}) {
         }
 
         _wireFaceReviewGrid();
+        _observeFaceCropImgs(grid);
         _renderFaceReviewLoadMore();
     } catch (e) {
         if (token !== _faceReviewToken) return;
@@ -2329,10 +2365,10 @@ function _faceReviewTile(row) {
     );
 
     return `
-        <div class="ai-face-review-tile group relative rounded-xl overflow-hidden shadow-sm hover:shadow-lg transition-all duration-200 bg-tg-bg/40${coverRing}" data-face-id="${faceId}" data-dl-id="${dlId}" data-meta="${meta}">
+        <div class="ai-face-review-tile group relative aspect-square rounded-xl overflow-hidden shadow-sm hover:shadow-lg transition-all duration-200 bg-tg-bg/40${coverRing}" data-face-id="${faceId}" data-dl-id="${dlId}" data-meta="${meta}">
             <button type="button" class="ai-face-review-open block w-full cursor-pointer" title="${escapeHtml(i18nT('maintenance.ai.face_review_open_source', 'Open source photo'))} — ${name}">
-                <img src="/api/ai/faces/${faceId}/crop?w=160" alt="${name}" loading="lazy"
-                    class="aspect-square w-full object-cover transition-transform duration-300 group-hover:scale-105">
+                <img data-src="/api/ai/faces/${faceId}/crop?w=160" alt="${name}" decoding="async"
+                    class="aspect-square w-full object-cover bg-tg-bg/40 transition-transform duration-300 group-hover:scale-105">
             </button>
             ${qBadge}
             ${coverBadge}
@@ -2606,6 +2642,7 @@ function _openUnclassifiedReview() {
 
 function _closeUnclassifiedReview() {
     _unclassifiedReviewActive = false;
+    _resetFaceCropLoads();
     _unclassifiedSelectedIds.clear();
     _unclassifiedFocusFaceId = null;
     _unclassifiedSuggestions = [];
@@ -2624,6 +2661,7 @@ async function _loadUnclassifiedReview({ append = false } = {}) {
     const token = ++_unclassifiedToken;
 
     if (!append) {
+        _resetFaceCropLoads();
         grid.innerHTML = `<div class="col-span-full text-center text-xs text-tg-textSecondary py-8">${escapeHtml(i18nT('common.loading', 'Loading…'))}</div>`;
         if (countEl) countEl.textContent = '';
     }
@@ -2670,6 +2708,7 @@ async function _loadUnclassifiedReview({ append = false } = {}) {
             );
         }
         _wireUnclassifiedGrid();
+        _observeFaceCropImgs(grid);
         _renderUnclassifiedLoadMore();
         _syncUnclassifiedSelectionUi();
     } catch (e) {
@@ -2726,10 +2765,10 @@ function _unclassifiedTile(row) {
         }),
     );
     return `
-        <div class="ai-unclassified-tile group relative rounded-xl overflow-hidden shadow-sm hover:shadow-lg transition-all duration-200 bg-tg-bg/40${selRing}" data-face-id="${faceId}" data-dl-id="${dlId}" data-meta="${meta}">
+        <div class="ai-unclassified-tile group relative aspect-square rounded-xl overflow-hidden shadow-sm hover:shadow-lg transition-all duration-200 bg-tg-bg/40${selRing}" data-face-id="${faceId}" data-dl-id="${dlId}" data-meta="${meta}">
             <button type="button" class="ai-unclassified-select block w-full cursor-pointer" title="${escapeHtml(i18nT('maintenance.ai.unclassified.select', 'Tap to select'))} — ${name}">
-                <img src="/api/ai/faces/${faceId}/crop?w=160" alt="${name}" loading="lazy"
-                    class="aspect-square w-full object-cover transition-transform duration-300 group-hover:scale-105">
+                <img data-src="/api/ai/faces/${faceId}/crop?w=160" alt="${name}" decoding="async"
+                    class="aspect-square w-full object-cover bg-tg-bg/40 transition-transform duration-300 group-hover:scale-105">
             </button>
             ${qBadge}
             ${selBadge}
@@ -2811,6 +2850,26 @@ function _wireUnclassifiedGrid() {
     grid.addEventListener('click', _unclassifiedGridClickHandler);
 }
 
+function _loadedUnclassifiedFaceIds(root) {
+    if (!root || typeof root.querySelectorAll !== 'function') return [];
+    const ids = [];
+    const tiles = root.querySelectorAll('.ai-unclassified-tile');
+    for (let i = 0; i < tiles.length; i++) {
+        const id = Number(tiles[i].dataset?.faceId);
+        if (Number.isFinite(id) && id > 0) ids.push(id);
+    }
+    return ids;
+}
+
+function _selectAllLoadedUnclassifiedFaces() {
+    const ids = _loadedUnclassifiedFaceIds($('#ai-unclassified-grid'));
+    if (!ids.length) return;
+    _unclassifiedSelectedIds.clear();
+    for (const id of ids) _unclassifiedSelectedIds.add(id);
+    _unclassifiedFocusFaceId = ids[ids.length - 1];
+    _syncUnclassifiedSelectionUi();
+}
+
 function _toggleUnclassifiedSelection(faceId) {
     const id = Number(faceId);
     if (!Number.isFinite(id) || id <= 0) return;
@@ -2867,6 +2926,10 @@ function _syncUnclassifiedSelectionUi() {
     $('#ai-unclassified-sel-assign-btn')?.toggleAttribute('disabled', disabled);
     $('#ai-unclassified-sel-new-btn')?.toggleAttribute('disabled', disabled);
     $('#ai-unclassified-sel-remove-btn')?.toggleAttribute('disabled', disabled);
+    $('#ai-unclassified-sel-all-btn')?.toggleAttribute(
+        'disabled',
+        _loadedUnclassifiedFaceIds(grid).length === 0,
+    );
 
     if (_unclassifiedFocusFaceId && _unclassifiedSelectedIds.has(_unclassifiedFocusFaceId)) {
         _loadUnclassifiedSuggestions(_unclassifiedFocusFaceId);
