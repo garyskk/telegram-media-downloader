@@ -5,6 +5,7 @@ All notable changes to this project are documented here. The format is based on 
 ## [Unreleased]
 
 ### Added
+- **Unclassified Select all.** Selects every face already in the review grid (loaded pages, including Show more) — not the remaining unloaded total.
 - **Similar clips** (Maintenance hub card + `#/maintenance/similar`). Near-duplicate **videos** and shorter clips inside longer ones — not byte-identical files (those stay on Duplicates / SHA-256). Scan runs its own ffmpeg (scene-or-floor `select`, 64×64 PDQ-256 + real pts) into `data/db.sqlite`; Analyze aligns sequences with Smith-Waterman (bumpers/excerpts, not t=0 Hamming). Matching knobs live on the page (`similarThreshold` 50, `partialFrameThreshold` 90, `sceneThreshold` / `floorIntervalSec`) and autosave into `advanced.similarClips` (`TGDL_SIMILAR_*` env overrides). Partial-clip search is a checkbox, **on** by default. **Purge Analyze** wipes groups and Analyze cursors (fingerprints stay). **Purge records** wipes hashes/groups/resume and keeps ignored pairs + hover sprites (`409` if Scan/Analyze is running). See [docs/SIMILAR-CLIPS.md](docs/SIMILAR-CLIPS.md).
 - **People grid Asc/Desc sort.** Shared direction toggle next to Faces / Quality / Name (persists across field changes; re-clicking the active field also flips direction). `GET /api/ai/people` accepts `sortBy`/`sort` (`face_count` \| `avg_quality` \| `name`) and `sortDir`/`dir` (`asc` \| `desc`); default remains `face_count` + `desc`. Name sort includes unlabeled: they lead on Asc and trail on Desc (sorted by id among themselves); labeled names sort A–Z / Z–A.
 - **Gallery shuffle mode (synced with player).** Media-tabs Shuffle chip + player button share one session. Enabling from the grid shuffles the full filtered ID set into the gallery without opening the lightbox; closing the player keeps the shuffled order. Infinite scroll hydrates the next shuffle window (not chronological pages). Time-section headers (Today / Yesterday / Older) are suppressed while shuffled. Filter/group/scope reloads clear the session.
@@ -29,6 +30,7 @@ All notable changes to this project are documented here. The format is based on 
 - **Mirror destination cards no longer show a cron schedule** — cron only applies to snapshot mode; saving a non-snapshot destination clears any leftover cron.
 
 ### Fixed
+- **Unclassified (and Review faces) crop tiles timed out under load.** Opening Unclassified used to insert a page of 100 `<img src=/api/ai/faces/:id/crop>` at once; each miss decodes a full photo or ffmpeg-extracts a video frame, so the burst hung until nginx/Cloudflare gave up. Tiles now keep `data-src` and a queue loads **4 crops at a time** as they scroll into view; pages are 24. The crop endpoints themselves also run at most 4 generations at once (`TGDL_FACE_CROP_CONCURRENCY`).
 - **Similar-clips Scan progress stuck at 5% when nothing was pending.** A no-op Scan (all videos already fingerprinted) finished before the POST response; the page then marked the job running with an empty progress object, which the bar treated as 5%. Status is re-checked after start, and `total === 0` is 100% / up to date instead of a fake 5%.
 - **Stale face tiles after a shared-file delete.** Hash-dedup can store two download rows against one on-disk path; deleting the duplicate unlinked the file while the keeper row (and its faces) stayed live, so crop URLs returned `{ error: "missing" }`. Deleting the last live reference now unlinks and wipes faces; deleting a duplicate keeps the file when another live row still points at it. A crop or `/files` 404 for a missing source tombstones every live row on that path and deletes their faces immediately (integrity sweep still catches stragglers).
 - **People Name sort ignored unlabeled clusters.** Asc/Desc only reordered labeled people while `Person #N` stayed pinned at the bottom. Unlabeled now lead on Asc and trail on Desc (by id); labeled still sort A–Z / Z–A.
@@ -45,7 +47,7 @@ All notable changes to this project are documented here. The format is based on 
 - **Seekbar sprites for 1h+ videos died at 120s with a fake "does not contain any stream" error.** Sprite encodes walk the whole file, but they reused the thumbnail ffmpeg kill (120s) and treated a sidecar 60s sync wait as a miss — which started a second ffmpeg. Node now submits async, polls the sidecar job, and uses a duration-scaled budget (`clamp(5 min, 1× realtime, 60 min)`). Timeouts stay retryable; gallery thumbs stay at 120s.
 
 ### Service worker
-- `VERSION = 'v2.24.5-23'` (served from `package.json` so a version bump always busts the PWA caches)
+- `VERSION = 'v2.24.5-25'` (served from `package.json` so a version bump always busts the PWA caches)
 
 ## [2.24.5] — 2026-05-31
 

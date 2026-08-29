@@ -1121,6 +1121,8 @@
     "maintenance.ai.unclassified.select": "Tap to select",
     "maintenance.ai.unclassified.sel_hint": "Tap faces to select",
     "maintenance.ai.unclassified.sel_n": "{n} selected",
+    "maintenance.ai.unclassified.sel_all": "Select all",
+    "maintenance.ai.unclassified.sel_all_title": "Select all loaded faces (not remaining pages)",
     "maintenance.ai.unclassified.suggest_applies_n": "Applies to all {n} selected",
     "maintenance.ai.unclassified.assign": "Assign to person…",
     "maintenance.ai.unclassified.assign_n": "Assign {n} faces…",
