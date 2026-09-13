@@ -120,8 +120,12 @@ left to the Duplicates page and are not re-checked here.
   on Similar). Clip must have ≥4 scenes and ≥4 matched scenes; coverage
   ≥ 0.5. `offset_sec` is the parent’s real `t_sec` at the alignment start.
   Confirmed vs `partial_review` (coverage ≥ 0.35). Keep the **longer**
-  video. Interrupt-safe via `similar_partial_scans`. Exact SHA-256 pairs
-  and `similar_ignores` are skipped.
+  video. Incremental: a new clip is compared to all longer parents,
+  **and** a new parent is compared to already-scanned shorter clips
+  (so a later full video still matches an earlier excerpt). Already-
+  grouped `remove`/`review` clips are not reopened. Interrupt-safe via
+  `similar_partial_scans`. Exact SHA-256 pairs and `similar_ignores`
+  are skipped.
 
 False-positive pairs go to `similar_ignores` (canonical `a_id < b_id`)
 and survive re-analyze **and** Purge records.
@@ -231,7 +235,9 @@ already-written fingerprints are kept.
 local file.
 
 **Short clip not found inside a long video.** Partial search is on by
-default. If the checkbox was turned off, turn it back on. Frame Hamming must be high enough for
+default. If the checkbox was turned off, turn it back on. A later full
+video is compared against already-scanned shorter clips — you do not
+need Purge Analyze for that order. Frame Hamming must be high enough for
 re-encodes (default **90**; 70 misses clips whose aligned PDQ sits
 ~80–90). The parent must have scene+PDQ fingerprints, not a leftover
 `phash-v1` row. Changing Frame Hamming does not require a re-Scan.

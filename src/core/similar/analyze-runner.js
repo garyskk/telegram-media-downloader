@@ -6,7 +6,8 @@
  * so a later Analyze only processes new/stale fingerprints. Stop keeps
  * those cursors and groups already written.
  *
- * Partial clips still use `similar_partial_scans` resume.
+ * Partial clips still use `similar_partial_scans` resume: new clips vs
+ * longer parents, and new parents vs already-scanned shorter clips.
  */
 
 import {
@@ -110,9 +111,13 @@ function _partialHashIds(videos, skipClipIds) {
     for (const clip of pending) {
         ids.add(Number(clip.id));
         const clipDur = Number(clip.durationSec);
-        for (const parent of videos) {
-            if (Number(parent.id) === Number(clip.id)) continue;
-            if (Number(parent.durationSec) + 1e-9 >= clipDur) ids.add(Number(parent.id));
+        for (const other of videos) {
+            if (Number(other.id) === Number(clip.id)) continue;
+            const otherDur = Number(other.durationSec);
+            if (otherDur + 1e-9 >= clipDur) ids.add(Number(other.id));
+            if (skipClipIds.has(Number(other.id)) && otherDur - 1e-9 <= clipDur) {
+                ids.add(Number(other.id));
+            }
         }
     }
     return [...ids];
@@ -223,8 +228,7 @@ export async function analyzeSimilarClips({ onProgress, signal, checkPartialClip
             skipLeftIds,
             framesById,
             signal,
-            onProgress: (p) =>
-                emit(p.stage || 'matching', { skipped: skipLeftIds.size, ...p }),
+            onProgress: (p) => emit(p.stage || 'matching', { skipped: skipLeftIds.size, ...p }),
             onLeftComplete: (left, newGroups) => {
                 for (const g of newGroups || []) {
                     insertSimilarGroup({
@@ -310,15 +314,24 @@ export async function analyzeSimilarClips({ onProgress, signal, checkPartialClip
 
     const skipClipIds = new Set([...skipDetected, ...skipScanned]);
     const skippedPartial = skipClipIds.size;
-    const pendingPartial = videos.filter(
+    const pendingPartialVideos = videos.filter(
         (v) => !skipClipIds.has(Number(v.id)) && Number(v.frameCount) >= PARTIAL_MIN_CLIP_FRAMES,
-    ).length;
+    );
+    const pendingPartial = pendingPartialVideos.length;
+    const recheckPartial = videos.filter((v) => {
+        const id = Number(v.id);
+        if (!skipScanned.has(id) || skipDetected.has(id)) return false;
+        if (Number(v.frameCount) < PARTIAL_MIN_CLIP_FRAMES) return false;
+        return pendingPartialVideos.some(
+            (p) => Number(p.durationSec) > Number(v.durationSec) + 1e-9,
+        );
+    }).length;
     let partialGroups = 0;
     let partialReviewGroups = 0;
 
     emit('partial', {
         processed: 0,
-        total: pendingPartial,
+        total: pendingPartial + recheckPartial,
         skipped: skippedPartial,
         groups: existingPartial.length,
     });
@@ -347,6 +360,7 @@ export async function analyzeSimilarClips({ onProgress, signal, checkPartialClip
         ignoredPairs: ignoredPartial,
         blockedPairs,
         skipClipIds,
+        skipDetectedIds: skipDetected,
         framesById,
         signal,
         onProgress: (p) => emit(p.stage || 'partial', { skipped: skippedPartial, ...p }),

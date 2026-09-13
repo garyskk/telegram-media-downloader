@@ -27,11 +27,9 @@ beforeAll(async () => {
     process.env.TGDL_DATA_DIR = DATA_DIR;
     api = await import('../src/core/db.js');
     db = api.getDb();
-    ({
-        effectivePartialMatchRatio,
-        bestSubsequenceMatch,
-        findPartialClipGroups,
-    } = await import('../src/core/similar/partial.js'));
+    ({ effectivePartialMatchRatio, bestSubsequenceMatch, findPartialClipGroups } = await import(
+        '../src/core/similar/partial.js'
+    ));
     ({ analyzeSimilarClips } = await import('../src/core/similar/analyze-runner.js'));
 });
 
@@ -102,13 +100,17 @@ describe('bestSubsequenceMatch', () => {
     });
 
     it('rejects a clip longer than the parent', async () => {
-        const { ratio, matched } = await bestSubsequenceMatch([H0, H1, H2], [H0, H1], { frameThreshold: 0 });
+        const { ratio, matched } = await bestSubsequenceMatch([H0, H1, H2], [H0, H1], {
+            frameThreshold: 0,
+        });
         expect(ratio).toBe(0);
         expect(matched).toBe(0);
     });
 
     it('counts per-frame Hamming within the threshold', async () => {
-        const { ratio, matched } = await bestSubsequenceMatch([H0, H1], [H0, HF], { frameThreshold: 0 });
+        const { ratio, matched } = await bestSubsequenceMatch([H0, H1], [H0, HF], {
+            frameThreshold: 0,
+        });
         expect(matched).toBe(1);
         expect(ratio).toBe(0.5);
     });
@@ -156,7 +158,13 @@ describe('findPartialClipGroups', () => {
         const { groups } = await findPartialClipGroups(
             [
                 video({ id: 1, durationSec: 10, fileHash: 'clip', fileSize: 100, hashes: clipH }),
-                video({ id: 2, durationSec: 60, fileHash: 'full', fileSize: 1000, hashes: parentH }),
+                video({
+                    id: 2,
+                    durationSec: 60,
+                    fileHash: 'full',
+                    fileSize: 1000,
+                    hashes: parentH,
+                }),
             ],
             {
                 ...opts,
@@ -180,7 +188,13 @@ describe('findPartialClipGroups', () => {
                 video({ id: 1, durationSec: 30, fileHash: 'hi', fileSize: 2000, hashes }),
                 video({ id: 2, durationSec: 30, fileHash: 'lo', fileSize: 800, hashes }),
             ],
-            { ...opts, framesById: new Map([[1, framesOf(hashes)], [2, framesOf(hashes)]]) },
+            {
+                ...opts,
+                framesById: new Map([
+                    [1, framesOf(hashes)],
+                    [2, framesOf(hashes)],
+                ]),
+            },
         );
         expect(groups).toHaveLength(0);
     });
@@ -191,7 +205,13 @@ describe('findPartialClipGroups', () => {
         const { groups } = await findPartialClipGroups(
             [
                 video({ id: 1, durationSec: 5, fileHash: 'tiny', fileSize: 50, hashes: clipH }),
-                video({ id: 2, durationSec: 60, fileHash: 'full', fileSize: 1000, hashes: parentH }),
+                video({
+                    id: 2,
+                    durationSec: 60,
+                    fileHash: 'full',
+                    fileSize: 1000,
+                    hashes: parentH,
+                }),
             ],
             {
                 ...opts,
@@ -210,7 +230,13 @@ describe('findPartialClipGroups', () => {
         const { groups } = await findPartialClipGroups(
             [
                 video({ id: 1, durationSec: 10, fileHash: 'clip', fileSize: 100, hashes: clipH }),
-                video({ id: 2, durationSec: 60, fileHash: 'full', fileSize: 1000, hashes: parentH }),
+                video({
+                    id: 2,
+                    durationSec: 60,
+                    fileHash: 'full',
+                    fileSize: 1000,
+                    hashes: parentH,
+                }),
             ],
             {
                 ...opts,
@@ -229,7 +255,13 @@ describe('findPartialClipGroups', () => {
         const { groups } = await findPartialClipGroups(
             [
                 video({ id: 1, durationSec: 400, fileHash: 'clip', fileSize: 100, hashes: clipH }),
-                video({ id: 2, durationSec: 500, fileHash: 'full', fileSize: 1000, hashes: parentH }),
+                video({
+                    id: 2,
+                    durationSec: 500,
+                    fileHash: 'full',
+                    fileSize: 1000,
+                    hashes: parentH,
+                }),
             ],
             {
                 ...opts,
@@ -267,7 +299,13 @@ describe('findPartialClipGroups', () => {
         const exact = await findPartialClipGroups(
             [
                 video({ id: 3, durationSec: 10, fileHash: 'same', fileSize: 100, hashes: clipH }),
-                video({ id: 4, durationSec: 60, fileHash: 'same', fileSize: 1000, hashes: parentH }),
+                video({
+                    id: 4,
+                    durationSec: 60,
+                    fileHash: 'same',
+                    fileSize: 1000,
+                    hashes: parentH,
+                }),
             ],
             { ...opts, framesById },
         );
@@ -280,7 +318,13 @@ describe('findPartialClipGroups', () => {
         const { groups } = await findPartialClipGroups(
             [
                 video({ id: 1, durationSec: 10, fileHash: 'clip', fileSize: 100, hashes: clipH }),
-                video({ id: 2, durationSec: 250, fileHash: 'full', fileSize: 1000, hashes: parentH }),
+                video({
+                    id: 2,
+                    durationSec: 250,
+                    fileHash: 'full',
+                    fileSize: 1000,
+                    hashes: parentH,
+                }),
             ],
             {
                 ...opts,
@@ -308,7 +352,13 @@ describe('findPartialClipGroups', () => {
         const { groups } = await findPartialClipGroups(
             [
                 video({ id: 1, durationSec: 10, fileHash: 'clip', fileSize: 100, hashes: clipH }),
-                video({ id: 2, durationSec: 60, fileHash: 'full', fileSize: 1000, hashes: parentH }),
+                video({
+                    id: 2,
+                    durationSec: 60,
+                    fileHash: 'full',
+                    fileSize: 1000,
+                    hashes: parentH,
+                }),
             ],
             {
                 ...opts,
@@ -335,11 +385,19 @@ describe('findPartialClipGroups', () => {
             [
                 video({ id: 1, durationSec: 10, fileHash: 'done', fileSize: 100, hashes: clipH }),
                 video({ id: 3, durationSec: 12, fileHash: 'new', fileSize: 110, hashes: clipH }),
-                video({ id: 2, durationSec: 60, fileHash: 'full', fileSize: 1000, hashes: parentH }),
+                video({
+                    id: 2,
+                    durationSec: 60,
+                    fileHash: 'full',
+                    fileSize: 1000,
+                    hashes: parentH,
+                }),
             ],
             {
                 ...opts,
-                skipClipIds: [1],
+                // Already-scanned *parent* is not shorter than pending clips, so
+                // the later-parent pass must not inflate total.
+                skipClipIds: [2],
                 framesById,
                 onProgress: (p) => progress.push({ ...p }),
             },
@@ -351,6 +409,139 @@ describe('findPartialClipGroups', () => {
         expect(last.total).toBe(2);
         expect(progress.every((p) => p.total === 2)).toBe(true);
         expect(progress.every((p) => Number(p.processed) <= 2)).toBe(true);
+    });
+
+    it('rechecks an already-scanned short clip against a later longer parent', async () => {
+        const clipH = [H0, H1, H2, H3];
+        const parentH = [HA, H0, H1, H2, H3, HF];
+        const { groups } = await findPartialClipGroups(
+            [
+                video({ id: 1, durationSec: 10, fileHash: 'bcd', fileSize: 100, hashes: clipH }),
+                video({
+                    id: 2,
+                    durationSec: 60,
+                    fileHash: 'abcdef',
+                    fileSize: 1000,
+                    hashes: parentH,
+                }),
+            ],
+            {
+                ...opts,
+                skipClipIds: [1],
+                framesById: new Map([
+                    [1, framesOf(clipH)],
+                    [2, framesOf(parentH)],
+                ]),
+            },
+        );
+        expect(groups).toHaveLength(1);
+        expect(groups[0].kind).toBe('partial');
+        expect(groups[0].offsetSec).toBe(1);
+        expect(groups[0].members.find((m) => m.role === 'keep').downloadId).toBe(2);
+        expect(groups[0].members.find((m) => m.role === 'remove').downloadId).toBe(1);
+    });
+
+    it('progress includes already-scanned shorter clips when a new parent arrives', async () => {
+        const clipH = [H0, H1, H2, H3];
+        const parentH = [HA, H0, H1, H2, H3, HF];
+        const progress = [];
+        await findPartialClipGroups(
+            [
+                video({ id: 1, durationSec: 10, fileHash: 'bcd', fileSize: 100, hashes: clipH }),
+                video({
+                    id: 2,
+                    durationSec: 60,
+                    fileHash: 'abcdef',
+                    fileSize: 1000,
+                    hashes: parentH,
+                }),
+            ],
+            {
+                ...opts,
+                skipClipIds: [1],
+                framesById: new Map([
+                    [1, framesOf(clipH)],
+                    [2, framesOf(parentH)],
+                ]),
+                onProgress: (p) => progress.push({ ...p }),
+            },
+        );
+        const first = progress.find((p) => p.stage === 'partial');
+        expect(first).toMatchObject({ processed: 0, total: 2, skipped: 1 });
+        const last = progress[progress.length - 1];
+        expect(last.processed).toBe(2);
+        expect(last.total).toBe(2);
+        expect(last.clipsScanned).toBe(2);
+    });
+
+    it('does not reopen an already-grouped clip against a later parent', async () => {
+        const clipH = [H0, H1, H2, H3];
+        const parentH = [HA, H0, H1, H2, H3, HF];
+        const { groups } = await findPartialClipGroups(
+            [
+                video({ id: 1, durationSec: 10, fileHash: 'bcd', fileSize: 100, hashes: clipH }),
+                video({
+                    id: 2,
+                    durationSec: 60,
+                    fileHash: 'abcdef',
+                    fileSize: 1000,
+                    hashes: parentH,
+                }),
+            ],
+            {
+                ...opts,
+                skipClipIds: [1],
+                skipDetectedIds: [1],
+                framesById: new Map([
+                    [1, framesOf(clipH)],
+                    [2, framesOf(parentH)],
+                ]),
+            },
+        );
+        expect(groups).toHaveLength(0);
+    });
+
+    it('skips ignored and exact SHA-256 pairs on the later-parent pass', async () => {
+        const clipH = [H0, H1, H2, H3];
+        const parentH = [HA, H0, H1, H2, H3, HF];
+        const ignored = await findPartialClipGroups(
+            [
+                video({ id: 1, durationSec: 10, fileHash: 'c1', fileSize: 100, hashes: clipH }),
+                video({ id: 2, durationSec: 60, fileHash: 'p1', fileSize: 1000, hashes: parentH }),
+            ],
+            {
+                ...opts,
+                skipClipIds: [1],
+                ignoredPairs: ['1:2'],
+                framesById: new Map([
+                    [1, framesOf(clipH)],
+                    [2, framesOf(parentH)],
+                ]),
+            },
+        );
+        expect(ignored.groups).toHaveLength(0);
+
+        const exact = await findPartialClipGroups(
+            [
+                video({ id: 3, durationSec: 10, fileHash: 'same', fileSize: 100, hashes: clipH }),
+                video({
+                    id: 4,
+                    durationSec: 60,
+                    fileHash: 'same',
+                    fileSize: 1000,
+                    hashes: parentH,
+                }),
+            ],
+            {
+                ...opts,
+                skipClipIds: [3],
+                framesById: new Map([
+                    [3, framesOf(clipH)],
+                    [4, framesOf(parentH)],
+                ]),
+            },
+        );
+        expect(exact.groups).toHaveLength(0);
     });
 });
 
@@ -455,6 +646,39 @@ describe('analyzeSimilarClips partial', () => {
             api.listSimilarGroups({ kind: 'partial' }).filter((g) => {
                 const m = new Set(g.members.map((row) => row.download_id));
                 return m.has(clip2) && m.has(parent);
+            }),
+        ).toHaveLength(1);
+    });
+
+    it('matches an already-scanned short clip when a longer parent arrives later', async () => {
+        const clipH = [H0, H1, H2, H3];
+        const parentH = [HA, H0, H1, H2, H3, HF];
+        const clip = seedVideo({ fileHash: 'later-c', fileSize: 100 });
+        seedFingerprint(clip, { durationSec: 10, fileHash: 'later-c', hashes: clipH });
+
+        const first = await analyzeSimilarClips({ checkPartialClips: true });
+        expect(first.partialGroups).toBe(0);
+        expect(api.getSimilarPartialScan(clip)?.frame_count).toBe(4);
+
+        const parent = seedVideo({ fileHash: 'later-p', fileSize: 900 });
+        seedFingerprint(parent, { durationSec: 60, fileHash: 'later-p', hashes: parentH });
+        const second = await analyzeSimilarClips({ checkPartialClips: true });
+        expect(second.partialGroups).toBe(1);
+        const groups = api.listSimilarGroups({ kind: 'partial' }).filter((g) => {
+            const m = new Set(g.members.map((row) => row.download_id));
+            return m.has(clip) && m.has(parent);
+        });
+        expect(groups).toHaveLength(1);
+        expect(groups[0].members.find((m) => m.role === 'keep').download_id).toBe(parent);
+        expect(groups[0].members.find((m) => m.role === 'remove').download_id).toBe(clip);
+        expect(groups[0].offset_sec).toBe(1);
+
+        const third = await analyzeSimilarClips({ checkPartialClips: true });
+        expect(third.partialGroups).toBe(0);
+        expect(
+            api.listSimilarGroups({ kind: 'partial' }).filter((g) => {
+                const m = new Set(g.members.map((row) => row.download_id));
+                return m.has(clip) && m.has(parent);
             }),
         ).toHaveLength(1);
     });
