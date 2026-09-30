@@ -1,4 +1,4 @@
-// Tools catalogue — the 11 maintenance tools, grouped into the four Tools
+// Tools catalogue — the 12 maintenance tools, grouped into the four Tools
 // pages under Settings. Pure data so the router (nav.js), the Tools pages
 // (tools-hub.js) and the command palette can share it without pulling in
 // each other.
@@ -16,9 +16,9 @@ export const TOOL_GROUPS = [
         title: ['tools.group.library', 'Library health'],
         desc: [
             'tools.group.library_desc',
-            'Duplicates, thumbnails, seekbar previews and videos that stream.',
+            'Duplicates, similar clips, thumbnails, seekbar previews and videos that stream.',
         ],
-        tools: ['duplicates', 'thumbs', 'seekbar', 'video'],
+        tools: ['duplicates', 'similar', 'thumbs', 'seekbar', 'video'],
     },
     {
         slug: 'safety',
@@ -57,6 +57,16 @@ export const TOOLS = {
             'Hash every file and reclaim space from byte-identical copies.',
         ],
         words: 'dedup duplicate hash reclaim space copies',
+    },
+    similar: {
+        icon: 'ri-scissors-cut-line',
+        accent: 'violet',
+        name: ['nav.maintenance.similar', 'Similar clips'],
+        desc: [
+            'maintenance.hub.similar.body',
+            'Near-duplicate videos and shorter clips inside longer ones. Scan fingerprints, then Analyze.',
+        ],
+        words: 'similar near duplicate partial clip pdq fingerprint scene',
     },
     thumbs: {
         icon: 'ri-image-2-line',

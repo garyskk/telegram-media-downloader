@@ -1092,6 +1092,16 @@ function renderPage(page, params = {}) {
         import('./maintenance-duplicates.js')
             .then((m) => m.init())
             .catch((e) => console.error('maintenance-duplicates', e));
+    } else if (page === 'maintenance-similar') {
+        _setPageText('title', 'maintenance.similar.page_title', 'Similar clips');
+        _setPageText(
+            'subtitle',
+            'maintenance.similar.subtitle',
+            'Find near-duplicate videos and shorter clips inside longer ones.',
+        );
+        import('./maintenance-similar.js')
+            .then((m) => m.init())
+            .catch((e) => console.error('maintenance-similar', e));
     } else if (page === 'maintenance-thumbs') {
         _setPageText('title', 'maintenance.thumbs.page_title', 'Build thumbnails');
         _setPageText(
@@ -1741,6 +1751,7 @@ const PAGE_HEADER_ICON = {
     settings: 'ri-settings-3-line',
     maintenance: 'ri-tools-line',
     'maintenance-duplicates': 'ri-file-copy-2-line',
+    'maintenance-similar': 'ri-scissors-cut-line',
     'maintenance-thumbs': 'ri-image-line',
     'maintenance-seekbar': 'ri-movie-line',
     'maintenance-video': 'ri-film-line',

@@ -61,6 +61,13 @@ import {
     getNsfwBlocklistCount,
     clearNsfwBlocklist,
     getDownloadHashesForIds,
+    getSimilarScanStats,
+    listSimilarGroups,
+    addSimilarIgnore,
+    listSimilarIgnores,
+    deleteSimilarIgnore,
+    purgeSimilarClipsRecords,
+    purgeSimilarAnalyzeRecords,
     setDownloadPinned,
     setDownloadsPinned,
     getDownloadById,
@@ -77,6 +84,12 @@ import { sanitizeName } from '../core/downloader.js';
 import { SecureSession } from '../core/security.js';
 import { AccountManager, hasAccountSessions } from '../core/accounts.js';
 import { loadConfig, saveConfig, watchConfig, getDefaultCsp } from '../config/manager.js';
+import { SIMILAR_CLIPS_DEFAULTS } from '../core/similar/config.js';
+import {
+    analyzeSimilarClips,
+    scanSimilarClips,
+    unlinkLeftoverFingerprintRaws,
+} from '../core/similar/index.js';
 import { buildSecurityHeaders, validateCsp } from './lib/security-headers.js';
 import { runtime } from '../core/runtime.js';
 import { getDiskRotator } from '../core/disk-rotator.js';
@@ -7183,6 +7196,196 @@ app.get('/api/maintenance/dedup/stats', async (req, res) => {
     }
 });
 
+// ====== Similar clips (fingerprint Scan + Analyze) ========================
+// Scan uses the similar-only ffmpeg runner (not seekbar). A file is skipped
+// when file_hash matches and algo is pdq-scene-v1.
+
+app.post('/api/maintenance/similar/scan', async (req, res) => {
+    const tracker = _jobTrackers.similarScan;
+    const r = tracker.tryStart(async ({ onProgress, signal }) => {
+        try {
+            kvSet('pending_job_similarScan', { startedAt: Date.now() });
+        } catch {}
+        const result = await scanSimilarClips({ onProgress, signal });
+        try {
+            kvSet('pending_job_similarScan', null);
+        } catch {}
+        try {
+            kvSet('similar_last_scan', { finishedAt: Date.now(), ...result });
+        } catch {}
+        return result;
+    });
+    if (!r.started) return res.status(409).json(r);
+    res.json({ started: true });
+});
+
+app.post('/api/maintenance/similar/scan/stop', (req, res) => {
+    _jobTrackers.similarScan.cancel();
+    res.json({ success: true });
+});
+
+app.get('/api/maintenance/similar/status', (req, res) => {
+    res.json({
+        ..._jobTrackers.similarScan.getStatus(),
+        analyze: _jobTrackers.similarAnalyze.getStatus(),
+    });
+});
+
+app.get('/api/maintenance/similar/stats', (req, res) => {
+    try {
+        res.json({
+            success: true,
+            ...getSimilarScanStats(),
+            lastScan: kvGet('similar_last_scan') || null,
+            lastAnalyze: kvGet('similar_last_analyze') || null,
+        });
+    } catch (e) {
+        res.status(500).json({ error: e?.message || String(e) });
+    }
+});
+
+app.post('/api/maintenance/similar/analyze', async (req, res) => {
+    const checkPartialClips = Boolean((req.body || {}).checkPartialClips);
+    const tracker = _jobTrackers.similarAnalyze;
+    const r = tracker.tryStart(async ({ onProgress, signal }) => {
+        try {
+            kvSet('pending_job_similarAnalyze', { startedAt: Date.now() });
+        } catch {}
+        const result = await analyzeSimilarClips({ onProgress, signal, checkPartialClips });
+        try {
+            kvSet('pending_job_similarAnalyze', null);
+        } catch {}
+        try {
+            kvSet('similar_last_analyze', { finishedAt: Date.now(), ...result });
+        } catch {}
+        return result;
+    });
+    if (!r.started) return res.status(409).json(r);
+    res.json({ started: true });
+});
+
+app.post('/api/maintenance/similar/analyze/stop', (req, res) => {
+    _jobTrackers.similarAnalyze.cancel();
+    res.json({ success: true });
+});
+
+app.get('/api/maintenance/similar/groups', (req, res) => {
+    try {
+        const kind = req.query.kind ? String(req.query.kind) : undefined;
+        res.json({ success: true, groups: listSimilarGroups({ kind }) });
+    } catch (e) {
+        res.status(500).json({ error: e?.message || String(e) });
+    }
+});
+
+app.post('/api/maintenance/similar/delete', async (req, res) => {
+    try {
+        const { ids } = req.body || {};
+        if (!Array.isArray(ids) || !ids.length) {
+            return res.status(400).json({ error: 'ids array required' });
+        }
+        const cleanIds = ids.map(Number).filter((n) => Number.isInteger(n) && n > 0);
+        if (!cleanIds.length) {
+            return res.status(400).json({ error: 'No valid ids supplied' });
+        }
+        const seekbarMap = collectSeekbarPaths(cleanIds);
+        const r = dedupDeleteByIds(cleanIds);
+        for (const id of cleanIds) {
+            try {
+                await purgeThumbsForDownload(id);
+            } catch {}
+            try {
+                await purgeSeekbarForDownload(id, seekbarMap.get(id));
+            } catch {}
+        }
+        try {
+            purgeOrphanPeople();
+        } catch {}
+        import('../core/deferred-delete.js').then((m) => m.startDrain()).catch(() => {});
+        try {
+            broadcast({ type: 'bulk_delete', count: cleanIds.length });
+        } catch {}
+        res.json({ success: true, ...r });
+    } catch (e) {
+        res.status(500).json({ error: e?.message || String(e) });
+    }
+});
+
+app.post('/api/maintenance/similar/ignore', (req, res) => {
+    try {
+        const { aId, bId, kind, note } = req.body || {};
+        const k = kind == null ? 'similar' : String(kind);
+        const id = addSimilarIgnore({ aId, bId, kind: k, note });
+        res.json({ success: true, id });
+    } catch (e) {
+        res.status(400).json({ error: e?.message || String(e) });
+    }
+});
+
+app.get('/api/maintenance/similar/ignore', (req, res) => {
+    try {
+        const kind = req.query.kind ? String(req.query.kind) : undefined;
+        res.json({ success: true, ignores: listSimilarIgnores({ kind }) });
+    } catch (e) {
+        res.status(500).json({ error: e?.message || String(e) });
+    }
+});
+
+app.delete('/api/maintenance/similar/ignore/:id', (req, res) => {
+    try {
+        const id = Number(req.params.id);
+        const changes = deleteSimilarIgnore(id);
+        if (!changes) return res.status(404).json({ error: 'ignore not found' });
+        res.json({ success: true });
+    } catch (e) {
+        res.status(500).json({ error: e?.message || String(e) });
+    }
+});
+
+app.post('/api/maintenance/similar/purge', async (req, res) => {
+    try {
+        if (
+            _jobTrackers.similarScan.getStatus().running ||
+            _jobTrackers.similarAnalyze.getStatus().running
+        ) {
+            return res.status(409).json({
+                error: 'A similar Scan or Analyze is already running. Cancel it before purging records.',
+                code: 'ALREADY_RUNNING',
+            });
+        }
+        const counts = purgeSimilarClipsRecords();
+        let leftoverRaws = 0;
+        try {
+            leftoverRaws = await unlinkLeftoverFingerprintRaws();
+        } catch (e) {
+            console.warn('[similar] leftover fp.raw unlink failed:', e?.message || e);
+        }
+        broadcast({ type: 'similar_purged', ts: Date.now() });
+        res.json({ success: true, leftoverRaws, ...counts });
+    } catch (e) {
+        res.status(500).json({ error: e?.message || String(e) });
+    }
+});
+
+app.post('/api/maintenance/similar/analyze/purge', (req, res) => {
+    try {
+        if (
+            _jobTrackers.similarScan.getStatus().running ||
+            _jobTrackers.similarAnalyze.getStatus().running
+        ) {
+            return res.status(409).json({
+                error: 'A similar Scan or Analyze is already running. Cancel it before purging Analyze records.',
+                code: 'ALREADY_RUNNING',
+            });
+        }
+        const counts = purgeSimilarAnalyzeRecords();
+        broadcast({ type: 'similar_purged', ts: Date.now(), scope: 'analyze' });
+        res.json({ success: true, ...counts });
+    } catch (e) {
+        res.status(500).json({ error: e?.message || String(e) });
+    }
+});
+
 // Bulk-delete N files. Used by both the duplicate finder ("delete the
 // non-keep copies") and the gallery selection bar ("delete N tiles").
 // At N=10k disk I/O can run for minutes — fire-and-forget so the request
@@ -12309,6 +12512,10 @@ app.post('/api/config', async (req, res) => {
                     ...(cur.seekbar || {}),
                     ...(inc.seekbar || {}),
                 },
+                similarClips: {
+                    ...(cur.similarClips || {}),
+                    ...(inc.similarClips || {}),
+                },
             };
             // ffmpeg hwaccel — allow-list validation. An attacker who
             // got past the admin gate could otherwise pass arbitrary
@@ -12596,6 +12803,63 @@ app.post('/api/config', async (req, res) => {
             sk.apiToken = typeof sk.apiToken === 'string' ? sk.apiToken.trim().slice(0, 256) : '';
             sk.pathMap = typeof sk.pathMap === 'string' ? sk.pathMap.slice(0, 4096) : '';
             delete sk.apiTokenSet;
+
+            const sc = merged.similarClips;
+            const scDef = SIMILAR_CLIPS_DEFAULTS;
+            const clampFloat = (v, lo, hi, def) => {
+                const n = Number(v);
+                if (!Number.isFinite(n)) return def;
+                return Math.max(lo, Math.min(hi, n));
+            };
+            sc.similarThreshold = clampInt(sc.similarThreshold, 0, 128, scDef.similarThreshold);
+            sc.durationTolerance = clampFloat(sc.durationTolerance, 0, 1, scDef.durationTolerance);
+            sc.partialMatchRatio = clampFloat(sc.partialMatchRatio, 0, 1, scDef.partialMatchRatio);
+            sc.partialFrameThreshold = clampInt(
+                sc.partialFrameThreshold,
+                0,
+                128,
+                scDef.partialFrameThreshold,
+            );
+            sc.partialShortClipSec = clampInt(
+                sc.partialShortClipSec,
+                1,
+                7200,
+                scDef.partialShortClipSec,
+            );
+            sc.partialShortMatchRatio = clampFloat(
+                sc.partialShortMatchRatio,
+                0,
+                1,
+                scDef.partialShortMatchRatio,
+            );
+            sc.partialReviewMatchRatio = clampFloat(
+                sc.partialReviewMatchRatio,
+                0,
+                1,
+                scDef.partialReviewMatchRatio,
+            );
+            sc.partialReviewMinMatchedFrames = clampInt(
+                sc.partialReviewMinMatchedFrames,
+                1,
+                100,
+                scDef.partialReviewMinMatchedFrames,
+            );
+            sc.fingerprintMaxFrames = clampInt(
+                sc.fingerprintMaxFrames,
+                10,
+                72000,
+                scDef.fingerprintMaxFrames,
+            );
+            sc.fingerprintTilePx = clampInt(sc.fingerprintTilePx, 32, 64, scDef.fingerprintTilePx);
+            sc.durationBucketSec = clampInt(
+                sc.durationBucketSec,
+                10,
+                3600,
+                scDef.durationBucketSec,
+            );
+            sc.sceneThreshold = clampFloat(sc.sceneThreshold, 0, 1, scDef.sceneThreshold);
+            sc.floorIntervalSec = clampFloat(sc.floorIntervalSec, 0.5, 30, scDef.floorIntervalSec);
+            delete sc.fingerprintFps;
 
             // `advanced.goCore` (the old tgdl-core mode switches) is no
             // longer read; like any key not listed above it is dropped on
@@ -13865,6 +14129,18 @@ const _jobTrackers = {
         broadcast,
         log,
         eventPrefix: 'seekbar_rebuild',
+    }),
+    similarScan: createJobTracker({
+        kind: 'similarScan',
+        broadcast,
+        log,
+        eventPrefix: 'similar',
+    }),
+    similarAnalyze: createJobTracker({
+        kind: 'similarAnalyze',
+        broadcast,
+        log,
+        eventPrefix: 'similar_analyze',
     }),
     // Same race fix as thumbsBuild — `let _faststartRunning` had the
     // identical broadcast-before-flag-reset window. Prefix 'faststart'

@@ -119,6 +119,45 @@ const LOADERS = {
         };
     },
 
+    async similar() {
+        const [st, stats] = await Promise.all([
+            get('/api/maintenance/similar/status'),
+            get('/api/maintenance/similar/stats'),
+        ]);
+        const scanRunning = !!st?.running;
+        const analyzeRunning = !!st?.analyze?.running;
+        const active = analyzeRunning ? st.analyze : st;
+        let line = never();
+        let tone = 'muted';
+        const last = stats?.lastAnalyze?.finishedAt ? stats.lastAnalyze : stats?.lastScan;
+        if (last?.finishedAt) {
+            line = lastRun(last.finishedAt);
+            tone = 'ok';
+        } else if (Number(stats?.missing) > 0) {
+            line = i18nTf(
+                'tools.similar.pending',
+                { n: num(stats.missing) },
+                `${num(stats.missing)} videos still need a fingerprint`,
+            );
+        }
+        return {
+            running: scanRunning || analyzeRunning,
+            pct: pctOf(active),
+            counts: countsOf(active),
+            line,
+            tone,
+            run: {
+                label: RUN.scan(),
+                icon: 'ri-fingerprint-line',
+                url: '/api/maintenance/similar/scan',
+                body: {},
+            },
+            stop: scanRunning
+                ? '/api/maintenance/similar/scan/stop'
+                : '/api/maintenance/similar/analyze/stop',
+        };
+    },
+
     async thumbs() {
         const [st, stats] = await Promise.all([
             get('/api/maintenance/thumbs/build/status'),
@@ -525,7 +564,7 @@ const LOADERS = {
 };
 
 // Tools that run a background job (and so have an Idle / Running state).
-const JOB_TOOLS = new Set(['duplicates', 'thumbs', 'seekbar', 'video', 'nsfw', 'ai']);
+const JOB_TOOLS = new Set(['duplicates', 'similar', 'thumbs', 'seekbar', 'video', 'nsfw', 'ai']);
 
 // Tools whose loaders are cheap enough for the Tools card's checks.
 const ATTENTION_TOOLS = [
@@ -559,6 +598,12 @@ async function loadInfo(tool, { fresh = false, force = false } = {}) {
 // Live job state from the WS, per tool.
 const WS_EVENTS = {
     duplicates: ['dedup_progress', 'dedup_done'],
+    similar: [
+        'similar_progress',
+        'similar_done',
+        'similar_analyze_progress',
+        'similar_analyze_done',
+    ],
     thumbs: ['thumbs_progress', 'thumbs_done'],
     seekbar: ['seekbar_progress', 'seekbar_done'],
     video: ['faststart_progress', 'faststart_done'],

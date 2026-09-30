@@ -195,6 +195,25 @@ const DEFAULT_CONFIG = {
             // ('', 'vaapi', 'qsv', 'cuda', 'videotoolbox', 'd3d11va', 'dxva2').
             hwaccel: null,
         },
+        // Similar clips (near-duplicate videos + partial-clip detection).
+        // PDQ fingerprints are a separate ffmpeg walk from hover sprites.
+        // Hover knobs stay under `seekbar.*`. Saved values are not rewritten
+        // on upgrade; env `TGDL_SIMILAR_*` wins over this block, then defaults.
+        similarClips: {
+            similarThreshold: 50,
+            durationTolerance: 0.1,
+            partialMatchRatio: 0.5,
+            partialFrameThreshold: 90,
+            partialShortClipSec: 300,
+            partialShortMatchRatio: 0.5,
+            partialReviewMatchRatio: 0.35,
+            partialReviewMinMatchedFrames: 4,
+            fingerprintMaxFrames: 7200,
+            fingerprintTilePx: 64,
+            durationBucketSec: 120,
+            sceneThreshold: 0.1,
+            floorIntervalSec: 3,
+        },
         // AI subsystem (semantic search + auto-tag + face clustering).
         // Master switch defaults OFF so existing installs are unaffected.
         // Search (embeddings) + Auto-tag were removed in this release;
@@ -684,6 +703,7 @@ function mergeConfig(userConfig) {
                 ...(userAdvanced.integrity || {}),
             },
             web: { ...DEFAULT_CONFIG.advanced.web, ...(userAdvanced.web || {}) },
+            similarClips: _mergeSimilarClips(userAdvanced.similarClips),
             // Spread `ai` so the operator's saved tagLabels, hfToken, etc.
             // win over the defaults but missing keys (added in a later
             // release) still pick up their default value.
@@ -700,6 +720,12 @@ function mergeConfig(userConfig) {
             filters: { ...DEFAULT_FILTERS, ...(group.filters || {}) },
         })),
     };
+}
+
+function _mergeSimilarClips(userSc) {
+    const user = userSc && typeof userSc === 'object' ? { ...userSc } : {};
+    delete user.fingerprintFps;
+    return { ...DEFAULT_CONFIG.advanced.similarClips, ...user };
 }
 
 /**

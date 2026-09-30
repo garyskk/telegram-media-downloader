@@ -418,6 +418,71 @@
       "kind": "route"
     },
     {
+      "key": "POST /api/maintenance/similar/scan",
+      "kind": "route",
+      "skip": "Similar-clips route (PDQ scene fingerprints); logic covered by tests/similar-*.test.js and tests/db-similar-*.test.js, needs ffmpeg + real videos for a golden exchange"
+    },
+    {
+      "key": "POST /api/maintenance/similar/scan/stop",
+      "kind": "route",
+      "skip": "Similar-clips route (PDQ scene fingerprints); logic covered by tests/similar-*.test.js and tests/db-similar-*.test.js, needs ffmpeg + real videos for a golden exchange"
+    },
+    {
+      "key": "GET /api/maintenance/similar/status",
+      "kind": "route",
+      "skip": "Similar-clips route (PDQ scene fingerprints); logic covered by tests/similar-*.test.js and tests/db-similar-*.test.js, needs ffmpeg + real videos for a golden exchange"
+    },
+    {
+      "key": "GET /api/maintenance/similar/stats",
+      "kind": "route",
+      "skip": "Similar-clips route (PDQ scene fingerprints); logic covered by tests/similar-*.test.js and tests/db-similar-*.test.js, needs ffmpeg + real videos for a golden exchange"
+    },
+    {
+      "key": "POST /api/maintenance/similar/analyze",
+      "kind": "route",
+      "skip": "Similar-clips route (PDQ scene fingerprints); logic covered by tests/similar-*.test.js and tests/db-similar-*.test.js, needs ffmpeg + real videos for a golden exchange"
+    },
+    {
+      "key": "POST /api/maintenance/similar/analyze/stop",
+      "kind": "route",
+      "skip": "Similar-clips route (PDQ scene fingerprints); logic covered by tests/similar-*.test.js and tests/db-similar-*.test.js, needs ffmpeg + real videos for a golden exchange"
+    },
+    {
+      "key": "GET /api/maintenance/similar/groups",
+      "kind": "route",
+      "skip": "Similar-clips route (PDQ scene fingerprints); logic covered by tests/similar-*.test.js and tests/db-similar-*.test.js, needs ffmpeg + real videos for a golden exchange"
+    },
+    {
+      "key": "POST /api/maintenance/similar/delete",
+      "kind": "route",
+      "skip": "Similar-clips route (PDQ scene fingerprints); logic covered by tests/similar-*.test.js and tests/db-similar-*.test.js, needs ffmpeg + real videos for a golden exchange"
+    },
+    {
+      "key": "POST /api/maintenance/similar/ignore",
+      "kind": "route",
+      "skip": "Similar-clips route (PDQ scene fingerprints); logic covered by tests/similar-*.test.js and tests/db-similar-*.test.js, needs ffmpeg + real videos for a golden exchange"
+    },
+    {
+      "key": "GET /api/maintenance/similar/ignore",
+      "kind": "route",
+      "skip": "Similar-clips route (PDQ scene fingerprints); logic covered by tests/similar-*.test.js and tests/db-similar-*.test.js, needs ffmpeg + real videos for a golden exchange"
+    },
+    {
+      "key": "DELETE /api/maintenance/similar/ignore/:id",
+      "kind": "route",
+      "skip": "Similar-clips route (PDQ scene fingerprints); logic covered by tests/similar-*.test.js and tests/db-similar-*.test.js, needs ffmpeg + real videos for a golden exchange"
+    },
+    {
+      "key": "POST /api/maintenance/similar/purge",
+      "kind": "route",
+      "skip": "Similar-clips route (PDQ scene fingerprints); logic covered by tests/similar-*.test.js and tests/db-similar-*.test.js, needs ffmpeg + real videos for a golden exchange"
+    },
+    {
+      "key": "POST /api/maintenance/similar/analyze/purge",
+      "kind": "route",
+      "skip": "Similar-clips route (PDQ scene fingerprints); logic covered by tests/similar-*.test.js and tests/db-similar-*.test.js, needs ffmpeg + real videos for a golden exchange"
+    },
+    {
       "key": "POST /api/maintenance/dedup/delete",
       "kind": "route"
     },
@@ -1847,6 +1912,41 @@
       "sources": [
         "src/web/server.js"
       ]
+    },
+    {
+      "type": "similar_analyze_done",
+      "sources": [
+        "src/core/job-tracker.js"
+      ],
+      "skip": "Similar-clips job event (createJobTracker broadcast); progress shape covered by tests/similar-scan.test.js"
+    },
+    {
+      "type": "similar_analyze_progress",
+      "sources": [
+        "src/core/job-tracker.js"
+      ],
+      "skip": "Similar-clips job event (createJobTracker broadcast); progress shape covered by tests/similar-scan.test.js"
+    },
+    {
+      "type": "similar_done",
+      "sources": [
+        "src/core/job-tracker.js"
+      ],
+      "skip": "Similar-clips job event (createJobTracker broadcast); progress shape covered by tests/similar-scan.test.js"
+    },
+    {
+      "type": "similar_progress",
+      "sources": [
+        "src/core/job-tracker.js"
+      ],
+      "skip": "Similar-clips job event (createJobTracker broadcast); progress shape covered by tests/similar-scan.test.js"
+    },
+    {
+      "type": "similar_purged",
+      "sources": [
+        "src/web/server.js"
+      ],
+      "skip": "Similar-clips job event (createJobTracker broadcast); progress shape covered by tests/similar-scan.test.js"
     },
     {
       "type": "stats_push",

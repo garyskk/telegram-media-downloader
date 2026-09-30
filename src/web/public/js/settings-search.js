@@ -23,6 +23,13 @@ const ELSEWHERE = [
         'Hash every file and reclaim space from byte-identical copies',
     ],
     [
+        '#/settings/tools/library/similar',
+        'nav.maintenance.similar',
+        'Similar clips',
+        'maintenance.similar.subtitle',
+        'Find near-duplicate videos and shorter clips inside longer ones',
+    ],
+    [
         '#/settings/tools/library/thumbs',
         'nav.maintenance.thumbs',
         'Thumbnails',
