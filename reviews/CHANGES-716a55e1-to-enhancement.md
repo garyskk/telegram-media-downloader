@@ -6,7 +6,21 @@ That commit is the merge base, so this is the full tree difference. 121 files, 2
 
 ---
 
-## 1. Video face detection
+## Port decision (`enhancement-v2.32.1`)
+
+**§1 and §2 are not ported.** Video face scanning stays the v2.32.1 sampler, and People stay on the v2.32.1 sort, crop cache, Go DBSCAN, re-cluster, and reindex. The content-adaptive sampler, face-review grid, unclassified-face workflow, exclusion denylist, pinned cover, merge suggestions, and the incremental-vs-rebuild split stay on the old `enhancement` branch.
+
+v2.32.1 already covers the operational overlap: faces-service 0.5.x (CPU budget, quality gate before embedding, streamed frames, `frame_time_sec`), scan rows left unscanned when the sidecar fails, undici timeouts past the old 300 s cap, disk-cached crops at `TGDL_FACE_CROP_CONCURRENCY` (default 4), server-side People sort, and DBSCAN in Go. `scanVideos` stays off unless turned on. Re-cluster still runs Phase B on existing embeddings. Reindex from scratch still wipes detections and clusters, then scans again.
+
+The Faces / people and Faces sidecar rows in §8, the `advanced.ai.faces` knobs in §9, and the face-review / video-sampler tests in §12 are part of this decision. People sort and the crop-concurrency cap are already on this branch from v2.32.1; they are not re-ported from here.
+
+**§3, §4, §5, and §6 are ported** on `enhancement-v2.32.1`. Notes: `CHANGES-similar-clips-port-v2.32.1.md`, `CHANGES-gallery-player-port-v2.32.1.md`, `CHANGES-deletes-port-v2.32.1.md`, `CHANGES-backup-port-v2.32.1.md`. `downloads.user_deleted` is not brought back. Operator deletes write `download_tombstones`, and similar-clips rows cascade on hard delete.
+
+---
+
+## 1. Video face detection — not ported
+
+Not ported. See the port decision above. The description below is what `enhancement` changed relative to `716a55e1`.
 
 Uniform evenly-spaced frame sampling and greedy single-best-frame dedup are replaced by a duration-independent, content-adaptive pipeline. A 10-second clip and a multi-hour video use the same window and floor interval. Sampling density no longer scales with duration.
 
@@ -47,7 +61,9 @@ Uniform evenly-spaced frame sampling and greedy single-best-frame dedup are repl
 
 ---
 
-## 2. People, clustering, and face review
+## 2. People, clustering, and face review — not ported
+
+Not ported. See the port decision above. The description below is what `enhancement` changed relative to `716a55e1`.
 
 ### Review faces
 
@@ -86,7 +102,13 @@ Uniform evenly-spaced frame sampling and greedy single-best-frame dedup are repl
 
 ---
 
-## 3. Similar clips
+## 3. Similar clips — ported
+
+Ported. Verified on this branch: `src/core/phash.js`, `src/core/similar/` (fingerprint, scan, matcher, align, partial, analyze, config), `pdq-scene-v1`, `pregenerateFingerprint` from the downloader, the seven similar tables, the 13 `/api/maintenance/similar/` routes, the five `similar_*` WebSocket events, and `maintenance-similar.js`. Smith-Waterman stays on a `worker_threads` worker. The Go sidecar still deletes `.fp.raw` with the sprite. Defaults match (`similarThreshold` 50, `partialFrameThreshold` 90, `partialMatchRatio` 0.5, `fingerprintMaxFrames` 7200). A stored `fingerprintFps` is dropped on merge.
+
+Adapted to this base: no `user_deleted` predicates (member rows cascade, and a group left with fewer than two members is pruned); the page lives under Tools (`#/settings/tools/library/similar`), with `#/maintenance/similar` redirecting there. Detail: `CHANGES-similar-clips-port-v2.32.1.md`.
+
+The description below is what `enhancement` changed relative to `716a55e1`.
 
 New subsystem for near-duplicate videos and for shorter excerpts inside longer videos. Byte-identical files stay on Maintenance → Duplicates (SHA-256).
 
@@ -141,7 +163,13 @@ Documented in `docs/SIMILAR-CLIPS.md`. UI: Maintenance hub card and `#/maintenan
 
 ---
 
-## 4. Gallery and player
+## 4. Gallery and player — ported
+
+Ported. The buffering spinner (ignores `stalled`, 200 ms `waiting` / `seeking` delay), the long-video sprite budget (`spriteBudgetMs`, clamp 5 min / 1× realtime / 60 min), and the faststart `-map -0:d` retry were already on v2.32.1. This branch adds the unpinned filter (`pinned=0` on gallery, group, and search, including federated), one shuffle session (`GET /api/downloads/ids`, `POST /api/downloads/by-ids`, shared by the grid chip and the player), and the docked player (`#video-stage`, `#video-controls` with `controls-collapsed`, `#preview-strip-container` removed).
+
+The faststart sweep does not skip `user_deleted` rows. Hard delete already removes the row. Detail: `CHANGES-gallery-player-port-v2.32.1.md`.
+
+The description below is what `enhancement` changed relative to `716a55e1`.
 
 ### Shuffle
 
@@ -183,7 +211,11 @@ Documented in `docs/SIMILAR-CLIPS.md`. UI: Maintenance hub card and `#/maintenan
 
 ---
 
-## 5. Deletes, dedup, and disk accounting
+## 5. Deletes, dedup, and disk accounting — ported
+
+Ported, without `downloads.user_deleted`. Shared-path unlink (`idsWithFileInUse`), `GET /api/maintenance/dedup/sets`, the `/files` missing-file prune, cascade of faces and the other side rows, and the disk-quota counter that pulls down to the catalogue total were already on v2.32.1. A missing source on a face crop calls that same prune. An operator delete writes `download_tombstones` so catch-up and pull-older do not fetch the message again; a boot migration copies any leftover `user_deleted = 1` rows into that table and drops the column. Cluster conflict still hard-deletes and tombstones. Detail: `CHANGES-deletes-port-v2.32.1.md`.
+
+The description below is what `enhancement` changed relative to `716a55e1`.
 
 ### Soft-delete
 
@@ -207,7 +239,11 @@ Documented in `docs/SIMILAR-CLIPS.md`. UI: Maintenance hub card and `#/maintenan
 
 ---
 
-## 6. Backup
+## 6. Backup — ported
+
+Ported. Keyset catch-up (no `.iterate()`), a missing local file failing that job without setting destination `last_error`, clearing `last_error` after a successful mirror run, snapshot retention, and the edit-wizard secret merge were already on v2.32.1. This branch adds the five gaps: cron is stored only for snapshot mode, retention also runs for manual mode, a boot pass clears a retention backlog, mirror Run now deletes remote orphans and skips `snapshots/`, and the Backup page shows the coverage tip with the cron badge limited to snapshot cards. The live set is every remaining `downloads` row. Detail: `CHANGES-backup-port-v2.32.1.md`.
+
+The description below is what `enhancement` changed relative to `716a55e1`.
 
 - Mirror **Run now** lists the destination, uploads missing live files (`user_deleted = 0`), and deletes remote orphans. Soft-deletes stay on the remote until the next Run now. The `snapshots/` prefix is skipped so a shared bucket with a snapshot destination stays intact.
 - Catch-up no longer uses better-sqlite3 `.iterate()` while enqueueing on the same connection (that raised “database connection is busy”). It uses keyset-paginated `.all()` batches.
@@ -223,7 +259,34 @@ Documented in `docs/SIMILAR-CLIPS.md`. UI: Maintenance hub card and `#/maintenan
 
 ## 7. Database
 
-New or altered in `data/db.sqlite` (applied with `IF NOT EXISTS` / `ADD COLUMN` guards):
+Schema review against `enhancement-v2.32.1`: nothing added for this port is unused, so nothing is dropped. The §1 / §2 objects were never created.
+
+In `src/core/db.js` and read by the ported code:
+
+| Object | Role |
+|---|---|
+| `download_tombstones` | §5. `(group_id, message_id)` primary key, `created_at`. `isDownloaded` and `getMessageIdRange` read it. |
+| `video_fingerprints` | §3. Indexes on `file_hash` and `aggregate_hash`. |
+| `video_frame_hashes` | §3. Index on `download_id`. |
+| `similar_groups` | §3. `kind`, `confidence`, `offset_sec`. |
+| `similar_group_members` | §3. Index on `download_id`. `role` and `reason` are shown on the page. |
+| `similar_ignores` | §3. Pair key plus optional `note`. |
+| `similar_partial_scans` | §3. Partial-analyze resume. |
+| `similar_video_scans` | §3. Incremental analyze cursor (`file_hash`, `algo`, `config_key`). |
+
+Per-download rows use `ON DELETE CASCADE` on `downloads(id)`. A group left with fewer than two members is pruned in code. There is no `user_deleted` predicate.
+
+Not in this schema. `initSchema` does not create them:
+
+| Object | Why it stays out |
+|---|---|
+| `downloads.user_deleted` | §5. `retireUserDeletedColumn` copies `user_deleted = 1` rows into `download_tombstones`, deletes those downloads, and `DROP COLUMN`s. A fresh database never has the column. |
+| `people.cover_face_id` | §2, not ported. `retireEnhancementFaceSchema` drops the column (and any index on it) on boot. The People query's `f.id AS cover_face_id` is an alias, not this column. |
+| `excluded_people` | §2, not ported. The same boot step `DROP TABLE`s it. Exclusion rows are not kept. |
+
+`faces.frame_time_sec` is already on v2.32.1 and is read by the face-crop path. It is not part of the unported sampler.
+
+The list below is what `enhancement` changed relative to `716a55e1`. It is not the schema of this branch.
 
 | Object | Change |
 |---|---|
@@ -239,13 +302,53 @@ New or altered in `data/db.sqlite` (applied with `IF NOT EXISTS` / `ADD COLUMN` 
 | `similar_partial_scans` | partial-analyze resume |
 | `similar_video_scans` | incremental analyze cursors |
 
-Soft-delete cleanup also removes similar-group membership and ignore rows that point at `user_deleted` ids.
+Soft-delete cleanup also removes similar-group membership and ignore rows that point at `user_deleted` ids. On this branch the cascade does that when the download row is deleted.
 
 ---
 
 ## 8. HTTP API added or changed
 
+Checked against `src/web/server.js` and `faces-service/tgdl_faces/app.py`. Routes follow the section they belong to. Nothing in the unported face-review list is registered.
+
+### On this branch
+
+| Method | Path | Status |
+|---|---|---|
+| `GET` | `/api/downloads/ids` | Ported with §4. |
+| `POST` | `/api/downloads/by-ids` | Ported with §4. Guest-allowed, cap 100. |
+| download lists | `pinned=0` | Ported with §4. No `user_deleted` query filter; a deleted message is a tombstone (§5). |
+| 13 routes | `/api/maintenance/similar/…` | Ported with §3. Same paths as the table below. |
+| `GET` | `/api/maintenance/dedup/sets` | Already on v2.32.1 (§5). Listed under Faces in the enhancement inventory; it is the duplicates page, not a face route. |
+| `POST` | `/api/ai/faces/recluster` | Already on v2.32.1. Starts a faces scan: Phase A for anything still unindexed, then Phase B. It is not enhancement's incremental-only recluster. |
+| `POST` | `/api/ai/faces/reindex` | Already on v2.32.1. Deletes `faces` and `people`, then clears `ai_indexed_at`. There is no exclusion denylist to clear. |
+| `GET` | `/api/ai/people` | Already on v2.32.1. Query is `sort` and `dir` (`face_count`, `avg_quality`, `name`). `sortBy` / `sortDir` are not read. |
+| `DELETE` | `/api/ai/people/:id` | Already on v2.32.1. Deletes the person row. `faces.person_id` is `ON DELETE SET NULL`, so the faces stay and can cluster again. |
+| `POST` | `/detect/video` | Already on v2.32.1. Body is `path`, thresholds, and `max_frames` (default 120, max 500). No `job_id` or `nice`. |
+
+### Not registered
+
+Left out with §1 and §2:
+
+| Method | Path |
+|---|---|
+| `POST` | `/api/ai/faces/rebuild` |
+| `GET` | `/api/ai/faces/unclassified` |
+| `GET` | `/api/ai/faces/:id/suggestions` |
+| `POST` | `/api/ai/faces/:id/new-person` |
+| `DELETE` | `/api/ai/faces/:id` |
+| `GET` | `/api/ai/people/:id/faces` |
+| `GET` | `/api/ai/people/:id/suggestions` |
+| `POST` | `/api/ai/people/:id/cover` |
+| `POST` | `/api/ai/people/:id/exclude` |
+| `GET` | `/api/ai/people/excluded` |
+| `DELETE` | `/api/ai/people/excluded/:id` |
+| `GET` | `/detect/video/status/{job_id}` |
+
+The tables below are what `enhancement` changed relative to `716a55e1`. They are not a list of missing work.
+
 ### Downloads
+
+Ported with §4. Lists take `pinned=0`. There is no `user_deleted` filter; a deleted message is a `download_tombstones` row (§5).
 
 | Method | Path | Change |
 |---|---|---|
@@ -254,6 +357,8 @@ Soft-delete cleanup also removes similar-group membership and ignore rows that p
 | existing download lists | | `unpinnedOnly` / unpinned filter; `user_deleted` excluded. |
 
 ### Similar clips (all new)
+
+Ported with §3. All 13 routes are registered.
 
 | Method | Path |
 |---|---|
@@ -272,6 +377,8 @@ Soft-delete cleanup also removes similar-group membership and ignore rows that p
 | `POST` | `/api/maintenance/similar/purge` |
 
 ### Faces / people
+
+Not ported with §1 and §2, except the four routes already on v2.32.1 called out above. People sort (`sort` / `dir`) is already on v2.32.1.
 
 | Method | Path | Change |
 |---|---|---|
@@ -294,6 +401,68 @@ Soft-delete cleanup also removes similar-group membership and ignore rows that p
 
 ### Faces sidecar
 
+Not ported with §1. v2.32.1 keeps evenly spaced frames, `CAP_PROP_POS_FRAMES` seeks, and a 120-frame cap.
+
+| Method | Path | Change |
+|---|---|---|
+| `POST` | `/detect/video` | Optional `job_id`, `nice`. New sampler and tracker. |
+| `GET` | `/detect/video/status/{job_id}` | New. |
+
+Ported with §4. Lists take `pinned=0`. There is no `user_deleted` filter; a deleted message is a `download_tombstones` row (§5).
+
+| Method | Path | Change |
+|---|---|---|
+| `GET` | `/api/downloads/ids` | New. Full filtered ID set for shuffle. |
+| `POST` | `/api/downloads/by-ids` | New. Hydrate up to 100 tiles. Guest-allowed. |
+| existing download lists | | `unpinnedOnly` / unpinned filter; `user_deleted` excluded. |
+
+### Similar clips (all new)
+
+Ported with §3. All 13 routes are registered.
+
+| Method | Path |
+|---|---|
+| `POST` | `/api/maintenance/similar/scan` |
+| `POST` | `/api/maintenance/similar/scan/stop` |
+| `GET` | `/api/maintenance/similar/status` |
+| `GET` | `/api/maintenance/similar/stats` |
+| `POST` | `/api/maintenance/similar/analyze` |
+| `POST` | `/api/maintenance/similar/analyze/stop` |
+| `GET` | `/api/maintenance/similar/groups` |
+| `POST` | `/api/maintenance/similar/delete` |
+| `POST` | `/api/maintenance/similar/ignore` |
+| `GET` | `/api/maintenance/similar/ignore` |
+| `DELETE` | `/api/maintenance/similar/ignore/:id` |
+| `POST` | `/api/maintenance/similar/analyze/purge` |
+| `POST` | `/api/maintenance/similar/purge` |
+
+### Faces / people
+
+Not ported with §1 and §2. People sort (`sort` / `dir`) is already on v2.32.1.
+
+| Method | Path | Change |
+|---|---|---|
+| `POST` | `/api/ai/faces/recluster` | Now incremental Phase B only. |
+| `POST` | `/api/ai/faces/rebuild` | New. Full DBSCAN reshape. |
+| `POST` | `/api/ai/faces/reindex` | Also clears the exclusion denylist. |
+| `GET` | `/api/ai/faces/unclassified` | New. |
+| `GET` | `/api/ai/faces/:id/suggestions` | New. |
+| `POST` | `/api/ai/faces/:id/new-person` | New. |
+| `DELETE` | `/api/ai/faces/:id` | New. |
+| `GET` | `/api/ai/people` | `sortBy` / `sortDir` (aliases `sort` / `dir`). |
+| `GET` | `/api/ai/people/:id/faces` | New. One row per face. |
+| `GET` | `/api/ai/people/:id/suggestions` | New. |
+| `POST` | `/api/ai/people/:id/cover` | New. |
+| `POST` | `/api/ai/people/:id/exclude` | New. |
+| `GET` | `/api/ai/people/excluded` | New. |
+| `DELETE` | `/api/ai/people/excluded/:id` | New. |
+| `DELETE` | `/api/ai/people/:id` | Still a temporary drop. |
+| `GET` | `/api/maintenance/dedup/sets` | New listing used by the duplicates page. |
+
+### Faces sidecar
+
+Not ported with §1. v2.32.1 keeps evenly spaced frames, `CAP_PROP_POS_FRAMES` seeks, and a 120-frame cap.
+
 | Method | Path | Change |
 |---|---|---|
 | `POST` | `/detect/video` | Optional `job_id`, `nice`. New sampler and tracker. |
@@ -304,6 +473,8 @@ Soft-delete cleanup also removes similar-group membership and ignore rows that p
 ## 9. Configuration and environment
 
 ### `advanced.ai.faces` (new or changed defaults)
+
+Not ported with §1 and §2. `scanVideos` and `TGDL_FACE_CROP_CONCURRENCY` already exist on v2.32.1 at the defaults this tree uses (`false` and `4`). `detSize` stays 640. `videoMaxFrames` stays the 120 density cap.
 
 | Key | Env | Default | Role |
 |---|---|---|---|
@@ -328,7 +499,7 @@ Soft-delete cleanup also removes similar-group membership and ignore rows that p
 
 ### `advanced.similarClips`
 
-Stored under that key. Env overrides are `TGDL_SIMILAR_*` as in section 3. Settings page fields:
+Ported with §3. Stored under that key. Env overrides are `TGDL_SIMILAR_*` as in section 3. Settings page fields:
 
 `similarThreshold`, `durationTolerance`, `durationBucketSec`, `sceneThreshold`, `floorIntervalSec`, `partialMatchRatio`, `partialFrameThreshold`, `partialShortClipSec`, `partialShortMatchRatio`, `partialReviewMatchRatio`, `partialReviewMinMatchedFrames`.
 
@@ -354,6 +525,8 @@ Stored under that key. Env overrides are `TGDL_SIMILAR_*` as in section 3. Setti
 
 ## 11. Localization and docs
 
+Face-review, unclassified-face, exclude, cover, and merge-suggestion strings, plus `docs/FACE-REVIEW-REQUIREMENTS.md` and the video face-detection parts of `docs/requirements.md`, are not ported with §1 and §2.
+
 - `src/web/public/locales/en.json` and `th.json`: strings for face review, unclassified faces, select-all, People sort, merge suggestions, exclude, cover, shuffle, similar clips (including the up-to-date scan status), and related settings labels.
 - New docs: `docs/requirements.md` (video face-detection redesign, phases 1–4, plus the progress-reporting follow-up), `docs/FACE-REVIEW-REQUIREMENTS.md`, `docs/SIMILAR-CLIPS.md`.
 - Updated: `CHANGELOG.md` (Unreleased through 2.24.5-26), `docs/AI.md`, `docs/API.md`, `docs/ARCHITECTURE.md`, `docs/BACKUP.md`, `docs/TROUBLESHOOTING.md`, `README.md` (version line), `faces-service/README.md`, `.env.example`.
@@ -361,6 +534,8 @@ Stored under that key. Env overrides are `TGDL_SIMILAR_*` as in section 3. Setti
 ---
 
 ## 12. Tests added or expanded
+
+Face-review and video-sampler tests are not ported with §1 and §2: `tests/ai/face-crop-queue.test.js`, `tests/ai/faces-client-video.test.js`, `tests/ai/unclassified-select-all.test.js`, `faces-service/tests/test_video_progress.py`, and the §1 portions of `tests/ai/scan-runner-video.test.js`, `tests/ai/face-cluster-ops.test.js`, `tests/ai/faces-client.test.js`, `faces-service/tests/test_video.py`, and `faces-service/tests/test_app.py`. v2.32.1 already has its own scan-runner video gate tests and face-crop tests.
 
 New files:
 

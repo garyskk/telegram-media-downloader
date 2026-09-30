@@ -96,3 +96,48 @@ describe('retireUserDeletedColumn', () => {
         expect(again).toEqual({ migrated: 0, dropped: false });
     });
 });
+
+describe('retireEnhancementFaceSchema', () => {
+    it('drops people.cover_face_id and excluded_people, and keeps people rows', () => {
+        db.exec('ALTER TABLE people ADD COLUMN cover_face_id INTEGER');
+        db.exec('CREATE INDEX idx_legacy_cover_face ON people(cover_face_id)');
+        db.exec(`
+            CREATE TABLE excluded_people (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                embedding_centroid BLOB NOT NULL,
+                label TEXT,
+                created_at INTEGER NOT NULL,
+                cover_face_id INTEGER
+            )
+        `);
+        const now = Date.now();
+        const personId = db
+            .prepare(
+                `INSERT INTO people (label, embedding_centroid, face_count, created_at, updated_at, cover_face_id)
+                 VALUES ('Ada', x'00', 1, ?, ?, 9)`,
+            )
+            .run(now, now).lastInsertRowid;
+        db.prepare(
+            `INSERT INTO excluded_people (embedding_centroid, label, created_at, cover_face_id)
+             VALUES (x'01', 'skip', ?, 9)`,
+        ).run(now);
+
+        const first = api.retireEnhancementFaceSchema();
+        expect(first).toEqual({ droppedCover: true, droppedExcluded: true });
+
+        const cols = db.prepare('PRAGMA table_info(people)').all().map((c) => c.name);
+        expect(cols).not.toContain('cover_face_id');
+        expect(
+            db.prepare(`SELECT name FROM sqlite_master WHERE name = 'idx_legacy_cover_face'`).get(),
+        ).toBeUndefined();
+        expect(
+            db.prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'excluded_people'`).get(),
+        ).toBeUndefined();
+        expect(db.prepare('SELECT label FROM people WHERE id = ?').get(personId).label).toBe('Ada');
+
+        expect(api.retireEnhancementFaceSchema()).toEqual({
+            droppedCover: false,
+            droppedExcluded: false,
+        });
+    });
+});

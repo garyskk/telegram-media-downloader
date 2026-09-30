@@ -295,6 +295,7 @@ function initSchema() {
         );
     `);
     retireUserDeletedColumn(db);
+    retireEnhancementFaceSchema(db);
     try {
         db.exec(
             'CREATE INDEX IF NOT EXISTS idx_filename_size ON downloads(group_id, file_name, file_size)',
@@ -2152,20 +2153,77 @@ export function retireUserDeletedColumn(database = getDb()) {
     }
 
     const now = Date.now();
-    const migrated = database.transaction(() => {
-        const copied = database
-            .prepare(
-                `INSERT OR IGNORE INTO download_tombstones (group_id, message_id, created_at)
-                 SELECT group_id, message_id, ?
-                   FROM downloads
-                  WHERE user_deleted = 1`,
-            )
-            .run(now);
-        database.prepare('DELETE FROM downloads WHERE user_deleted = 1').run();
-        return copied.changes;
-    })();
+    database.exec(
+        'CREATE TEMP TABLE IF NOT EXISTS _retire_user_deleted (id INTEGER PRIMARY KEY)',
+    );
+    const fill = database.prepare(
+        `INSERT INTO _retire_user_deleted (id)
+         SELECT id FROM downloads WHERE user_deleted = 1 LIMIT ?`,
+    );
+    const copy = database.prepare(
+        `INSERT OR IGNORE INTO download_tombstones (group_id, message_id, created_at)
+         SELECT d.group_id, d.message_id, ?
+           FROM downloads d
+           JOIN _retire_user_deleted r ON r.id = d.id`,
+    );
+    const remove = database.prepare(
+        'DELETE FROM downloads WHERE id IN (SELECT id FROM _retire_user_deleted)',
+    );
+    const clear = database.prepare('DELETE FROM _retire_user_deleted');
+    const step = database.transaction((limit) => {
+        clear.run();
+        fill.run(limit);
+        const copied = copy.run(now).changes;
+        const removed = remove.run().changes;
+        return { copied, removed };
+    });
+    let migrated = 0;
+    for (;;) {
+        const batch = step(TOMBSTONE_CHUNK);
+        migrated += batch.copied;
+        if (batch.removed < TOMBSTONE_CHUNK) break;
+    }
+    database.exec('DROP TABLE IF EXISTS _retire_user_deleted');
     database.exec('ALTER TABLE downloads DROP COLUMN user_deleted');
     return { migrated, dropped: true };
+}
+
+/**
+ * Databases from the old enhancement branch keep the face-review schema
+ * this branch does not read: `people.cover_face_id` and `excluded_people`.
+ * Drop both. People rows stay. A no-op when they are already gone.
+ *
+ * @param {import('better-sqlite3').Database} [database]
+ * @returns {{ droppedCover: boolean, droppedExcluded: boolean }}
+ */
+export function retireEnhancementFaceSchema(database = getDb()) {
+    const hasCover = database
+        .prepare('PRAGMA table_info(people)')
+        .all()
+        .some((col) => col.name === 'cover_face_id');
+    if (hasCover) {
+        const indexes = database
+            .prepare(
+                `SELECT name FROM sqlite_master
+                  WHERE type = 'index' AND tbl_name = 'people'
+                    AND sql LIKE '%cover_face_id%'`,
+            )
+            .all();
+        for (const idx of indexes) {
+            const name = String(idx.name).replaceAll('"', '""');
+            database.exec(`DROP INDEX IF EXISTS "${name}"`);
+        }
+        database.exec('ALTER TABLE people DROP COLUMN cover_face_id');
+    }
+
+    const hasExcluded = database
+        .prepare(
+            `SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = 'excluded_people'`,
+        )
+        .get();
+    if (hasExcluded) database.exec('DROP TABLE excluded_people');
+
+    return { droppedCover: hasCover, droppedExcluded: Boolean(hasExcluded) };
 }
 
 /** Bulk-delete by ids (preferred) or file_paths. Returns the number removed.
