@@ -119,7 +119,7 @@ function _renderCard(dest) {
                         ${lockHint}
                     </div>
                     <h3 class="text-tg-text text-sm font-semibold mt-1 truncate">${escapeHtml(dest.name)}</h3>
-                    <div class="text-[11px] text-tg-textSecondary capitalize">${escapeHtml(dest.mode)}${dest.cron ? ' · ' + escapeHtml(dest.cron) : ''}</div>
+                    <div class="text-[11px] text-tg-textSecondary capitalize">${escapeHtml(dest.mode)}${dest.mode === 'snapshot' && dest.cron ? ' · ' + escapeHtml(dest.cron) : ''}</div>
                 </div>
             </div>
             <div class="grid grid-cols-3 gap-2 mt-1">
@@ -695,7 +695,7 @@ function _wireWizard(root, sheet, providers, existing) {
             provider,
             config: fields,
             mode,
-            cron: cron || null,
+            cron: mode === 'snapshot' ? cron || null : null,
             retainCount,
             encryption,
             passphrase: passphrase || undefined,

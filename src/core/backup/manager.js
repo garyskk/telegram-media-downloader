@@ -101,6 +101,18 @@ export function init(deps = {}) {
                 });
             }
             _scheduleSnapshot(dest);
+            // Clears a retain_count backlog (e.g. lowered after already having
+            // more archives than that on the remote) without waiting for the
+            // next snapshot upload to trigger retention.
+            if (dest.mode === 'snapshot' || dest.mode === 'manual') {
+                _reconcileRetentionBacklog(dest).catch((e) => {
+                    _log({
+                        source: 'backup',
+                        level: 'warn',
+                        msg: `boot retention failed for #${dest.id}: ${e.message}`,
+                    });
+                });
+            }
         }
     }
 }
@@ -195,6 +207,10 @@ export function updateDestination(id, patch = {}) {
         next.mode = patch.mode;
     }
     if (patch.cron !== undefined) next.cron = patch.cron || null;
+    // Cron only applies to snapshot mode — saving a mirror/manual
+    // destination always clears a leftover cron instead of keeping
+    // whatever the (hidden) form field happened to submit.
+    if (next.mode !== 'snapshot') next.cron = null;
     if (patch.retainCount != null)
         next.retain_count = Math.max(1, Math.min(365, Number(patch.retainCount) || 7));
     if (patch.enabled != null) next.enabled = patch.enabled ? 1 : 0;
@@ -371,7 +387,83 @@ export async function runBackup(id) {
         level: 'info',
         msg: `mirror catch-up enqueued ${enqueued} jobs for #${id}`,
     });
-    return { started: true, mode: 'mirror', enqueued };
+    // Reconcile the remote: delete anything that's no longer a live
+    // download row. Best-effort — a listing/delete failure never fails
+    // the catch-up walk above, which already queued the uploads.
+    let reconciled = { listed: 0, deleted: 0 };
+    try {
+        reconciled = await _reconcileMirrorRemote(_loadDestRowOrThrow(id));
+    } catch (e) {
+        _log({
+            source: 'backup',
+            level: 'warn',
+            msg: `mirror reconcile failed for #${id}: ${e.message}`,
+        });
+    }
+    return { started: true, mode: 'mirror', enqueued, reconciled };
+}
+
+/**
+ * Mirror mode's own reconciliation step: list the remote (skipping
+ * `snapshots/`, which a snapshot-mode destination may share the same
+ * bucket/root with) and delete anything that no longer matches a
+ * `downloads` row. This build has no soft-delete column — every row
+ * still in `downloads` is "live" — so a file only disappears from the
+ * remote once its download row is actually deleted.
+ */
+async function _reconcileMirrorRemote(dest) {
+    const ProviderClass = PROVIDER_CLASSES[dest.provider];
+    if (!ProviderClass) return { listed: 0, deleted: 0 };
+    let cfg;
+    try {
+        cfg = _decryptCfgOrThrow(dest);
+    } catch (e) {
+        _log({
+            source: 'backup',
+            level: 'warn',
+            msg: `mirror reconcile skipped for #${dest.id}: ${e.message}`,
+        });
+        return { listed: 0, deleted: 0 };
+    }
+    const live = new Set(
+        getDb()
+            .prepare('SELECT file_path FROM downloads WHERE file_path IS NOT NULL')
+            .all()
+            .map((row) => _mirrorRemotePath(row)),
+    );
+    const provider = new ProviderClass();
+    const ctx = { destinationId: dest.id, log: _log, signal: new AbortController().signal };
+    let listed = 0;
+    let deleted = 0;
+    try {
+        await provider.init(cfg, ctx);
+        for await (const item of provider.list('', ctx)) {
+            const name = String(item.name || '')
+                .replace(/\\/g, '/')
+                .replace(/^\/+/, '');
+            if (!name || name.startsWith('snapshots/')) continue;
+            listed += 1;
+            if (live.has(name)) continue;
+            try {
+                await provider.delete(name, ctx);
+                deleted += 1;
+            } catch (e) {
+                _log({
+                    source: 'backup',
+                    level: 'warn',
+                    msg: `mirror reconcile could not delete ${name} on #${dest.id}: ${e.message}`,
+                });
+            }
+        }
+    } finally {
+        await provider.close().catch(() => {});
+    }
+    _log({
+        source: 'backup',
+        level: 'info',
+        msg: `mirror reconcile on #${dest.id}: listed ${listed}, deleted ${deleted}`,
+    });
+    return { listed, deleted };
 }
 
 /** Pause / resume the worker. Existing pending jobs sit in the DB
@@ -680,7 +772,7 @@ class Worker {
                 if (head && !dest.encryption && head.size === localSize && localSize > 0) {
                     queue.markDone(job.id, { bytes: head.size, remotePath });
                     _bumpDestStats(this.destinationId, head.size, 1);
-                    if (job.snapshot_path && dest.mode === 'snapshot') {
+                    if (job.snapshot_path && (dest.mode === 'snapshot' || dest.mode === 'manual')) {
                         await _applySnapshotRetention(
                             dest,
                             job,
@@ -729,7 +821,7 @@ class Worker {
             );
             queue.markDone(job.id, { bytes: result.bytes, remotePath: result.remotePath });
             _bumpDestStats(this.destinationId, result.bytes, 1);
-            if (job.snapshot_path && dest.mode === 'snapshot') {
+            if (job.snapshot_path && (dest.mode === 'snapshot' || dest.mode === 'manual')) {
                 await _applySnapshotRetention(
                     dest,
                     job,
@@ -1080,23 +1172,27 @@ async function _applySnapshotRetention(dest, job, remotePath, bytes, provider, c
     const destId = dest.id;
     const warn = (msg) => _log({ source: 'backup', level: 'warn', msg });
 
+    // `job.snapshot_path` is null for the boot-time backlog pass, which has
+    // no specific upload to piggyback on — just list + prune + reconcile.
     const local = job.snapshot_path;
-    try {
-        if (
-            path.dirname(path.resolve(local)) === path.resolve(SNAPSHOTS_DIR) &&
-            SNAPSHOT_NAME_RE.test(path.basename(local))
-        ) {
-            const stillQueued = getDb()
-                .prepare(`
+    if (local) {
+        try {
+            if (
+                path.dirname(path.resolve(local)) === path.resolve(SNAPSHOTS_DIR) &&
+                SNAPSHOT_NAME_RE.test(path.basename(local))
+            ) {
+                const stillQueued = getDb()
+                    .prepare(`
                 SELECT 1 FROM backup_jobs
                  WHERE snapshot_path = ? AND id != ? AND status IN ('pending', 'uploading')
                  LIMIT 1
             `)
-                .get(local, job.id);
-            if (!stillQueued) await fsp.unlink(local);
+                    .get(local, job.id);
+                if (!stillQueued) await fsp.unlink(local);
+            }
+        } catch (e) {
+            if (e.code !== 'ENOENT') warn(`could not delete ${local}: ${e.message}`);
         }
-    } catch (e) {
-        if (e.code !== 'ENOENT') warn(`could not delete ${local}: ${e.message}`);
     }
 
     try {
@@ -1147,6 +1243,32 @@ async function _applySnapshotRetention(dest, job, remotePath, bytes, provider, c
         });
     } catch (e) {
         warn(`retention failed for #${destId}: ${e.message}`);
+    }
+}
+
+/**
+ * Boot-time retention backlog pass for snapshot/manual destinations. A
+ * `retain_count` lowered between restarts (or a backlog left over from
+ * before retention existed) would otherwise only get trimmed once the
+ * next snapshot upload lands — this runs the same list+prune+reconcile
+ * logic immediately at boot, without a specific job to piggyback on.
+ */
+async function _reconcileRetentionBacklog(dest) {
+    const ProviderClass = PROVIDER_CLASSES[dest.provider];
+    if (!ProviderClass) return;
+    let cfg;
+    try {
+        cfg = _decryptCfgOrThrow(dest);
+    } catch {
+        return; // undecryptable (share secret rotated) — same as elsewhere, skip
+    }
+    const provider = new ProviderClass();
+    const ctx = { destinationId: dest.id, log: _log, signal: new AbortController().signal };
+    try {
+        await provider.init(cfg, ctx);
+        await _applySnapshotRetention(dest, { snapshot_path: null }, null, 0, provider, ctx);
+    } finally {
+        await provider.close().catch(() => {});
     }
 }
 
@@ -1237,7 +1359,9 @@ function _validateInput(input) {
         encryption: !!input.encryption,
         passphrase: input.passphrase || null,
         mode,
-        cron: input.cron || null,
+        // Cron only means anything for snapshot mode — mirror/manual never
+        // store one, even if the (hidden) form field still had a value.
+        cron: mode === 'snapshot' ? input.cron || null : null,
         retainCount: input.retainCount || input.retain_count || 7,
     };
 }

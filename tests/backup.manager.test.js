@@ -245,7 +245,7 @@ describe('snapshot retention', () => {
         manager.removeDestination(otherId);
     });
 
-    it('leaves manual destinations alone', async () => {
+    it('applies retention to manual destinations too', async () => {
         const root = path.join(REMOTE_ROOT, 'manual');
         seedRemote(root, [
             ['snapshots/snapshot-20260101-000000.tar.gz', 10],
@@ -261,8 +261,8 @@ describe('snapshot retention', () => {
         const local = stageArchive('snapshot-20260928-140000.tar.gz', 30);
         await upload(destId, local);
 
-        expect(listRemote(root)).toHaveLength(3);
-        expect(fs.existsSync(local)).toBe(true);
+        expect(listRemote(root)).toHaveLength(1);
+        expect(fs.existsSync(local)).toBe(false);
         expect(destRow(destId).total_files).toBe(1);
         manager.removeDestination(destId);
     });
@@ -359,6 +359,35 @@ describe('editing a destination', () => {
             bucket: 'new-bucket',
             prefix: '',
         });
+        manager.removeDestination(destId);
+    });
+});
+
+describe('cron only applies to snapshot mode', () => {
+    it('never stores a cron for a mirror destination, even if one is submitted', () => {
+        const destId = manager.addDestination({
+            name: 'mirror-cron',
+            provider: 'local',
+            config: { rootPath: path.join(REMOTE_ROOT, 'mirror-cron') },
+            mode: 'mirror',
+            cron: '0 3 * * *',
+        });
+        expect(destRow(destId).cron).toBeNull();
+        manager.removeDestination(destId);
+    });
+
+    it('clears a stored cron when an existing destination switches away from snapshot mode', () => {
+        const destId = manager.addDestination({
+            name: 'snap-to-mirror',
+            provider: 'local',
+            config: { rootPath: path.join(REMOTE_ROOT, 'snap-to-mirror') },
+            mode: 'snapshot',
+            cron: NEVER,
+        });
+        expect(destRow(destId).cron).toBe(NEVER);
+
+        manager.updateDestination(destId, { mode: 'mirror', cron: '0 3 * * *' });
+        expect(destRow(destId).cron).toBeNull();
         manager.removeDestination(destId);
     });
 });
