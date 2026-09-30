@@ -42,6 +42,7 @@ import {
     backfillGroupNames,
     searchDownloads,
     deleteDownloadsBy,
+    rememberDeletedDownloads,
     findDownloadsByPaths,
     purgeOrphanPeople,
     createShareLink,
@@ -6080,6 +6081,7 @@ app.delete('/api/file', async (req, res) => {
         const seekbarMap = collectSeekbarPaths(matchingIds);
         const delStmt = db.prepare('DELETE FROM downloads WHERE id = ?');
         db.transaction((ids) => {
+            rememberDeletedDownloads(ids);
             for (const id of ids) delStmt.run(id);
         })(matchingIds);
         for (const id of matchingIds) {
@@ -9755,10 +9757,12 @@ app.get('/api/ai/person/:id/face', async (req, res) => {
         if (!row) return res.status(404).json({ error: 'no face found' });
 
         const resolved = await safeResolveDownload(row.file_path);
-        if (!resolved.ok)
+        if (!resolved.ok) {
+            if (resolved.reason === 'missing') await pruneMissingDownload(row.file_path);
             return res
                 .status(resolved.reason === 'missing' ? 404 : 403)
                 .json({ error: resolved.reason });
+        }
 
         const buf = await _faceCropper.crop(row, resolved.real, size);
         res.set('content-type', 'image/jpeg');
@@ -9796,10 +9800,12 @@ app.get('/api/ai/faces/:id/crop', async (req, res) => {
         if (!row) return res.status(404).json({ error: 'face not found' });
 
         const resolved = await safeResolveDownload(row.file_path);
-        if (!resolved.ok)
+        if (!resolved.ok) {
+            if (resolved.reason === 'missing') await pruneMissingDownload(row.file_path);
             return res
                 .status(resolved.reason === 'missing' ? 404 : 403)
                 .json({ error: resolved.reason });
+        }
 
         const buf = await _faceCropper.crop(row, resolved.real, size);
         res.set('content-type', 'image/jpeg');
@@ -11761,6 +11767,7 @@ app.post('/api/cluster/files/delete', async (req, res) => {
         const seekbarRow = getDb()
             .prepare('SELECT sprite_path, meta_path FROM seekbar_sprites WHERE download_id = ?')
             .get(Number(row.id));
+        rememberDeletedDownloads([Number(row.id)]);
         getDb().prepare('DELETE FROM downloads WHERE id = ?').run(Number(row.id));
         purgeThumbsForDownload(row.id).catch(() => {});
         purgeSeekbarForDownload(row.id, seekbarRow || undefined).catch(() => {});

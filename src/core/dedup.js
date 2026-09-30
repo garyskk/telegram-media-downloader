@@ -20,7 +20,7 @@
 
 import fs from 'fs';
 import path from 'path';
-import { getDb } from './db.js';
+import { getDb, rememberDeletedDownloads } from './db.js';
 import { sha256OfFile } from './checksum.js';
 import { getDownloadsDir } from './paths.js';
 import { deferDelete } from './deferred-delete.js';
@@ -410,12 +410,17 @@ export function deleteByIds(ids) {
     }
 
     let removed = 0;
-    for (let i = 0; i < idsToDrop.length; i += SQL_IN_CHUNK) {
-        const slice = idsToDrop.slice(i, i + SQL_IN_CHUNK);
-        const ph = slice.map(() => '?').join(',');
-        const r = db.prepare(`DELETE FROM downloads WHERE id IN (${ph})`).run(...slice);
-        removed += r.changes;
-    }
+    const tx = db.transaction((idList) => {
+        rememberDeletedDownloads(idList);
+        let n = 0;
+        for (let i = 0; i < idList.length; i += SQL_IN_CHUNK) {
+            const slice = idList.slice(i, i + SQL_IN_CHUNK);
+            const ph = slice.map(() => '?').join(',');
+            n += db.prepare(`DELETE FROM downloads WHERE id IN (${ph})`).run(...slice).changes;
+        }
+        return n;
+    });
+    removed = tx(idsToDrop);
     return { removed, freedBytes: freed, missingFiles: missing };
 }
 

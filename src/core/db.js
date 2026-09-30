@@ -284,6 +284,17 @@ function initSchema() {
             /* column already exists */
         }
     }
+    // Intentional deletes leave (group_id, message_id) here so backfill
+    // still treats the message as downloaded after the downloads row is gone.
+    db.exec(`
+        CREATE TABLE IF NOT EXISTS download_tombstones (
+            group_id TEXT NOT NULL,
+            message_id INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY (group_id, message_id)
+        );
+    `);
+    retireUserDeletedColumn(db);
     try {
         db.exec(
             'CREATE INDEX IF NOT EXISTS idx_filename_size ON downloads(group_id, file_name, file_size)',
@@ -1355,33 +1366,43 @@ function _prep(sql) {
 }
 
 export function isDownloaded(groupId, messageId) {
-    return !!_prep('SELECT 1 FROM downloads WHERE group_id = ? AND message_id = ? LIMIT 1').get(
-        String(groupId),
-        Number(messageId),
-    );
+    const gid = String(groupId);
+    const mid = Number(messageId);
+    return !!_prep(
+        `SELECT 1 FROM downloads WHERE group_id = ? AND message_id = ?
+         UNION ALL
+         SELECT 1 FROM download_tombstones WHERE group_id = ? AND message_id = ?
+         LIMIT 1`,
+    ).get(gid, mid, gid, mid);
 }
 
 /**
- * Min + max message_id for one group in the downloads table.
+ * Min + max message_id for one group across downloads and tombstones.
  *
  * Powers the v2.3.34 smart-resume path in the history backfill: we tell
  * gramJS `iterMessages({ maxId: minMessageId - 1 })` so the iterator
  * skips every message we already have on disk and resumes from the
  * oldest hole. Same idea in reverse with `minId: maxMessageId + 1` for
- * the post-monitor-restart catch-up flow.
+ * the post-monitor-restart catch-up flow. Tombstones keep a deleted
+ * message inside that range so pull-older and catch-up do not walk it again.
  *
- * Returns `{ minMessageId: null, maxMessageId: null, count: 0 }` for an
- * empty group so the caller can default to "first-time backfill" (no
- * range filter, iterate from newest).
+ * `count` is distinct message ids we already know, including tombstones.
+ * Returns `{ minMessageId: null, maxMessageId: null, count: 0 }` for a
+ * group that has never been seen so the caller can default to a
+ * first-time backfill (no range filter, iterate from newest).
  */
 export function getMessageIdRange(groupId) {
+    const gid = String(groupId);
     const r = getDb()
         .prepare(`
         SELECT MIN(message_id) AS min_id, MAX(message_id) AS max_id, COUNT(*) AS n
-          FROM downloads
-         WHERE group_id = ?
+          FROM (
+                SELECT message_id FROM downloads WHERE group_id = ?
+                UNION
+                SELECT message_id FROM download_tombstones WHERE group_id = ?
+          )
     `)
-        .get(String(groupId));
+        .get(gid, gid);
     return {
         minMessageId: r?.min_id ?? null,
         maxMessageId: r?.max_id ?? null,
@@ -1916,21 +1937,118 @@ export function getDownloadById(id) {
     return getDb().prepare('SELECT * FROM downloads WHERE id = ?').get(numId) || null;
 }
 
+const TOMBSTONE_CHUNK = 500;
+
+/**
+ * Record (group_id, message_id) for downloads that are about to be removed
+ * on purpose, so isDownloaded() and getMessageIdRange() still see them.
+ * Does not start its own transaction — callers wrap it with the DELETE.
+ *
+ * @param {import('better-sqlite3').Database} database
+ * @param {Array<number|string>} ids
+ * @returns {number}
+ */
+function rememberDeletedDownloadsOn(database, ids) {
+    const clean = [
+        ...new Set(
+            (Array.isArray(ids) ? ids : [])
+                .map(Number)
+                .filter((n) => Number.isSafeInteger(n) && n > 0),
+        ),
+    ];
+    if (!clean.length) return 0;
+    const now = Date.now();
+    const insert = database.prepare(
+        `INSERT OR IGNORE INTO download_tombstones (group_id, message_id, created_at)
+         VALUES (?, ?, ?)`,
+    );
+    let n = 0;
+    for (let i = 0; i < clean.length; i += TOMBSTONE_CHUNK) {
+        const slice = clean.slice(i, i + TOMBSTONE_CHUNK);
+        const marks = slice.map(() => '?').join(',');
+        const rows = database
+            .prepare(`SELECT group_id, message_id FROM downloads WHERE id IN (${marks})`)
+            .all(...slice);
+        for (const row of rows) {
+            if (row.group_id == null || row.message_id == null) continue;
+            n += insert.run(String(row.group_id), Number(row.message_id), now).changes;
+        }
+    }
+    return n;
+}
+
+/** Tombstone then return. Safe to call on its own before a raw DELETE. */
+export function rememberDeletedDownloads(ids) {
+    const database = getDb();
+    return database.transaction((idList) => rememberDeletedDownloadsOn(database, idList))(ids);
+}
+
+/**
+ * Databases from the old enhancement branch keep downloads.user_deleted.
+ * Copy the flagged rows into download_tombstones, delete them, and drop
+ * the column. A no-op when the column is already gone.
+ *
+ * @param {import('better-sqlite3').Database} [database]
+ * @returns {{ migrated: number, dropped: boolean }}
+ */
+export function retireUserDeletedColumn(database = getDb()) {
+    const hasColumn = database
+        .prepare('PRAGMA table_info(downloads)')
+        .all()
+        .some((col) => col.name === 'user_deleted');
+    if (!hasColumn) return { migrated: 0, dropped: false };
+
+    const indexes = database
+        .prepare(
+            `SELECT name FROM sqlite_master
+              WHERE type = 'index' AND tbl_name = 'downloads'
+                AND sql LIKE '%user_deleted%'`,
+        )
+        .all();
+    for (const idx of indexes) {
+        const name = String(idx.name).replaceAll('"', '""');
+        database.exec(`DROP INDEX IF EXISTS "${name}"`);
+    }
+
+    const now = Date.now();
+    const migrated = database.transaction(() => {
+        const copied = database
+            .prepare(
+                `INSERT OR IGNORE INTO download_tombstones (group_id, message_id, created_at)
+                 SELECT group_id, message_id, ?
+                   FROM downloads
+                  WHERE user_deleted = 1`,
+            )
+            .run(now);
+        database.prepare('DELETE FROM downloads WHERE user_deleted = 1').run();
+        return copied.changes;
+    })();
+    database.exec('ALTER TABLE downloads DROP COLUMN user_deleted');
+    return { migrated, dropped: true };
+}
+
 /** Bulk-delete by ids (preferred) or file_paths. Returns the number removed.
+ *  Tombstones each removed message so backfill does not fetch it again.
  *  Also purges orphaned people rows whose faces were cascade-deleted. */
 export function deleteDownloadsBy(opts) {
     const db = getDb();
     let removed = 0;
-    if (Array.isArray(opts?.ids) && opts.ids.length) {
+    const dropIds = (ids) => {
+        rememberDeletedDownloadsOn(db, ids);
         const stmt = db.prepare('DELETE FROM downloads WHERE id = ?');
-        const tx = db.transaction(() => opts.ids.reduce((n, id) => n + stmt.run(id).changes, 0));
-        removed = tx();
+        return ids.reduce((n, id) => n + stmt.run(id).changes, 0);
+    };
+    if (Array.isArray(opts?.ids) && opts.ids.length) {
+        removed = db.transaction(() => dropIds(opts.ids))();
     } else if (Array.isArray(opts?.filePaths) && opts.filePaths.length) {
-        const stmt = db.prepare('DELETE FROM downloads WHERE file_path = ?');
-        const tx = db.transaction(() =>
-            opts.filePaths.reduce((n, p) => n + stmt.run(p).changes, 0),
-        );
-        removed = tx();
+        removed = db.transaction(() => {
+            const sel = db.prepare('SELECT id FROM downloads WHERE file_path = ?');
+            const ids = [];
+            for (const p of opts.filePaths) {
+                for (const row of sel.all(p)) ids.push(row.id);
+            }
+            return dropIds(ids);
+        })();
     }
     if (removed > 0) {
         purgeOrphanPeople();

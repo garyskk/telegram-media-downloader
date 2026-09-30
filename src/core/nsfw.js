@@ -24,6 +24,7 @@ import { Worker } from 'worker_threads';
 import sharp from 'sharp';
 import {
     getDb,
+    rememberDeletedDownloads,
     getUnscannedNsfwBatch,
     setNsfwResult,
     getNsfwStats,
@@ -888,6 +889,7 @@ async function _drainBg() {
                                 .get(Number(id));
                         } catch {}
                         try {
+                            rememberDeletedDownloads([Number(id)]);
                             db.prepare('DELETE FROM downloads WHERE id = ?').run(Number(id));
                         } catch {}
                         try {

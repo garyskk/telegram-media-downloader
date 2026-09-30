@@ -158,7 +158,7 @@ export async function resolveConflict(conflictId, keep) {
     let unlinked = 0;
     let queued = 0;
     let remoteDeleted = 0;
-    const { getDb, enqueuePeerDeleteJob } = await import('../db.js');
+    const { getDb, enqueuePeerDeleteJob, rememberDeletedDownloads } = await import('../db.js');
     const { purgeThumbsForDownload } = await import('../thumbs.js');
     const { purgeSeekbarForDownload } = await import('../seekbar/index.js');
     const selfId = getSelfPeerId();
@@ -183,6 +183,7 @@ export async function resolveConflict(conflictId, keep) {
                         await fs.unlink(abs).catch(() => {});
                     }
                 }
+                rememberDeletedDownloads([id]);
                 getDb().prepare('DELETE FROM downloads WHERE id = ?').run(id);
                 purgeThumbsForDownload(id).catch(() => {});
                 purgeSeekbarForDownload(id, seekbarRow || undefined).catch(() => {});
