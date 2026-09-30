@@ -408,73 +408,36 @@ Not ported with §1. v2.32.1 keeps evenly spaced frames, `CAP_PROP_POS_FRAMES` s
 | `POST` | `/detect/video` | Optional `job_id`, `nice`. New sampler and tracker. |
 | `GET` | `/detect/video/status/{job_id}` | New. |
 
-Ported with §4. Lists take `pinned=0`. There is no `user_deleted` filter; a deleted message is a `download_tombstones` row (§5).
-
-| Method | Path | Change |
-|---|---|---|
-| `GET` | `/api/downloads/ids` | New. Full filtered ID set for shuffle. |
-| `POST` | `/api/downloads/by-ids` | New. Hydrate up to 100 tiles. Guest-allowed. |
-| existing download lists | | `unpinnedOnly` / unpinned filter; `user_deleted` excluded. |
-
-### Similar clips (all new)
-
-Ported with §3. All 13 routes are registered.
-
-| Method | Path |
-|---|---|
-| `POST` | `/api/maintenance/similar/scan` |
-| `POST` | `/api/maintenance/similar/scan/stop` |
-| `GET` | `/api/maintenance/similar/status` |
-| `GET` | `/api/maintenance/similar/stats` |
-| `POST` | `/api/maintenance/similar/analyze` |
-| `POST` | `/api/maintenance/similar/analyze/stop` |
-| `GET` | `/api/maintenance/similar/groups` |
-| `POST` | `/api/maintenance/similar/delete` |
-| `POST` | `/api/maintenance/similar/ignore` |
-| `GET` | `/api/maintenance/similar/ignore` |
-| `DELETE` | `/api/maintenance/similar/ignore/:id` |
-| `POST` | `/api/maintenance/similar/analyze/purge` |
-| `POST` | `/api/maintenance/similar/purge` |
-
-### Faces / people
-
-Not ported with §1 and §2. People sort (`sort` / `dir`) is already on v2.32.1.
-
-| Method | Path | Change |
-|---|---|---|
-| `POST` | `/api/ai/faces/recluster` | Now incremental Phase B only. |
-| `POST` | `/api/ai/faces/rebuild` | New. Full DBSCAN reshape. |
-| `POST` | `/api/ai/faces/reindex` | Also clears the exclusion denylist. |
-| `GET` | `/api/ai/faces/unclassified` | New. |
-| `GET` | `/api/ai/faces/:id/suggestions` | New. |
-| `POST` | `/api/ai/faces/:id/new-person` | New. |
-| `DELETE` | `/api/ai/faces/:id` | New. |
-| `GET` | `/api/ai/people` | `sortBy` / `sortDir` (aliases `sort` / `dir`). |
-| `GET` | `/api/ai/people/:id/faces` | New. One row per face. |
-| `GET` | `/api/ai/people/:id/suggestions` | New. |
-| `POST` | `/api/ai/people/:id/cover` | New. |
-| `POST` | `/api/ai/people/:id/exclude` | New. |
-| `GET` | `/api/ai/people/excluded` | New. |
-| `DELETE` | `/api/ai/people/excluded/:id` | New. |
-| `DELETE` | `/api/ai/people/:id` | Still a temporary drop. |
-| `GET` | `/api/maintenance/dedup/sets` | New listing used by the duplicates page. |
-
-### Faces sidecar
-
-Not ported with §1. v2.32.1 keeps evenly spaced frames, `CAP_PROP_POS_FRAMES` seeks, and a 120-frame cap.
-
-| Method | Path | Change |
-|---|---|---|
-| `POST` | `/detect/video` | Optional `job_id`, `nice`. New sampler and tracker. |
-| `GET` | `/detect/video/status/{job_id}` | New. |
-
 ---
 
 ## 9. Configuration and environment
 
+Checked against this branch and the current compose files. The app image is built from this tree (`build: .`) with `NODE_ENV=development`. Faces stays on `ghcr.io/botnick/tgdl-faces`. Watchtower and autoheal stay. `faces-openvino` stays removed.
+
+### On this branch
+
+| Item | Status |
+|---|---|
+| `advanced.similarClips` and `TGDL_SIMILAR_*` | Ported with §3. Commented block in `.env.example`. |
+| `scanVideos` | Already on v2.32.1, default `false`. Dashboard flag, no compose env. |
+| `TGDL_FACE_CROP_CONCURRENCY` | Already on v2.32.1, default 4. |
+| `detSize` | Stays 640. Enhancement's 480 is not ported. |
+| `TGDL_FACES_DETECTOR_MODEL` | Stays `buffalo_l`. Compose does not set it. Enhancement's `buffalo_m` default is not ported; a recognition-head change still needs a re-scan. |
+| `TGDL_FACES_CPU_LIMIT` | Ported. CPU `tgdl-faces` (and the Synology compose) set `cpus: ${TGDL_FACES_CPU_LIMIT:-6}`. The CUDA service is uncapped, same as enhancement. |
+
+### Not ported with §1
+
+These only exist for the content-adaptive video sampler. Compose does not inject them, and this branch does not read them:
+
+`videoScanLimit`, `videoNice`, `videoFloorIntervalSec`, `videoMaxFrames` (20,000), `videoProgressPollMs`, `videoWindowSec`, `videoMotionThreshold`, `TGDL_FACES_VIDEO_CONFIRMED_MIN_QUALITY`, `TGDL_FACES_VIDEO_CONFIRMED_MIN_SCORE`, `TGDL_FACES_VIDEO_SINGLETON_MIN_QUALITY`, `TGDL_FACES_VIDEO_SINGLETON_MIN_SCORE`, `TGDL_FACES_VIDEO_MIN_LANDMARK_REGULARITY`.
+
+The commented `cpu_shares: 256` on the faces service is not ported. The CPU cap above is the limit that stays.
+
+The tables below are what `enhancement` changed relative to `716a55e1`.
+
 ### `advanced.ai.faces` (new or changed defaults)
 
-Not ported with §1 and §2. `scanVideos` and `TGDL_FACE_CROP_CONCURRENCY` already exist on v2.32.1 at the defaults this tree uses (`false` and `4`). `detSize` stays 640. `videoMaxFrames` stays the 120 density cap.
+Not ported with §1 and §2, except `scanVideos`, `TGDL_FACE_CROP_CONCURRENCY`, and the CPU cap above. `detSize` stays 640. `videoMaxFrames` stays the 120 density cap.
 
 | Key | Env | Default | Role |
 |---|---|---|---|
@@ -509,6 +472,21 @@ Ported with §3. Stored under that key. Env overrides are `TGDL_SIMILAR_*` as in
 
 ## 10. Docker, packaging, and runtime
 
+Checked against the v2.32.1 image layout. `telegram-downloader` builds from this tree (`build: .` in both compose files) with `NODE_ENV=development`. Faces stays the published `ghcr.io/botnick/tgdl-faces` image (CPU and CUDA profiles). Autoheal and the idle watchtower stay. The faces service stays on pip and `requirements*.txt`. `faces-openvino` stays removed. The service-worker version stays `v2321`, not `v2.24.5-26`.
+
+### On this branch
+
+| Item | Status |
+|---|---|
+| `/etc/hosts` readability | Already in `scripts/docker-entrypoint.sh`. Root `chmod a+r` on `/etc/hosts`, `/etc/resolv.conf`, and `/etc/hostname` before `gosu node`. |
+| Seekbar binary in the image | Ported. The `seekbar` stage cross-compiles `./cmd/server` with the same Go 1.25 toolchain as `tgdl-core` (`CGO_ENABLED=0`) to `/app/seekbar-service/bin/seekbar-server`. `SEEKBAR_BIN` points there, which `src/core/seekbar/spawn.js` uses when `SEEKBAR_SIDECAR_URL` is unset. |
+| `.dockerignore` | Ported. `seekbar-service/bin` and `seekbar-service/data` stay out of the build context. |
+| `bufferutil` on arm64 | Ported in the `deps` stage only: `python3`, `make`, and `g++` so `npm ci` can compile `bufferutil` when Node 24 has no prebuild. The runtime stage does not install them. |
+| VA-API drivers | `vainfo` on every arch. `intel-media-va-driver` and `i965-va-driver` only when `TARGETARCH` is `amd64` — Debian bookworm has no arm64 candidate, which failed `docker compose build` on this host. |
+| Faces `uv` packaging | Not ported. v2.32.1 faces images still install from `requirements*.txt`. The OpenVINO extra and the `uv` release workflow are not brought back. |
+
+The list below is what `enhancement` changed relative to `716a55e1`.
+
 - `docker-compose.yml`: `telegram-downloader` builds locally (`build: .`) instead of pulling `ghcr.io/botnick/telegram-media-downloader:latest`. `NODE_ENV=development`.
 - Faces services build from `./faces-service` instead of pulling `ghcr.io/botnick/tgdl-faces:latest`.
 - `autoheal` and `watchtower` services are commented out. Labels and `WATCHTOWER_URL` on the app services remain.
@@ -525,7 +503,22 @@ Ported with §3. Stored under that key. Env overrides are `TGDL_SIMILAR_*` as in
 
 ## 11. Localization and docs
 
-Face-review, unclassified-face, exclude, cover, and merge-suggestion strings, plus `docs/FACE-REVIEW-REQUIREMENTS.md` and the video face-detection parts of `docs/requirements.md`, are not ported with §1 and §2.
+Strings and docs follow the sections they belong to. Face-review copy and the video-sampler requirements are not on this branch. `CHANGELOG.md` is not updated for these ports. The service worker stays `v2321`.
+
+### On this branch
+
+| Item | Status |
+|---|---|
+| Similar clips | `en.json` and `th.json` have the `maintenance.similar.*` strings. `docs/SIMILAR-CLIPS.md` is the design note. |
+| Shuffle and unpinned | `gallery.filter.pinned_unpinned` is in both locale files. |
+| Backup coverage tip | The English sentence is the fallback text on the Backup page (`maintenance.backup.coverage_tip`). The key is not in `en.json` or `th.json`, so Thai stays on that English sentence. |
+| `docs/API.md`, `docs/ARCHITECTURE.md` | No similar-clips section. The behavior is in `docs/SIMILAR-CLIPS.md`. |
+
+### Not on this branch
+
+Face-review, unclassified-face, exclude, cover, and merge-suggestion strings. `docs/FACE-REVIEW-REQUIREMENTS.md`. `docs/requirements.md` (the video face-detection redesign). Enhancement's `CHANGELOG.md` entries through 2.24.5-26.
+
+The list below is what `enhancement` changed relative to `716a55e1`.
 
 - `src/web/public/locales/en.json` and `th.json`: strings for face review, unclassified faces, select-all, People sort, merge suggestions, exclude, cover, shuffle, similar clips (including the up-to-date scan status), and related settings labels.
 - New docs: `docs/requirements.md` (video face-detection redesign, phases 1–4, plus the progress-reporting follow-up), `docs/FACE-REVIEW-REQUIREMENTS.md`, `docs/SIMILAR-CLIPS.md`.
@@ -535,7 +528,25 @@ Face-review, unclassified-face, exclude, cover, and merge-suggestion strings, pl
 
 ## 12. Tests added or expanded
 
-Face-review and video-sampler tests are not ported with §1 and §2: `tests/ai/face-crop-queue.test.js`, `tests/ai/faces-client-video.test.js`, `tests/ai/unclassified-select-all.test.js`, `faces-service/tests/test_video_progress.py`, and the §1 portions of `tests/ai/scan-runner-video.test.js`, `tests/ai/face-cluster-ops.test.js`, `tests/ai/faces-client.test.js`, `faces-service/tests/test_video.py`, and `faces-service/tests/test_app.py`. v2.32.1 already has its own scan-runner video gate tests and face-crop tests.
+Face-review and video-sampler tests are not on this branch. The ported features have their own tests, some under different filenames because this branch hard-deletes and already had the spinner and the sprite budget.
+
+### On this branch
+
+| Area | Tests |
+|---|---|
+| Similar clips | `tests/pdq.test.js`, `tests/similar-align.test.js`, `tests/similar-config.test.js`, `tests/similar-fingerprint.test.js`, `tests/similar-matcher.test.js`, `tests/similar-partial.test.js`, `tests/similar-scan.test.js`, `tests/db-similar-clips.test.js`, `tests/db-similar-purge.test.js`, `tests/seekbar-fingerprint.test.js` |
+| Shuffle and unpinned | `tests/db-shuffle-ids.test.js`, `tests/viewer-shuffle.test.js`, plus `unpinnedOnly` cases in `tests/db.test.js`, `tests/db-federated-gallery.test.js`, `tests/db-search.test.js`, and `tests/contract/downloads.contract.test.js` |
+| Deletes | `tests/download-tombstone.test.js` (tombstones and dropping `user_deleted`, `cover_face_id`, and `excluded_people`). Shared-path unlink is `tests/dedup-shared-files.test.js`, already on v2.32.1. |
+| Backup | The five gaps are in `tests/backup.manager.test.js`, not the four enhancement filenames. |
+| Video face scan gate | `tests/ai/scan-runner-video.test.js` is the v2.32.1 gate (`scanVideos` on/off). It is not the content-adaptive sampler. |
+| Sprite budget | `spriteBudgetMs` cases in `tests/seekbar.generator.test.js`. |
+| Buffering spinner | Already covered by the v2.32.1 player. `tests/viewer-spinner.test.js` is not added. |
+
+### Not on this branch
+
+`tests/ai/face-crop-queue.test.js`, `tests/ai/faces-client-video.test.js`, `tests/ai/unclassified-select-all.test.js`, `faces-service/tests/test_video_progress.py`, `tests/db-soft-delete.test.js`, `tests/dedup-shared-path.test.js`, `tests/seekbar-timeout.test.js`, `tests/viewer-spinner.test.js`, `tests/backup.destination.edit.test.js`, `tests/backup.manager.run.test.js`, `tests/backup.mirror.reconcile.test.js`, `tests/backup.retention.test.js`.
+
+The list below is what `enhancement` added relative to `716a55e1`.
 
 New files:
 
@@ -570,6 +581,18 @@ Expanded: `tests/ai/face-cluster-ops.test.js`, `tests/ai/faces-client.test.js`, 
 ---
 
 ## 13. Files touched
+
+This list is the `enhancement` tree versus `716a55e1`. It is not the file list for this branch.
+
+### On this branch, from the ported sections
+
+`src/core/phash.js`, `src/core/similar/` (align, analyze-runner, config, fingerprint, index, matcher, partial, scan-runner), `src/web/public/js/maintenance-similar.js`, `docs/SIMILAR-CLIPS.md`, `tests/download-tombstone.test.js`, and the similar-clips and shuffle tests in §12. `Dockerfile` compiles the seekbar binary. `.dockerignore` ignores `seekbar-service/bin` and `seekbar-service/data`. Both compose files build the app locally and set `NODE_ENV=development`.
+
+### Not on this branch
+
+`docs/FACE-REVIEW-REQUIREMENTS.md`, `docs/requirements.md`, `faces-service/.dockerignore`, `faces-service/build.sh`, `faces-service/uv.lock`, `faces-service/tgdl_faces/video_progress.py`, `faces-service/tests/test_video_progress.py`, `src/web/public/js/face-crop-queue.js`. `faces-service/requirements.txt`, `requirements-cuda.txt`, and `requirements-directml.txt` are still here. `src/web/public/js/maintenance-hub.js` is not here; v2.32.1 uses the Tools pages.
+
+The inventory below is what `enhancement` changed relative to `716a55e1`.
 
 ### Added
 

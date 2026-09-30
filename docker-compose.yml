@@ -1,18 +1,15 @@
 # Compose file for Telegram Media Downloader.
 #
-# Defaults to the prebuilt multi-arch image from GitHub Container Registry.
-# `pull_policy: always` ensures `docker compose up -d` grabs the newest
-# release each time — without this, an older locally-cached image wins and
-# manifests as `Cannot find module '/app/src/web/server.js'` after upgrades.
-#
-# To build from source instead (for local dev), comment out `image:` +
-# `pull_policy:` and uncomment `build:`.
+# The app image is built from this tree (`build: .`). Faces stays on the
+# published `ghcr.io/botnick/tgdl-faces` image. `docker compose up -d --build`
+# picks up local Dockerfile and source changes. Watchtower still updates
+# the faces image; it does not replace this locally built app image.
 
 services:
   telegram-downloader:
-    image: ghcr.io/botnick/telegram-media-downloader:latest
-    pull_policy: always
-    # build: .
+    build: .
+    # image: ghcr.io/botnick/telegram-media-downloader:latest
+    # pull_policy: always
     container_name: telegram-downloader
     restart: unless-stopped
     ports:
@@ -26,7 +23,7 @@ services:
       # - /mnt/ssd/tgdl/data:/app/data
       # - /mnt/hdd/tgdl/downloads:/mnt/hdd/downloads
     environment:
-      - NODE_ENV=production
+      - NODE_ENV=development
       - TZ=${TZ:-UTC}
       - TGDL_DEBUG=${TGDL_DEBUG:-}
       # V8 heap ceiling. Default 8 GiB so a 1M-row library doesn't trip
@@ -238,6 +235,8 @@ services:
         # tighter envelopes (Pi 4 4GB, small Synology).
         limits:
           memory: ${TGDL_FACES_MEM_LIMIT:-2g}
+          # Keep a photo scan from taking every core. Override in .env.
+          cpus: ${TGDL_FACES_CPU_LIMIT:-6}
         reservations:
           memory: 512m
     logging:
@@ -333,6 +332,8 @@ services:
     image: willfarrell/autoheal:1.2.0
     container_name: telegram-downloader-autoheal
     restart: unless-stopped
+    profiles:
+      - autoheal
     # autoheal only needs the docker socket — no inbound network. `none`
     # makes a hypothetical RCE in autoheal unable to phone home.
     network_mode: none
@@ -387,6 +388,8 @@ services:
     image: nickfedor/watchtower:1.22
     container_name: telegram-downloader-updater
     restart: unless-stopped
+    profiles:
+      - autoupdate
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       # Only the generated token folder, never the DB/sessions.
@@ -412,8 +415,11 @@ services:
 #   from localhost on first run), then go to Settings → Telegram Accounts
 #   → Add account.
 #
-# Upgrade (manual):
-#   docker compose pull && docker compose up -d
+# Upgrade the app image from this tree:
+#   docker compose up -d --build
+#
+# Faces (and watchtower) still come from the registry:
+#   docker compose pull tgdl-faces tgdl-faces-cuda watchtower && docker compose up -d
 #
 # Upgrade (one-click): Settings → Maintenance → "Install update". Needs
 #   no setup (token is generated; WATCHTOWER_HTTP_API_TOKEN in .env overrides).

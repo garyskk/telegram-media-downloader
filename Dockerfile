@@ -4,6 +4,9 @@
 #   - "gocore" compiles tgdl-core (core-service/, the Go companion process)
 #     on the build host for the target platform — CGO off, so no QEMU and
 #     no C toolchain; works the same for linux/amd64 and linux/arm64.
+#   - "seekbar" compiles the hover-sprite sidecar the same way. Node
+#     auto-spawns SEEKBAR_BIN when SEEKBAR_SIDECAR_URL is unset, so the
+#     image does not download a release tarball on first use.
 #   - "deps" installs prod dependencies only (npm ci --omit=dev) so the runtime
 #     image stays small.
 #   - "runtime" copies node_modules from "deps" + the source, runs as the
@@ -29,12 +32,35 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
 FROM scratch AS gocore-bin
 COPY --from=gocore /out/tgdl-core /tgdl-core
 
+# Hover-sprite sidecar. go 1.22 module, built with the same toolchain as
+# tgdl-core. CGO off → static binary; ffmpeg stays in the runtime stage.
+FROM --platform=$BUILDPLATFORM golang:1.25-bookworm AS seekbar
+ARG TARGETOS=linux
+ARG TARGETARCH
+ARG TARGETVARIANT
+WORKDIR /src
+COPY seekbar-service/go.mod seekbar-service/go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download
+COPY seekbar-service/ ./
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    GOARM_V="${TARGETVARIANT#v}"; \
+    CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} GOARM=${GOARM_V:-7} \
+    go build -trimpath -ldflags "-s -w" -o /out/seekbar-server ./cmd/server
+
 FROM node:24.18.0-bookworm-slim AS deps
 WORKDIR /app
 COPY package.json package-lock.json ./
+# `ws` optionally builds `bufferutil`. linux/arm64 + Node 24 often has no
+# prebuilt binary, and node-gyp needs a compiler. Tooling stays in this
+# stage; the runtime image does not copy it.
 # tgdl-core comes from the gocore stage above, never from the npm
 # postinstall download.
-RUN TGDL_CORE_SKIP_INSTALL=1 npm ci --omit=dev --no-audit --no-fund
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3 make g++ \
+    && rm -rf /var/lib/apt/lists/* \
+    && TGDL_CORE_SKIP_INSTALL=1 npm ci --omit=dev --no-audit --no-fund
 
 FROM node:24.18.0-bookworm-slim AS runtime
 
@@ -56,7 +82,8 @@ ENV NODE_ENV=production \
     MALLOC_ARENA_MAX=2 \
     UV_THREADPOOL_SIZE=16 \
     GIT_SHA=${GIT_SHA} \
-    BUILT_AT=${BUILT_AT}
+    BUILT_AT=${BUILT_AT} \
+    SEEKBAR_BIN=/app/seekbar-service/bin/seekbar-server
 
 # tini    — proper PID 1 (signal handling + zombie reaping). Debian ships
 #           the binary at /usr/bin/tini.
@@ -65,25 +92,29 @@ ENV NODE_ENV=production \
 # ffmpeg  — used by src/core/thumbs.js for video first-frame thumbnails
 #           and audio cover-art extraction. ~30 MB — tiny next to libvips
 #           and node_modules.
-# intel-media-va-driver / i965-va-driver — VA-API userland drivers needed
-#           for `-hwaccel vaapi` (Intel iGPU + AMD via the same libva ABI).
-#           Without these the ffmpeg path in thumbs.js falls back to CPU
-#           decode even when the host exposes /dev/dri. iHD is Gen8+ and
-#           the Quick Sync runtime; i965 covers Gen4-Gen7 hardware.
-# vainfo  — `vainfo` from libva-utils. Not used by the app itself, but
-#           lets operators `docker exec <ctr> vainfo` to confirm the
-#           driver actually loaded inside the container without having
-#           to bake their own debug image.
+# intel-media-va-driver / i965-va-driver — VA-API userland drivers for
+#           `-hwaccel vaapi` on Intel (iHD is Gen8+, i965 is Gen4–Gen7).
+#           Debian bookworm ships them for amd64 only. An arm64 build
+#           has no installation candidate, so they are installed only
+#           when TARGETARCH is amd64. Without them, thumbs fall back to
+#           CPU decode.
+# vainfo  — `vainfo` from libva-utils, every arch. Not used by the app
+#           itself; `docker exec <ctr> vainfo` shows whether a driver
+#           loaded.
 #
 # Base is bookworm-slim (glibc) rather than alpine (musl) because
 # `onnxruntime-node` (pulled in by @huggingface/transformers for the NSFW
 # classifier) ships glibc-only prebuilt .so files; loading them on musl
 # crashes the whole process at boot with "ld-linux-x86-64.so.2: No such
 # file or directory". libstdc++ is part of the base image, no install needed.
+ARG TARGETARCH
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        tini gosu ffmpeg procps \
-        intel-media-va-driver i965-va-driver vainfo \
+        tini gosu ffmpeg procps vainfo \
+    && if [ "$TARGETARCH" = "amd64" ]; then \
+         apt-get install -y --no-install-recommends \
+           intel-media-va-driver i965-va-driver; \
+       fi \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -94,6 +125,7 @@ COPY runner.js config.example.json package.json LICENSE README.md SECURITY.md CH
 # tgdl-core — found at this path by src/core/gocore/spawn.js, so Docker
 # installs never download it. The app runs fine without it (Node fallback).
 COPY --from=gocore --chmod=0755 /out/tgdl-core /app/bin/tgdl-core
+COPY --from=seekbar --chmod=0755 /out/seekbar-server /app/seekbar-service/bin/seekbar-server
 
 # Persistent state (sessions, config, downloads) — mount this as a volume.
 # `chmod a+rX` guarantees files end up readable + dirs traversable even when
