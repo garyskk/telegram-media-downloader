@@ -4,13 +4,7 @@
 // event that leaves the DB referencing a path that no longer exists on
 // disk, the gallery should self-heal — no manual SQL, no SSH. We walk
 // every row, stat the file at row.file_path (relative to DOWNLOADS_DIR),
-// and mark the row as user_deleted=1 if the file is missing or zero bytes.
-//
-// We intentionally do NOT hard-delete missing-file rows. Keeping the row
-// with user_deleted=1 means isDownloaded(groupId, messageId) still returns
-// true, so a subsequent backfill will not re-download a file the operator
-// has deliberately removed. Gallery queries already filter out user_deleted
-// rows, so stale entries never surface in the UI.
+// and delete the row if the file is missing or zero bytes.
 //
 // Counterpart guards already in place:
 //   - downloader.js verifies file size after every fs.rename
@@ -20,7 +14,8 @@
 import fs from 'fs/promises';
 import path from 'path';
 import crypto from 'crypto';
-import { getDb, insertDownload, deleteDownloadsBy, purgeSoftDeletedArtifacts } from './db.js';
+import { getDb, insertDownload, purgeOrphanPeople } from './db.js';
+import { statMany, uvError, walkTree } from './gocore/fs.js';
 import { sanitizeName } from './downloader.js';
 import { getDownloadsDir } from './paths.js';
 import { purgeThumbsForDownload } from './thumbs.js';
@@ -35,17 +30,25 @@ let _broadcast = () => {};
 // Cached batch size, refreshed from config on each start() call.
 let _batchSize = 64;
 
+// Automatic runs (boot + timer) refuse to prune when more than this share
+// of the library looks missing at once — that's an unmounted disk or a
+// stale network share far more often than real deletions.
+const AUTO_PRUNE_MAX_SHARE = 0.5;
+const AUTO_PRUNE_MIN_ROWS = 20;
+// Only these mean "the file is gone". EACCES / EIO / ENOTCONN / ESTALE …
+// are an unreadable disk, not a deleted file.
+const MISSING_CODES = new Set(['ENOENT', 'ENOTDIR']);
+
 /**
- * Walk every non-deleted row, stat each file, and mark rows as
- * user_deleted=1 where the file is missing or zero-bytes. Returns
- * `{ scanned, pruned, sizeFixed }`. Concurrency-guarded — a second call
- * while the first is in-flight is a no-op.
+ * Walk every row, stat each file, drop rows where the file is missing
+ * or zero-bytes. Returns `{ scanned, pruned, sizeFixed }`. Concurrency-
+ * guarded — a second call while the first is in-flight is a no-op.
  *
  * Optional `onProgress({ processed, total, stage, sizeFixed })` fires
  * after every batch so the verify-files admin page can render a
  * determinate bar without polling.
  */
-export async function sweep(onProgress) {
+export async function sweep(onProgress, { auto = false } = {}) {
     if (_running) return { scanned: 0, pruned: 0, skipped: true };
     _running = true;
     const result = { scanned: 0, pruned: 0, sizeFixed: 0 };
@@ -56,6 +59,17 @@ export async function sweep(onProgress) {
         } catch {}
     };
     try {
+        // An unmounted / unreadable downloads disk makes every file look
+        // missing — never prune the library because of that.
+        try {
+            await fs.readdir(DOWNLOADS_DIR);
+        } catch (e) {
+            console.warn(
+                `[integrity] downloads dir unavailable (${e?.code || e?.message}) — sweep skipped, nothing pruned`,
+            );
+            return { ...result, skipped: true, reason: 'downloads_dir_unavailable' };
+        }
+
         // Use keyset-paginated `.all()` instead of `.iterate()`. A live
         // `.iterate()` cursor holds the better-sqlite3 connection open for
         // its entire lifetime — if an `await` (fs.stat, Promise.all) yields
@@ -68,11 +82,7 @@ export async function sweep(onProgress) {
         // async stat checks that follow.
         const db = getDb();
         const total = db
-            .prepare(
-                `SELECT COUNT(*) AS n FROM downloads
-                  WHERE file_path IS NOT NULL
-                    AND (user_deleted IS NULL OR user_deleted = 0)`,
-            )
+            .prepare(`SELECT COUNT(*) AS n FROM downloads WHERE file_path IS NOT NULL`)
             .get().n;
         result.scanned = total;
         _emit({ processed: 0, total, stage: 'scanning' });
@@ -94,49 +104,88 @@ export async function sweep(onProgress) {
             `SELECT id, file_path, file_name, group_id, file_size
                FROM downloads
               WHERE file_path IS NOT NULL
-                AND (user_deleted IS NULL OR user_deleted = 0)
                 AND id < ?
               ORDER BY id DESC
               LIMIT ?`,
         );
-        while (true) {
+        // Rows are still read and decided page by page (progress, yields and
+        // every rule below are per page, as before), but the stats for up
+        // to STAT_AHEAD_ROWS rows come from tgdl-core in one request: a
+        // round trip per page would cost more main-thread time than the
+        // stats themselves.
+        const STAT_AHEAD_ROWS = 1024;
+        let exhausted = false;
+        while (!exhausted) {
             // `.all()` opens + closes the statement synchronously; the
             // connection is free by the time the async stat checks run.
-            const page = pageStmt.all(beforeId, PAGE_SIZE);
-            if (!page.length) break;
-            const checks = await Promise.all(
-                page.map(async (r) => {
+            const pages = [];
+            let ahead = 0;
+            while (!exhausted && (ahead === 0 || ahead + PAGE_SIZE <= STAT_AHEAD_ROWS)) {
+                const page = pageStmt.all(beforeId, PAGE_SIZE);
+                if (!page.length) {
+                    exhausted = true;
+                    break;
+                }
+                pages.push(page);
+                ahead += page.length;
+                beforeId = Number(page[page.length - 1].id);
+                if (page.length < PAGE_SIZE) exhausted = true;
+            }
+            if (!pages.length) break;
+            const targets = pages.map((page) => {
+                const pageTargets = [];
+                for (const r of page) {
                     let rel = String(r.file_path || '').replace(/\\/g, '/');
-                    if (!rel) return null;
+                    if (!rel) continue;
                     // Tolerate the legacy `data/downloads/` prefix that some
                     // older rows still carry — same fix that
                     // safeResolveDownload() does in the request path.
                     while (rel.startsWith('data/downloads/'))
                         rel = rel.slice('data/downloads/'.length);
-                    // Defence-in-depth: refuse to stat anything that walks outside
-                    // DOWNLOADS_DIR. Rows with bogus paths get pruned.
-                    if (rel.includes('..') || path.isAbsolute(rel)) return r.id;
-                    const abs = path.join(DOWNLOADS_DIR, rel);
-                    try {
-                        const st = await fs.stat(abs);
-                        if (st.size <= 0) return r.id;
+                    // Federated-dedup rows point at a peer's copy; there is
+                    // nothing local to stat.
+                    if (rel.startsWith('_clusterref/')) continue;
+                    // Absolute or `../` paths come from a custom download
+                    // path outside DOWNLOADS_DIR — stat where they point
+                    // instead of pruning them for their shape.
+                    pageTargets.push({ r, abs: path.resolve(DOWNLOADS_DIR, rel) });
+                }
+                return pageTargets;
+            });
+            // fs.stat of those rows, done by tgdl-core with Node's own
+            // error codes. If it can't answer, stop here: nothing has been
+            // pruned or rewritten yet.
+            let stats;
+            try {
+                stats = await statMany(targets.flat().map((t) => t.abs));
+            } catch (e) {
+                console.warn(
+                    `[integrity] file check unavailable (${e?.message || e}) — sweep stopped, nothing pruned`,
+                );
+                return { ...result, skipped: true, reason: 'core_unavailable' };
+            }
+            let k = 0;
+            for (let p = 0; p < pages.length; p++) {
+                for (const { r } of targets[p]) {
+                    const st = stats[k++];
+                    if (st.ok) {
+                        if (st.size <= 0) {
+                            deleteIds.push(r.id);
+                            continue;
+                        }
                         // Backfill or correct the stored file_size if it's
                         // null / 0 / wrong. Tolerance > 0 for the rare case
                         // an editor / re-encode legitimately changed bytes.
                         const stored = Number(r.file_size) || 0;
                         if (stored !== st.size) sizeFixes.push({ id: r.id, size: st.size });
-                        return null;
-                    } catch {
-                        return r.id;
+                    } else if (MISSING_CODES.has(st.code)) {
+                        deleteIds.push(r.id);
                     }
-                }),
-            );
-            for (const id of checks) if (id) deleteIds.push(id);
-            processed += page.length;
-            beforeId = Number(page[page.length - 1].id);
-            _emit({ processed, total, stage: 'scanning' });
-            await new Promise((r) => setImmediate(r));
-            if (page.length < PAGE_SIZE) break;
+                }
+                processed += pages[p].length;
+                _emit({ processed, total, stage: 'scanning' });
+                await new Promise((r) => setImmediate(r));
+            }
         }
 
         if (sizeFixes.length) {
@@ -160,16 +209,47 @@ export async function sweep(onProgress) {
             result.sizeFixed = sizeFixed;
         }
 
+        if (
+            auto &&
+            deleteIds.length >= AUTO_PRUNE_MIN_ROWS &&
+            deleteIds.length > total * AUTO_PRUNE_MAX_SHARE
+        ) {
+            console.warn(
+                `[integrity] ${deleteIds.length} of ${total} files look missing — not pruning ` +
+                    'automatically (disk unmounted?). Run Maintenance → Verify files to prune.',
+            );
+            result.skipped = true;
+            result.reason = 'too_many_missing';
+            result.missing = deleteIds.length;
+            deleteIds.length = 0;
+        }
+
         if (deleteIds.length) {
             _emit({ processed, total, stage: 'pruning' });
             const seekbarMap = collectSeekbarPaths(deleteIds);
-            // Soft-delete via deleteDownloadsBy so faces / embeddings /
-            // pending backup jobs are wiped along with the tombstone.
-            result.pruned = deleteDownloadsBy({ ids: deleteIds });
+            // One transaction per chunk with a yield in between: a single
+            // transaction over every dead row (plus its cascades) blocked
+            // the event loop for ~35 s at 150k rows.
+            const DELETE_CHUNK = 500;
+            const tx = getDb().transaction((slice) => {
+                const stmt = getDb().prepare(
+                    `DELETE FROM downloads WHERE id IN (${slice.map(() => '?').join(',')})`,
+                );
+                return stmt.run(...slice).changes;
+            });
+            result.pruned = 0;
+            for (let i = 0; i < deleteIds.length; i += DELETE_CHUNK) {
+                result.pruned += tx(deleteIds.slice(i, i + DELETE_CHUNK));
+                _emit({ processed: i, total: deleteIds.length, stage: 'pruning' });
+                await new Promise((r) => setImmediate(r));
+            }
             for (const id of deleteIds) {
                 purgeThumbsForDownload(id).catch(() => {});
                 purgeSeekbarForDownload(id, seekbarMap.get(id)).catch(() => {});
             }
+            try {
+                purgeOrphanPeople();
+            } catch {}
             try {
                 _broadcast({
                     type: 'integrity_swept',
@@ -197,24 +277,8 @@ export function start({ broadcast, intervalMin = 60, batchSize = 64 } = {}) {
     if (broadcast) _broadcast = broadcast;
     if (Number.isFinite(batchSize) && batchSize > 0) _batchSize = Math.floor(batchSize);
     if (_timer) clearInterval(_timer);
-    // Heal soft-deleted rows that predate face/artifact cleanup on delete.
-    try {
-        const healed = purgeSoftDeletedArtifacts();
-        const n =
-            (healed.faces || 0) +
-            (healed.embeddings || 0) +
-            (healed.tags || 0) +
-            (healed.backupJobs || 0);
-        if (n > 0) {
-            console.log(
-                `[integrity] purged soft-deleted artifacts — faces=${healed.faces} embeddings=${healed.embeddings} tags=${healed.tags} backupJobs=${healed.backupJobs}`,
-            );
-        }
-    } catch (e) {
-        console.warn('[integrity] soft-deleted artifact purge failed:', e.message);
-    }
     setTimeout(() => {
-        sweep()
+        sweep(null, { auto: true })
             .then(({ scanned, pruned }) => {
                 if (pruned > 0) {
                     console.log(
@@ -226,7 +290,7 @@ export function start({ broadcast, intervalMin = 60, batchSize = 64 } = {}) {
     }, 30 * 1000);
     _timer = setInterval(
         () => {
-            sweep()
+            sweep(null, { auto: true })
                 .then(({ scanned, pruned }) => {
                     if (pruned > 0) {
                         console.log(
@@ -338,69 +402,78 @@ export async function reindexFromDisk(configGroups, onProgress) {
         startedAt: Date.now(),
     };
     try {
-        let topEntries = [];
-        try {
-            topEntries = await fs.readdir(DOWNLOADS_DIR, { withFileTypes: true });
-        } catch {
+        // tgdl-core lists the tree (fs.readdir withFileTypes order and
+        // kinds) and stats the files; the rules below are unchanged.
+        const top = await walkTree(DOWNLOADS_DIR, { maxDepth: 1 });
+        if (top.events.some((ev) => ev.t === 'e' && ev.p === '')) {
             // No downloads dir → nothing to do, succeed quietly.
             return { ...result, finishedAt: Date.now() };
         }
-        const groupDirs = topEntries.filter((e) => e.isDirectory() && e.name !== '.deleted');
+        const groupDirs = top.events
+            .filter((ev) => ev.t === 'd' && ev.p !== '.deleted')
+            .map((ev) => ev.p);
         result.groups = groupDirs.length;
         let groupsDone = 0;
-        for (const gd of groupDirs) {
-            const folderName = gd.name;
+        for (const folderName of groupDirs) {
             const resolved = resolveGroupId(folderName, configGroups);
             const groupId = resolved ? resolved.id : `unknown:${folderName}`;
             const groupName = resolved ? resolved.name : folderName;
 
             // Two-deep walk: <group>/<typeFolder>/<file>. Files at the
             // top level of <group>/ (rare, but happens with hand-pasted
-            // archives) get bucketed by extension.
-            const subEntries = await fs.readdir(path.join(DOWNLOADS_DIR, folderName), {
-                withFileTypes: true,
-            });
-            for (const sub of subEntries) {
-                if (sub.isDirectory()) {
-                    const typeFolder = sub.name;
+            // archives) get bucketed by extension. Events arrive in the
+            // order the nested readdir loops visited them.
+            const groupAbs = path.join(DOWNLOADS_DIR, folderName);
+            const { events } = await walkTree(groupAbs, { maxDepth: 2, stat: 'files' });
+            const rootErr = events.find((ev) => ev.t === 'e' && ev.p === '');
+            // An unreadable group folder fails the run, as its readdir did.
+            if (rootErr) throw uvError(rootErr.code, 'scandir', groupAbs);
+            let sinceYield = 0;
+            for (const ev of events) {
+                // Files only (links, devices and deeper folders are skipped;
+                // an unreadable type folder has no entries).
+                if (ev.t !== 'f' || ev.k !== 'file') continue;
+                const parts = ev.p.split('/');
+                const fileName = parts[parts.length - 1];
+                if (fileName.endsWith('.part')) continue;
+                if (parts.length === 2) {
+                    const typeFolder = parts[0];
                     const folderType = TYPE_FOLDER_TO_FILETYPE[typeFolder] || null;
-                    let files = [];
-                    try {
-                        files = await fs.readdir(path.join(DOWNLOADS_DIR, folderName, typeFolder), {
-                            withFileTypes: true,
-                        });
-                    } catch {
-                        continue;
-                    }
-                    for (const f of files) {
-                        if (!f.isFile() || f.name.endsWith('.part')) continue;
-                        const fullAbs = path.join(DOWNLOADS_DIR, folderName, typeFolder, f.name);
-                        const relPath = path.posix
-                            .join(folderName, typeFolder, f.name)
-                            .replace(/\\/g, '/');
-                        await _ingestOne({
-                            result,
-                            fullAbs,
-                            relPath,
-                            fileName: f.name,
-                            groupId,
-                            groupName,
-                            fileType:
-                                folderType || fileTypeFromExt(path.extname(f.name).toLowerCase()),
-                        });
-                    }
-                } else if (sub.isFile() && !sub.name.endsWith('.part')) {
-                    const fullAbs = path.join(DOWNLOADS_DIR, folderName, sub.name);
-                    const relPath = path.posix.join(folderName, sub.name).replace(/\\/g, '/');
-                    await _ingestOne({
+                    const fullAbs = path.join(DOWNLOADS_DIR, folderName, typeFolder, fileName);
+                    const relPath = path.posix
+                        .join(folderName, typeFolder, fileName)
+                        .replace(/\\/g, '/');
+                    _ingestOne({
                         result,
                         fullAbs,
+                        st: ev,
                         relPath,
-                        fileName: sub.name,
+                        fileName,
                         groupId,
                         groupName,
-                        fileType: fileTypeFromExt(path.extname(sub.name).toLowerCase()),
+                        fileType:
+                            folderType || fileTypeFromExt(path.extname(fileName).toLowerCase()),
                     });
+                } else if (parts.length === 1) {
+                    const fullAbs = path.join(DOWNLOADS_DIR, folderName, fileName);
+                    const relPath = path.posix.join(folderName, fileName).replace(/\\/g, '/');
+                    _ingestOne({
+                        result,
+                        fullAbs,
+                        st: ev,
+                        relPath,
+                        fileName,
+                        groupId,
+                        groupName,
+                        fileType: fileTypeFromExt(path.extname(fileName).toLowerCase()),
+                    });
+                } else {
+                    continue;
+                }
+                // Inserts are synchronous; let the event loop breathe.
+                if (++sinceYield >= 256) {
+                    sinceYield = 0;
+                    await new Promise((r) => setImmediate(r));
                 }
             }
             groupsDone++;
@@ -424,11 +497,12 @@ export async function reindexFromDisk(configGroups, onProgress) {
     }
 }
 
-async function _ingestOne({ result, fullAbs, relPath, fileName, groupId, groupName, fileType }) {
+// `st` is the walk's fs.stat of the file: { ok, size, isFile } or { code }.
+function _ingestOne({ result, fullAbs, st, relPath, fileName, groupId, groupName, fileType }) {
     result.scanned += 1;
     try {
-        const st = await fs.stat(fullAbs);
-        if (!st.isFile() || st.size <= 0) {
+        if (!st?.ok) throw uvError(st?.code || 'UNKNOWN', 'stat', fullAbs);
+        if (!st.isFile || st.size <= 0) {
             result.skipped += 1;
             return;
         }

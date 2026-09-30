@@ -12,20 +12,25 @@ process.env.TGDL_DATA_DIR = DATA_DIR;
 
 const getSidecarUrl = vi.hoisted(() => vi.fn(() => ''));
 const submitOne = vi.hoisted(() => vi.fn());
-const waitForJob = vi.hoisted(() => vi.fn());
 const runFfmpegArgs = vi.hoisted(() => vi.fn());
 
 vi.mock('../src/core/seekbar/client.js', () => ({
     getSidecarUrl,
     submitOne,
-    waitForJob,
     getJob: vi.fn(),
+    cancelJob: vi.fn(async () => {}),
     setSidecarUrl: vi.fn(),
     health: vi.fn(),
     submitBatch: vi.fn(),
-    deleteSprite: vi.fn(),
+    deleteSprite: vi.fn(async () => {}),
+    downloadSprite: vi.fn(),
     probeHwaccel: vi.fn(),
     stats: vi.fn(),
+    hasFeature: vi.fn(() => false),
+    isSourceNotFound: vi.fn(() => false),
+    toSidecarPath: (p) => p,
+    fromSidecarPath: (p) => p,
+    uploadSource: vi.fn(),
 }));
 
 vi.mock('../src/core/thumbs.js', async (importOriginal) => {
@@ -76,7 +81,6 @@ afterEach(() => {
     getSidecarUrl.mockReset();
     getSidecarUrl.mockReturnValue('');
     submitOne.mockReset();
-    waitForJob.mockReset();
     runFfmpegArgs.mockReset();
     spawn.mockImplementation((...args) => childHolder.spawn(...args));
     vi.restoreAllMocks();
@@ -123,33 +127,6 @@ function writeMockOutputs(args) {
     }
 }
 
-describe('buildSpriteFfmpegArgs', () => {
-    it('uses hover-only -vf, not filter_complex dual-output', () => {
-        const plan = generator.planSprite(10, {
-            intervalSec: 4,
-            maxTiles: 240,
-            columns: 10,
-            tileWidth: 160,
-        });
-        const args = generator.buildSpriteFfmpegArgs({
-            srcAbs: '/tmp/in.mp4',
-            dstTmp: '/tmp/out.tmp.webp',
-            plan,
-            useWebp: true,
-            quality: 75,
-            hwArgs: [],
-            scaleVf: null,
-        });
-        const joined = args.join(' ');
-        expect(joined).toMatch(/(^|\s)-vf\s/);
-        expect(joined).not.toContain('-filter_complex');
-        expect(joined).not.toContain('rawvideo');
-        expect(joined).not.toContain('.fp.raw');
-        expect(args.filter((a) => a === '-map')).toHaveLength(0);
-        expect(args.includes('libwebp')).toBe(true);
-    });
-});
-
 describe('generateForDownload — hover only', () => {
     beforeEach(() => {
         spawn.mockImplementation((bin, args) => {
@@ -175,8 +152,13 @@ describe('generateForDownload — hover only', () => {
         expect(meta?.download_id).toBe(id);
         expect(runFfmpegArgs).toHaveBeenCalled();
         const args = runFfmpegArgs.mock.calls[0][0];
-        expect(args.join(' ')).toContain('-vf');
-        expect(args.join(' ')).not.toContain('split=2');
+        const joined = args.join(' ');
+        expect(joined).toContain('-vf');
+        expect(joined).not.toContain('split=2');
+        expect(joined).not.toContain('-filter_complex');
+        expect(joined).not.toContain('rawvideo');
+        expect(joined).not.toContain('.fp.raw');
+        expect(args.filter((a) => a === '-map')).toHaveLength(0);
         expect(getVideoFingerprint(id)).toBeNull();
     });
 
@@ -186,8 +168,10 @@ describe('generateForDownload — hover only', () => {
         const sidecarSprite = path.join(DATA_DIR, 'from-sidecar.webp');
         fs.writeFileSync(sidecarSprite, Buffer.alloc(32));
         submitOne.mockResolvedValue({
+            id: 'job-1',
             status: 'done',
             sprite_path: sidecarSprite,
+            video_id: String(id),
             duration: 10,
             frames: 8,
             cols: 10,

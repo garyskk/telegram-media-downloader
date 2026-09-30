@@ -61,7 +61,6 @@ export async function installPwa() {
         const msg = isIos
             ? 'Tap the Share button ⎋ then "Add to Home Screen"'
             : 'Use your browser menu to install this app';
-        const toastEl = document.querySelector('.toast-container') || document.body;
         if (typeof window.showToast === 'function') {
             window.showToast(msg, 'info');
         } else {
@@ -122,17 +121,6 @@ if ('serviceWorker' in navigator) {
         navigator.serviceWorker
             .register('/sw.js', { scope: '/' })
             .then((reg) => {
-                const ping = () => {
-                    try {
-                        reg.update();
-                    } catch {
-                        /* best-effort */
-                    }
-                };
-                ping();
-                document.addEventListener('visibilitychange', () => {
-                    if (document.visibilityState === 'visible') ping();
-                });
                 // If a new worker is found, tell it to take over right
                 // away (matches the SW's skipWaiting handler).
                 reg.addEventListener('updatefound', () => {

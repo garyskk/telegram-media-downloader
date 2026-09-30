@@ -66,16 +66,19 @@ jobs:
       run:
         working-directory: faces-service
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@v6
+      - name: Setup Python
+        uses: actions/setup-python@v7
         with:
           python-version: '3.12'
 
       - name: Install build deps
         shell: bash
-        run: uv sync --group dev --group build
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[test]"
+          pip install pyinstaller
 
       - name: Pre-download buffalo_l weights
         shell: bash
@@ -83,7 +86,7 @@ jobs:
           TGDL_FACES_MODELS_DIR: ${{ runner.temp }}/tgdl-faces-models
         run: |
           mkdir -p "$TGDL_FACES_MODELS_DIR"
-          uv run python -c "from insightface.app import FaceAnalysis; a = FaceAnalysis(name='buffalo_l', root=r'${TGDL_FACES_MODELS_DIR}'); a.prepare(ctx_id=-1)"
+          python -c "from insightface.app import FaceAnalysis; a = FaceAnalysis(name='buffalo_l', root=r'${TGDL_FACES_MODELS_DIR}'); a.prepare(ctx_id=-1)"
 
       - name: PyInstaller — build one-file bundle
         shell: bash
@@ -97,7 +100,7 @@ jobs:
             DATA_SEP=":"
           fi
 
-          uv run pyinstaller \
+          pyinstaller \
             --onefile \
             --name tgdl-faces \
             --collect-all insightface \
@@ -126,6 +129,9 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           files: faces-service/dist/${{ matrix.archive }}
+          # Sidecar releases must never become the repo's "Latest" release —
+          # that slot belongs to the app (vX.Y.Z tags).
+          make_latest: false
           fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -144,7 +150,7 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v4
@@ -171,3 +177,52 @@ jobs:
             ghcr.io/botnick/tgdl-faces:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # ---------------------------------------------------------------
+  # Job 3 — CUDA container image (linux/amd64 only)
+  # ---------------------------------------------------------------
+  #
+  # Backs the `faces-cuda` compose profile, which pulls
+  # ghcr.io/botnick/tgdl-faces:cuda-latest. NVIDIA publishes no arm64
+  # onnxruntime-gpu wheels, so this is amd64-only.
+  build-docker-cuda:
+    name: docker cuda (linux/amd64)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      # The CUDA + cuDNN base layers are several GB unpacked; reclaim
+      # runner disk that the build doesn't use before starting.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          df -h /
+
+      - uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build + push CUDA image
+        uses: docker/build-push-action@v7
+        with:
+          context: ./faces-service
+          file: ./faces-service/Dockerfile.cuda
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ghcr.io/botnick/tgdl-faces:cuda-${{ github.ref_name }}
+            ghcr.io/botnick/tgdl-faces:cuda-latest
+          # Separate cache scope so the CPU and CUDA builds don't evict
+          # each other's layers.
+          cache-from: type=gha,scope=faces-cuda
+          cache-to: type=gha,mode=max,scope=faces-cuda

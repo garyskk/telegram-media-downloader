@@ -51,16 +51,22 @@ const NUMBER_KEYS = new Set([
     'healthMonitorIntervalMs',
     'healthFailuresBeforeRelaunch',
     'downloadRedirectCap',
-    'videoFloorIntervalSec',
-    'videoMaxFrames',
-    'videoScanLimit',
-    'videoNice',
-    'videoProgressPollMs',
+    'cpuThrottleRatio',
+    'sidecarWaitMs',
+    'sidecarNice',
 ]);
 
 const BOOL_KEYS = new Set(['autoDownload', 'federate', 'qualityWeightedCentroid']);
 
-const STRING_KEYS = new Set(['backend', 'sidecarUrl', 'detectorModel', 'providers', 'detector']);
+const STRING_KEYS = new Set([
+    'backend',
+    'sidecarUrl',
+    'sidecarToken',
+    'pathMap',
+    'detectorModel',
+    'providers',
+    'detector',
+]);
 
 // Keys whose value is an array of numbers parsed from comma- or
 // colon-separated env strings.
@@ -74,6 +80,11 @@ const STRING_ARRAY_KEYS = new Set(['fileTypes', 'downloadMirrors', 'excludeExten
 const ENV_MAP = Object.freeze({
     backend: 'TGDL_FACES_BACKEND',
     sidecarUrl: 'TGDL_FACES_SIDECAR_URL',
+    // Shared secret for a network-reachable sidecar (its TGDL_FACES_API_TOKEN).
+    sidecarToken: 'TGDL_FACES_SIDECAR_TOKEN',
+    // `app path=sidecar path` rules (`;`- or newline-separated) for an
+    // external sidecar that mounts the downloads at a different path.
+    pathMap: 'TGDL_FACES_PATH_MAP',
     autoDownload: 'TGDL_FACES_AUTO_DOWNLOAD',
     minDetectionScore: 'TGDL_FACES_MIN_DETECTION_SCORE',
     minFaceSizePx: 'TGDL_FACES_MIN_FACE_SIZE_PX',
@@ -90,6 +101,13 @@ const ENV_MAP = Object.freeze({
     fileTypes: 'TGDL_FACES_FILE_TYPES',
     excludeExtensions: 'TGDL_FACES_EXCLUDE_EXTENSIONS',
     sidecarMaxConcurrency: 'TGDL_FACES_MAX_CONCURRENCY',
+    // Documented in docs/AI.md since the throttle landed but never wired.
+    cpuThrottleRatio: 'TGDL_FACES_CPU_THROTTLE_RATIO',
+    // How long a scan waits for the sidecar to come (back) up before it
+    // gives up and leaves the remaining rows for the next run.
+    sidecarWaitMs: 'TGDL_FACES_SIDECAR_WAIT_MS',
+    // Priority (nice) of an auto-spawned sidecar; 0 = same as Node.
+    sidecarNice: 'TGDL_FACES_SIDECAR_NICE',
     healthCacheTtlMs: 'TGDL_FACES_HEALTH_CACHE_TTL_MS',
     requestTimeoutMs: 'TGDL_FACES_REQUEST_TIMEOUT_MS',
     maxRetries: 'TGDL_FACES_MAX_RETRIES',
@@ -104,24 +122,6 @@ const ENV_MAP = Object.freeze({
     downloadMirrors: 'TGDL_FACES_DOWNLOAD_MIRRORS',
     federate: 'TGDL_FACES_FEDERATE',
     qualityWeightedCentroid: 'TGDL_FACES_QUALITY_WEIGHTED_CENTROID',
-    // §5 video knobs — shared env-var names with the Python sidecar so an
-    // operator can tune both processes with the same value. Only the two
-    // knobs that have a real Node-side equivalent are wired here:
-    // `videoWindowSec` (windowed best-frame selection) and
-    // `videoMotionThreshold` (0-255 luma-diff scale) have no equivalent in
-    // the Node ffmpeg fallback's single continuous `select` filter, which
-    // has no windowing concept and uses ffmpeg's own differently-scaled
-    // `scene` score instead — see docs/requirements.md §4.5/§5 and
-    // `faces-client.js`'s `_extractVideoFrames`.
-    videoFloorIntervalSec: 'TGDL_FACES_VIDEO_FLOOR_INTERVAL_SEC',
-    videoMaxFrames: 'TGDL_FACES_VIDEO_MAX_FRAMES',
-    videoScanLimit: 'TGDL_FACES_VIDEO_SCAN_LIMIT',
-    videoNice: 'TGDL_FACES_VIDEO_NICE',
-    // Node-only — how often `detectFacesInVideo` polls the sidecar's
-    // GET /detect/video/status/{job_id} while a video request is in
-    // flight. No Python-side equivalent: the sidecar just answers
-    // whatever it's asked, on whatever cadence it's asked.
-    videoProgressPollMs: 'TGDL_FACES_VIDEO_PROGRESS_POLL_MS',
 });
 
 /**

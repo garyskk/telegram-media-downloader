@@ -1,34 +1,43 @@
 # syntax=docker/dockerfile:1.7
 #
 # Multi-stage build:
+#   - "gocore" compiles tgdl-core (core-service/, the Go companion process)
+#     on the build host for the target platform — CGO off, so no QEMU and
+#     no C toolchain; works the same for linux/amd64 and linux/arm64.
+#   - "seekbar" compiles the hover-sprite sidecar the same way. Node
+#     auto-spawns SEEKBAR_BIN when SEEKBAR_SIDECAR_URL is unset, so the
+#     image does not download a release tarball on first use.
 #   - "deps" installs prod dependencies only (npm ci --omit=dev) so the runtime
 #     image stays small.
-#   - "seekbar" compiles the Go sidecar (static binary) so `docker compose build`
-#     ships it at /app/seekbar-service/bin/seekbar-server. Node auto-spawns
-#     that path when SEEKBAR_SIDECAR_URL is unset — no GitHub download and
-#     no extra compose service.
-#   - "runtime" copies node_modules from "deps", the sidecar binary, and the
-#     source; runs as the non-root `node` user; exposes 3000; healthchecks
-#     /api/auth_check.
+#   - "runtime" copies node_modules from "deps" + the source, runs as the
+#     non-root `node` user, exposes 3000, and ships a healthcheck that hits
+#     the dashboard's /api/auth_check endpoint.
 #
 # Pin a specific patch version. Floating tags drift; this image is reproducible.
 
-FROM node:24.16.0-bookworm-slim AS deps
-WORKDIR /app
-# `websocket` (gramJS/telegram) depends on `bufferutil`, which compiles via
-# node-gyp when no prebuilt binary exists (common on linux/arm64 + Node 24).
-# Install build tooling in this stage only — the runtime image stays slim.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends python3 make g++ \
-    && rm -rf /var/lib/apt/lists/*
-COPY package.json package-lock.json ./
-RUN npm ci --omit=dev --no-audit --no-fund
-
-# Compile the seekbar sidecar for the image's target arch (BuildKit sets
-# TARGETOS/TARGETARCH). CGO off → static binary; ffmpeg stays in runtime.
-FROM --platform=$BUILDPLATFORM golang:1.22-bookworm AS seekbar
+FROM --platform=$BUILDPLATFORM golang:1.25-bookworm AS gocore
 ARG TARGETOS=linux
 ARG TARGETARCH
+ARG TARGETVARIANT
+WORKDIR /src
+COPY core-service/ ./
+# linux/arm/v7 → GOARM=7 (ignored for every other GOARCH).
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    GOARM_V="${TARGETVARIANT#v}"; \
+    CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} GOARM=${GOARM_V:-7} \
+    go build -trimpath -ldflags "-s -w" -o /out/tgdl-core ./cmd/tgdl-core
+
+# Just the binary, for `docker buildx build --target gocore-bin -o …` (CI
+# checks the arm64 build this way). Not part of the default build.
+FROM scratch AS gocore-bin
+COPY --from=gocore /out/tgdl-core /tgdl-core
+
+# Hover-sprite sidecar. go 1.22 module, built with the same toolchain as
+# tgdl-core. CGO off → static binary; ffmpeg stays in the runtime stage.
+FROM --platform=$BUILDPLATFORM golang:1.25-bookworm AS seekbar
+ARG TARGETOS=linux
+ARG TARGETARCH
+ARG TARGETVARIANT
 WORKDIR /src
 COPY seekbar-service/go.mod seekbar-service/go.sum ./
 RUN --mount=type=cache,target=/go/pkg/mod \
@@ -36,18 +45,42 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 COPY seekbar-service/ ./
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH:-$(go env GOARCH)} \
-        go build -trimpath -ldflags '-s -w' -o /out/seekbar-server ./cmd/server
+    GOARM_V="${TARGETVARIANT#v}"; \
+    CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} GOARM=${GOARM_V:-7} \
+    go build -trimpath -ldflags "-s -w" -o /out/seekbar-server ./cmd/server
 
-FROM node:24.16.0-bookworm-slim AS runtime
+FROM node:24.18.0-bookworm-slim AS deps
+WORKDIR /app
+COPY package.json package-lock.json ./
+# `ws` optionally builds `bufferutil`. linux/arm64 + Node 24 often has no
+# prebuilt binary, and node-gyp needs a compiler. Tooling stays in this
+# stage; the runtime image does not copy it.
+# tgdl-core comes from the gocore stage above, never from the npm
+# postinstall download.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3 make g++ \
+    && rm -rf /var/lib/apt/lists/* \
+    && TGDL_CORE_SKIP_INSTALL=1 npm ci --omit=dev --no-audit --no-fund
+
+FROM node:24.18.0-bookworm-slim AS runtime
 
 # Build identity — passed in by CI (`docker build --build-arg GIT_SHA=…
 # --build-arg BUILT_AT=…`) and surfaced via `/api/version` so the
 # status-bar chip always reflects what's actually deployed.
 ARG GIT_SHA=dev
 ARG BUILT_AT=
+# MALLOC_ARENA_MAX: glibc gives every thread that allocates its own malloc
+# arena, and freed native memory (sharp/libvips, onnxruntime, SQLite)
+# fragments across them, so RSS keeps creeping up in a long-running
+# process. Two arenas keep it compact at a negligible speed cost.
+# UV_THREADPOOL_SIZE — libuv's worker pool (default 4) is shared by every
+# fs call, sendFile stream, crypto hash, dns lookup AND each sharp
+# thumbnail job. libuv reads it once at process start, so it has to be
+# set here rather than from inside the app.
 ENV NODE_ENV=production \
     PORT=3000 \
+    MALLOC_ARENA_MAX=2 \
+    UV_THREADPOOL_SIZE=16 \
     GIT_SHA=${GIT_SHA} \
     BUILT_AT=${BUILT_AT} \
     SEEKBAR_BIN=/app/seekbar-service/bin/seekbar-server
@@ -59,26 +92,29 @@ ENV NODE_ENV=production \
 # ffmpeg  — used by src/core/thumbs.js for video first-frame thumbnails
 #           and audio cover-art extraction. ~30 MB — tiny next to libvips
 #           and node_modules.
-# intel-media-va-driver / i965-va-driver — VA-API userland drivers needed
-#           for `-hwaccel vaapi` (Intel iGPU + AMD via the same libva ABI).
-#           Without these the ffmpeg path in thumbs.js falls back to CPU
-#           decode even when the host exposes /dev/dri. iHD is Gen8+ and
-#           the Quick Sync runtime; i965 covers Gen4-Gen7 hardware.
-# vainfo  — `vainfo` from libva-utils. Not used by the app itself, but
-#           lets operators `docker exec <ctr> vainfo` to confirm the
-#           driver actually loaded inside the container without having
-#           to bake their own debug image.
+# intel-media-va-driver / i965-va-driver — VA-API userland drivers for
+#           `-hwaccel vaapi` on Intel (iHD is Gen8+, i965 is Gen4–Gen7).
+#           Debian bookworm ships them for amd64 only. An arm64 build
+#           has no installation candidate, so they are installed only
+#           when TARGETARCH is amd64. Without them, thumbs fall back to
+#           CPU decode.
+# vainfo  — `vainfo` from libva-utils, every arch. Not used by the app
+#           itself; `docker exec <ctr> vainfo` shows whether a driver
+#           loaded.
 #
 # Base is bookworm-slim (glibc) rather than alpine (musl) because
 # `onnxruntime-node` (pulled in by @huggingface/transformers for the NSFW
 # classifier) ships glibc-only prebuilt .so files; loading them on musl
 # crashes the whole process at boot with "ld-linux-x86-64.so.2: No such
 # file or directory". libstdc++ is part of the base image, no install needed.
+ARG TARGETARCH
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        tini gosu ffmpeg procps \
-        # intel-media-va-driver i965-va-driver vainfo \
-        vainfo \
+        tini gosu ffmpeg procps vainfo \
+    && if [ "$TARGETARCH" = "amd64" ]; then \
+         apt-get install -y --no-install-recommends \
+           intel-media-va-driver i965-va-driver; \
+       fi \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -86,7 +122,10 @@ COPY --from=deps /app/node_modules ./node_modules
 COPY src ./src
 COPY scripts ./scripts
 COPY runner.js config.example.json package.json LICENSE README.md SECURITY.md CHANGELOG.md ./
-COPY --from=seekbar /out/seekbar-server /app/seekbar-service/bin/seekbar-server
+# tgdl-core — found at this path by src/core/gocore/spawn.js, so Docker
+# installs never download it. The app runs fine without it (Node fallback).
+COPY --from=gocore --chmod=0755 /out/tgdl-core /app/bin/tgdl-core
+COPY --from=seekbar --chmod=0755 /out/seekbar-server /app/seekbar-service/bin/seekbar-server
 
 # Persistent state (sessions, config, downloads) — mount this as a volume.
 # `chmod a+rX` guarantees files end up readable + dirs traversable even when
@@ -95,15 +134,13 @@ COPY --from=seekbar /out/seekbar-server /app/seekbar-service/bin/seekbar-server
 RUN mkdir -p /app/data /app/data/downloads /app/data/logs /app/data/sessions /app/data/backups /app/data/models \
     && chmod -R a+rX /app \
     && chmod +x /app/scripts/docker-entrypoint.sh \
-    && chmod +x /app/seekbar-service/bin/seekbar-server \
     && chown -R node:node /app
 
-# Pre-warm the AI model cache at build time so a first scan completes in
-# milliseconds instead of waiting on a cold ~150 MB download. Allowed to
-# fail with `|| true` for offline / firewalled CI machines — first run
-# falls back to lazy download. Skips silently when @huggingface/transformers
-# isn't installed (minimal builds without the optional dep).
-RUN node scripts/pre-download-models.js || true
+# The NSFW model is NOT baked into the image: it would land in /app/data,
+# which the ./data bind-mount hides at runtime, and it would add ~85 MB for
+# an opt-in feature. It downloads lazily on the first scan; to seed it ahead
+# of time (e.g. before going offline) run inside the container:
+#   docker compose exec -u node telegram-downloader npm run pre-download-models
 
 # We deliberately run the entrypoint as root so it can chown the bind-mounted
 # /app/data volume on first boot — gosu drops to `node` before exec'ing

@@ -1,20 +1,18 @@
 #!/bin/sh
 # Container entrypoint:
-#   1. Ensure /etc/hosts + /etc/resolv.conf are world-readable. Some Docker
-#      Engine / host umask combos lay these down as 0640; the non-root
-#      `node` user then gets getaddrinfo EAI_AGAIN for every hostname
-#      (extra_hosts is useless if the file isn't readable).
-#   2. Fix ownership + permissions on the bind-mounted /app/data so the
+#   1. Fix ownership + permissions on the bind-mounted /app/data so the
 #      `node` user (uid 1000) can always read/write — host-side perms
 #      from `docker run -v ./data:/app/data` otherwise win and locked
 #      out new installs on Linux hosts.
-#   3. Detect every `/dev/dri/render*` and `/dev/dri/card*` device
+#   2. Detect every `/dev/dri/render*` and `/dev/dri/card*` device
 #      mounted into the container, look up its GID on the host, and add
 #      `node` to a matching group so VAAPI / QSV ffmpeg can open the
 #      device for hardware-accelerated thumbnails. The host GID varies
 #      by distro AND Synology DSM version (DSM 6 ≈ 937, DSM 7 ≈ 100, RHEL
 #      uses 39, plain Debian uses 104), so a hard-coded `group_add` in
 #      compose isn't portable. Detect at boot instead.
+#   3. Make /etc/hosts, /etc/resolv.conf and /etc/hostname world-readable
+#      so DNS works after dropping to `node`.
 #   4. Drop privileges to `node` via gosu and exec the CMD.
 #
 # Idempotent: safe to run on every container start. The chown/chmod walk
@@ -24,11 +22,6 @@
 set -e
 
 if [ "$(id -u)" = "0" ]; then
-    # Docker-generated resolver files must be readable by the dropped-priv
-    # `node` user. Mode 0640 → getaddrinfo EAI_AGAIN for localhost, compose
-    # service names, and extra_hosts alike.
-    chmod a+r /etc/hosts /etc/resolv.conf /etc/hostname 2>/dev/null || true
-
     if [ "${FAST_BOOT:-0}" != "1" ]; then
         # Pre-create every directory the running app writes to. `backups`
         # holds pre-update DB snapshots (data/backups/db-pre-update-*.sqlite)
@@ -105,6 +98,12 @@ if [ "$(id -u)" = "0" ]; then
     # NVIDIA / non-DRI accelerators (cuda) — `nvidia-container-runtime`
     # injects /dev/nvidia* with mode 0666, so no group fix is needed; the
     # device works for any UID. Skip the loop.
+
+    # Some hosts bind-mount /etc/hosts, /etc/resolv.conf and /etc/hostname
+    # as 0640 root. Once we drop to `node` the resolver can't read them and
+    # every lookup fails with EAI_AGAIN (Telegram, update checks). They hold
+    # no secrets — make them readable.
+    chmod a+r /etc/hosts /etc/resolv.conf /etc/hostname 2>/dev/null || true
 
     # gosu accepts either `<user>` or `<user>:<group>`. The latter
     # requires both a user AND a group named `node` to exist — true on

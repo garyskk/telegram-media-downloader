@@ -459,6 +459,8 @@ export async function loadSettings() {
             };
         }
 
+        setupCspEditor(config);
+
         const rlToggle = document.getElementById('setting-rate-limit');
         const rlInput = document.getElementById('setting-rate-limit-rpm');
         if (rlToggle && rlInput) {
@@ -516,10 +518,12 @@ export async function loadSettings() {
         bind('proxy-port', proxy.port || '');
         bind('proxy-username', proxy.username || '');
         bind('proxy-secret', proxy.secret || '');
-        // password is intentionally never echoed back; placeholder hint:
+        // The server never returns the password (only `passwordSet`), and
+        // saveProxy() leaves it out when the field is blank so the saved
+        // one is kept. Placeholder hint:
         const pw = document.getElementById('proxy-password');
         if (pw)
-            pw.placeholder = proxy.password
+            pw.placeholder = proxy.passwordSet
                 ? i18nT('settings.tg_api.saved_placeholder', '(saved — leave blank to keep)')
                 : '';
         const apiHashEl = document.getElementById('setting-api-hash');
@@ -834,7 +838,6 @@ const ADVANCED_DEFAULTS = {
         maxConcurrency: 20,
         scalerIntervalSec: 5,
         idleSleepMs: 200,
-        spilloverThreshold: 2000,
     },
     history: {
         backpressureCap: 500,
@@ -908,7 +911,6 @@ export function loadAdvanced(config) {
     set('setting-adv-max-concurrency', dl.maxConcurrency);
     set('setting-adv-scaler-sec', dl.scalerIntervalSec);
     set('setting-adv-idle-sleep-ms', dl.idleSleepMs);
-    set('setting-adv-spillover', dl.spilloverThreshold);
 
     const h = { ...ADVANCED_DEFAULTS.history, ...(adv.history || {}) };
     set('setting-adv-backpressure', h.backpressureCap);
@@ -1026,12 +1028,12 @@ export function loadAdvanced(config) {
     wireToggle('setting-adv-seekbar-autoOnDownload', sk.autoOnDownload !== false);
 
     const sc = adv.similarClips || {};
-    _setIfNum('setting-adv-similarClips-similarThreshold', sc.similarThreshold, 50);
     const _setIfFloat = (id, val, def) => {
         const el = document.getElementById(id);
         if (!el) return;
         el.value = Number.isFinite(Number(val)) ? String(val) : String(def);
     };
+    _setIfNum('setting-adv-similarClips-similarThreshold', sc.similarThreshold, 50);
     _setIfFloat('setting-adv-similarClips-durationTolerance', sc.durationTolerance, 0.1);
     _setIfNum('setting-adv-similarClips-durationBucketSec', sc.durationBucketSec, 120);
     _setIfFloat('setting-adv-similarClips-sceneThreshold', sc.sceneThreshold, 0.1);
@@ -1108,10 +1110,6 @@ function gatherAdvanced() {
                 ADVANCED_DEFAULTS.downloader.scalerIntervalSec,
             ),
             idleSleepMs: num('setting-adv-idle-sleep-ms', ADVANCED_DEFAULTS.downloader.idleSleepMs),
-            spilloverThreshold: num(
-                'setting-adv-spillover',
-                ADVANCED_DEFAULTS.downloader.spilloverThreshold,
-            ),
         },
         history: {
             backpressureCap: num(
@@ -1549,10 +1547,7 @@ function _gatherScopedPayload(page) {
                     sceneThreshold: flt('setting-adv-similarClips-sceneThreshold', 0.1),
                     floorIntervalSec: flt('setting-adv-similarClips-floorIntervalSec', 3),
                     partialMatchRatio: flt('setting-adv-similarClips-partialMatchRatio', 0.5),
-                    partialFrameThreshold: num(
-                        'setting-adv-similarClips-partialFrameThreshold',
-                        90,
-                    ),
+                    partialFrameThreshold: num('setting-adv-similarClips-partialFrameThreshold', 90),
                     partialShortClipSec: num('setting-adv-similarClips-partialShortClipSec', 300),
                     partialShortMatchRatio: flt(
                         'setting-adv-similarClips-partialShortMatchRatio',
@@ -2148,7 +2143,7 @@ async function refreshUpdateStatus() {
                     '· ' +
                     i18nT(
                         'maintenance.update.no_watchtower',
-                        'enable the auto-update profile to use this',
+                        'set WATCHTOWER_HTTP_API_TOKEN in .env to use this',
                     );
             }
         }
@@ -3349,4 +3344,127 @@ function formatBytesShort(bytes) {
         i++;
     }
     return v.toFixed(v >= 10 ? 0 : 1) + ' ' + units[i];
+}
+
+// Content-Security-Policy editor (Settings -> Dashboard security). The markup
+// is built here (not in index.html) and inserted before the guest-access block.
+const _cspToggle = (id) => `<div id="${id}" class="tg-toggle shrink-0"></div>`;
+function _cspSectionHtml() {
+    const t = i18nT;
+    return `<h4 class="text-tg-text text-sm font-medium mb-1 flex items-center gap-2">
+            <i class="ri-shield-check-line text-tg-blue"></i>
+            <span>${escapeHtml(t('settings.csp.title', 'Content Security Policy'))}</span>
+        </h4>
+        <p class="text-xs text-tg-textSecondary mb-3">${escapeHtml(t('settings.csp.help', 'Controls which sites the dashboard may load scripts, styles, fonts, images and frames from. One source per line. Changes apply on the next request. If you lock yourself out, start the server with TGDL_CSP=off.'))}</p>
+        <p id="csp-env-note" class="hidden text-xs text-amber-300 mb-2">${escapeHtml(t('settings.csp.env_off', 'TGDL_CSP=off is set on the server: CSP is disabled regardless of these settings.'))}</p>
+        <div class="flex items-center justify-between gap-3 py-1">
+            <div class="text-tg-text text-sm">${escapeHtml(t('settings.csp.enabled', 'Enable CSP'))}</div>
+            ${_cspToggle('setting-csp-enabled')}
+        </div>
+        <p id="csp-warn-off" class="hidden text-xs text-amber-300 mb-2">${escapeHtml(t('settings.csp.warn_off', 'CSP is off: the browser will not restrict what the dashboard can load.'))}</p>
+        <div class="flex items-start justify-between gap-3 py-1">
+            <div class="min-w-0">
+                <div class="text-tg-text text-sm">${escapeHtml(t('settings.csp.report_only', 'Report-only'))}</div>
+                <p class="text-xs text-tg-textSecondary mt-0.5">${escapeHtml(t('settings.csp.report_only_help', 'Violations are logged in the browser console but not blocked.'))}</p>
+            </div>
+            ${_cspToggle('setting-csp-report-only')}
+        </div>
+        <div id="csp-directives" class="space-y-3 mt-2"></div>
+        <div class="flex gap-2 mt-3">
+            <button id="csp-save-btn" type="button" class="tg-btn-secondary text-sm flex-1">${escapeHtml(t('settings.csp.save', 'Save'))}</button>
+            <button id="csp-reset-btn" type="button" class="tg-btn-secondary text-sm flex-1">${escapeHtml(t('settings.csp.reset', 'Reset to defaults'))}</button>
+        </div>`;
+}
+
+async function setupCspEditor(config) {
+    const card = document.getElementById('settings-card-security');
+    if (!card) return;
+    let sec = document.getElementById('csp-section');
+    if (!sec) {
+        sec = document.createElement('div');
+        sec.id = 'csp-section';
+        sec.className = 'mt-4 pt-4 border-t border-tg-border/50';
+        const guest = card.querySelector('#setting-guest-enabled')?.closest('.mt-4');
+        if (guest) guest.before(sec);
+        else card.querySelector('.space-y-3')?.append(sec);
+    }
+    sec.innerHTML = _cspSectionHtml();
+    const box = document.getElementById('csp-directives');
+    const enabledT = document.getElementById('setting-csp-enabled');
+    const reportT = document.getElementById('setting-csp-report-only');
+    if (!box || !enabledT || !reportT) return;
+    let info;
+    try {
+        info = await api.get('/api/csp');
+    } catch {
+        sec.remove(); // guests / older server
+        return;
+    }
+    const defaults = info.defaults;
+    const warn = () =>
+        document
+            .getElementById('csp-warn-off')
+            ?.classList.toggle('hidden', enabledT.classList.contains('active'));
+    const render = (csp) => {
+        enabledT.classList.toggle('active', csp.enabled !== false);
+        reportT.classList.toggle('active', csp.reportOnly === true);
+        const dirs = csp.directives || defaults.directives;
+        box.innerHTML = Object.keys(defaults.directives)
+            .map(
+                (name) => `<div>
+                    <label class="text-tg-text text-xs block mb-1"><code>${escapeHtml(name)}</code></label>
+                    <textarea data-csp-dir="${escapeHtml(name)}" rows="${Math.max(2, (dirs[name] || []).length)}" spellcheck="false" class="tg-input w-full text-xs font-mono">${escapeHtml((dirs[name] || []).join('\n'))}</textarea>
+                </div>`,
+            )
+            .join('');
+        warn();
+    };
+    render(config.web?.csp || defaults);
+    document.getElementById('csp-env-note')?.classList.toggle('hidden', !info.envOff);
+    for (const t of [enabledT, reportT]) {
+        t.onclick = (e) => {
+            e.preventDefault();
+            t.classList.toggle('active');
+            warn();
+        };
+    }
+    const fail = (err) =>
+        showToast(
+            i18nTf('toast.save_failed', { msg: err.message }, `Save failed: ${err.message}`),
+            'error',
+        );
+    document.getElementById('csp-save-btn').onclick = async () => {
+        const directives = {};
+        for (const ta of box.querySelectorAll('textarea[data-csp-dir]')) {
+            directives[ta.dataset.cspDir] = ta.value
+                .split('\n')
+                .map((l) => l.trim())
+                .filter(Boolean);
+        }
+        const csp = {
+            enabled: enabledT.classList.contains('active'),
+            reportOnly: reportT.classList.contains('active'),
+            directives,
+        };
+        try {
+            await api.post('/api/config', { web: { csp } });
+            config.web = { ...(config.web || {}), csp };
+            showToast(
+                i18nT('settings.csp.saved', 'CSP saved. Applies on the next request.'),
+                'success',
+            );
+        } catch (err) {
+            fail(err);
+        }
+    };
+    document.getElementById('csp-reset-btn').onclick = async () => {
+        try {
+            await api.post('/api/config', { web: { csp: null } });
+            if (config.web) delete config.web.csp;
+            render(defaults);
+            showToast(i18nT('settings.csp.reset_done', 'CSP reset to defaults.'), 'info');
+        } catch (err) {
+            fail(err);
+        }
+    };
 }

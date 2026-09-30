@@ -1,3 +1,9 @@
+---
+title: "Architecture"
+description: "How the Node.js app, tgdl-core (Go) and the sidecars fit together."
+nav_order: 8
+---
+
 # Architecture
 
 Two top-level entry points share state through `data/`:
@@ -5,7 +11,7 @@ Two top-level entry points share state through `data/`:
 1. **CLI** (`src/index.js`) — interactive menus, ad-hoc commands.
 2. **Web server** (`src/web/server.js`) — Express + WebSocket on `:3000`, serves the SPA from `src/web/public/`.
 
-Both share state through `data/db.sqlite` (WAL mode → safe shared reads, single writer). Every runtime state surface — settings, account list, group filters, session tokens, disk-usage cache, recent-backfills history, queue-history snapshots, the spillover queue, and the auto-update audit log — lives in SQLite tables. There is **no JSON state file in normal operation**. Legacy installs upgrading from pre-v2.8 carry `data/config.json` / `data/disk_usage.json` / `data/web-sessions.json` / `data/history-jobs.json` / `data/queue-history.json` / `data/logs/queue_backlog.jsonl` — all auto-imported on first boot and renamed to `*.migrated` as a reversible backup.
+Both share state through `data/db.sqlite` (WAL mode → safe shared reads, single writer). Every runtime state surface — settings, account list, group filters, session tokens, disk-usage cache, recent-backfills history, queue-history snapshots, and the auto-update audit log — lives in SQLite tables. There is **no JSON state file in normal operation**. Legacy installs upgrading from pre-v2.8 carry `data/config.json` / `data/disk_usage.json` / `data/web-sessions.json` / `data/history-jobs.json` / `data/queue-history.json` — all auto-imported on first boot and renamed to `*.migrated` as a reversible backup. A leftover `data/logs/queue_backlog.jsonl` is deleted instead (its jobs held serialised Telegram credentials).
 
 ## Request flow
 
@@ -43,9 +49,8 @@ flowchart LR
 ```
 data/
 ├── db.sqlite             # downloads, queue, share_links, kv, web_sessions,
-│                          queue_backlog, update_history, faces, people,
-│                          seekbar_sprites, video_fingerprints, similar_*,
-│                          backup_destinations / backup_jobs,
+│                          update_history, faces, people,
+│                          seekbar_sprites, backup_destinations / backup_jobs,
 │                          peer_*, cluster_audit — WAL mode
 │                          (kv holds config + disk_usage + history_jobs +
 │                          queue_history; deep-merged on load)
@@ -74,13 +79,11 @@ data/
 | `kv['history_jobs']` | `src/web/server.js` (`loadHistoryJobsFromStore` / `saveHistoryJobsToStore`) | `data/history-jobs.json` |
 | `kv['queue_history']` | `src/web/server.js` (`pushQueueHistory` / `flushQueueHistorySoon`) | `data/queue-history.json` |
 | `web_sessions` table | `src/core/web-auth.js` + `src/core/db.js` accessors | `data/web-sessions.json` |
-| `queue_backlog` table | `src/core/db.js` (`pushQueueBacklog` / `popQueueBacklog`) + `src/core/downloader.js` spillover | `data/logs/queue_backlog.jsonl` |
 | `update_history` table | `src/core/db.js` (`recordUpdateAttempt` / `recordUpdateFailure` / `finaliseSuccessfulTrigger` / `finalisePendingUpdates`) | (new in v2.8, hardened in v2.10) |
 | `peers` + `peer_*` tables | `src/core/cluster/peers.js` + `src/core/cluster/sync.js` | (new in v2.10) |
 | `cluster_audit` table | `src/core/cluster/audit.js` | (new in v2.10) |
 | `faces` + `people` tables | `src/core/ai/faces.js` + `src/core/db.js` | (new in v2.16) |
 | `seekbar_sprites` table | `src/core/seekbar/generator.js` + `src/core/db.js` | (new in v2.17) |
-| `video_fingerprints` + `similar_*` tables | `src/core/similar/` (scene+PDQ ffmpeg; Smith-Waterman Analyze) | similar-clips |
 
 `saveConfig()` emits a `change` event on an in-process `EventEmitter` after every commit — `monitor.js` subscribes via `watchConfig()` and reloads without any filesystem watcher. Migration from JSON files is one-shot, idempotent, and runs inside `getDb()`; source files are renamed to `*.migrated` and kept as a reversible backup. The auto-update audit table is finalised on every container boot — any `triggered` row whose `from_version` *or* `from_instance_id` differs from the running container is promoted to `success`, capturing the actual transition observed (the `from_instance_id` column was added in v2.10 to handle `:latest`-tag rebuilds where semver is unchanged).
 
@@ -124,7 +127,7 @@ All failure modes return 401 with a body `code` (`bad_sig` / `revoked` / `expire
 `Downloader` runs N workers (1–20, auto-scaled). The queue is split:
 
 - `_high[]` — realtime (priority 1) and TTL/self-destruct (priority 0, unshifted to the front).
-- `queue[]` — history backfill (priority 2). Spills to the `queue_backlog` SQLite table past 2000 entries (atomic appends, FIFO-by-id pops in one transaction — can't double-deliver after a crash mid-rehydrate).
+- `queue[]` — history backfill (priority 2). Kept in memory; the history walker pauses while the downloader has more than `advanced.history.backpressureCap` (default 500) jobs pending.
 
 Workers always drain `_high` first, then `queue`, then rehydrate from the backlog table. Realtime never starves behind backfill.
 
@@ -143,12 +146,16 @@ src/web/public/js/
 ├── ws.js             # WebSocket client with auto-reconnect
 ├── store.js          # state container (carries `role` + `selected`)
 ├── router.js         # hash router with admin-route redirect for guest sessions
+├── nav.js            # the four places (Library / Chats / Queue / Settings), Tools routes, Ctrl/Cmd+K
+├── command-palette.js # "Go anywhere" — pages, tools, settings, chats, actions (lazy)
+├── tools-catalog.js  # the 11 tools in 4 groups (Library health, Safety & AI, Backup & sync, System)
+├── tools-hub.js      # Settings → Tools card (needs attention) + the Tools group pages
 ├── settings.js       # Settings page + accounts + proxy + security + maintenance
 ├── nsfw-ui.js        # NSFW review sheet (lazy-loaded from settings.js)
 ├── share.js          # Share-link sheet (lazy-loaded from viewer + settings)
 ├── gallery-select.js # Drag-to-select lasso + ctrl/shift gestures + keyboard
-├── viewer.js         # full-screen media viewer (seekbar, continuous play, gallery-synced full-library shuffle)
-├── maintenance-thumbs.js / maintenance-seekbar.js / maintenance-ai.js / maintenance-nsfw.js / maintenance-video.js / maintenance-duplicates.js / maintenance-logs.js / maintenance-hub.js
+├── viewer.js         # full-screen media viewer (seekbar sprite hover preview)
+├── maintenance-thumbs.js / maintenance-seekbar.js / maintenance-ai.js / maintenance-nsfw.js / maintenance-video.js / maintenance-duplicates.js / maintenance-logs.js … (full tool pages, opened from a Tools group)
 ├── queue.js          # IDM-style queue page (append-on-scroll, in-place patch)
 ├── backfill.js       # Backfill page (active jobs + recent + start)
 ├── engine.js         # Engine card (start/stop/status)
@@ -198,6 +205,11 @@ src/core/
 │   ├── faces-config.js  # kv-config + TGDL_FACES_* env-var precedence
 │   ├── faces-spawn.js   # Binary auto-download / Python fallback / Docker passthrough
 │   └── scan-runner.js   # Phase A (detect + embed) over downloads.iterate
+├── gocore/           # tgdl-core, the app's Go engine (see docs/GO-CORE.md)
+│   ├── spawn.js      # Binary lookup / verified download / spawn / health / restart / stop, 503 + fix
+│   ├── client.js     # HTTP client: deadlines, readiness wait, JSON / NDJSON / binary bodies
+│   ├── hash.js       # checksum.sha256OfFile → POST /v1/hash (EOUTSIDE → in-process stream)
+│   └── fs.js         # statMany / walkTree / diskUsage → /v1/fs/* (EOUTSIDE → fs.stat)
 ├── seekbar/          # Video timeline preview subsystem (v2.17+, opt-in)
 │   ├── index.js      # pregenerateSeekbar() hook, build/purge, cache stats
 │   ├── generator.js  # Per-row sprite + sidecar generator (Go sidecar client)
@@ -241,6 +253,56 @@ Spawn order on each:
 
 The dashboard polls each sidecar's `/health` every 60 s; three consecutive failures triggers a respawn. Status transitions broadcast as `ai_faces_status` / `seekbar_sidecar_status` so the Maintenance pages can paint live pills without polling.
 
+## Go core (`tgdl-core`)
+
+Unlike the sidecars above, `tgdl-core` (Go, `core-service/`) is a
+required part of the app: the only implementation of the file-heavy and
+CPU-heavy work below. Node keeps the database, the rules and every
+decision; tgdl-core answers the questions. Details and measurements:
+[GO-CORE.md](GO-CORE.md).
+
+```
+checksum.sha256OfFile(path)          dedup.js, downloader.registerDownload, nsfw.js blocklist
+  └─ gocore/hash.js ─→ POST /v1/hash
+integrity.sweep()                    Verify files, boot + hourly sweep
+  └─ gocore/fs.js statMany ─→ POST /v1/fs/stat-batch   (fs.stat, libuv's error codes)
+integrity.reindexFromDisk()          Re-index from disk
+  └─ gocore/fs.js walkTree ─→ POST /v1/fs/walk         (fs.readdir withFileTypes + fs.stat)
+server.js scanDirectorySize()        /api/stats fallback when the catalogue is empty
+  └─ gocore/fs.js diskUsage ─→ POST /v1/fs/walk
+ai/faces.js clusterFacesOffThread()  scan runner Phase B
+  └─ gocore/client.js dbscan ─→ POST /v1/dbscan        (port of ai/dbscan.js)
+```
+
+- **Lifecycle** (`gocore/spawn.js`): started from the `server.listen`
+  callback without being awaited (and on first use elsewhere, e.g. the
+  CLI), so boot and `/api/auth_check` never wait on it. Binary lookup:
+  `TGDL_CORE_BIN` → `/app/bin/tgdl-core` (Docker) →
+  `core-service/bin/tgdl-core-<slug>` (`npm run build:core`, used only
+  when it is the pinned version) → `data/core-service/bin/` (`npm install`
+  or a download at startup of the `core-v<CORE_VERSION>` release, checked
+  against `SHA256SUMS`). The child gets a minimal env (token, port `0`,
+  pool size, allowed roots), prints its address as one JSON line on
+  stdout, and exits when its stdin pipe closes, so it can't be orphaned
+  (Windows). Health probe every 30 s; three failures or an exit restart it
+  with backoff; calls made meanwhile wait for it (up to 15 s).
+  `gracefulShutdown` stops it first.
+- **Missing / broken**: the server still starts. `GET /api/system/health`
+  → `goCore.problem`, the dashboard banner (`GET /api/monitor/status` →
+  `core`) and the log give the fix; Verify files, Re-index, the duplicate
+  scan and Re-cluster answer 503 `TGDL_CORE_UNAVAILABLE`; download-time
+  hashing stores the row without a hash (as on a read error); the
+  integrity sweep prunes nothing.
+- **Contract**: `127.0.0.1` only, `X-API-Token` on everything but
+  `/health`; `/health` advertises `features` (an older binary without a
+  feature is reported as outdated).
+- **Data**: tgdl-core never opens `db.sqlite`; Node stays the only
+  writer. It reads only inside `TGDL_CORE_ALLOW_ROOTS` (the app's
+  download folders, checked before and after resolving links); for
+  anything else it answers `EOUTSIDE` and Node reads that one path itself.
+- **Observability**: `goCore` in `GET /api/system/health`;
+  `tgdl_gocore_calls_total{feature,result}` on `/metrics`.
+
 ## Fire-and-forget admin jobs (`JobTracker`)
 
 Every long-running admin action (verify files, db vacuum, dedup scan, thumbnail build, faststart sweep, NSFW scan, cluster sweep, etc.) follows one shared lifecycle in v2.10+:
@@ -270,5 +332,3 @@ Optional federation across two or more dashboards. Each peer keeps its own DB an
 - **LAN auto-discovery** — UDP broadcast on port 28910 with the cluster's identity + token fingerprint; peers that match auto-surface in the Cluster page's "Discovered" section for one-click pair.
 
 See `docs/CLUSTER.md` for operator setup, troubleshooting, and the per-pair-secret migration story.
-
-See `docs/SIMILAR-CLIPS.md` for near-duplicate video / partial-clip detection (scene-aware PDQ-256 fingerprints in the same `db.sqlite`, separate from seekbar hover sprites).

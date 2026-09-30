@@ -3,9 +3,11 @@
 Near-duplicate **videos** and **partial clips** (a shorter video that
 appears inside a longer one). Scan writes scene-aware **PDQ-256**
 fingerprints with its own ffmpeg walk. Analyze aligns hash sequences
-with Smith-Waterman. Matching, the Maintenance UI, and delete stay in
+with Smith-Waterman. Matching, the Tools UI, and delete stay in
 Node. Hover sprites stay on the Seekbar page — they are a separate
-pipeline.
+pipeline. The page is Settings → Tools → Library health → Similar clips
+(`#/settings/tools/library/similar`). `#/maintenance/similar` opens that
+group and focuses the card.
 
 Exact byte-identical files are **not** this feature. Those stay on
 Maintenance → Duplicates (SHA-256 in `src/core/dedup.js`).
@@ -158,9 +160,8 @@ Confirm-gated overflow control on the similar page.
 
 Selected `remove` / `review` members go through
 `dedup.deleteByIds` so thumbs, faces, seekbar files, and these
-fingerprint rows stay consistent. Soft-delete also purges similar-clips
-artifacts (the downloads tombstone is kept so Telegram does not
-re-fetch). Groups with fewer than two live members are dropped so a
+fingerprint rows stay consistent. Deleting a download cascades those
+rows. Groups with fewer than two live members are dropped so a
 deleted extra does not leave a keep-only card.
 
 ## Schema
@@ -176,14 +177,15 @@ in `src/core/db.js` `initSchema`). **No second database.**
 | `similar_group_members` | `role` ∈ `keep` \| `remove` \| `review` |
 | `similar_ignores` | False-positive pairs (`CHECK a_id < b_id`) |
 | `similar_partial_scans` | Per-clip resume cursor for long partial analyze |
+| `similar_video_scans` | Incremental Analyze cursor per video |
 
-`ON DELETE CASCADE` from `downloads`. Soft-delete (row kept,
-`user_deleted=1`) wipes the same artifacts explicitly — FK CASCADE only
-fires on a hard `DELETE`.
+`ON DELETE CASCADE` from `downloads`. A hard `DELETE` of the download
+row removes the child rows. `deleteDownloadsBy` also drops groups that
+no longer have two members.
 
 ## API surface
 
-All endpoints are admin-only. See [docs/API.md](API.md#similar-clips).
+All endpoints are admin-only.
 
 | Method | Path | Notes |
 |---|---|---|

@@ -3,14 +3,18 @@
 
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
     <meta name="color-scheme" content="dark">
     <title>Telegram Downloader</title>
 
     <!-- PWA: web-app manifest, theme colour for the address bar / status bar,
          and an apple-touch-icon so iOS picks up a proper home-screen tile. -->
     <link rel="manifest" href="/manifest.webmanifest">
-    <meta name="theme-color" content="#3390EC">
+    <!-- Browser / status-bar colour follows the app chrome (#content-header
+         background) instead of a fixed brand blue. theme.js rewrites both
+         when the user forces light or dark regardless of the OS setting. -->
+    <meta name="theme-color" content="#17212B" media="(prefers-color-scheme: dark)">
+    <meta name="theme-color" content="#FFFFFF" media="(prefers-color-scheme: light)">
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <meta name="apple-mobile-web-app-title" content="TG Downloader">
@@ -29,7 +33,7 @@
         })();
     </script>
 
-    <!-- Pre-boot route guard — runs BEFORE Tailwind / module scripts so the
+    <!-- Pre-boot route guard — runs BEFORE the stylesheets / module scripts so the
          first paint never shows the wrong page. The full DOM-aware version
          lives at the end of <body> where every #page-* div has been
          parsed; here we just inject a `<style>` that hides every page
@@ -50,33 +54,6 @@
                 document.documentElement.dataset.prebooting = '1';
             } catch {}
         })();
-    </script>
-
-    <script src="https://cdn.tailwindcss.com"></script>
-    <script>
-        tailwind.config = {
-            theme: {
-                extend: {
-                    colors: {
-                        tg: {
-                            blue: '#2AABEE',
-                            darkBlue: '#229ED9',
-                            bg: '#17212B',
-                            sidebar: '#0E1621',
-                            panel: '#242F3D',
-                            hover: '#2B5278',
-                            border: '#0D1117',
-                            text: '#F5F5F5',
-                            textSecondary: '#8B9BAA',
-                            green: '#4FAE4E',
-                            red: '#E53935',
-                            orange: '#FF9800',
-                            lightBg: '#182533'
-                        }
-                    }
-                }
-            }
-        }
     </script>
 
     <link href="https://cdn.jsdelivr.net/npm/remixicon@4.0.0/fonts/remixicon.css" rel="stylesheet">
@@ -148,23 +125,31 @@
          the service worker shell cache. The SW also picks /css/* up via the
          isStaticAsset filter in sw.js. -->
     <link rel="stylesheet" href="/css/main.css">
-    <!-- v2.5.1 — cache-bust bump for thumbnail opacity fix. Tile thumbs
-         used to stay invisible at opacity:0 because the IntersectionObserver
-         that adds `.loaded` doesn't fire for native loading="lazy" imgs;
-         the new app.js flips the class from inline onload/onerror handlers. -->
+    <!-- Prebuilt Tailwind utilities (`npm run build:css`, generated from
+         scripts/tailwind.config.cjs — do not edit by hand). Replaces the
+         in-browser Play CDN, which recompiled CSS on every load and on
+         every DOM mutation. It MUST stay after main.css: the Play CDN
+         appended its <style> at the end of <head>, so utilities have
+         always won same-specificity ties against main.css (e.g. `.hidden`
+         vs `.role-pill { display:flex }`). Flipping the order changes
+         ~900 computed values across the page. -->
+    <link rel="stylesheet" href="/css/tailwind.css">
 
     <!-- Modulepreload — kick off the SPA's hot-path import graph in
          parallel instead of waiting for the discover-then-fetch waterfall
          that <script type="module"> would otherwise do. Cuts time-to-
          interactive on a fresh page-load, especially on slow links.
-         Same `?v=` cache-bust as the stylesheet so a release bumps both. -->
-    <link rel="modulepreload" href="/js/app.js?v=2.5.1">
-    <link rel="modulepreload" href="/js/api.js?v=2.5.1">
-    <link rel="modulepreload" href="/js/ws.js?v=2.5.1">
-    <link rel="modulepreload" href="/js/router.js?v=2.5.1">
-    <link rel="modulepreload" href="/js/i18n.js?v=2.5.1">
-    <link rel="modulepreload" href="/js/store.js?v=2.5.1">
-    <link rel="modulepreload" href="/js/utils.js?v=2.5.1">
+         Keep these hrefs BARE: the server stamps `?v=<version>` onto
+         every /js/ URL in the HTML and in import statements, and skips
+         URLs that already carry a query. A hard-coded `?v=` here fetched
+         module URLs that no import ever asked for (7 wasted requests). -->
+    <link rel="modulepreload" href="/js/app.js">
+    <link rel="modulepreload" href="/js/api.js">
+    <link rel="modulepreload" href="/js/ws.js">
+    <link rel="modulepreload" href="/js/router.js">
+    <link rel="modulepreload" href="/js/i18n.js">
+    <link rel="modulepreload" href="/js/store.js">
+    <link rel="modulepreload" href="/js/utils.js">
 </head>
 
 <body class="h-screen overflow-hidden" data-role="">
@@ -178,73 +163,50 @@
         <aside id="sidebar"
             class="fixed md:relative w-[min(85vw,18rem)] sm:w-80 bg-tg-sidebar border-r border-tg-border flex flex-col h-full z-50 sidebar-mobile md:transform-none">
 
-            <!-- Header -->
-            <div class="p-3 flex items-center gap-3 border-b border-tg-border/40">
-                <button id="sidebar-close"
-                    class="md:hidden w-10 h-10 flex items-center justify-center rounded-full hover:bg-tg-hover">
-                    <i class="ri-arrow-left-line text-xl text-tg-textSecondary"></i>
+            <!-- Header: Go anywhere (js/command-palette.js, Ctrl/Cmd+K) and,
+                 on phones, the drawer's close button. -->
+            <div class="p-2 flex items-center gap-2 border-b border-tg-border/40">
+                <button id="sidebar-close" type="button"
+                    class="md:hidden w-11 h-11 shrink-0 flex items-center justify-center rounded-full hover:bg-tg-hover"
+                    data-i18n-aria-label="common.close" aria-label="Close">
+                    <i class="ri-arrow-left-line text-xl text-tg-textSecondary" aria-hidden="true"></i>
+                </button>
+                <button id="sidebar-search-btn" type="button" class="palette-trigger" aria-haspopup="dialog"
+                    data-i18n-aria-label="palette.title" aria-label="Go anywhere">
+                    <i class="ri-search-line" aria-hidden="true"></i>
+                    <span class="palette-trigger-label" data-i18n="palette.trigger">Search or jump to…</span>
+                    <kbd class="palette-trigger-kbd" data-palette-kbd aria-hidden="true">Ctrl K</kbd>
                 </button>
             </div>
 
-            <!-- Navigation -->
-            <!-- Sidebar "Viewer" entry removed in v2.3.12 — was a third
-                 redundant entry-point to the same #/viewer page (the
-                 "All Media" card below + the bottom-nav "Library" item
-                 already cover it). -->
-            <nav class="border-b border-tg-border/40 px-2 py-2 flex flex-col gap-0.5">
-                <div class="nav-item flex items-center gap-2.5 px-2.5 py-2 rounded-lg cursor-pointer hover:bg-tg-hover transition-colors" data-page="groups" data-admin-only
-                    onclick="navigateTo('groups')">
-                    <div class="w-7 h-7 rounded-md bg-blue-500/10 flex items-center justify-center flex-shrink-0">
-                        <i class="ri-group-line text-sm text-blue-400"></i>
-                    </div>
-                    <span class="text-tg-text text-sm font-medium" data-i18n="nav.groups">Groups</span>
-                </div>
-                <div class="nav-item flex items-center gap-2.5 px-2.5 py-2 rounded-lg cursor-pointer hover:bg-tg-hover transition-colors" data-page="backfill" data-admin-only
-                    onclick="navigateTo('backfill')">
-                    <div class="w-7 h-7 rounded-md bg-purple-500/10 flex items-center justify-center flex-shrink-0">
-                        <i class="ri-history-line text-sm text-purple-400"></i>
-                    </div>
-                    <span class="text-tg-text text-sm font-medium" data-i18n="nav.backfill">Backfill</span>
-                </div>
-                <div class="nav-item flex items-center gap-2.5 px-2.5 py-2 rounded-lg cursor-pointer hover:bg-tg-hover transition-colors" data-page="queue" data-admin-only
-                    onclick="navigateTo('queue')">
-                    <div class="w-7 h-7 rounded-md bg-green-500/10 flex items-center justify-center flex-shrink-0">
+            <!-- Navigation — the four places, same as the phone bottom nav
+                 (js/nav.js). Backfill lives under Chats, Maintenance is the
+                 Tools section of Settings. -->
+            <nav class="sidebar-nav border-b border-tg-border/40 px-2 py-2 flex flex-col gap-0.5" data-i18n-aria-label="nav.primary" aria-label="Primary">
+                <a href="#/viewer" data-library-link class="nav-item flex items-center gap-2.5 px-2.5 py-2 rounded-lg hover:bg-tg-hover transition-colors" data-page="viewer">
+                    <span class="w-7 h-7 rounded-md bg-purple-500/10 flex items-center justify-center flex-shrink-0" aria-hidden="true">
+                        <i class="ri-gallery-line text-sm text-purple-400"></i>
+                    </span>
+                    <span class="text-tg-text text-sm font-medium" data-i18n="nav.library">Library</span>
+                </a>
+                <a href="#/groups" class="nav-item flex items-center gap-2.5 px-2.5 py-2 rounded-lg hover:bg-tg-hover transition-colors" data-page="groups" data-admin-only>
+                    <span class="w-7 h-7 rounded-md bg-blue-500/10 flex items-center justify-center flex-shrink-0" aria-hidden="true">
+                        <i class="ri-chat-3-line text-sm text-blue-400"></i>
+                    </span>
+                    <span class="text-tg-text text-sm font-medium" data-i18n="nav.chats">Chats</span>
+                </a>
+                <a href="#/queue" class="nav-item flex items-center gap-2.5 px-2.5 py-2 rounded-lg hover:bg-tg-hover transition-colors" data-page="queue" data-admin-only>
+                    <span class="w-7 h-7 rounded-md bg-green-500/10 flex items-center justify-center flex-shrink-0" aria-hidden="true">
                         <i class="ri-download-cloud-2-line text-sm text-green-400"></i>
-                    </div>
+                    </span>
                     <span class="text-tg-text text-sm font-medium" data-i18n="nav.queue">Queue</span>
-                </div>
-                <div class="nav-item flex items-center gap-2.5 px-2.5 py-2 rounded-lg cursor-pointer hover:bg-tg-hover transition-colors" data-page="settings"
-                    onclick="navigateTo('settings')">
-                    <div class="w-7 h-7 rounded-md bg-gray-500/10 flex items-center justify-center flex-shrink-0">
+                </a>
+                <a href="#/settings" class="nav-item flex items-center gap-2.5 px-2.5 py-2 rounded-lg hover:bg-tg-hover transition-colors" data-page="settings">
+                    <span class="w-7 h-7 rounded-md bg-gray-500/10 flex items-center justify-center flex-shrink-0" aria-hidden="true">
                         <i class="ri-settings-3-line text-sm text-gray-400"></i>
-                    </div>
+                    </span>
                     <span class="text-tg-text text-sm font-medium" data-i18n="nav.settings">Settings</span>
-                </div>
-                <div class="nav-item flex items-center gap-2.5 px-2.5 py-2 rounded-lg cursor-pointer hover:bg-tg-hover transition-colors" data-page="maintenance" data-admin-only
-                    onclick="navigateTo('maintenance')">
-                    <div class="w-7 h-7 rounded-md bg-amber-500/10 flex items-center justify-center flex-shrink-0">
-                        <i class="ri-tools-line text-sm text-amber-400"></i>
-                    </div>
-                    <span class="text-tg-text text-sm font-medium" data-i18n="nav.maintenance.section">Maintenance</span>
-                </div>
-                <!-- Hidden anchors so existing inline-onclick deep-links
-                     (settings.js maint cards) keep working without code
-                     changes — they call navigateTo('maintenance/<slug>')
-                     and the router still resolves to the per-feature
-                     page. No nav row rendered. -->
-                <div class="hidden">
-                    <div data-page="maintenance-duplicates"></div>
-                    <div data-page="maintenance-similar"></div>
-                    <div data-page="maintenance-thumbs"></div>
-                    <div data-page="maintenance-video"></div>
-                    <div data-page="maintenance-nsfw"></div>
-                    <div data-page="maintenance-ai"></div>
-                    <div data-page="maintenance-logs"></div>
-                    <div data-page="maintenance-backup"></div>
-                    <div data-page="maintenance-cluster"></div>
-                    <div data-page="maintenance-recovery"></div>
-                    <div data-page="maintenance-updates"></div>
-                </div>
+                </a>
             </nav>
 
             <!-- All Media Button -->
@@ -269,9 +231,9 @@
                     <button id="downloaded-groups-toggle" type="button"
                         class="w-full px-3 pt-3 pb-1.5 text-xs text-tg-textSecondary uppercase tracking-wide flex items-center justify-between hover:bg-tg-hover transition-colors"
                         aria-expanded="true" aria-controls="downloaded-groups-body"
-                        data-i18n-aria-label="sidebar.downloaded_groups_collapse" aria-label="Collapse downloaded groups"
-                        data-i18n-title="sidebar.downloaded_groups_collapse" title="Collapse downloaded groups">
-                        <span data-i18n="sidebar.downloaded_groups">Downloaded Groups</span>
+                        data-i18n-aria-label="sidebar.downloaded_groups_collapse" aria-label="Collapse downloaded chats"
+                        data-i18n-title="sidebar.downloaded_groups_collapse" title="Collapse downloaded chats">
+                        <span data-i18n="sidebar.downloaded_groups">Downloaded chats</span>
                         <i id="downloaded-groups-chevron" class="ri-arrow-up-s-line text-base normal-case transition-transform" aria-hidden="true"></i>
                     </button>
                     <div class="px-3 pt-1 pb-3">
@@ -282,10 +244,11 @@
                                 was suggesting saved emails because the field defaulted to
                                 type=text inside a focusable input. Belt-and-braces because no
                                 single attribute covers every vendor:
-                                  - `type="search"` signals search semantics, not a username.
-                                  - `autocomplete="off"` is the basic switch.
+                                  - `type="search"` signals search semantics, not a username
+                                    (it already maps to the `searchbox` role for AT).
+                                  - `autocomplete="nope"` — an unknown token Chrome can't map to
+                                    a saved field; it ignores plain `off` on credential-like inputs.
                                   - `name="filter"` avoids Chrome's email/username heuristic.
-                                  - `role="searchbox"` reinforces the semantic for AT + browsers.
                                   - `data-form-type="other"` mutes Bitwarden's "is-this-a-login"
                                     detector; `data-lpignore`, `data-1p-ignore`, `data-bwignore`
                                     cover LastPass / 1Password / Bitwarden variants explicitly.
@@ -294,16 +257,15 @@
                             <input type="text" name="prevent_autofill" autocomplete="username"
                                 tabindex="-1" aria-hidden="true"
                                 style="position:absolute;width:0;height:0;overflow:hidden;opacity:0;pointer-events:none">
-                            <input type="search" id="sidebar-groups-search" name="filter"
-                                role="searchbox"
-                                autocomplete="nope"
+                            <!-- biome-ignore lint/a11y/useValidAutocomplete: deliberate autofill defence, see comment above -->
+                            <input type="search" id="sidebar-groups-search" name="filter" autocomplete="nope"
                                 spellcheck="false"
                                 data-form-type="other"
                                 data-lpignore="true"
                                 data-1p-ignore="true"
                                 data-bwignore="true"
-                                data-i18n-placeholder="sidebar.groups_search" placeholder="Filter groups…"
-                                aria-label="Filter downloaded groups"
+                                data-i18n-placeholder="sidebar.groups_search" placeholder="Filter chats…"
+                                data-i18n-aria-label="sidebar.groups_search" aria-label="Filter chats…"
                                 class="tg-input pl-9 py-2 text-sm w-full"
                                 oninput="filterSidebarGroups(this.value)">
                         </div>
@@ -329,253 +291,6 @@
                 </button>
             </div>
         </aside>
-
-        <!-- Group Settings Modal -->
-        <div id="group-modal" class="fixed inset-0 z-50 flex items-center justify-center p-3 modal-backdrop hidden">
-            <div
-                class="bg-tg-sidebar w-full max-w-lg rounded-xl overflow-hidden shadow-2xl transform scale-100 transition-all">
-                <!-- Header — slimmer than before so the modal fits more
-                     content on short viewports. -->
-                <div class="bg-tg-panel px-4 py-3 flex items-center justify-between border-b border-tg-border">
-                    <h3 class="text-white font-medium text-base" data-i18n="group.modal.title">Group Settings</h3>
-                    <button onclick="closeGroupSettings()"
-                        class="w-7 h-7 rounded-full hover:bg-tg-hover flex items-center justify-center transition-colors">
-                        <i class="ri-close-line text-tg-textSecondary text-lg"></i>
-                    </button>
-                </div>
-
-                <!-- Tabs — 3 instead of 5 so they always fit on one row
-                     without horizontal scroll. The merge:
-                       Filters  = Media filters + Topics
-                       Routing  = Auto Forward + Accounts + Cluster
-                       Data     = Stats + Recent + Backfill + Rescue + Danger
-                     Icons keep the labels short enough for narrow viewports;
-                     `flex-1` makes each tap target evenly sized. -->
-                <div class="flex border-b border-tg-border">
-                    <div class="tab-item active flex-1 text-center inline-flex items-center justify-center gap-1.5 text-sm" onclick="switchSettingsTab('media')" id="tab-media">
-                        <i class="ri-filter-line"></i><span data-i18n="group.modal.tab.media">Filters</span>
-                    </div>
-                    <div class="tab-item flex-1 text-center inline-flex items-center justify-center gap-1.5 text-sm" onclick="switchSettingsTab('forward')" id="tab-forward">
-                        <i class="ri-share-forward-line"></i><span data-i18n="group.modal.tab.forward">Routing</span>
-                    </div>
-                    <div class="tab-item flex-1 text-center inline-flex items-center justify-center gap-1.5 text-sm" onclick="switchSettingsTab('data')" id="tab-data">
-                        <i class="ri-database-2-line"></i><span data-i18n="group.modal.tab.data">Data</span>
-                    </div>
-                </div>
-
-                <!-- Suspended group warning banner — shown when group.suspended === true -->
-                <div id="group-suspended-banner" class="hidden px-4 py-2.5 bg-red-500/10 border-b border-red-500/20 flex items-center gap-2">
-                    <i class="ri-forbid-line text-red-400 text-sm flex-shrink-0"></i>
-                    <span class="text-red-400 text-xs leading-snug" data-i18n="group.suspended.banner">This group was deleted or suspended on Telegram. Monitoring is permanently disabled.</span>
-                </div>
-
-                <!-- Content — compact density + tall scroll area so most
-                     of the modal real estate goes to actual content. -->
-                <div class="p-3 max-h-[75vh] overflow-y-auto custom-scrollbar">
-
-                    <!-- Filters tab — master enable + allowed media types
-                         + forum-topic filter (was its own tab). -->
-                    <div id="content-media" class="space-y-3">
-                        <label class="flex items-center justify-between p-3 bg-tg-panel rounded-lg cursor-pointer hover:bg-tg-hover transition-colors">
-                            <span class="text-white text-sm font-medium" data-i18n="group.modal.enable_monitoring">Enable Monitoring</span>
-                            <div class="tg-toggle" id="group-enable-toggle" onclick="toggleGroupEnabled(event)"></div>
-                        </label>
-
-                        <div>
-                            <p class="text-tg-textSecondary text-[11px] px-2 mb-1 uppercase font-medium tracking-wide" data-i18n="group.modal.allowed_media">Allowed Media Types</p>
-                            <div class="grid grid-cols-1 gap-1" id="filter-options">
-                                <!-- injected by JS -->
-                            </div>
-                        </div>
-
-                        <!-- Forum-topic filter (folded in from the old
-                             "Topics" tab — same fields/IDs). -->
-                        <div class="p-3 bg-tg-panel rounded-lg border border-tg-border/40">
-                            <label class="flex items-center justify-between mb-2">
-                                <span class="text-white text-sm font-medium" data-i18n="group.topics.title">Forum-topic filter</span>
-                                <div class="tg-toggle" id="topics-enable-toggle" onclick="event.preventDefault(); event.stopPropagation(); this.classList.toggle('active');"></div>
-                            </label>
-                            <p class="text-[11px] text-tg-textSecondary mb-2 leading-snug" data-i18n="group.topics.help_html">
-                                Forum supergroups only. Restrict downloads to specific topic IDs. Empty = all topics.
-                            </p>
-                            <input id="topics-ids" type="text" class="tg-input w-full text-sm" data-i18n-placeholder="group.topics.ids_placeholder" placeholder="e.g., 12, 34, 56">
-                        </div>
-                    </div>
-
-                    <!-- Routing tab — Auto-Forward + per-role account
-                         assignment + cluster routing. The old standalone
-                         "Accounts" and "Topics" tabs were folded in (Topics
-                         moved up into Filters; Accounts + Cluster live here)
-                         to drop the tab count from 5 to 3. All field IDs
-                         preserved so the save handler keeps working. -->
-                    <div id="content-forward" class="hidden space-y-3">
-                        <!-- Auto Forward -->
-                        <div class="p-3 bg-tg-panel rounded-lg border border-tg-border/40">
-                            <label class="flex items-center justify-between mb-2 cursor-pointer">
-                                <div class="min-w-0">
-                                    <div class="text-white text-sm font-medium" data-i18n="group.fwd.title">Auto Forward</div>
-                                    <p class="text-[11px] text-tg-textSecondary" data-i18n="group.fwd.subtitle">Forward media to another channel</p>
-                                </div>
-                                <div class="tg-toggle shrink-0" id="fwd-enable-toggle" onclick="toggleFwdEnabled(event)"></div>
-                            </label>
-                            <div class="space-y-2" id="fwd-settings">
-                                <div>
-                                    <label class="block text-tg-textSecondary text-[11px] mb-1" data-i18n="group.fwd.destination">Destination</label>
-                                    <div class="relative">
-                                        <input type="text" id="fwd-destination" class="tg-input pr-9 text-sm py-2"
-                                            data-i18n-placeholder="group.fwd.dest_placeholder"
-                                            placeholder="Use 'Select' button or type ID">
-                                        <button onclick="openDestinationPicker()"
-                                            class="absolute right-2 top-1/2 transform -translate-y-1/2 text-tg-textSecondary hover:text-white p-0.5 rounded hover:bg-white/10 transition-colors"
-                                            data-i18n-title="group.fwd.select_from_list" title="Select from list">
-                                            <i class="ri-list-check-2"></i>
-                                        </button>
-                                    </div>
-                                </div>
-                                <label onclick="toggleFwdDelete(event)" class="flex items-center justify-between py-1.5 cursor-pointer">
-                                    <span class="text-tg-text text-xs" data-i18n="group.fwd.delete_after">Delete after forward</span>
-                                    <div class="tg-toggle" id="fwd-delete-toggle"></div>
-                                </label>
-                            </div>
-                        </div>
-
-                        <!-- Account assignment (was its own tab). -->
-                        <div class="p-3 bg-tg-panel rounded-lg border border-tg-border/40 space-y-2">
-                            <div class="text-white text-sm font-medium" data-i18n="group.accounts.title">Account Assignment</div>
-                            <div>
-                                <label class="block text-tg-textSecondary text-[11px] mb-1">
-                                    <i class="ri-download-line mr-1"></i><span data-i18n="group.accounts.monitor">Monitor</span>
-                                </label>
-                                <select id="monitor-account" class="tg-input w-full text-sm py-2">
-                                    <option value="" data-i18n="group.accounts.default_option">(Default Account)</option>
-                                </select>
-                            </div>
-                            <div>
-                                <label class="block text-tg-textSecondary text-[11px] mb-1">
-                                    <i class="ri-share-forward-line mr-1"></i><span data-i18n="group.accounts.forward">Forward</span>
-                                </label>
-                                <select id="forward-account" class="tg-input w-full text-sm py-2">
-                                    <option value="" data-i18n="group.accounts.default_option">(Default Account)</option>
-                                </select>
-                            </div>
-                        </div>
-
-                        <!-- Cluster routing — auto-hidden when no peers paired. -->
-                        <div id="group-cluster-routing" class="hidden p-3 bg-tg-panel rounded-lg border border-tg-border/40 space-y-2">
-                            <div class="text-white text-sm font-medium flex items-center gap-2">
-                                <i class="ri-broadcast-line text-tg-blue"></i>
-                                <span data-i18n="group.cluster.title">Cluster routing</span>
-                            </div>
-                            <div>
-                                <label class="block text-tg-textSecondary text-[11px] mb-1">
-                                    <i class="ri-server-line mr-1"></i><span data-i18n="group.cluster.owner_peer">Owner peer</span>
-                                </label>
-                                <select id="group-owner-peer" class="tg-input w-full text-sm py-2">
-                                    <option value="" data-i18n="group.cluster.any_peer">(Any peer — first online wins)</option>
-                                </select>
-                            </div>
-                            <div>
-                                <label class="block text-tg-textSecondary text-[11px] mb-1">
-                                    <i class="ri-shield-flash-line mr-1"></i><span data-i18n="group.cluster.backup_peer">Backup peer</span>
-                                </label>
-                                <select id="group-backup-peer" class="tg-input w-full text-sm py-2">
-                                    <option value="" data-i18n="group.cluster.no_backup">(No automatic failover)</option>
-                                </select>
-                            </div>
-                        </div>
-                    </div>
-
-                    <!-- Data tab — single home for everything related to this
-                         group's stored content. Layout (top → bottom):
-                           1. Stats  (Files / Size / Type breakdown / Last download)
-                           2. Recent files (paginated list, Load more)
-                           3. Backfill history (quick-shortcut preset row)
-                           4. Rescue mode (per-group retention policy)
-                           5. Danger zone (Delete files only / Wipe all data)
-                         Rescue + Backfill used to live OUTSIDE the tab container,
-                         which meant they bled into every tab. Folding them into
-                         the Data tab keeps the modal focused — each tab now owns
-                         a single concern. -->
-                    <div id="content-data" class="hidden space-y-3">
-                        <!-- 1. Stats -->
-                        <div id="group-data-stats" class="grid grid-cols-2 sm:grid-cols-4 gap-1.5"></div>
-
-                        <!-- 2. Recent files -->
-                        <div class="bg-tg-panel rounded-lg p-3 border border-tg-border/40">
-                            <div class="flex items-center justify-between mb-1.5">
-                                <h4 class="text-tg-text text-sm font-medium flex items-center gap-1.5">
-                                    <i class="ri-file-list-3-line text-tg-blue"></i>
-                                    <span data-i18n="group.data.recent">Recent files</span>
-                                </h4>
-                                <span id="group-data-files-count" class="text-[10px] text-tg-textSecondary tabular-nums"></span>
-                            </div>
-                            <div id="group-data-files" class="space-y-1 max-h-64 overflow-y-auto pr-1"></div>
-                            <button id="group-data-loadmore" type="button" class="text-[11px] text-tg-blue hover:underline mt-1.5 hidden" data-i18n="group.data.loadmore">Load more</button>
-                        </div>
-
-                        <!-- 3. Backfill — preset chip row, deep-links to /#/backfill -->
-                        <div class="bg-tg-panel rounded-lg p-3 border border-tg-border/40">
-                            <h4 class="text-tg-text text-sm font-medium mb-1.5 flex items-center gap-1.5">
-                                <i class="ri-history-line text-tg-blue"></i>
-                                <span data-i18n="backfill.modal.title">Backfill history</span>
-                            </h4>
-                            <div class="grid grid-cols-6 gap-1 text-[11px]">
-                                <button class="tg-btn-secondary py-1 px-1" data-history-limit="5" data-i18n="backfill.preset.last_5">5</button>
-                                <button class="tg-btn-secondary py-1 px-1" data-history-limit="10" data-i18n="backfill.preset.last_10">10</button>
-                                <button class="tg-btn-secondary py-1 px-1" data-history-limit="100" data-i18n="backfill.preset.last_100">100</button>
-                                <button class="tg-btn-secondary py-1 px-1" data-history-limit="1000" data-i18n="backfill.preset.last_1k">1k</button>
-                                <button class="tg-btn-secondary py-1 px-1" data-history-limit="10000" data-i18n="backfill.preset.last_10k">10k</button>
-                                <button class="tg-btn-secondary py-1 px-1" data-history-limit="0" data-i18n="backfill.preset.all">All</button>
-                            </div>
-                            <p id="history-progress" class="text-[11px] text-tg-textSecondary mt-1.5 hidden"></p>
-                        </div>
-
-                        <!-- 4. Rescue mode -->
-                        <div class="bg-tg-panel rounded-lg p-3 border border-tg-border/40">
-                            <h4 class="text-tg-text text-sm font-medium mb-1.5 flex items-center gap-1.5">
-                                <i class="ri-lifebuoy-line text-tg-blue"></i>
-                                <span data-i18n="group.rescue.title">Rescue mode</span>
-                            </h4>
-                            <div class="flex gap-1 mb-2" id="setting-rescue-mode" role="radiogroup" data-i18n-aria-label="group.rescue.title" aria-label="Rescue mode">
-                                <button type="button" data-rescue-value="auto" class="rescue-chip flex-1 py-1 px-2 rounded text-[11px] bg-tg-bg/40 hover:bg-tg-hover transition-colors" data-i18n="group.rescue.mode_auto">Auto</button>
-                                <button type="button" data-rescue-value="on" class="rescue-chip flex-1 py-1 px-2 rounded text-[11px] bg-tg-bg/40 hover:bg-tg-hover transition-colors" data-i18n="group.rescue.mode_on">On</button>
-                                <button type="button" data-rescue-value="off" class="rescue-chip flex-1 py-1 px-2 rounded text-[11px] bg-tg-bg/40 hover:bg-tg-hover transition-colors" data-i18n="group.rescue.mode_off">Off</button>
-                            </div>
-                            <div class="flex items-center gap-2">
-                                <label for="setting-rescue-hours" class="text-[11px] text-tg-textSecondary shrink-0" data-i18n="group.rescue.hours_label">Retention (h)</label>
-                                <input id="setting-rescue-hours" type="number" min="1" max="720" placeholder="48" class="tg-input flex-1 text-sm py-1.5" />
-                            </div>
-                        </div>
-
-                        <!-- 5. Danger zone -->
-                        <div class="bg-tg-panel rounded-lg p-3 border border-red-500/30">
-                            <h4 class="text-red-300 text-sm font-medium mb-1.5 flex items-center gap-1.5">
-                                <i class="ri-alert-line"></i>
-                                <span data-i18n="group.data.actions">Danger zone</span>
-                            </h4>
-                            <div class="grid grid-cols-2 gap-1.5">
-                                <button id="group-data-delete-files-btn" type="button" class="px-2 py-1.5 rounded bg-tg-orange/15 hover:bg-tg-orange/25 text-tg-orange text-[11px] font-medium inline-flex items-center justify-center gap-1 transition-colors">
-                                    <i class="ri-eraser-line"></i><span data-i18n="group.data.delete_files">Delete files</span>
-                                </button>
-                                <button id="group-data-purge-btn" type="button" class="px-2 py-1.5 rounded bg-red-500/20 hover:bg-red-500/30 text-red-300 text-[11px] font-medium inline-flex items-center justify-center gap-1 transition-colors">
-                                    <i class="ri-delete-bin-line"></i><span data-i18n="group.data.wipe_all">Wipe all</span>
-                                </button>
-                            </div>
-                        </div>
-                    </div>
-
-                </div>
-
-                <!-- Footer — slimmer; the modal already eats more vertical
-                     space than most other surfaces, so trim where we can. -->
-                <div class="px-3 py-2.5 border-t border-tg-border flex justify-end gap-2 bg-tg-sidebar">
-                    <button onclick="closeGroupSettings()"
-                        class="px-3 py-1.5 text-sm rounded-lg text-tg-textButton hover:bg-tg-hover transition-colors" data-i18n="common.cancel">Cancel</button>
-                    <button onclick="saveGroupSettings()"
-                        class="px-4 py-1.5 text-sm rounded-lg bg-tg-blue text-white font-medium hover:bg-opacity-90 transition-all shadow-lg shadow-tg-blue/20" data-i18n="group.modal.save_changes">Save Changes</button>
-                </div>
-            </div>
-        </div>
 
         <!-- Main column. onboarding.js inserts the banner as a sibling
              of <main>; without this wrapper the parent would be the
@@ -611,7 +326,7 @@
                         <h1 id="page-title" class="font-medium text-tg-text truncate text-sm sm:text-base" data-i18n="nav.viewer">Viewer</h1>
                         <p id="page-subtitle" class="text-xs text-tg-textSecondary truncate hidden sm:block" data-i18n="nav.viewer_sub">View downloaded files</p>
                     </div>
-                    <span id="role-pill" class="role-pill hidden shrink-0" aria-label="Account role"></span>
+                    <span id="role-pill" class="role-pill hidden shrink-0" title="Account role"></span>
                 </div>
 
                 <div class="flex items-center gap-0.5 sm:gap-1 shrink-0">
@@ -623,6 +338,16 @@
                         <span class="engine-status-label" data-i18n="status.idle">Idle</span>
                         <span id="engine-nav-badge" class="nav-badge hidden"></span>
                     </a>
+
+                    <!-- Go anywhere (command palette). Phones; wider screens have
+                         it at the top of the sidebar (the drawer on tablets) +
+                         Ctrl/Cmd+K — the header has no room left there. -->
+                    <button id="palette-btn" type="button" aria-haspopup="dialog"
+                        class="sm:hidden w-10 h-10 min-w-[44px] min-h-[44px] rounded-full hover:bg-tg-hover flex items-center justify-center"
+                        data-i18n-aria-label="palette.title" aria-label="Go anywhere"
+                        data-i18n-title="palette.title" title="Go anywhere">
+                        <i class="ri-search-line text-xl text-tg-textSecondary" aria-hidden="true"></i>
+                    </button>
 
                     <div class="relative" data-admin-only>
                         <button id="notify-bell-btn" type="button"
@@ -662,6 +387,15 @@
                         data-i18n-aria-label="viewer.select_mode" aria-label="Toggle selection mode"
                         data-i18n-title="viewer.select_mode" title="Toggle selection mode">
                         <i class="ri-checkbox-multiple-line text-xl text-tg-textSecondary" aria-hidden="true"></i>
+                    </button>
+
+                    <!-- Backfill this chat — only while a chat's gallery is open
+                         (body.in-chat). Phones: in the ⋮ menu below. -->
+                    <button id="backfill-chat-btn" type="button" data-admin-only data-chat-only
+                        class="hidden sm:flex w-10 h-10 min-w-[44px] min-h-[44px] rounded-full hover:bg-tg-hover items-center justify-center"
+                        data-i18n-aria-label="backfill.sheet.header_btn" aria-label="Backfill older messages of this chat"
+                        data-i18n-title="backfill.sheet.header_btn" title="Backfill older messages of this chat">
+                        <i class="ri-history-line text-xl text-tg-textSecondary" aria-hidden="true"></i>
                     </button>
 
                     <!-- Desktop-only buttons. On <640px these collapse into the
@@ -731,6 +465,10 @@
                                 <i class="ri-camera-line"></i>
                                 <span class="vm-label" data-i18n="header.stories">Download Telegram Stories</span>
                             </button>
+                            <button type="button" data-overflow="backfill-chat" data-admin-only data-chat-only role="menuitem">
+                                <i class="ri-history-line"></i>
+                                <span class="vm-label" data-i18n="backfill.sheet.menu_item">Backfill this chat</span>
+                            </button>
                             <div class="border-t border-tg-border my-1"></div>
                             <button type="button" data-overflow="vm-grid" role="menuitem">
                                 <i class="ri-layout-grid-line"></i>
@@ -754,34 +492,25 @@
                 </div>
             </header>
 
-            <!-- Media Tabs -->
-            <div id="media-tabs" class="flex border-b border-tg-border bg-tg-bg px-1">
+            <!-- Gallery toolbar: search box + Sort & filter button, then the
+                 type tabs. Phones: search on its own row above the tabs;
+                 md+: one row, tabs left and search right. The search box
+                 (js/gallery-toolbar.js) searches file + chat names of the
+                 open chat or All Media and keeps the type tab / pinned
+                 filter. The old Pinned chip lives in Sort & filter now,
+                 together with the type and the layout. -->
+            <div id="media-tabs" class="gallery-toolbar relative flex flex-wrap items-center border-b border-tg-border bg-tg-bg px-1">
                 <div class="tab-item active" data-type="all" data-i18n="viewer.tab.all">All</div>
                 <div class="tab-item" data-type="images" data-i18n="viewer.tab.images">Photos</div>
                 <div class="tab-item" data-type="videos" data-i18n="viewer.tab.videos">Videos</div>
                 <div class="tab-item" data-type="documents" data-i18n="viewer.tab.documents">Files</div>
                 <div class="tab-item" data-type="audio" data-i18n="viewer.tab.audio">Audio</div>
-                <!-- Pinned: independent 3-state chip (all → pinned →
-                     unpinned → all). Stacks with the type filter instead
-                     of replacing it. -->
-                <div class="tab-item tab-item--toggle" data-pinned-toggle
-                     data-pin-filter="all"
-                     data-i18n-title="favorites.filter_all_title" title="Show all — click for pinned only"
-                     role="button" aria-pressed="false">
-                    <i class="ri-pushpin-2-line mr-1" aria-hidden="true"></i><span data-i18n="favorites.filter">Pinned</span>
-                </div>
-                <button id="gallery-shuffle-btn" type="button"
-                    class="tab-item tab-item--toggle"
-                    data-i18n-title="toast.viewer_shuffle_on" title="Shuffle"
-                    aria-pressed="false">
-                    <i class="ri-shuffle-line mr-1" aria-hidden="true"></i><span data-i18n="viewer.shuffle">Shuffle</span>
-                </button>
                 <!-- Gallery scope chip — federated gallery toggle (Layer 1).
                      Hidden by default; app.js reveals it once it knows the
                      cluster has at least one paired peer. The popover menu
                      is rendered into #gallery-scope-menu lazily on click. -->
                 <div id="gallery-scope-chip" class="tab-item tab-item--toggle hidden ml-auto"
-                     data-admin-only role="button" aria-haspopup="menu" aria-expanded="false"
+                     data-admin-only role="button" tabindex="0" aria-haspopup="menu" aria-expanded="false"
                      data-i18n-title="gallery.scope.label" title="Scope">
                     <i class="ri-broadcast-line mr-1" aria-hidden="true"></i>
                     <span id="gallery-scope-label" data-i18n="gallery.scope.this_peer">This peer</span>
@@ -790,57 +519,95 @@
                 <!-- Popover menu, positioned absolutely under the chip. -->
                 <div id="gallery-scope-menu" class="hidden absolute right-2 mt-9 z-30 bg-tg-panel border border-tg-border/40 rounded-lg shadow-lg min-w-[12rem] py-1"
                      role="menu" aria-labelledby="gallery-scope-chip"></div>
+                <div id="gallery-search-row" class="gallery-search-row">
+                    <div class="gallery-search" role="search">
+                        <i class="ri-search-line gallery-search-icon" aria-hidden="true"></i>
+                        <!-- biome-ignore lint/a11y/useValidAutocomplete: deliberate autofill defence, see #sidebar-groups-search -->
+                        <input type="search" id="gallery-search-input" name="gallery-q" autocomplete="nope"
+                            autocapitalize="off" spellcheck="false" enterkeyhint="search"
+                            data-form-type="other" data-lpignore="true" data-1p-ignore="true" data-bwignore="true"
+                            data-i18n-placeholder="gallery.search.placeholder" placeholder="Search files and chats"
+                            data-i18n-aria-label="gallery.search.label" aria-label="Search the library by file name or chat name">
+                        <span id="gallery-search-count" class="gallery-search-count hidden" aria-live="polite"></span>
+                        <button type="button" id="gallery-search-clear" class="gallery-search-clear hidden"
+                            data-i18n-aria-label="gallery.search.clear" aria-label="Clear search"
+                            data-i18n-title="gallery.search.clear" title="Clear search">
+                            <i class="ri-close-circle-fill" aria-hidden="true"></i>
+                        </button>
+                    </div>
+                    <button type="button" id="gallery-shuffle-btn" class="gallery-filter-btn"
+                        data-i18n-title="viewer.shuffle" title="Shuffle" aria-pressed="false">
+                        <i class="ri-shuffle-line" aria-hidden="true"></i>
+                        <span data-i18n="viewer.shuffle">Shuffle</span>
+                    </button>
+                    <button type="button" id="gallery-filter-btn" class="gallery-filter-btn" aria-haspopup="dialog"
+                        data-i18n-title="gallery.filter.title" title="Sort &amp; filter" aria-label="Sort &amp; filter">
+                        <i class="ri-equalizer-line" aria-hidden="true"></i>
+                        <span id="gallery-filter-label" class="gallery-filter-label">Filter</span>
+                        <span id="gallery-filter-dot" class="gallery-filter-dot hidden" aria-hidden="true"></span>
+                    </button>
+                </div>
             </div>
 
             <!-- Content Area -->
             <div id="content-area" class="flex-1 overflow-y-auto overscroll-contain p-2 sm:p-4 bg-tg-lightBg">
 
-                <!-- Maintenance tab strip — admin-only, only rendered when
-                     the user is on a per-feature maintenance page (NOT on
-                     the hub itself). Lets the operator hop between tools
-                     without a sidebar trip. Active tab highlighted by
-                     app.js's renderPage(); a back arrow on the left
-                     returns to the hub. Mobile: horizontal scroll. -->
-                <nav id="maintenance-tabs" class="maintenance-tabs hidden mb-3 max-w-5xl mx-auto" data-admin-only role="tablist" aria-label="Maintenance tools">
-                    <a class="maintenance-tab-back" href="#/maintenance" data-i18n-aria-label="maintenance.tabs.back" aria-label="Back to hub">
-                        <i class="ri-arrow-left-s-line"></i>
+                <!-- Chats | Backfill — Backfill is a tab of the Chats place
+                     (js/nav.js). Shown on #/groups and #/backfill only. -->
+                <nav id="chats-tabs" class="chats-tabs hidden max-w-5xl mx-auto px-3 sm:px-4" data-admin-only
+                    data-i18n-aria-label="chats.tabs.label" aria-label="Chats views">
+                    <a class="chats-tab" data-chats-tab="groups" href="#/groups">
+                        <i class="ri-chat-3-line" aria-hidden="true"></i><span data-i18n="nav.chats">Chats</span>
+                    </a>
+                    <a class="chats-tab" data-chats-tab="backfill" href="#/backfill">
+                        <i class="ri-history-line" aria-hidden="true"></i><span data-i18n="nav.backfill">Backfill</span>
+                    </a>
+                </nav>
+
+                <!-- Tool tab strip — shown on a tool's page (#/settings/tools/
+                     <group>/<tool>): a back link to the group page, then the
+                     group's other tools. js/nav.js sets data-group, which
+                     hides the other groups' tabs. Mobile: horizontal scroll. -->
+                <nav id="maintenance-tabs" class="maintenance-tabs hidden mb-3 max-w-5xl mx-auto" data-admin-only role="tablist" aria-label="Tools">
+                    <a class="maintenance-tab-back" href="#/settings/tools" aria-label="Tools">
+                        <i class="ri-arrow-left-s-line" aria-hidden="true"></i><span class="maintenance-tab-back-label"></span>
                     </a>
                     <div class="maintenance-tabs-scroll">
-                        <a class="maintenance-tab" data-mt-page="maintenance-duplicates" href="#/maintenance/duplicates" role="tab" data-i18n-title="nav.maintenance.duplicates" title="Duplicates">
-                            <i class="ri-file-copy-2-line"></i><span data-i18n="nav.maintenance.duplicates">Duplicates</span>
+                        <a class="maintenance-tab" data-mt-page="maintenance-duplicates" data-tool-group="library" href="#/settings/tools/library/duplicates" role="tab" data-i18n-title="nav.maintenance.duplicates" title="Duplicates">
+                            <i class="ri-file-copy-2-line" aria-hidden="true"></i><span data-i18n="nav.maintenance.duplicates">Duplicates</span>
                         </a>
-                        <a class="maintenance-tab" data-mt-page="maintenance-similar" href="#/maintenance/similar" role="tab" data-i18n-title="nav.maintenance.similar" title="Similar clips">
-                            <i class="ri-scissors-cut-line"></i><span data-i18n="nav.maintenance.similar">Similar clips</span>
+                        <a class="maintenance-tab" data-mt-page="maintenance-similar" data-tool-group="library" href="#/settings/tools/library/similar" role="tab" data-i18n-title="nav.maintenance.similar" title="Similar clips">
+                            <i class="ri-scissors-cut-line" aria-hidden="true"></i><span data-i18n="nav.maintenance.similar">Similar clips</span>
                         </a>
-                        <a class="maintenance-tab" data-mt-page="maintenance-thumbs" href="#/maintenance/thumbs" role="tab" data-i18n-title="nav.maintenance.thumbs" title="Thumbnails">
-                            <i class="ri-image-2-line"></i><span data-i18n="nav.maintenance.thumbs">Thumbnails</span>
+                        <a class="maintenance-tab" data-mt-page="maintenance-thumbs" data-tool-group="library" href="#/settings/tools/library/thumbs" role="tab" data-i18n-title="nav.maintenance.thumbs" title="Thumbnails">
+                            <i class="ri-image-2-line" aria-hidden="true"></i><span data-i18n="nav.maintenance.thumbs">Thumbnails</span>
                         </a>
-                        <a class="maintenance-tab" data-mt-page="maintenance-seekbar" href="#/maintenance/seekbar" role="tab" data-i18n-title="nav.maintenance.seekbar" title="Seekbar previews">
-                            <i class="ri-movie-line"></i><span data-i18n="nav.maintenance.seekbar">Seekbar previews</span>
+                        <a class="maintenance-tab" data-mt-page="maintenance-seekbar" data-tool-group="library" href="#/settings/tools/library/seekbar" role="tab" data-i18n-title="nav.maintenance.seekbar" title="Seekbar previews">
+                            <i class="ri-movie-line" aria-hidden="true"></i><span data-i18n="nav.maintenance.seekbar">Seekbar previews</span>
                         </a>
-                        <a class="maintenance-tab" data-mt-page="maintenance-video" href="#/maintenance/video" role="tab" data-i18n-title="nav.maintenance.video" title="Videos">
-                            <i class="ri-film-line"></i><span data-i18n="nav.maintenance.video">Videos</span>
+                        <a class="maintenance-tab" data-mt-page="maintenance-video" data-tool-group="library" href="#/settings/tools/library/video" role="tab" data-i18n-title="tools.video" title="Video faststart">
+                            <i class="ri-film-line" aria-hidden="true"></i><span data-i18n="tools.video">Video faststart</span>
                         </a>
-                        <a class="maintenance-tab" data-mt-page="maintenance-nsfw" href="#/maintenance/nsfw" role="tab" data-i18n-title="nav.maintenance.nsfw" title="NSFW">
-                            <i class="ri-alarm-warning-line"></i><span data-i18n="nav.maintenance.nsfw">NSFW</span>
+                        <a class="maintenance-tab" data-mt-page="maintenance-nsfw" data-tool-group="safety" href="#/settings/tools/safety/nsfw" role="tab" data-i18n-title="nav.maintenance.nsfw" title="NSFW">
+                            <i class="ri-alarm-warning-line" aria-hidden="true"></i><span data-i18n="nav.maintenance.nsfw">NSFW</span>
                         </a>
-                        <a class="maintenance-tab" data-mt-page="maintenance-ai" href="#/maintenance/ai" role="tab" data-i18n-title="nav.maintenance.ai" title="AI">
-                            <i class="ri-sparkling-2-line"></i><span data-i18n="nav.maintenance.ai">AI</span>
+                        <a class="maintenance-tab" data-mt-page="maintenance-ai" data-tool-group="safety" href="#/settings/tools/safety/ai" role="tab" data-i18n-title="tools.faces" title="Faces">
+                            <i class="ri-user-smile-line" aria-hidden="true"></i><span data-i18n="tools.faces">Faces</span>
                         </a>
-                        <a class="maintenance-tab" data-mt-page="maintenance-backup" href="#/maintenance/backup" role="tab" data-i18n-title="nav.maintenance.backup" title="Backup">
-                            <i class="ri-cloud-line"></i><span data-i18n="nav.maintenance.backup">Backup</span>
+                        <a class="maintenance-tab" data-mt-page="maintenance-backup" data-tool-group="sync" href="#/settings/tools/sync/backup" role="tab" data-i18n-title="nav.maintenance.backup" title="Backup">
+                            <i class="ri-cloud-line" aria-hidden="true"></i><span data-i18n="nav.maintenance.backup">Backup</span>
                         </a>
-                        <a class="maintenance-tab" data-mt-page="maintenance-cluster" href="#/maintenance/cluster" role="tab" data-i18n-title="nav.maintenance.cluster" title="Cluster">
-                            <i class="ri-broadcast-line"></i><span data-i18n="nav.maintenance.cluster">Cluster</span>
+                        <a class="maintenance-tab" data-mt-page="maintenance-cluster" data-tool-group="sync" href="#/settings/tools/sync/cluster" role="tab" data-i18n-title="nav.maintenance.cluster" title="Cluster">
+                            <i class="ri-broadcast-line" aria-hidden="true"></i><span data-i18n="nav.maintenance.cluster">Cluster</span>
                         </a>
-                        <a class="maintenance-tab" data-mt-page="maintenance-recovery" href="#/maintenance/recovery" role="tab" data-i18n-title="nav.maintenance.recovery" title="Recovery">
-                            <i class="ri-first-aid-kit-line"></i><span data-i18n="nav.maintenance.recovery">Recovery</span>
+                        <a class="maintenance-tab" data-mt-page="maintenance-logs" data-tool-group="system" href="#/settings/tools/system/logs" role="tab" data-i18n-title="nav.maintenance.logs" title="Logs">
+                            <i class="ri-terminal-box-line" aria-hidden="true"></i><span data-i18n="nav.maintenance.logs">Logs</span>
                         </a>
-                        <a class="maintenance-tab" data-mt-page="maintenance-logs" href="#/maintenance/logs" role="tab" data-i18n-title="nav.maintenance.logs" title="Logs">
-                            <i class="ri-terminal-box-line"></i><span data-i18n="nav.maintenance.logs">Logs</span>
+                        <a class="maintenance-tab" data-mt-page="maintenance-updates" data-tool-group="system" href="#/settings/tools/system/updates" role="tab" data-i18n-title="nav.maintenance.updates" title="Updates">
+                            <i class="ri-download-cloud-2-line" aria-hidden="true"></i><span data-i18n="nav.maintenance.updates">Updates</span>
                         </a>
-                        <a class="maintenance-tab" data-mt-page="maintenance-updates" href="#/maintenance/updates" role="tab" data-i18n-title="nav.maintenance.updates" title="Updates">
-                            <i class="ri-download-cloud-2-line"></i><span data-i18n="nav.maintenance.updates">Updates</span>
+                        <a class="maintenance-tab" data-mt-page="maintenance-recovery" data-tool-group="system" href="#/settings/tools/system/recovery" role="tab" data-i18n-title="nav.maintenance.recovery" title="Recovery">
+                            <i class="ri-first-aid-kit-line" aria-hidden="true"></i><span data-i18n="nav.maintenance.recovery">Recovery</span>
                         </a>
                     </div>
                 </nav>
@@ -853,6 +620,21 @@
                      hidden class, so the browser painted it before the
                      router could swap. -->
                 <div id="page-viewer" class="hidden">
+                    <!-- First-visit tip on touch screens (app.js
+                         _maybeShowSelectHint): long-press is how you select
+                         several files. Remembered in localStorage once
+                         dismissed or once select mode has been used. -->
+                    <div id="select-hint" class="select-hint hidden" role="note">
+                        <span class="select-hint-icon" aria-hidden="true"><i class="ri-checkbox-multiple-line"></i></span>
+                        <div class="select-hint-text">
+                            <strong data-i18n="viewer.select_hint.title">Select several at once</strong>
+                            <span data-i18n="viewer.select_hint.body">Press and hold a photo, then tap more to download, pin or delete them together.</span>
+                        </div>
+                        <div class="select-hint-actions">
+                            <button id="select-hint-try" type="button" class="select-hint-btn is-primary" data-i18n="viewer.select_hint.try">Try it</button>
+                            <button id="select-hint-dismiss" type="button" class="select-hint-btn" data-i18n="viewer.select_hint.dismiss">Got it</button>
+                        </div>
+                    </div>
                     <div id="media-grid" class="media-grid"></div>
                     <!-- Drag-to-select rubber-band rectangle. Single shared
                          element managed by gallery-select.js — kept outside
@@ -884,63 +666,95 @@
                 <!-- Groups Config Page -->
                 <div id="page-groups" class="hidden max-w-5xl mx-auto px-3 sm:px-4">
                     <!-- Tabs -->
-                    <div class="flex border-b border-tg-border mb-4">
+                    <div class="groups-tabs flex border-b border-tg-border mb-4 overflow-x-auto">
                         <button id="groups-tab-all" onclick="switchGroupsTab('all')"
-                            class="px-4 py-2 text-sm font-medium border-b-2 border-tg-blue text-tg-blue" data-i18n="groups.tab.all">
+                            class="px-3 sm:px-4 py-2 text-sm font-medium border-b-2 border-tg-blue text-tg-blue whitespace-nowrap shrink-0" data-i18n="groups.tab.all">
                             All Dialogs
                         </button>
                         <button id="groups-tab-monitored" onclick="switchGroupsTab('monitored')"
-                            class="px-4 py-2 text-sm font-medium border-b-2 border-transparent text-tg-textSecondary hover:text-white transition-colors" data-i18n="groups.tab.monitored">
+                            class="px-3 sm:px-4 py-2 text-sm font-medium border-b-2 border-transparent text-tg-textSecondary hover:text-white transition-colors whitespace-nowrap shrink-0" data-i18n="groups.tab.monitored">
                             Monitored Only
                         </button>
                         <button id="groups-tab-unmonitored" onclick="switchGroupsTab('unmonitored')"
-                            class="px-4 py-2 text-sm font-medium border-b-2 border-transparent text-tg-textSecondary hover:text-white transition-colors" data-i18n="groups.tab.unmonitored">
+                            class="px-3 sm:px-4 py-2 text-sm font-medium border-b-2 border-transparent text-tg-textSecondary hover:text-white transition-colors whitespace-nowrap shrink-0" data-i18n="groups.tab.unmonitored">
                             Unmonitored
+                        </button>
+                        <!-- Chats no account can read (js/chat-access.js). -->
+                        <button id="groups-tab-attention" onclick="switchGroupsTab('attention')"
+                            class="px-3 sm:px-4 py-2 text-sm font-medium border-b-2 border-transparent text-tg-textSecondary hover:text-white transition-colors whitespace-nowrap shrink-0">
+                            <span data-i18n="groups.tab.attention">Needs attention</span><span id="groups-attn-count" class="groups-tab-count hidden"></span>
                         </button>
                     </div>
                     <!-- Search Box -->
-                    <div id="groups-search-box" class="mb-4">
-                        <div class="relative">
+                    <div id="groups-search-box" class="mb-4 flex items-center gap-2">
+                        <div class="relative flex-1 min-w-0">
                             <i
                                 class="ri-search-line absolute left-3 top-1/2 transform -translate-y-1/2 text-tg-textSecondary"></i>
                             <input type="text" name="prevent_autofill_2" autocomplete="username"
                                 tabindex="-1" aria-hidden="true"
                                 style="position:absolute;width:0;height:0;overflow:hidden;opacity:0;pointer-events:none">
-                            <input type="search" id="groups-search" name="filter" role="searchbox"
-                                autocomplete="nope" spellcheck="false"
+                            <!-- biome-ignore lint/a11y/useValidAutocomplete: deliberate autofill defence, see #sidebar-groups-search -->
+                            <input type="search" id="groups-search" name="filter" autocomplete="nope"
+                                spellcheck="false"
                                 data-form-type="other"
                                 data-lpignore="true" data-1p-ignore="true" data-bwignore="true"
                                 class="w-full bg-tg-panel border border-tg-border rounded-lg pl-10 pr-4 py-2 text-tg-text focus:ring-1 focus:ring-tg-blue focus:border-tg-blue outline-none"
                                 data-i18n-placeholder="groups.search_placeholder"
-                                placeholder="Search groups/channels..." oninput="filterDialogs(this.value)">
+                                placeholder="Search chats and channels…" oninput="filterDialogs(this.value)">
                         </div>
+                        <!-- Add sheet (js/add-sheet.js); phones use the + button. -->
+                        <button type="button" id="groups-add-btn" class="tg-btn groups-add-btn" data-admin-only>
+                            <i class="ri-add-line" aria-hidden="true"></i><span data-i18n="add.button">Add chat or link</span>
+                        </button>
                     </div>
+                    <div id="groups-attn-panel" class="hidden"></div>
                     <div id="groups-config-list" class="space-y-3"></div>
                 </div>
 
                 <!-- Settings Page -->
                 <div id="page-settings" class="hidden max-w-5xl mx-auto px-3 sm:px-4">
 
-                    <!-- Sticky chip-nav. Drives smooth-scroll to the five
-                         anchored sections below (System / Accounts /
-                         Downloads / Look & Feel / Privacy & Net). Click
-                         updates the hash; an IntersectionObserver at the
-                         bottom of the page mirrors active section back
-                         to the chip via [aria-selected]. -->
-                    <nav class="settings-chip-nav" role="tablist" aria-label="Settings sections">
-                        <!-- Trimmed in v2.9: 10 chips → 5. Engine card +
-                             Maintenance card moved to a header Session menu /
-                             the /maintenance hub respectively; Quick Presets
-                             retired; Advanced collapsed behind a footer
-                             <details>. The chip-nav now mirrors only the
-                             top-level configuration sections. -->
-                        <button type="button" role="tab" data-admin-only class="settings-chip" data-chip="card-tg-api" aria-selected="true">
-                            <i class="ri-key-2-line" aria-hidden="true"></i>
-                            <span data-i18n="settings.tg_api">Telegram API</span>
+                    <!-- Sticky top bar: settings search (js/settings-search.js) +
+                         the section chips — a side table of contents on wide
+                         screens. A chip click goes to #/settings/<section>; the
+                         chip of the section on screen lights up (js/nav.js).
+                         While a query is typed the chips hide, non-matching
+                         cards hide, matching labels are highlighted and tools
+                         on other pages are listed. -->
+                    <div class="settings-top-bar">
+                    <div class="settings-search" role="search">
+                        <i class="ri-search-line settings-search-icon" aria-hidden="true"></i>
+                        <!-- biome-ignore lint/a11y/useValidAutocomplete: deliberate autofill defence, see #sidebar-groups-search -->
+                        <input type="search" id="settings-search-input" name="settings-q" autocomplete="nope"
+                            autocapitalize="off" spellcheck="false" enterkeyhint="search"
+                            data-form-type="other" data-lpignore="true" data-1p-ignore="true" data-bwignore="true"
+                            data-i18n-placeholder="settings.search.placeholder" placeholder="Search settings"
+                            data-i18n-aria-label="settings.search.label" aria-label="Search settings by name"
+                            aria-describedby="settings-search-status">
+                        <button type="button" id="settings-search-clear" class="settings-search-clear hidden"
+                            data-i18n-aria-label="settings.search.clear" aria-label="Clear search"
+                            data-i18n-title="settings.search.clear" title="Clear search">
+                            <i class="ri-close-circle-fill" aria-hidden="true"></i>
+                        </button>
+                    </div>
+                    <!-- Section chips (phones) / side table of contents (desktop,
+                         ≥1024 px — css .settings-top-bar). Order follows the page. -->
+                    <nav class="settings-chip-nav" role="tablist" aria-label="Settings sections" data-i18n-aria-label="settings.sections">
+                        <button type="button" role="tab" data-admin-only class="settings-chip" data-chip="card-engine" aria-selected="true">
+                            <i class="ri-pulse-line" aria-hidden="true"></i>
+                            <span data-i18n="settings.chip.monitor">Monitor</span>
+                        </button>
+                        <button type="button" role="tab" data-admin-only class="settings-chip" data-chip="tools" aria-selected="false">
+                            <i class="ri-tools-line" aria-hidden="true"></i>
+                            <span data-i18n="tools.title">Tools</span>
                         </button>
                         <button type="button" role="tab" data-admin-only class="settings-chip" data-chip="card-accounts" aria-selected="false">
                             <i class="ri-user-line" aria-hidden="true"></i>
                             <span data-i18n="settings.accounts">Accounts</span>
+                        </button>
+                        <button type="button" role="tab" data-admin-only class="settings-chip" data-chip="card-tg-api" aria-selected="false">
+                            <i class="ri-key-2-line" aria-hidden="true"></i>
+                            <span data-i18n="settings.tg_api">Telegram API</span>
                         </button>
                         <button type="button" role="tab" data-admin-only class="settings-chip" data-chip="card-federation" aria-selected="false">
                             <i class="ri-broadcast-line" aria-hidden="true"></i>
@@ -959,6 +773,9 @@
                             <span data-i18n="settings.security">Security</span>
                         </button>
                     </nav>
+                    </div>
+                    <p id="settings-search-status" class="settings-search-status hidden" role="status" aria-live="polite"></p>
+                    <div id="settings-search-elsewhere" class="settings-search-elsewhere hidden"></div>
 
                     <!-- PWA install affordance — hidden until the browser
                          fires `beforeinstallprompt` (handled in js/pwa.js).
@@ -982,7 +799,7 @@
                          The animated dot + state pill mirror the topbar
                          indicator so at-a-glance status is consistent
                          everywhere. -->
-                    <section id="settings-card-engine" class="engine-card bg-tg-panel rounded-xl p-4 mb-6">
+                    <section id="settings-card-engine" data-settings-section="card-engine" class="engine-card bg-tg-panel rounded-xl p-4 mb-6">
                         <header class="engine-header">
                             <div class="engine-title-group">
                                 <span id="engine-state-dot" class="engine-state-dot" data-state="stopped" aria-hidden="true"></span>
@@ -1042,20 +859,23 @@
                         <p id="engine-error" class="engine-error hidden"></p>
                     </section>
 
-                    <!-- Discovery pointer to the Maintenance hub. Replaces
-                         the 14-button card retired in v2.9 — keeps the
-                         affordance discoverable from Settings without
-                         duplicating every action button across two pages. -->
-                    <a href="#/maintenance" class="block bg-tg-panel hover:bg-tg-hover transition-colors rounded-xl p-4 mb-6 flex items-start gap-3 group" data-admin-only>
-                        <div class="w-10 h-10 rounded-xl bg-tg-blue/15 text-tg-blue flex items-center justify-center text-xl shrink-0">
-                            <i class="ri-tools-line"></i>
+                    <!-- Tools — what used to be the Maintenance hub. What needs
+                         attention first, then the four groups; each group page
+                         has a card per tool (js/tools-hub.js). #/settings/tools
+                         and the old #/maintenance land here. -->
+                    <div id="settings-tools" data-settings-section="tools" class="settings-tools-card bg-tg-panel rounded-xl p-4 mb-6" data-admin-only>
+                        <div class="flex items-start gap-3 mb-3">
+                            <div class="w-10 h-10 rounded-xl bg-tg-blue/15 text-tg-blue flex items-center justify-center text-xl shrink-0" aria-hidden="true">
+                                <i class="ri-tools-line"></i>
+                            </div>
+                            <div class="flex-1 min-w-0">
+                                <h3 class="text-tg-text text-base font-semibold" data-i18n="tools.title">Tools</h3>
+                                <p class="text-xs text-tg-textSecondary leading-relaxed" data-i18n="tools.subtitle">Maintenance jobs, backups and diagnostics.</p>
+                            </div>
                         </div>
-                        <div class="flex-1 min-w-0">
-                            <h3 class="text-tg-text text-sm font-semibold mb-1" data-i18n="settings.maintenance_link.title">Maintenance &amp; admin tools</h3>
-                            <p class="text-xs text-tg-textSecondary leading-relaxed" data-i18n="settings.maintenance_link.body">Dedup, thumbnails, NSFW review, logs, updates, DB integrity, share links — every operational tool moved to the Maintenance hub.</p>
-                        </div>
-                        <i class="ri-arrow-right-s-line text-tg-textSecondary self-center group-hover:translate-x-0.5 transition-transform" aria-hidden="true"></i>
-                    </a>
+                        <div id="tools-attention" class="tools-attention" aria-live="polite"></div>
+                        <div id="tools-groups" class="tools-groups"></div>
+                    </div>
 
                     <!-- Advanced (runtime tunables) — collapsed by default in v2.9.
                          Power-user settings — every value here was a hardcoded
@@ -1098,11 +918,6 @@
                                         <label for="setting-adv-idle-sleep-ms" class="text-tg-text text-xs block mb-1" data-i18n="settings.advanced.idle_sleep">Idle sleep (ms)</label>
                                         <input id="setting-adv-idle-sleep-ms" type="number" min="50" max="10000" class="tg-input w-full text-sm" placeholder="200">
                                         <p class="text-[10px] text-tg-textSecondary mt-1" data-i18n="settings.advanced.idle_sleep_help">Worker pause when no job is queued. Lower = snappier.</p>
-                                    </div>
-                                    <div class="sm:col-span-2">
-                                        <label for="setting-adv-spillover" class="text-tg-text text-xs block mb-1" data-i18n="settings.advanced.spillover">History spillover threshold</label>
-                                        <input id="setting-adv-spillover" type="number" min="100" max="100000" class="tg-input w-full text-sm" placeholder="2000">
-                                        <p class="text-[10px] text-tg-textSecondary mt-1" data-i18n="settings.advanced.spillover_help">When the history queue exceeds this size, new jobs spill to disk to bound RAM. Realtime never spills.</p>
                                     </div>
                                 </div>
                             </div>
@@ -1216,7 +1031,7 @@
                     <div id="settings-card-accounts" data-settings-section="card-accounts" class="bg-tg-panel rounded-xl p-4 mb-4 scroll-mt-24" data-admin-only>
                         <h3 class="text-tg-text font-medium mb-4 flex items-center gap-2">
                             <i class="ri-user-line text-tg-blue"></i> <span data-i18n="settings.accounts">Telegram Accounts</span>
-                            <a href="/add-account.html" class="ml-auto tg-btn-secondary text-xs px-3 py-1 inline-flex items-center gap-1">
+                            <a href="#/account/add" class="ml-auto tg-btn-secondary text-xs px-3 py-1 inline-flex items-center gap-1">
                                 <i class="ri-add-line"></i> <span data-i18n="settings.accounts.add">Add account</span>
                             </a>
                         </h3>
@@ -1660,7 +1475,7 @@
                         <label class="flex items-start justify-between gap-4 p-3 rounded-lg cursor-pointer hover:bg-tg-hover transition-colors">
                             <div class="min-w-0 flex-1">
                                 <div class="text-tg-text text-sm font-medium" data-i18n="settings.privacy.allow_dm">Allow DM downloads</div>
-                                <p class="text-xs text-tg-textSecondary mt-1 leading-snug" data-i18n="settings.privacy.allow_dm_help">Lets the Groups picker show 1-on-1 chats. Off by default — once enabled you'll see DMs in the dialog list and can opt them in individually.</p>
+                                <p class="text-xs text-tg-textSecondary mt-1 leading-snug" data-i18n="settings.privacy.allow_dm_help">Lets the Chats page show 1-on-1 chats. Off by default — once enabled you'll see DMs in the dialog list and can opt them in individually.</p>
                             </div>
                             <div id="setting-allow-dm" class="tg-toggle shrink-0 mt-0.5"></div>
                         </label>
@@ -1796,7 +1611,7 @@
                     </div>
 
                     <!-- Danger Zone -->
-                    <div class="mt-6 bg-red-500/5 border border-red-500/20 rounded-xl p-4" data-admin-only>
+                    <div class="mt-6 bg-red-500/5 border border-red-500/20 rounded-xl p-4" data-admin-only data-settings-search-card>
                         <h3 class="text-red-400 font-medium mb-2 flex items-center gap-2">
                             <i class="ri-error-warning-line"></i> <span data-i18n="settings.danger.title">Danger Zone</span>
                         </h3>
@@ -1808,49 +1623,6 @@
                         </button>
                     </div>
 
-                    <script type="module">
-                        // Settings chip-nav: smooth-scroll on click, IntersectionObserver-driven
-                        // active state on scroll. Self-contained; no external dependency. Runs
-                        // once because #page-settings is mounted statically in index.html.
-                        (function () {
-                            const nav = document.querySelector('.settings-chip-nav');
-                            if (!nav) return;
-                            const chips = Array.from(nav.querySelectorAll('.settings-chip'));
-                            const sections = chips.map(c => document.getElementById('settings-' + c.dataset.chip)).filter(Boolean);
-                            if (!sections.length) return;
-
-                            // Click → update hash; router.js + app.js handle the smooth scroll.
-                            chips.forEach(c => c.addEventListener('click', (e) => {
-                                e.preventDefault();
-                                window.location.hash = '#/settings/' + c.dataset.chip;
-                            }));
-
-                            // Scroll → mark the chip whose section is most visible.
-                            const setActive = (anchor) => {
-                                chips.forEach(c => c.setAttribute('aria-selected', c.dataset.chip === anchor ? 'true' : 'false'));
-                                // Keep the active chip in view inside the horizontally-scrolling nav.
-                                const active = chips.find(c => c.dataset.chip === anchor);
-                                if (active && nav.scrollWidth > nav.clientWidth) {
-                                    const navRect = nav.getBoundingClientRect();
-                                    const chipRect = active.getBoundingClientRect();
-                                    if (chipRect.left < navRect.left + 16) nav.scrollBy({ left: chipRect.left - navRect.left - 16, behavior: 'smooth' });
-                                    else if (chipRect.right > navRect.right - 16) nav.scrollBy({ left: chipRect.right - navRect.right + 16, behavior: 'smooth' });
-                                }
-                            };
-
-                            const io = new IntersectionObserver((entries) => {
-                                // Pick the entry with the largest intersection ratio that's
-                                // currently intersecting. Ignores leave events.
-                                let best = null;
-                                for (const e of entries) {
-                                    if (!e.isIntersecting) continue;
-                                    if (!best || e.intersectionRatio > best.intersectionRatio) best = e;
-                                }
-                                if (best) setActive(best.target.getAttribute('data-settings-section'));
-                            }, { rootMargin: '-80px 0px -55% 0px', threshold: [0, 0.1, 0.5, 1] });
-                            sections.forEach(s => io.observe(s));
-                        })();
-                    </script>
                 </div>
 
                 <!-- Backfill Page (top-level surface for the History
@@ -1941,50 +1713,86 @@
                      visible rows + a small over-scroll buffer (see
                      js/queue.js for the math). -->
                 <div id="page-queue" class="hidden max-w-5xl mx-auto px-3 sm:px-4">
-                    <!-- Top toolbar — chips, sort, search, global actions -->
+                    <!-- Top toolbar — status chips (one scrollable row; the default
+                         "Active" view shows downloading + queued + paused), then
+                         search, sort and the ⋮ menu (speed limit, and the global
+                         actions below 1280 px — js/queue.js moves them). -->
                     <section class="bg-tg-panel rounded-xl p-3 mb-3">
-                        <div id="queue-chips" class="flex flex-wrap gap-1.5 mb-3"></div>
-                        <div class="flex flex-wrap items-center gap-2">
-                            <div class="relative flex-1 min-w-[180px]">
-                                <i class="ri-search-line absolute left-3 top-1/2 -translate-y-1/2 text-tg-textSecondary"></i>
-                                <input id="queue-search" type="text" autocomplete="off"
-                                    class="tg-input w-full pl-9 text-sm"
+                        <div id="queue-chips" class="queue-chip-row" role="toolbar" data-i18n-aria-label="queue.chips_label" aria-label="Show downloads"></div>
+                        <div class="flex items-center gap-2 mt-3">
+                            <div class="relative flex-1 min-w-0">
+                                <i class="ri-search-line absolute left-3 top-1/2 -translate-y-1/2 text-tg-textSecondary" aria-hidden="true"></i>
+                                <input id="queue-search" type="search" autocomplete="off"
+                                    class="tg-input w-full pl-9 text-sm queue-search-input"
                                     data-i18n-placeholder="queue.search_placeholder"
-                                    placeholder="Search filename or group…">
+                                    placeholder="Search filename or group…"
+                                    data-i18n-aria-label="queue.search_placeholder" aria-label="Search filename or group…">
                             </div>
-                            <select id="queue-sort" class="tg-input text-sm">
+                            <div id="queue-sort-inline" class="shrink-0">
+                            <select id="queue-sort" class="tg-input text-sm w-auto queue-sort-select"
+                                data-i18n-aria-label="queue.sort.label" aria-label="Sort by">
                                 <option value="addedAt" data-i18n="queue.sort.added">Added time</option>
                                 <option value="size" data-i18n="queue.sort.size">Size</option>
                                 <option value="progress" data-i18n="queue.sort.progress">Progress</option>
                                 <option value="group" data-i18n="queue.sort.group">Group</option>
                                 <option value="filename" data-i18n="queue.sort.filename">Filename</option>
                             </select>
-                            <div class="flex items-center gap-1.5 ml-auto">
-                                <button id="queue-pause-all" type="button"
-                                    class="px-3 py-1.5 text-xs rounded-lg bg-tg-bg/60 hover:bg-tg-hover text-tg-text flex items-center gap-1.5"
-                                    data-i18n-title="queue.action.pause_all" title="Pause all">
-                                    <i class="ri-pause-line"></i><span class="hidden sm:inline" data-i18n="queue.action.pause_all">Pause all</span>
+                            </div>
+                            <div id="queue-actions-inline" class="shrink-0">
+                                <div id="queue-global-actions" class="queue-global-actions">
+                                    <button id="queue-pause-all" type="button"
+                                        class="px-3 py-1.5 text-xs rounded-lg bg-tg-bg/60 hover:bg-tg-hover text-tg-text flex items-center gap-1.5"
+                                        data-i18n-title="queue.action.pause_all" title="Pause all">
+                                        <i class="ri-pause-line" aria-hidden="true"></i><span data-i18n="queue.action.pause_all">Pause all</span>
+                                    </button>
+                                    <button id="queue-resume-all" type="button"
+                                        class="px-3 py-1.5 text-xs rounded-lg bg-tg-bg/60 hover:bg-tg-hover text-tg-text flex items-center gap-1.5"
+                                        data-i18n-title="queue.action.resume_all" title="Resume all">
+                                        <i class="ri-play-line" aria-hidden="true"></i><span data-i18n="queue.action.resume_all">Resume all</span>
+                                    </button>
+                                    <button id="queue-retry-all" type="button"
+                                        class="px-3 py-1.5 text-xs rounded-lg bg-tg-bg/60 hover:bg-tg-hover text-tg-text flex items-center gap-1.5 disabled:opacity-40 disabled:cursor-not-allowed"
+                                        data-i18n-title="queue.action.retry_all" title="Retry all failed" disabled>
+                                        <i class="ri-refresh-line" aria-hidden="true"></i><span data-i18n="queue.action.retry_all">Retry all</span>
+                                    </button>
+                                    <button id="queue-clear-finished" type="button"
+                                        class="px-3 py-1.5 text-xs rounded-lg bg-tg-bg/60 hover:bg-tg-hover text-tg-text flex items-center gap-1.5"
+                                        data-i18n-title="queue.action.clear_finished" title="Clear finished">
+                                        <i class="ri-check-double-line" aria-hidden="true"></i><span data-i18n="queue.action.clear_finished">Clear finished</span>
+                                    </button>
+                                    <button id="queue-cancel-all" type="button"
+                                        class="px-3 py-1.5 text-xs rounded-lg bg-red-500/15 hover:bg-red-500/25 text-red-400 flex items-center gap-1.5"
+                                        data-i18n-title="queue.action.cancel_all" title="Cancel all queued">
+                                        <i class="ri-close-circle-line" aria-hidden="true"></i><span data-i18n="queue.action.cancel_all">Cancel queued</span>
+                                    </button>
+                                </div>
+                            </div>
+                            <div class="relative shrink-0">
+                                <button id="queue-more-btn" type="button"
+                                    class="w-11 h-11 rounded-lg bg-tg-bg/60 hover:bg-tg-hover flex items-center justify-center"
+                                    aria-haspopup="menu" aria-expanded="false" aria-controls="queue-more-menu"
+                                    data-i18n-aria-label="queue.more" aria-label="More queue actions"
+                                    data-i18n-title="queue.more" title="More queue actions">
+                                    <i class="ri-more-2-fill text-lg text-tg-textSecondary" aria-hidden="true"></i>
                                 </button>
-                                <button id="queue-resume-all" type="button"
-                                    class="px-3 py-1.5 text-xs rounded-lg bg-tg-bg/60 hover:bg-tg-hover text-tg-text flex items-center gap-1.5"
-                                    data-i18n-title="queue.action.resume_all" title="Resume all">
-                                    <i class="ri-play-line"></i><span class="hidden sm:inline" data-i18n="queue.action.resume_all">Resume all</span>
-                                </button>
-                                <button id="queue-retry-all" type="button"
-                                    class="px-3 py-1.5 text-xs rounded-lg bg-tg-bg/60 hover:bg-tg-hover text-tg-text flex items-center gap-1.5 disabled:opacity-40 disabled:cursor-not-allowed"
-                                    data-i18n-title="queue.action.retry_all" title="Retry all failed" disabled>
-                                    <i class="ri-refresh-line"></i><span class="hidden sm:inline" data-i18n="queue.action.retry_all">Retry all</span>
-                                </button>
-                                <button id="queue-clear-finished" type="button"
-                                    class="px-3 py-1.5 text-xs rounded-lg bg-tg-bg/60 hover:bg-tg-hover text-tg-text flex items-center gap-1.5"
-                                    data-i18n-title="queue.action.clear_finished" title="Clear finished">
-                                    <i class="ri-check-double-line"></i><span class="hidden sm:inline" data-i18n="queue.action.clear_finished">Clear finished</span>
-                                </button>
-                                <button id="queue-cancel-all" type="button"
-                                    class="px-3 py-1.5 text-xs rounded-lg bg-red-500/15 hover:bg-red-500/25 text-red-400 flex items-center gap-1.5"
-                                    data-i18n-title="queue.action.cancel_all" title="Cancel all queued">
-                                    <i class="ri-close-circle-line"></i><span class="hidden sm:inline" data-i18n="queue.action.cancel_all">Cancel queued</span>
-                                </button>
+                                <div id="queue-more-menu" class="view-mode-menu queue-more-menu" role="menu" aria-labelledby="queue-more-btn">
+                                    <div data-menu-slot class="queue-menu-sort">
+                                        <label for="queue-sort" class="text-xs text-tg-textSecondary flex items-center gap-1.5 mb-1">
+                                            <i class="ri-sort-desc" aria-hidden="true"></i><span data-i18n="queue.sort.label">Sort by</span>
+                                        </label>
+                                        <div id="queue-sort-menu-slot"></div>
+                                    </div>
+                                    <div data-menu-slot><div id="queue-actions-menu-slot"></div></div>
+                                    <div class="queue-throttle" role="group" aria-labelledby="queue-throttle-label">
+                                        <div class="flex items-center justify-between gap-2 mb-1">
+                                            <label id="queue-throttle-label" for="queue-throttle" class="text-xs text-tg-textSecondary flex items-center gap-1.5">
+                                                <i class="ri-speed-up-line" aria-hidden="true"></i><span data-i18n="queue.throttle.label">Max speed</span>
+                                            </label>
+                                            <span id="queue-throttle-value" class="text-xs text-tg-text tabular-nums" data-i18n="queue.throttle.unlimited">Unlimited</span>
+                                        </div>
+                                        <input id="queue-throttle" type="range" min="0" max="52428800" step="262144" value="0" class="w-full accent-tg-blue">
+                                    </div>
+                                </div>
                             </div>
                         </div>
                     </section>
@@ -2056,192 +1864,51 @@
                              patch the matching DOM row in place (no
                              re-render) so a 1000-job queue stays smooth
                              even with dozens of concurrent downloads. -->
-                        <div id="queue-viewport" class="overflow-y-auto" style="height: calc(100vh - 280px); min-height: 320px;">
+                        <div id="queue-viewport" class="overflow-y-auto" style="height: calc(100vh - 280px); height: calc(100dvh - 280px); min-height: 320px;">
                             <div id="queue-rows" class="divide-y divide-tg-border/30"></div>
                             <div id="queue-load-more" class="flex items-center justify-center py-3 text-xs text-tg-textSecondary hidden">
                                 <i class="ri-loader-4-line animate-spin mr-2"></i>
                                 <span data-i18n="queue.loading_more">Loading more…</span>
                             </div>
-                            <div id="queue-empty" class="hidden text-center py-12">
-                                <i class="ri-download-cloud-2-line text-4xl text-tg-textSecondary mb-2"></i>
-                                <p class="text-sm text-tg-textSecondary" data-i18n="queue.empty.title">Queue is empty</p>
-                                <p class="text-xs text-tg-textSecondary opacity-70 mt-1" data-i18n="queue.empty.body">Start the engine or kick off a backfill — every download flows through here.</p>
+                            <div id="queue-empty" class="hidden text-center py-12 px-4">
+                                <i class="ri-download-cloud-2-line text-4xl text-tg-textSecondary mb-2" aria-hidden="true"></i>
+                                <p id="queue-empty-title" class="text-sm text-tg-text font-medium">Queue is empty</p>
+                                <p id="queue-empty-body" class="text-xs text-tg-textSecondary mt-1 max-w-sm mx-auto">Start the engine or kick off a backfill — every download flows through here.</p>
+                                <button id="queue-empty-show-all" type="button" class="hidden tg-btn-secondary text-sm px-4 min-h-[44px] mt-4 inline-flex items-center gap-2">
+                                    <i class="ri-list-check-2" aria-hidden="true"></i><span data-i18n="queue.empty.show_all">Show all downloads</span>
+                                </button>
                             </div>
                         </div>
                     </section>
 
-                    <!-- Bottom strip: aggregate counters + speed throttle -->
+                    <!-- Bottom strip: aggregate counters. The speed limit moved
+                         into the ⋮ menu of the toolbar (same #queue-throttle). -->
                     <section class="bg-tg-panel rounded-xl p-3 mt-3 flex flex-wrap items-center gap-3">
                         <div id="queue-aggregate" class="text-xs text-tg-textSecondary tabular-nums flex items-center gap-3 flex-wrap"></div>
-                        <div class="flex items-center gap-2 ml-auto">
-                            <label for="queue-throttle" class="text-xs text-tg-textSecondary" data-i18n="queue.throttle.label">Max speed</label>
-                            <input id="queue-throttle" type="range" min="0" max="52428800" step="262144" value="0" class="w-32 accent-tg-blue">
-                            <span id="queue-throttle-value" class="text-xs text-tg-text tabular-nums w-20 text-right" data-i18n="queue.throttle.unlimited">Unlimited</span>
-                        </div>
                     </section>
                 </div>
 
-                <!-- Maintenance hub page (admin-only) — single landing
-                     surface that lists every tool as a card. Lives at
-                     `/maintenance`. Replaces the previous "5 sidebar
-                     entries" approach so the sidebar stays clean on
-                     both mobile + desktop. -->
-                <div id="page-maintenance" class="hidden max-w-5xl mx-auto px-3 sm:px-4" data-admin-only
-                     data-page-title-key="maintenance.hub.title"
-                     data-page-subtitle-key="maintenance.hub.subtitle">
-                    <section class="bg-tg-panel rounded-xl p-4 mb-4">
-                        <div class="flex items-start justify-between gap-3 flex-wrap">
-                            <div class="min-w-0">
-                                <h2 class="text-tg-text text-base font-semibold flex items-center gap-2">
-                                    <i class="ri-tools-line text-tg-blue"></i>
-                                    <span data-i18n="maintenance.hub.title">Maintenance</span>
-                                </h2>
-                                <p class="text-xs text-tg-textSecondary mt-0.5" data-i18n="maintenance.hub.subtitle">Catalogue, thumbnails, NSFW review, logs, backup destinations — and AI search when enabled.</p>
-                            </div>
+                <!-- Tools group page (admin-only) — #/settings/tools/<group>.
+                     One card per tool with its status, a run / stop button and
+                     Open (js/tools-hub.js). Keeps the old Maintenance hub ids. -->
+                <div id="page-maintenance" class="hidden max-w-5xl mx-auto px-3 sm:px-4" data-admin-only>
+                    <nav class="tools-crumbs" data-i18n-aria-label="tools.breadcrumb" aria-label="Breadcrumb">
+                        <a href="#/settings" data-i18n="nav.settings">Settings</a>
+                        <i class="ri-arrow-right-s-line" aria-hidden="true"></i>
+                        <a href="#/settings/tools" data-i18n="tools.title">Tools</a>
+                    </nav>
+                    <section class="tools-group-head">
+                        <div class="w-11 h-11 rounded-xl bg-tg-blue/15 text-tg-blue flex items-center justify-center text-2xl shrink-0" aria-hidden="true">
+                            <i id="tools-group-icon" class="ri-tools-line"></i>
+                        </div>
+                        <div class="min-w-0">
+                            <h2 id="tools-group-title" class="text-tg-text text-lg font-semibold" data-i18n="tools.title">Tools</h2>
+                            <p id="tools-group-desc" class="text-xs text-tg-textSecondary mt-0.5"></p>
                         </div>
                     </section>
-                    <div id="hub-grid" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3"></div>
+                    <div id="hub-grid" class="tools-grid" role="region" aria-label="Tools"></div>
                 </div>
 
-                <!-- Maintenance / Duplicates page (admin-only) -->
-                <div id="page-maintenance-duplicates" class="hidden max-w-5xl mx-auto px-3 sm:px-4" data-admin-only
-                     data-page-title-key="maintenance.duplicates.title"
-                     data-page-subtitle-key="maintenance.duplicates.subtitle">
-                    <section class="bg-tg-panel rounded-xl p-4 mb-3">
-                        <div class="flex items-start justify-between gap-3 flex-wrap">
-                            <div class="min-w-0">
-                                <h2 class="text-tg-text text-base font-semibold" data-i18n="maintenance.duplicates.title">Find duplicate files</h2>
-                                <p class="text-xs text-tg-textSecondary mt-0.5" data-i18n="maintenance.duplicates.subtitle">Hash every file and reclaim space from byte-identical copies. The first run is slow on large libraries; subsequent runs only hash newly-downloaded files.</p>
-                            </div>
-                            <div class="flex items-center gap-2 shrink-0 flex-wrap justify-end">
-                                <button id="dup-verify-btn" class="tg-btn-secondary text-xs px-3 py-1.5 inline-flex items-center gap-1.5"
-                                        data-i18n-title="maintenance.duplicates.verify.tooltip"
-                                        title="Walk every catalogue row and drop entries whose file is missing on disk.">
-                                    <i class="ri-shield-check-line"></i><span data-i18n="maintenance.duplicates.verify.button">Verify files</span>
-                                </button>
-                                <button id="dup-reindex-btn" class="tg-btn-secondary text-xs px-3 py-1.5 inline-flex items-center gap-1.5"
-                                        data-i18n-title="maintenance.duplicates.reindex.tooltip"
-                                        title="Walk data/downloads/ and add catalogue rows for files that aren't tracked yet.">
-                                    <i class="ri-refresh-line"></i><span data-i18n="maintenance.reindex.button">Re-index from disk</span>
-                                </button>
-                                <button id="dup-stop-btn" class="hidden tg-btn-secondary text-xs px-3 py-1.5 inline-flex items-center gap-1.5 text-red-400 border-red-400/40 hover:bg-red-400/10"
-                                        data-i18n-title="maintenance.duplicates.stop_scan.tooltip"
-                                        title="Stop the running scan. Progress is saved — you can resume later.">
-                                    <i class="ri-stop-circle-line"></i><span data-i18n="maintenance.duplicates.stop_scan">Stop</span>
-                                </button>
-                                <button id="dup-scan-btn" class="tg-btn text-xs px-3 py-1.5 inline-flex items-center gap-1.5"
-                                        data-i18n-title="maintenance.duplicates.scan.tooltip"
-                                        title="Hash every catalogued file and group byte-identical copies.">
-                                    <i class="ri-search-line"></i><span data-i18n="maintenance.duplicates.scan">Scan</span>
-                                </button>
-                            </div>
-                        </div>
-
-                        <!-- Library status — hash coverage + last scan summary.
-                             Surfaces "what does this page even do" before
-                             the user clicks any button, so a fresh visit
-                             can see at a glance: total files, % hashed,
-                             how many bytes the next Scan needs to read,
-                             and what the previous scan found. Survives
-                             server restart via kv['dedup_last_scan']. -->
-                        <div id="dup-stats" class="mt-3 grid grid-cols-2 sm:grid-cols-4 gap-2 text-center">
-                            <div class="bg-tg-bg/40 rounded-lg p-3">
-                                <div class="text-[10px] uppercase tracking-wide text-tg-textSecondary" data-i18n="maintenance.duplicates.stats.total">Total files</div>
-                                <div id="dup-stat-total" class="text-xl font-semibold text-tg-text tabular-nums">—</div>
-                            </div>
-                            <div class="bg-tg-bg/40 rounded-lg p-3">
-                                <div class="text-[10px] uppercase tracking-wide text-tg-textSecondary" data-i18n="maintenance.duplicates.stats.hashed">Hashed</div>
-                                <div id="dup-stat-hashed" class="text-xl font-semibold text-tg-text tabular-nums">—</div>
-                            </div>
-                            <div class="bg-tg-bg/40 rounded-lg p-3">
-                                <div class="text-[10px] uppercase tracking-wide text-tg-textSecondary" data-i18n="maintenance.duplicates.stats.missing">Awaiting hash</div>
-                                <div id="dup-stat-missing" class="text-xl font-semibold text-tg-orange tabular-nums">—</div>
-                            </div>
-                            <div class="bg-tg-bg/40 rounded-lg p-3">
-                                <div class="text-[10px] uppercase tracking-wide text-tg-textSecondary" data-i18n="maintenance.duplicates.stats.last_scan">Last scan</div>
-                                <div id="dup-stat-last" class="text-xs text-tg-text tabular-nums leading-tight pt-1">—</div>
-                            </div>
-                        </div>
-                        <div id="dup-stat-summary" class="hidden mt-2 text-xs text-tg-textSecondary text-center"></div>
-
-                        <div id="dup-reindex-progress" class="hidden mt-3">
-                            <div class="text-xs text-tg-textSecondary mb-1.5 flex items-center gap-1.5">
-                                <i class="ri-loader-4-line animate-spin text-tg-orange"></i>
-                                <span data-i18n="maintenance.reindex.running">Re-indexing…</span>
-                                <span id="dup-reindex-status" class="text-tg-text"></span>
-                            </div>
-                            <div class="h-2 bg-tg-bg/60 rounded overflow-hidden">
-                                <div id="dup-reindex-progress-bar" class="h-full bg-tg-orange transition-all" style="width:0%"></div>
-                            </div>
-                        </div>
-                        <div id="dup-verify-progress" class="hidden mt-3">
-                            <div class="text-xs text-tg-textSecondary mb-1.5 flex items-center gap-1.5">
-                                <i class="ri-loader-4-line animate-spin text-tg-blue"></i>
-                                <span data-i18n="maintenance.duplicates.verify.running">Verifying files on disk…</span>
-                                <span id="dup-verify-status" class="text-tg-text"></span>
-                            </div>
-                            <div class="h-2 bg-tg-bg/60 rounded overflow-hidden">
-                                <div id="dup-verify-progress-bar" class="h-full bg-tg-blue transition-all" style="width:0%"></div>
-                            </div>
-                        </div>
-                        <div id="dup-progress" class="hidden mt-3">
-                            <div class="text-sm text-tg-text mb-1.5 flex items-center gap-1.5 font-medium">
-                                <i class="ri-loader-4-line animate-spin text-tg-blue"></i>
-                                <span id="dup-progress-stage">Scanning…</span>
-                            </div>
-                            <div class="h-2 bg-tg-bg/60 rounded overflow-hidden">
-                                <div id="dup-progress-bar" class="h-full bg-tg-blue transition-all" style="width:0%"></div>
-                            </div>
-                            <div id="dup-progress-pct" class="text-[11px] text-tg-textSecondary mt-1 tabular-nums text-right"></div>
-                        </div>
-                    </section>
-                    <section class="bg-tg-panel rounded-xl p-4">
-                        <div id="dup-totals" class="text-sm text-tg-text mb-2"></div>
-                        <!-- Bulk keep-decisions — applies the rule to every
-                             set in one click. Hidden when the list is empty. -->
-                        <div id="dup-bulk-bar" class="hidden mb-3 pb-3 border-b border-tg-border/30 space-y-2">
-                            <div class="flex items-center justify-between gap-2 flex-wrap">
-                                <span class="text-[11px] uppercase tracking-wide text-tg-textSecondary" data-i18n="maintenance.duplicates.bulk.heading">Apply to all sets</span>
-                                <div class="flex items-center gap-1.5 flex-wrap">
-                                    <button id="dup-bulk-oldest" type="button" class="tg-btn-secondary text-xs px-3 py-1.5 inline-flex items-center gap-1.5">
-                                        <i class="ri-time-line"></i><span data-i18n="maintenance.duplicates.bulk.keep_oldest">Keep oldest in every set</span>
-                                    </button>
-                                    <button id="dup-bulk-newest" type="button" class="tg-btn-secondary text-xs px-3 py-1.5 inline-flex items-center gap-1.5">
-                                        <i class="ri-flashlight-line"></i><span data-i18n="maintenance.duplicates.bulk.keep_newest">Keep newest in every set</span>
-                                    </button>
-                                    <button id="dup-bulk-clear" type="button" class="tg-btn-secondary text-xs px-3 py-1.5 inline-flex items-center gap-1.5">
-                                        <i class="ri-eraser-line"></i><span data-i18n="maintenance.duplicates.bulk.clear">Clear selection</span>
-                                    </button>
-                                </div>
-                            </div>
-                            <div class="flex items-center gap-1.5 flex-wrap">
-                                <button id="dup-delete-all-oldest" type="button" class="px-3 py-1.5 rounded-lg bg-red-500/15 text-red-400 hover:bg-red-500/25 text-xs font-medium transition inline-flex items-center gap-1.5">
-                                    <i class="ri-delete-bin-line"></i><span data-i18n="maintenance.duplicates.bulk.delete_keep_oldest">Delete all extras (keep oldest)</span>
-                                </button>
-                                <button id="dup-delete-all-newest" type="button" class="px-3 py-1.5 rounded-lg bg-red-500/15 text-red-400 hover:bg-red-500/25 text-xs font-medium transition inline-flex items-center gap-1.5">
-                                    <i class="ri-delete-bin-line"></i><span data-i18n="maintenance.duplicates.bulk.delete_keep_newest">Delete all extras (keep newest)</span>
-                                </button>
-                                <span id="dup-delete-all-progress" class="text-xs text-tg-textSecondary hidden"></span>
-                            </div>
-                            <!-- Delete progress bar -->
-                            <div id="dup-delete-progress" class="hidden">
-                                <div class="h-1.5 bg-tg-bg/60 rounded-full overflow-hidden">
-                                    <div id="dup-delete-progress-bar" class="h-full bg-red-400 rounded-full transition-all duration-300" style="width:0%"></div>
-                                </div>
-                            </div>
-                        </div>
-                        <div id="dup-empty" class="text-center py-8 text-sm text-tg-textSecondary" data-i18n="maintenance.duplicates.empty">No scan yet — click "Scan" to begin.</div>
-                        <div id="dup-list" class="max-h-[60vh] overflow-y-auto pr-1"></div>
-                        <div class="mt-3 flex items-center justify-between gap-3 flex-wrap">
-                            <div id="dup-summary" class="text-xs text-tg-textSecondary"></div>
-                            <button id="dup-delete-btn" type="button" class="px-4 py-2 rounded-lg bg-red-500/20 text-red-300 hover:bg-red-500/30 font-medium text-sm transition">
-                                <i class="ri-delete-bin-line mr-1"></i><span data-i18n="maintenance.duplicates.delete_selected">Delete selected</span>
-                            </button>
-                        </div>
-                    </section>
-                </div>
-
-                <!-- Maintenance / Similar clips (admin-only) -->
                 <div id="page-maintenance-similar" class="hidden max-w-5xl mx-auto px-3 sm:px-4" data-admin-only
                      data-page-title-key="maintenance.similar.page_title"
                      data-page-subtitle-key="maintenance.similar.subtitle">
@@ -2377,15 +2044,15 @@
                                 </div>
                                 <div>
                                     <label for="setting-adv-similarClips-partialShortMatchRatio" class="text-tg-text text-xs block mb-1" data-i18n="maintenance.similar.settings.short_ratio">Short ratio</label>
-                                    <input id="setting-adv-similarClips-partialShortMatchRatio" type="number" min="0" max="1" step="0.05" class="tg-input w-full text-sm" value="0.35">
+                                    <input id="setting-adv-similarClips-partialShortMatchRatio" type="number" min="0" max="1" step="0.05" class="tg-input w-full text-sm" value="0.5">
                                 </div>
                                 <div>
                                     <label for="setting-adv-similarClips-partialReviewMatchRatio" class="text-tg-text text-xs block mb-1" data-i18n="maintenance.similar.settings.review_ratio">Review ratio</label>
-                                    <input id="setting-adv-similarClips-partialReviewMatchRatio" type="number" min="0" max="1" step="0.05" class="tg-input w-full text-sm" value="0.1">
+                                    <input id="setting-adv-similarClips-partialReviewMatchRatio" type="number" min="0" max="1" step="0.05" class="tg-input w-full text-sm" value="0.35">
                                 </div>
                                 <div>
                                     <label for="setting-adv-similarClips-partialReviewMinMatchedFrames" class="text-tg-text text-xs block mb-1" data-i18n="maintenance.similar.settings.review_frames">Review min frames</label>
-                                    <input id="setting-adv-similarClips-partialReviewMinMatchedFrames" type="number" min="1" max="100" step="1" class="tg-input w-full text-sm" value="2">
+                                    <input id="setting-adv-similarClips-partialReviewMinMatchedFrames" type="number" min="1" max="100" step="1" class="tg-input w-full text-sm" value="4">
                                 </div>
                             </div>
                         </details>
@@ -2412,6 +2079,144 @@
                     </section>
                 </div>
 
+                <!-- Maintenance / Duplicates page (admin-only) -->
+                <div id="page-maintenance-duplicates" class="hidden max-w-5xl mx-auto px-3 sm:px-4" data-admin-only
+                     data-page-title-key="maintenance.duplicates.title"
+                     data-page-subtitle-key="maintenance.duplicates.subtitle">
+                    <section class="bg-tg-panel rounded-xl p-4 mb-3">
+                        <div class="flex items-start justify-between gap-3 flex-wrap">
+                            <div class="min-w-0">
+                                <h2 class="text-tg-text text-base font-semibold" data-i18n="maintenance.duplicates.title">Find duplicate files</h2>
+                                <p class="text-xs text-tg-textSecondary mt-0.5" data-i18n="maintenance.duplicates.subtitle">Hash every file and reclaim space from byte-identical copies. The first run is slow on large libraries; subsequent runs only hash newly-downloaded files.</p>
+                            </div>
+                            <div class="flex items-center gap-2 min-w-0 flex-wrap justify-end">
+                                <button id="dup-verify-btn" class="tg-btn-secondary text-xs px-3 py-1.5 inline-flex items-center gap-1.5"
+                                        data-i18n-title="maintenance.duplicates.verify.tooltip"
+                                        title="Walk every catalogue row and drop entries whose file is missing on disk.">
+                                    <i class="ri-shield-check-line"></i><span data-i18n="maintenance.duplicates.verify.button">Verify files</span>
+                                </button>
+                                <button id="dup-reindex-btn" class="tg-btn-secondary text-xs px-3 py-1.5 inline-flex items-center gap-1.5"
+                                        data-i18n-title="maintenance.duplicates.reindex.tooltip"
+                                        title="Walk data/downloads/ and add catalogue rows for files that aren't tracked yet.">
+                                    <i class="ri-refresh-line"></i><span data-i18n="maintenance.reindex.button">Re-index from disk</span>
+                                </button>
+                                <button id="dup-stop-btn" class="hidden tg-btn-secondary text-xs px-3 py-1.5 inline-flex items-center gap-1.5 text-red-400 border-red-400/40 hover:bg-red-400/10"
+                                        data-i18n-title="maintenance.duplicates.stop_scan.tooltip"
+                                        title="Stop the running scan. Progress is saved — you can resume later.">
+                                    <i class="ri-stop-circle-line"></i><span data-i18n="maintenance.duplicates.stop_scan">Stop</span>
+                                </button>
+                                <button id="dup-scan-btn" class="tg-btn text-xs px-3 py-1.5 inline-flex items-center gap-1.5"
+                                        data-i18n-title="maintenance.duplicates.scan.tooltip"
+                                        title="Hash every catalogued file and group byte-identical copies.">
+                                    <i class="ri-search-line"></i><span data-i18n="maintenance.duplicates.scan">Scan</span>
+                                </button>
+                            </div>
+                        </div>
+
+                        <!-- Library status — hash coverage + last scan summary.
+                             Surfaces "what does this page even do" before
+                             the user clicks any button, so a fresh visit
+                             can see at a glance: total files, % hashed,
+                             how many bytes the next Scan needs to read,
+                             and what the previous scan found. Survives
+                             server restart via kv['dedup_last_scan']. -->
+                        <div id="dup-stats" class="mt-3 grid grid-cols-2 sm:grid-cols-4 gap-2 text-center">
+                            <div class="bg-tg-bg/40 rounded-lg p-3">
+                                <div class="text-[10px] uppercase tracking-wide text-tg-textSecondary" data-i18n="maintenance.duplicates.stats.total">Total files</div>
+                                <div id="dup-stat-total" class="text-xl font-semibold text-tg-text tabular-nums">—</div>
+                            </div>
+                            <div class="bg-tg-bg/40 rounded-lg p-3">
+                                <div class="text-[10px] uppercase tracking-wide text-tg-textSecondary" data-i18n="maintenance.duplicates.stats.hashed">Hashed</div>
+                                <div id="dup-stat-hashed" class="text-xl font-semibold text-tg-text tabular-nums">—</div>
+                            </div>
+                            <div class="bg-tg-bg/40 rounded-lg p-3">
+                                <div class="text-[10px] uppercase tracking-wide text-tg-textSecondary" data-i18n="maintenance.duplicates.stats.missing">Awaiting hash</div>
+                                <div id="dup-stat-missing" class="text-xl font-semibold text-tg-orange tabular-nums">—</div>
+                            </div>
+                            <div class="bg-tg-bg/40 rounded-lg p-3">
+                                <div class="text-[10px] uppercase tracking-wide text-tg-textSecondary" data-i18n="maintenance.duplicates.stats.last_scan">Last scan</div>
+                                <div id="dup-stat-last" class="text-xs text-tg-text tabular-nums leading-tight pt-1">—</div>
+                            </div>
+                        </div>
+                        <div id="dup-stat-summary" class="hidden mt-2 text-xs text-tg-textSecondary text-center"></div>
+
+                        <div id="dup-reindex-progress" class="hidden mt-3">
+                            <div class="text-xs text-tg-textSecondary mb-1.5 flex items-center gap-1.5">
+                                <i class="ri-loader-4-line animate-spin text-tg-orange"></i>
+                                <span data-i18n="maintenance.reindex.running">Re-indexing…</span>
+                                <span id="dup-reindex-status" class="text-tg-text"></span>
+                            </div>
+                            <div class="h-2 bg-tg-bg/60 rounded overflow-hidden">
+                                <div id="dup-reindex-progress-bar" class="h-full bg-tg-orange transition-all" style="width:0%"></div>
+                            </div>
+                        </div>
+                        <div id="dup-verify-progress" class="hidden mt-3">
+                            <div class="text-xs text-tg-textSecondary mb-1.5 flex items-center gap-1.5">
+                                <i class="ri-loader-4-line animate-spin text-tg-blue"></i>
+                                <span data-i18n="maintenance.duplicates.verify.running">Verifying files on disk…</span>
+                                <span id="dup-verify-status" class="text-tg-text"></span>
+                            </div>
+                            <div class="h-2 bg-tg-bg/60 rounded overflow-hidden">
+                                <div id="dup-verify-progress-bar" class="h-full bg-tg-blue transition-all" style="width:0%"></div>
+                            </div>
+                        </div>
+                        <div id="dup-progress" class="hidden mt-3">
+                            <div class="text-sm text-tg-text mb-1.5 flex items-center gap-1.5 font-medium">
+                                <i class="ri-loader-4-line animate-spin text-tg-blue"></i>
+                                <span id="dup-progress-stage">Scanning…</span>
+                            </div>
+                            <div class="h-2 bg-tg-bg/60 rounded overflow-hidden">
+                                <div id="dup-progress-bar" class="h-full bg-tg-blue transition-all" style="width:0%"></div>
+                            </div>
+                            <div id="dup-progress-pct" class="text-[11px] text-tg-textSecondary mt-1 tabular-nums text-right"></div>
+                        </div>
+                    </section>
+                    <section class="bg-tg-panel rounded-xl p-4">
+                        <div id="dup-totals" class="text-sm text-tg-text mb-2"></div>
+                        <!-- Bulk keep-decisions — applies the rule to every
+                             set in one click. Hidden when the list is empty. -->
+                        <div id="dup-bulk-bar" class="hidden mb-3 pb-3 border-b border-tg-border/30 space-y-2">
+                            <div class="flex items-center justify-between gap-2 flex-wrap">
+                                <span class="text-[11px] uppercase tracking-wide text-tg-textSecondary" data-i18n="maintenance.duplicates.bulk.heading">Apply to all sets</span>
+                                <div class="flex items-center gap-1.5 flex-wrap">
+                                    <button id="dup-bulk-oldest" type="button" class="tg-btn-secondary text-xs px-3 py-1.5 inline-flex items-center gap-1.5">
+                                        <i class="ri-time-line"></i><span data-i18n="maintenance.duplicates.bulk.keep_oldest">Keep oldest in every set</span>
+                                    </button>
+                                    <button id="dup-bulk-newest" type="button" class="tg-btn-secondary text-xs px-3 py-1.5 inline-flex items-center gap-1.5">
+                                        <i class="ri-flashlight-line"></i><span data-i18n="maintenance.duplicates.bulk.keep_newest">Keep newest in every set</span>
+                                    </button>
+                                    <button id="dup-bulk-clear" type="button" class="tg-btn-secondary text-xs px-3 py-1.5 inline-flex items-center gap-1.5">
+                                        <i class="ri-eraser-line"></i><span data-i18n="maintenance.duplicates.bulk.clear">Clear selection</span>
+                                    </button>
+                                </div>
+                            </div>
+                            <div class="flex items-center gap-1.5 flex-wrap">
+                                <button id="dup-delete-all-oldest" type="button" class="px-3 py-1.5 rounded-lg bg-red-500/15 text-red-400 hover:bg-red-500/25 text-xs font-medium transition inline-flex items-center gap-1.5">
+                                    <i class="ri-delete-bin-line"></i><span data-i18n="maintenance.duplicates.bulk.delete_keep_oldest">Delete all extras (keep oldest)</span>
+                                </button>
+                                <button id="dup-delete-all-newest" type="button" class="px-3 py-1.5 rounded-lg bg-red-500/15 text-red-400 hover:bg-red-500/25 text-xs font-medium transition inline-flex items-center gap-1.5">
+                                    <i class="ri-delete-bin-line"></i><span data-i18n="maintenance.duplicates.bulk.delete_keep_newest">Delete all extras (keep newest)</span>
+                                </button>
+                                <span id="dup-delete-all-progress" class="text-xs text-tg-textSecondary hidden"></span>
+                            </div>
+                            <!-- Delete progress bar -->
+                            <div id="dup-delete-progress" class="hidden">
+                                <div class="h-1.5 bg-tg-bg/60 rounded-full overflow-hidden">
+                                    <div id="dup-delete-progress-bar" class="h-full bg-red-400 rounded-full transition-all duration-300" style="width:0%"></div>
+                                </div>
+                            </div>
+                        </div>
+                        <div id="dup-empty" class="text-center py-8 text-sm text-tg-textSecondary" data-i18n="maintenance.duplicates.empty">No scan yet — click "Scan" to begin.</div>
+                        <div id="dup-list" class="max-h-[60vh] overflow-y-auto pr-1"></div>
+                        <div class="mt-3 flex items-center justify-between gap-3 flex-wrap">
+                            <div id="dup-summary" class="text-xs text-tg-textSecondary"></div>
+                            <button id="dup-delete-btn" type="button" class="px-4 py-2 rounded-lg bg-red-500/20 text-red-300 hover:bg-red-500/30 font-medium text-sm transition">
+                                <i class="ri-delete-bin-line mr-1"></i><span data-i18n="maintenance.duplicates.delete_selected">Delete selected</span>
+                            </button>
+                        </div>
+                    </section>
+                </div>
+
                 <!-- Maintenance / Thumbnails page (admin-only) -->
                 <div id="page-maintenance-thumbs" class="hidden max-w-5xl mx-auto px-3 sm:px-4" data-admin-only
                      data-page-title-key="maintenance.thumbs.page_title"
@@ -2426,7 +2231,7 @@
                                     <span data-i18n="maintenance.thumbs.no_ffmpeg_chip">Video / audio thumbs disabled — ffmpeg missing on PATH</span>
                                 </div>
                             </div>
-                            <div class="flex items-center gap-2 shrink-0 flex-wrap justify-end">
+                            <div class="flex items-center gap-2 min-w-0 flex-wrap justify-end">
                                 <button id="thumbs-wipe-btn" class="tg-btn-secondary text-xs px-3 py-1.5 inline-flex items-center gap-1.5"
                                         data-i18n-title="maintenance.thumbs.wipe_tooltip"
                                         title="Wipes every cached thumbnail; the next gallery scroll regenerates them on demand.">
@@ -2644,7 +2449,7 @@
                                 </div>
                                 <p id="seekbar-sidecar-detail" class="text-[10.5px] text-tg-textSecondary/80 mt-1 font-mono break-all"></p>
                             </div>
-                            <div class="flex items-center gap-2 shrink-0 flex-wrap justify-end">
+                            <div class="flex items-center gap-2 min-w-0 flex-wrap justify-end">
                                 <button id="seekbar-cancel-btn" type="button" class="tg-btn-secondary text-xs px-3 py-1.5 inline-flex items-center gap-1.5" disabled
                                         data-i18n-title="maintenance.seekbar.cancel"
                                         title="Cancel the running scan">
@@ -2779,8 +2584,50 @@
                                 <dt class="text-tg-textSecondary" data-i18n="maintenance.seekbar.health.version">Version</dt>
                                 <dd id="seekbar-health-version" class="text-tg-text font-mono">—</dd>
                             </div>
+                            <div class="flex items-center justify-between gap-2 py-1 border-b border-tg-bg/30">
+                                <dt class="text-tg-textSecondary" data-i18n="maintenance.seekbar.health.transfer">Video transfer</dt>
+                                <dd id="seekbar-health-transfer" class="text-tg-text font-mono truncate">—</dd>
+                            </div>
                         </dl>
                         <p id="seekbar-health-error" class="hidden mt-2 text-[11px] text-red-400 font-mono break-all"></p>
+
+                        <!-- External sidecar (another host / container /
+                             tunnel). URL, token and path map are saved
+                             together by Apply — ids stay outside the
+                             `setting-*` autosave net because saving
+                             reconnects the sidecar. -->
+                        <div class="mt-3 pt-3 border-t border-tg-border/30">
+                            <p class="text-tg-text text-xs mb-2" data-i18n="maintenance.ai.sidecar_mode">Sidecar mode</p>
+                            <div class="inline-flex rounded-lg overflow-hidden border border-tg-border/50" id="seekbar-mode-toggle">
+                                <button type="button" data-mode="local" class="ai-mode-btn px-4 py-2 text-xs font-medium inline-flex items-center gap-1.5 transition-colors" onclick="window._seekbarModeToggle?.('local')">
+                                    <i class="ri-computer-line"></i> Local
+                                </button>
+                                <button type="button" data-mode="external" class="ai-mode-btn px-4 py-2 text-xs font-medium inline-flex items-center gap-1.5 transition-colors" onclick="window._seekbarModeToggle?.('external')">
+                                    <i class="ri-global-line"></i> External
+                                </button>
+                            </div>
+                            <div id="seekbar-external-panel" class="hidden mt-3">
+                                <div class="flex items-stretch gap-2">
+                                    <input id="seekbar-sidecar-url" type="url" class="tg-input flex-1 text-sm" placeholder="https://gpu.example.com/seekbar" autocomplete="off" spellcheck="false" oninput="window._seekbarSidecarInput?.()">
+                                    <button id="seekbar-sidecar-test-btn" type="button" class="tg-btn-input-secondary shrink-0 inline-flex items-center gap-1.5" onclick="window._seekbarSidecarTest?.()">
+                                        <i class="ri-wifi-line"></i><span data-i18n="maintenance.ai.sidecar_test">Test</span>
+                                    </button>
+                                </div>
+                                <p id="seekbar-sidecar-env-note" class="hidden text-[10.5px] text-yellow-400 mt-1"></p>
+                                <label for="seekbar-sidecar-token" class="text-tg-text text-xs block mt-2 mb-1" data-i18n="maintenance.sidecar.token">API token</label>
+                                <div class="flex items-stretch gap-2">
+                                    <input id="seekbar-sidecar-token" type="password" class="tg-input flex-1 text-sm" autocomplete="new-password" spellcheck="false" data-i18n-placeholder="maintenance.sidecar.token_placeholder" placeholder="Optional — the token set on the sidecar" oninput="window._seekbarSidecarInput?.()">
+                                    <button id="seekbar-sidecar-token-clear" type="button" class="hidden tg-btn-input-secondary shrink-0 text-xs" onclick="window._seekbarSidecarClearToken?.()" data-i18n="maintenance.sidecar.token_clear">Clear saved token</button>
+                                </div>
+                                <label for="seekbar-sidecar-pathmap" class="text-tg-text text-xs block mt-2 mb-1" data-i18n="maintenance.sidecar.path_map">Path mapping (optional)</label>
+                                <textarea id="seekbar-sidecar-pathmap" rows="2" class="tg-input w-full text-xs font-mono" spellcheck="false" placeholder="/app/data/downloads=/mnt/media" oninput="window._seekbarSidecarInput?.()"></textarea>
+                                <p class="text-[10px] text-tg-textSecondary mt-1" data-i18n="maintenance.seekbar.external.help">One rule per line: app path = the same folder as the sidecar sees it. Only needed when the sidecar mounts the downloads at a different path. Without shared storage, seekbar-service 0.4.0+ receives each video as an upload and the sprite is downloaded back.</p>
+                                <span id="seekbar-sidecar-test-result" class="text-[11px] mt-1.5 block"></span>
+                                <button id="seekbar-sidecar-apply-btn" type="button" class="tg-btn-input shrink-0 inline-flex items-center gap-1.5 mt-2" disabled onclick="window._seekbarSidecarApply?.()">
+                                    <i class="ri-check-line"></i><span data-i18n="maintenance.ai.sidecar_apply">Use External</span>
+                                </button>
+                            </div>
+                        </div>
                     </details>
 
                     <!-- Sprite settings — flat layout, all controls at
@@ -3021,7 +2868,7 @@
                                     <span data-i18n="maintenance.video.no_ffmpeg_chip">Faststart unavailable — ffmpeg missing on PATH</span>
                                 </div>
                             </div>
-                            <div class="flex items-center gap-2 shrink-0 flex-wrap justify-end">
+                            <div class="flex items-center gap-2 min-w-0 flex-wrap justify-end">
                                 <button id="video-scan-btn" class="tg-btn text-xs px-3 py-1.5 inline-flex items-center gap-1.5"
                                         data-i18n-title="maintenance.video.scan_tooltip"
                                         title="Backfill the moov rewrite across every MP4 / MOV / M4V already in the library. New downloads are handled automatically by the hook above.">
@@ -3095,7 +2942,7 @@
                                     <span><span data-i18n="maintenance.nsfw.concurrency_label">Concurrency:</span> <span id="nsfw-concurrency-value" class="text-tg-text tabular-nums">—</span></span>
                                 </div>
                             </div>
-                            <div class="flex items-center gap-2 shrink-0 flex-wrap justify-end">
+                            <div class="flex items-center gap-2 min-w-0 flex-wrap justify-end">
                                 <button id="nsfw-scan-btn" class="tg-btn text-xs px-3 py-1.5 inline-flex items-center gap-1.5" data-mode="scan"
                                         data-i18n-title="maintenance.nsfw.scan_tooltip"
                                         title="Run the NSFW classifier across every photo in the library. Local-only, no upload.">
@@ -3255,6 +3102,17 @@
                                         <i class="ri-wifi-line"></i><span data-i18n="maintenance.nsfw.sidecar_test">Test</span>
                                     </button>
                                 </div>
+                                <p id="nsfw-sidecar-env-note" class="hidden text-[10.5px] text-yellow-400 mt-1"></p>
+                                <!-- Token + path map: saved only by Apply (ids stay
+                                     outside the `setting-*` autosave net). -->
+                                <label for="nsfw-sidecar-token" class="text-tg-text text-xs block mt-2 mb-1" data-i18n="maintenance.sidecar.token">API token</label>
+                                <div class="flex items-stretch gap-2">
+                                    <input id="nsfw-sidecar-token" type="password" class="tg-input flex-1 text-sm" autocomplete="new-password" spellcheck="false" data-i18n-placeholder="maintenance.sidecar.token_placeholder" placeholder="Optional — the token set on the sidecar" oninput="window._nsfwSidecarUrlInput?.()">
+                                    <button id="nsfw-sidecar-token-clear" type="button" class="hidden tg-btn-input-secondary shrink-0 text-xs" onclick="window._nsfwSidecarClearToken?.()" data-i18n="maintenance.sidecar.token_clear">Clear saved token</button>
+                                </div>
+                                <label for="nsfw-sidecar-pathmap" class="text-tg-text text-xs block mt-2 mb-1" data-i18n="maintenance.sidecar.path_map">Path mapping (optional)</label>
+                                <textarea id="nsfw-sidecar-pathmap" rows="2" class="tg-input w-full text-xs font-mono" spellcheck="false" placeholder="/app/data/downloads=/mnt/media" oninput="window._nsfwSidecarUrlInput?.()"></textarea>
+                                <p class="text-[10px] text-tg-textSecondary mt-1" data-i18n="maintenance.sidecar.path_map_help">One rule per line: app path = the same folder as the sidecar sees it. Lets a sidecar with a shared mount read files directly; without it, files are uploaded to the sidecar.</p>
                                 <span id="nsfw-sidecar-test-result" class="text-[11px] mt-1.5 block"></span>
                                 <button id="nsfw-sidecar-apply-btn" type="button" class="tg-btn-input shrink-0 inline-flex items-center gap-1.5 mt-2" disabled onclick="window._nsfwSidecarApply?.()">
                                     <i class="ri-check-line"></i><span data-i18n="maintenance.nsfw.sidecar_apply">Apply</span>
@@ -3373,7 +3231,7 @@
                                  GPU support) tuck behind an overflow
                                  details menu so the header reads at a
                                  glance instead of overwhelming. -->
-                            <div class="flex items-center gap-2 shrink-0 flex-wrap justify-end">
+                            <div class="flex items-center gap-2 min-w-0 flex-wrap justify-end">
                                 <button id="ai-cancel-btn" type="button" class="tg-btn-secondary text-xs px-3 py-1.5 inline-flex items-center gap-1.5" disabled
                                         title="Cancel the running scan">
                                     <i class="ri-stop-circle-line"></i><span data-i18n="maintenance.ai.cancel">Cancel</span>
@@ -3391,13 +3249,8 @@
                                     <div class="absolute right-0 top-full mt-1 z-30 w-56 bg-tg-panel border border-tg-border rounded-lg shadow-xl py-1" role="menu">
                                         <button id="ai-recluster-btn" type="button" class="w-full text-left px-3 py-2 text-xs text-tg-text hover:bg-tg-bg/40 inline-flex items-center gap-2"
                                                 data-i18n-title="maintenance.ai.recluster_tooltip"
-                                                title="Assign unassigned faces to existing People (or form new clusters). Keeps merges and labels.">
+                                                title="Run DBSCAN clustering only — uses existing face detections + the current threshold to surface People. Fast (seconds, not minutes).">
                                             <i class="ri-refresh-line text-tg-blue"></i><span data-i18n="maintenance.ai.recluster">Re-cluster</span>
-                                        </button>
-                                        <button id="ai-rebuild-btn" type="button" class="w-full text-left px-3 py-2 text-xs text-tg-text hover:bg-tg-bg/40 inline-flex items-center gap-2"
-                                                data-i18n-title="maintenance.ai.rebuild_tooltip"
-                                                title="Wipe all People and re-run DBSCAN on every face. Use after changing ε. Merges are NOT preserved.">
-                                            <i class="ri-shake-hands-line text-amber-300"></i><span data-i18n="maintenance.ai.rebuild">Rebuild all clusters</span>
                                         </button>
                                         <button id="ai-quality-backfill-btn" type="button" class="hidden w-full text-left px-3 py-2 text-xs text-tg-text hover:bg-tg-bg/40 inline-flex items-center gap-2"
                                                 title="Compute quality scores for older faces that were scanned before quality ranking was added.">
@@ -3453,14 +3306,9 @@
                                 <div class="text-[10px] uppercase tracking-wide text-tg-textSecondary truncate" data-i18n="maintenance.ai.stat_people">People clusters</div>
                                 <div id="ai-stat-people" class="text-base sm:text-xl font-semibold text-tg-blue tabular-nums">—</div>
                             </div>
-                            <div class="bg-tg-bg/40 rounded-lg p-2 sm:p-3 cursor-pointer hover:bg-tg-bg/60 transition-colors disabled:cursor-default"
-                                id="ai-stat-noise-tile"
-                                role="button"
-                                tabindex="0"
-                                data-i18n-title="maintenance.ai.unclassified.open_title"
-                                title="Review unclassified faces">
+                            <div class="bg-tg-bg/40 rounded-lg p-2 sm:p-3">
                                 <div class="text-[10px] uppercase tracking-wide text-tg-textSecondary truncate" data-i18n="maintenance.ai.stat_noise">Unclassified faces</div>
-                                <div id="ai-stat-noise" class="text-base sm:text-xl font-semibold text-tg-textSecondary tabular-nums" title="Faces that didn't fit any cluster. Excluded identities are not counted.">—</div>
+                                <div id="ai-stat-noise" class="text-base sm:text-xl font-semibold text-tg-textSecondary tabular-nums" title="DBSCAN noise points — faces that didn't fit any cluster. Reduce ε or minPoints to include more.">—</div>
                             </div>
                             <div class="bg-tg-bg/40 rounded-lg p-2 sm:p-3">
                                 <div class="text-[10px] uppercase tracking-wide text-tg-textSecondary truncate" data-i18n="maintenance.ai.stat_last">Last scan</div>
@@ -3507,6 +3355,16 @@
                                         <i class="ri-wifi-line"></i><span data-i18n="maintenance.ai.sidecar_test">Test</span>
                                     </button>
                                 </div>
+                                <p id="ai-faces-sidecar-env-note" class="hidden text-[10.5px] text-yellow-400 mt-1"></p>
+                                <!-- Token + path map are saved with the URL by Apply. -->
+                                <label for="ai-faces-sidecar-token" class="text-tg-text text-xs block mt-2 mb-1" data-i18n="maintenance.sidecar.token">API token</label>
+                                <div class="flex items-stretch gap-2">
+                                    <input id="ai-faces-sidecar-token" type="password" class="tg-input flex-1 text-sm" autocomplete="new-password" spellcheck="false" data-i18n-placeholder="maintenance.sidecar.token_placeholder" placeholder="Optional — the token set on the sidecar" oninput="window._facesSidecarUrlInput?.()">
+                                    <button id="ai-faces-sidecar-token-clear" type="button" class="hidden tg-btn-input-secondary shrink-0 text-xs" onclick="window._facesSidecarClearToken?.()" data-i18n="maintenance.sidecar.token_clear">Clear saved token</button>
+                                </div>
+                                <label for="ai-faces-sidecar-pathmap" class="text-tg-text text-xs block mt-2 mb-1" data-i18n="maintenance.sidecar.path_map">Path mapping (optional)</label>
+                                <textarea id="ai-faces-sidecar-pathmap" rows="2" class="tg-input w-full text-xs font-mono" spellcheck="false" placeholder="/app/data/downloads=/mnt/media" oninput="window._facesSidecarUrlInput?.()"></textarea>
+                                <p class="text-[10px] text-tg-textSecondary mt-1" data-i18n="maintenance.sidecar.path_map_help">One rule per line: app path = the same folder as the sidecar sees it. Lets a sidecar with a shared mount read files directly; without it, files are uploaded to the sidecar.</p>
                                 <span id="ai-faces-sidecar-test-result" class="text-[11px] mt-1.5 block"></span>
                                 <button id="ai-faces-sidecar-apply-btn" type="button" class="tg-btn-input shrink-0 inline-flex items-center gap-1.5 mt-2" disabled onclick="window._facesSidecarApply?.()">
                                     <i class="ri-check-line"></i><span data-i18n="maintenance.ai.sidecar_apply">Apply</span>
@@ -3532,7 +3390,7 @@
                                 </h3>
                                 <p class="text-[11px] text-tg-textSecondary mt-1 max-w-xl" data-i18n="maintenance.ai.install.desc">One click installs the matching onnxruntime backend for this host (DirectML on Windows, CUDA on Linux + NVIDIA, OpenVINO on Linux + Intel, CoreML on macOS, CPU elsewhere) and starts the sidecar. Takes 1–5 minutes the first time while wheels download.</p>
                             </div>
-                            <div class="flex items-center gap-2 shrink-0 flex-wrap justify-end">
+                            <div class="flex items-center gap-2 min-w-0 flex-wrap justify-end">
                                 <select id="ai-install-force" class="tg-input text-xs py-1 px-2" title="Override platform detection">
                                     <option value=""         data-i18n="maintenance.ai.install.auto">Auto-detect</option>
                                     <option value="directml" data-i18n="maintenance.ai.install.force_directml">Force DirectML (Windows)</option>
@@ -3611,29 +3469,6 @@
                                 <div id="ai-scan-videos-toggle" class="tg-toggle shrink-0 mt-0.5" role="switch" aria-checked="false" tabindex="0"></div>
                             </div>
 
-                            <!-- Video scan limit — cap how many unindexed videos
-                                 Phase A processes per run (0 = unlimited).
-                                 Useful while testing tighter detection filters. -->
-                            <div class="flex items-start justify-between gap-3">
-                                <div class="min-w-0">
-                                    <label for="ai-faces-video-scan-limit" class="text-tg-text text-sm" data-i18n="maintenance.ai.video_scan_limit_label">Video scan limit</label>
-                                    <p class="text-[11px] text-tg-textSecondary mt-0.5" data-i18n="maintenance.ai.video_scan_limit_help">Max videos to process per scan run. 0 = no limit. Set a small number (e.g. 5) to test detection changes without re-scanning the whole library.</p>
-                                </div>
-                                <input id="ai-faces-video-scan-limit" type="number" min="0" max="10000" step="1" value="0"
-                                    class="tg-input w-20 text-sm text-right shrink-0 mt-0.5" inputmode="numeric">
-                            </div>
-
-                            <!-- Video CPU nice — lower scheduling priority during
-                                 the video phase so downloads/UI stay responsive. -->
-                            <div class="flex items-start justify-between gap-3">
-                                <div class="min-w-0">
-                                    <label for="ai-faces-video-nice" class="text-tg-text text-sm" data-i18n="maintenance.ai.video_nice_label">Video CPU priority (nice)</label>
-                                    <p class="text-[11px] text-tg-textSecondary mt-0.5" data-i18n="maintenance.ai.video_nice_help">Unix only. 0 = normal priority. 10–15 = background-friendly — keeps Telegram downloads and the dashboard responsive during long video scans. Also applies to the faces sidecar and ffmpeg fallback.</p>
-                                </div>
-                                <input id="ai-faces-video-nice" type="number" min="0" max="19" step="1" value="0"
-                                    class="tg-input w-20 text-sm text-right shrink-0 mt-0.5" inputmode="numeric">
-                            </div>
-
                             <!-- Detector model select. Switching the
                                  preset auto-restarts the sidecar +
                                  reminds the operator that the existing
@@ -3647,7 +3482,7 @@
                                     <option value="buffalo_m">buffalo_m — faster, smaller ResNet50</option>
                                     <option value="buffalo_s">buffalo_s — fastest, ResNet34</option>
                                 </select>
-                                <p id="ai-faces-model-status" class="text-[10px] text-tg-textSecondary mt-1" data-i18n="maintenance.ai.faces.model_help">Switching the model restarts the sidecar. Rebuild all clusters (or Reindex) after switching — embedding spaces differ.</p>
+                                <p id="ai-faces-model-status" class="text-[10px] text-tg-textSecondary mt-1" data-i18n="maintenance.ai.faces.model_help">Switching the model restarts the sidecar. Re-cluster recommended after switching.</p>
                             </div>
 
                             <!-- Sensitivity presets — one-click way to
@@ -3727,7 +3562,7 @@
                     </section>
 
                     <!-- People — face clusters grid -->
-                    <section id="ai-pane-people" class="bg-tg-panel rounded-xl p-4 mb-3" role="region" aria-label="Face clusters">
+                    <section id="ai-pane-people" class="bg-tg-panel rounded-xl p-4 mb-3" aria-label="Face clusters">
 
                         <!-- Header row -->
                         <div class="flex items-center justify-between mb-4">
@@ -3753,7 +3588,7 @@
                         <!-- Epsilon over-merge warning (hidden by default) -->
                         <div id="ai-epsilon-warning" class="hidden mb-3 flex items-start gap-2 px-3 py-2.5 rounded-xl bg-amber-500/10 border border-amber-400/20 text-amber-300 text-xs">
                             <i class="ri-alert-line shrink-0 mt-px"></i>
-                            <span data-i18n="maintenance.ai.epsilon_warning">One cluster contains an unusually large share of all faces — the DBSCAN ε threshold may be too high, causing different people to merge. Try lowering ε and running Rebuild all clusters.</span>
+                            <span data-i18n="maintenance.ai.epsilon_warning">One cluster contains an unusually large share of all faces — the DBSCAN ε threshold may be too high, causing different people to merge. Try lowering ε and running Re-cluster.</span>
                         </div>
 
                         <!-- Search + filter row -->
@@ -3789,32 +3624,20 @@
                                 <div id="ai-people-sort-group" class="inline-flex items-center rounded-full border border-tg-border/30 overflow-hidden">
                                     <button type="button" data-sort="face_count"
                                         class="ai-sort-btn px-2.5 py-1 text-[11px] font-medium transition-all select-none bg-tg-blue/10 text-tg-blue border-r border-tg-border/20"
-                                        title="Sort by face count"
-                                        data-i18n-title="maintenance.ai.people.sort.face_count">
+                                        title="Sort by face count">
                                         <i class="ri-group-line text-[10px]"></i>
                                     </button>
                                     <button type="button" data-sort="avg_quality"
                                         class="ai-sort-btn px-2.5 py-1 text-[11px] font-medium text-tg-textSecondary hover:text-tg-blue transition-all select-none border-r border-tg-border/20"
-                                        title="Sort by quality score"
-                                        data-i18n-title="maintenance.ai.people.sort.avg_quality">
+                                        title="Sort by quality score">
                                         <i class="ri-medal-line text-[10px]"></i>
                                     </button>
                                     <button type="button" data-sort="name"
                                         class="ai-sort-btn px-2.5 py-1 text-[11px] font-medium text-tg-textSecondary hover:text-tg-blue transition-all select-none"
-                                        title="Sort by name"
-                                        data-i18n-title="maintenance.ai.people.sort.name">
+                                        title="Sort by name">
                                         <i class="ri-sort-alphabet-asc text-[10px]"></i>
                                     </button>
                                 </div>
-                                <button id="ai-people-sort-dir" type="button"
-                                    class="inline-flex items-center justify-center w-7 h-7 rounded-full border border-tg-border/30 text-tg-textSecondary hover:text-tg-blue hover:border-tg-blue/50 transition-all select-none"
-                                    title="Sort descending"
-                                    data-i18n-title="maintenance.ai.people.sort.dir_desc"
-                                    aria-label="Sort descending"
-                                    data-i18n-aria-label="maintenance.ai.people.sort.dir_desc"
-                                    data-dir="desc">
-                                    <i class="ri-sort-desc text-[12px]" aria-hidden="true"></i>
-                                </button>
                             </div>
                             <!-- Quality legend -->
                             <div id="ai-quality-legend" class="hidden flex items-center gap-3 text-[10px] text-tg-textSecondary/70 mt-0.5">
@@ -3832,50 +3655,6 @@
                             <p class="text-[11px] text-tg-textSecondary/60">Run a scan above to get started.</p>
                         </div>
                         <div id="ai-people-empty-help" class="hidden mt-2 text-center text-[11px] text-tg-textSecondary/70 max-w-xs mx-auto leading-relaxed"></div>
-
-                        <!-- Unclassified faces review — opened from the KPI tile -->
-                        <div id="ai-unclassified-review" class="hidden mb-3 rounded-xl border border-tg-border/30 overflow-hidden bg-tg-bg/20">
-                            <div class="flex items-center justify-between gap-2 px-3 py-2 bg-tg-blue/5 border-b border-tg-blue/10">
-                                <div class="min-w-0">
-                                    <p class="text-xs font-medium text-tg-text" data-i18n="maintenance.ai.unclassified.heading">Unclassified faces</p>
-                                    <p id="ai-unclassified-count" class="text-[11px] text-tg-textSecondary"></p>
-                                </div>
-                                <button id="ai-unclassified-close-btn" type="button"
-                                    class="tg-btn-secondary text-[11px] h-7 px-2 inline-flex items-center gap-1"
-                                    title="Close">
-                                    <i class="ri-close-line"></i>
-                                    <span class="hidden sm:inline" data-i18n="common.close">Close</span>
-                                </button>
-                            </div>
-                            <div id="ai-unclassified-suggestions" class="hidden px-3 py-2 border-b border-tg-border/20">
-                                <p class="text-[10px] uppercase tracking-wide text-tg-textSecondary mb-1.5" data-i18n="maintenance.ai.unclassified.suggestions">Suggested matches</p>
-                                <div id="ai-unclassified-suggestions-list" class="flex flex-wrap gap-1.5"></div>
-                                <p id="ai-unclassified-suggestions-empty" class="hidden text-[11px] text-tg-textSecondary/70" data-i18n="maintenance.ai.unclassified.no_match">No close match</p>
-                            </div>
-                            <div id="ai-unclassified-sel-bar" class="hidden items-center justify-between gap-2 px-3 py-2 border-b border-tg-blue/20 bg-tg-blue/5">
-                                <span id="ai-unclassified-sel-count" class="text-xs text-tg-textSecondary" data-i18n="maintenance.ai.unclassified.sel_hint">Tap faces to select</span>
-                                <div class="flex flex-wrap gap-1.5 justify-end">
-                                    <button id="ai-unclassified-sel-all-btn" type="button" class="tg-btn-secondary text-[11px] h-7 px-2"
-                                        data-i18n="maintenance.ai.unclassified.sel_all"
-                                        data-i18n-title="maintenance.ai.unclassified.sel_all_title"
-                                        title="Select all loaded faces">Select all</button>
-                                    <button id="ai-unclassified-sel-clear-btn" type="button" class="tg-btn-secondary text-[11px] h-7 px-2" data-i18n="common.clear">Clear</button>
-                                    <button id="ai-unclassified-sel-assign-btn" type="button" class="tg-btn-secondary text-[11px] h-7 px-2 inline-flex items-center gap-1" disabled>
-                                        <i class="ri-user-shared-line"></i>
-                                        <span data-i18n="maintenance.ai.unclassified.assign">Assign to person…</span>
-                                    </button>
-                                    <button id="ai-unclassified-sel-new-btn" type="button" class="tg-btn-secondary text-[11px] h-7 px-2 inline-flex items-center gap-1 text-emerald-300" disabled>
-                                        <i class="ri-user-add-line"></i>
-                                        <span data-i18n="maintenance.ai.unclassified.new_person">Create new person</span>
-                                    </button>
-                                    <button id="ai-unclassified-sel-remove-btn" type="button" class="tg-btn-secondary text-[11px] h-7 px-2 inline-flex items-center gap-1 text-red-300" disabled>
-                                        <i class="ri-delete-bin-line"></i>
-                                        <span data-i18n="maintenance.ai.unclassified.remove">Remove face</span>
-                                    </button>
-                                </div>
-                            </div>
-                            <div id="ai-unclassified-grid" class="grid grid-cols-3 sm:grid-cols-5 md:grid-cols-6 lg:grid-cols-8 gap-1 p-1.5"></div>
-                        </div>
 
                         <!-- Test-detection diagnostic (shown only after scan with 0 people) -->
                         <div id="ai-detect-test-form" class="hidden mt-4 text-center">
@@ -3918,13 +3697,6 @@
                                     </div>
                                 </div>
                                 <div class="flex items-center gap-1 flex-shrink-0">
-                                    <button id="ai-person-review-faces-btn"
-                                        class="tg-btn-secondary text-[11px] h-8 px-2 inline-flex items-center gap-1.5"
-                                        data-i18n-title="maintenance.ai.review_faces_btn_title"
-                                        title="Show every detected face in this cluster, cropped, so you can verify each match">
-                                        <i class="ri-focus-3-line"></i>
-                                        <span class="hidden sm:inline" data-i18n="maintenance.ai.people.actions.review_faces">Review faces</span>
-                                    </button>
                                     <button id="ai-person-merge-btn"
                                         class="tg-btn-secondary text-[11px] h-8 px-2 inline-flex items-center gap-1.5"
                                         title="Merge into another cluster">
@@ -3938,26 +3710,12 @@
                                         <i class="ri-scissors-cut-line"></i>
                                         <span class="hidden sm:inline" data-i18n="maintenance.ai.people.actions.split">Split…</span>
                                     </button>
-                                    <button id="ai-person-exclude-btn"
-                                        class="tg-btn-secondary text-[11px] h-8 px-2 inline-flex items-center gap-1.5 text-amber-300 hover:border-amber-400/40"
-                                        data-i18n-title="maintenance.ai.exclude_btn_title"
-                                        title="Exclude this identity — it will not reappear after recluster">
-                                        <i class="ri-eye-off-line"></i>
-                                        <span class="hidden sm:inline" data-i18n="maintenance.ai.people.actions.exclude">Exclude</span>
-                                    </button>
                                     <button id="ai-person-delete-btn"
                                         class="tg-btn-secondary text-[11px] w-8 h-8 p-0 inline-flex items-center justify-center text-red-300 hover:border-red-400/40"
-                                        data-i18n-title="maintenance.ai.delete_btn_title"
-                                        title="Delete cluster (temporary — may reappear on recluster)">
+                                        title="Delete cluster">
                                         <i class="ri-delete-bin-line"></i>
                                     </button>
                                 </div>
-                            </div>
-                            <!-- Nearest other clusters for one-tap merge (centroid match) -->
-                            <div id="ai-person-merge-suggestions" class="hidden px-3 py-2 border-b border-tg-border/20">
-                                <p class="text-[10px] uppercase tracking-wide text-tg-textSecondary mb-1.5" data-i18n="maintenance.ai.unclassified.suggestions">Suggested matches</p>
-                                <div id="ai-person-merge-suggestions-list" class="flex flex-wrap gap-1.5"></div>
-                                <p id="ai-person-merge-suggestions-empty" class="hidden text-[11px] text-tg-textSecondary/70" data-i18n="maintenance.ai.unclassified.no_match">No close match</p>
                             </div>
                             <!-- Split mode hint banner — only visible while split mode is active -->
                             <div id="ai-split-hint" class="hidden items-center gap-2 px-3 py-2 bg-tg-blue/10 border-b border-tg-blue/20 text-xs text-tg-blue">
@@ -3975,42 +3733,6 @@
                                         <i class="ri-scissors-cut-line mr-1"></i><span data-i18n="maintenance.ai.people.actions.split">Split…</span>
                                     </button>
                                 </div>
-                            </div>
-
-                            <!-- Face-level review grid — additive, opt-in via "Review faces".
-                                 Shows one tile PER DETECTED FACE (cropped to the bbox), sourced
-                                 from every photo/video the cluster appears in, so the operator
-                                 can confirm or reject each individual match. Closing it returns
-                                 to the existing per-photo grid above, unchanged. -->
-                            <div id="ai-face-review" class="hidden border-t border-tg-border/20">
-                                <div class="flex items-center justify-between gap-2 px-3 py-2 bg-tg-blue/5 border-b border-tg-blue/10">
-                                    <p id="ai-face-review-count" class="text-[11px] text-tg-textSecondary"></p>
-                                    <button id="ai-face-review-close-btn" type="button"
-                                        class="tg-btn-secondary text-[11px] h-7 px-2 inline-flex items-center gap-1"
-                                        title="Close face review">
-                                        <i class="ri-close-line"></i>
-                                        <span class="hidden sm:inline" data-i18n="common.close">Close</span>
-                                    </button>
-                                </div>
-                                <div id="ai-face-review-grid" class="grid grid-cols-3 sm:grid-cols-5 md:grid-cols-6 lg:grid-cols-8 gap-1 p-1.5"></div>
-                            </div>
-                        </div>
-
-                        <!-- Durable exclusions — sits under the selected-cluster panel -->
-                        <div id="ai-people-excluded" class="hidden mt-3 rounded-xl bg-tg-bg/30 border border-white/5 overflow-hidden">
-                            <button type="button" id="ai-people-excluded-toggle"
-                                class="w-full flex items-center justify-between gap-2 px-3 py-2.5 text-left hover:bg-white/[0.02] transition-colors"
-                                aria-expanded="false" aria-controls="ai-people-excluded-body">
-                                <span class="inline-flex items-center gap-2 min-w-0">
-                                    <i class="ri-eye-off-line text-amber-400/80 text-sm"></i>
-                                    <span class="text-xs font-medium text-tg-text" data-i18n="maintenance.ai.excluded.heading">Excluded</span>
-                                    <span id="ai-people-excluded-count" class="text-[10px] text-tg-textSecondary"></span>
-                                </span>
-                                <i class="ri-arrow-down-s-line text-tg-textSecondary text-sm transition-transform" id="ai-people-excluded-chevron"></i>
-                            </button>
-                            <div id="ai-people-excluded-body" class="hidden border-t border-white/5 px-3 py-2">
-                                <p class="text-[11px] text-tg-textSecondary/70 mb-2" data-i18n="maintenance.ai.excluded.help">These identities stay out of People across reclusters. Rebuild all clusters clears this list. Restore to allow them again.</p>
-                                <ul id="ai-people-excluded-list" class="space-y-1"></ul>
                             </div>
                         </div>
 
@@ -4050,7 +3772,7 @@
                                 <h2 class="text-tg-text text-base font-semibold" data-i18n="maintenance.logs.page_title">Server logs</h2>
                                 <p class="text-xs text-tg-textSecondary mt-0.5" data-i18n="maintenance.logs.subtitle">Realtime stream of every event the engine emits — filter by source, level, or text. Useful when something feels off and you want to see what the server is actually doing.</p>
                             </div>
-                            <div class="flex items-center gap-2 shrink-0 flex-wrap justify-end">
+                            <div class="flex items-center gap-2 min-w-0 flex-wrap justify-end">
                                 <label class="inline-flex items-center gap-1 text-xs text-tg-textSecondary cursor-pointer select-none">
                                     <input id="logs-autoscroll" type="checkbox" checked class="accent-tg-blue">
                                     <span data-i18n="maintenance.logs.autoscroll">Auto-scroll</span>
@@ -4098,7 +3820,7 @@
                              viewport on landscape mobile (a 360 px-tall
                              screen made the previous calc()+min-height
                              pair drop the bottom rows below the nav bar). -->
-                        <pre id="logs-stream" class="bg-tg-bg/60 p-3 text-[11px] font-mono whitespace-pre overflow-auto leading-snug" style="height: clamp(240px, calc(100vh - 320px), 70vh);" role="log" aria-live="polite" aria-atomic="false" aria-label="Realtime server log"></pre>
+                        <pre id="logs-stream" class="bg-tg-bg/60 p-3 text-[11px] font-mono whitespace-pre overflow-auto leading-snug" style="height: clamp(240px, calc(100vh - 320px), 70vh); height: clamp(240px, calc(100dvh - 320px), 70dvh);" role="log" aria-live="polite" aria-atomic="false" aria-label="Realtime server log"></pre>
                     </section>
                 </div>
 
@@ -4117,7 +3839,7 @@
                                 <h2 class="text-tg-text text-base font-semibold" data-i18n="maintenance.backup.page_title">Backup destinations</h2>
                                 <p class="text-xs text-tg-textSecondary mt-0.5" data-i18n="maintenance.backup.subtitle">Mirror new downloads to S3-compatible storage, an SFTP NAS, or a local mount. Optional client-side encryption + scheduled snapshots.</p>
                             </div>
-                            <div class="flex items-center gap-2 shrink-0 flex-wrap justify-end">
+                            <div class="flex items-center gap-2 min-w-0 flex-wrap justify-end">
                                 <button id="backup-add-btn" class="tg-btn text-xs px-3 py-1.5 inline-flex items-center gap-1.5">
                                     <i class="ri-add-line"></i><span data-i18n="maintenance.backup.add">Add destination</span>
                                 </button>
@@ -4147,14 +3869,9 @@
                         </div>
                     </section>
 
-                    <!-- Full-coverage tip: one mode alone is not a complete backup. -->
-                    <div id="backup-coverage-tip" class="mb-3 flex items-start gap-2 px-3 py-2.5 rounded-xl bg-tg-blue/10 border border-tg-blue/20 text-tg-blue text-xs">
-                        <i class="ri-information-line shrink-0 mt-px"></i>
-                        <div class="min-w-0 space-y-1">
-                            <p data-i18n="maintenance.backup.coverage_tip">For a full off-site copy, add both a Continuous mirror (media files; Run now also prunes remote orphans) and a Scheduled snapshot (database, faces, config, sessions). One destination = one mode — create two if you want both.</p>
-                            <p class="text-tg-blue/80" data-i18n="maintenance.backup.coverage_path_tip">They can share the same bucket or folder. Snapshots upload under <code class="font-mono text-[11px]">snapshots/</code> automatically — no separate path setting needed.</p>
-                            <p id="backup-coverage-status" class="hidden font-medium"></p>
-                        </div>
+                    <div class="bg-tg-blue/10 border border-tg-blue/20 rounded-lg px-3 py-2 mb-3 flex items-start gap-2 text-[11px] text-tg-textSecondary">
+                        <i class="ri-lightbulb-line text-tg-blue mt-0.5"></i>
+                        <span data-i18n="maintenance.backup.coverage_tip">Mirror only covers files downloaded after it's enabled — pair it with a scheduled snapshot destination to also cover the database and config, and to catch anything mirror missed.</span>
                     </div>
 
                     <div id="backup-empty" class="hidden bg-tg-panel rounded-xl p-8 text-center text-sm text-tg-textSecondary mb-3">
@@ -4499,7 +4216,7 @@
                                 <h2 class="text-tg-text text-base font-semibold" data-i18n="update.history.title">Update history</h2>
                                 <p class="text-xs text-tg-textSecondary mt-0.5" data-i18n="update.history.help">Audit log of every Install update click — the structured error code makes repeat failures easy to diagnose.</p>
                             </div>
-                            <div class="flex items-center gap-2 shrink-0 flex-wrap justify-end">
+                            <div class="flex items-center gap-2 min-w-0 flex-wrap justify-end">
                                 <button id="updates-refresh-btn" class="tg-btn-secondary text-xs px-3 py-1.5 inline-flex items-center gap-1.5">
                                     <i class="ri-refresh-line"></i><span data-i18n="update.history.refresh">Refresh</span>
                                 </button>
@@ -4541,20 +4258,36 @@
         </div>
     </div>
 
-    <!-- Selection footer (shown when items are selected) -->
-    <div id="selection-bar" class="hidden fixed bottom-8 left-1/2 -translate-x-1/2 bg-tg-panel border border-tg-border rounded-full px-4 py-2 shadow-xl z-40 flex items-center gap-3 text-sm">
-        <span id="selection-count" class="text-tg-text">0 selected</span>
-        <button id="selection-all" class="text-tg-blue hover:text-tg-text" data-i18n-title="viewer.selection.select_all_title" title="Select every visible tile (Ctrl/⌘+A)" data-i18n="viewer.selection.select_all">Select all</button>
-        <button id="selection-clear" class="text-tg-textSecondary hover:text-tg-text" data-i18n="viewer.selection.clear">Clear</button>
-        <button id="selection-zip" class="px-3 py-1 rounded bg-tg-blue/20 text-tg-blue hover:bg-tg-blue/30">
-            <i class="ri-archive-line"></i> <span data-i18n="viewer.selection.zip">Download ZIP</span>
+    <!-- Selection bar — every bulk action in one place. Shown while select
+         mode is on (long-press a tile, the ☑ header button, Ctrl/Shift-click,
+         drag-select) and whenever something is selected. ✕ leaves select
+         mode; "Select all N" loads the rest of the view first. -->
+    <div id="selection-bar" class="hidden fixed bottom-8 left-1/2 -translate-x-1/2 bg-tg-panel border border-tg-border rounded-full px-2 py-1.5 shadow-xl z-40 flex items-center gap-1 text-sm"
+         role="toolbar" data-i18n-aria-label="viewer.selection.toolbar" aria-label="Selected files">
+        <button id="selection-exit" type="button" class="selection-icon-btn"
+            data-i18n-aria-label="viewer.selection.done" aria-label="Done selecting"
+            data-i18n-title="viewer.selection.done" title="Done selecting">
+            <i class="ri-close-line" aria-hidden="true"></i>
         </button>
-        <button id="selection-pin" class="px-3 py-1 rounded bg-yellow-500/20 text-yellow-300 hover:bg-yellow-500/30" data-admin-only>
-            <i class="ri-pushpin-2-line"></i> <span data-i18n="favorites.pin">Pin</span>
+        <span id="selection-count" class="text-tg-text font-medium px-1 tabular-nums" aria-live="polite">0 selected</span>
+        <button id="selection-all" type="button" class="selection-text-btn text-tg-blue hover:text-tg-text" data-i18n-title="viewer.selection.select_all_title" title="Select every loaded file (Ctrl/⌘+A)" data-i18n="viewer.selection.select_all">Select all</button>
+        <button id="selection-all-matching" type="button" class="selection-text-btn hidden text-tg-blue hover:text-tg-text">Select all</button>
+        <button id="selection-clear" type="button" class="selection-text-btn text-tg-textSecondary hover:text-tg-text" data-i18n="viewer.selection.clear">Clear</button>
+        <span class="selection-sep" aria-hidden="true"></span>
+        <div class="selection-actions">
+        <button id="selection-zip" type="button" class="selection-action px-3 py-1 rounded-full bg-tg-blue/20 text-tg-blue hover:bg-tg-blue/30"
+            data-i18n-title="viewer.selection.zip" title="Download ZIP">
+            <i class="ri-archive-line" aria-hidden="true"></i> <span data-i18n="viewer.selection.zip">Download ZIP</span>
         </button>
-        <button id="selection-delete" class="px-3 py-1 rounded bg-red-500/20 text-red-400 hover:bg-red-500/30" data-admin-only>
-            <i class="ri-delete-bin-line"></i> <span data-i18n="viewer.selection.delete">Delete</span>
+        <button id="selection-pin" type="button" class="selection-action px-3 py-1 rounded-full bg-yellow-500/20 text-yellow-300 hover:bg-yellow-500/30" data-admin-only
+            data-i18n-title="favorites.pin" title="Pin">
+            <i class="ri-pushpin-2-line" aria-hidden="true"></i> <span data-i18n="favorites.pin">Pin</span>
         </button>
+        <button id="selection-delete" type="button" class="selection-action px-3 py-1 rounded-full bg-red-500/20 text-red-400 hover:bg-red-500/30" data-admin-only
+            data-i18n-title="viewer.selection.delete" title="Delete">
+            <i class="ri-delete-bin-line" aria-hidden="true"></i> <span data-i18n="viewer.selection.delete">Delete</span>
+        </button>
+        </div>
     </div>
 
     <!-- Drag-drop overlay for t.me URLs. Hidden by default; the SPA toggles
@@ -4652,7 +4385,7 @@
             <div class="flex gap-2">
                 <button id="modal-shuffle-btn" type="button" title="Shuffle"
                     class="w-10 h-10 rounded-full bg-black/50 hover:bg-black/70 flex items-center justify-center text-white transition"
-                    aria-pressed="false">
+                    data-i18n-title="viewer.shuffle" aria-pressed="false">
                     <i class="ri-shuffle-line text-xl"></i>
                 </button>
                 <button id="modal-fullscreen-btn"
@@ -4711,59 +4444,56 @@
             </div>
 
             <!-- Custom Video Player Container.
-                 Column layout: video stage (flex-1) above a docked controls
-                 band so the seekbar never overlays the picture. -->
+                 Column layout: video stage above a docked controls band so
+                 the seekbar never overlays the picture. -->
             <div id="video-container"
                 class="relative w-full h-full flex flex-col bg-black hidden">
-                <!-- Picture + overlays. Takes remaining height above the
-                     controls band; object-contain letterboxes inside. -->
                 <div id="video-stage"
                     class="relative flex-1 min-h-0 w-full flex items-center justify-center">
-                    <!-- The hit-target for tap-to-toggle play/pause + tap-to-show-controls.
-                         Sits BEHIND the controls so clicks on buttons / sliders
-                         never bubble to it. Scoped to the stage only. -->
-                    <div id="video-tap-layer" class="absolute inset-0 z-10"></div>
+                <!-- The hit-target for tap-to-toggle play/pause + tap-to-show-controls.
+                     Scoped to the stage so it does not cover the docked controls. -->
+                <div id="video-tap-layer" class="absolute inset-0 z-10"></div>
 
-                    <video id="modal-video" class="max-w-full max-h-full object-contain w-full h-full relative z-0" playsinline></video>
+                <video id="modal-video" class="max-w-full max-h-full object-contain w-full h-full relative z-0" playsinline></video>
 
-                    <!-- Double-tap seek overlays (YouTube-style visual feedback). -->
-                    <div id="video-seek-back-overlay"
-                        class="absolute left-0 top-0 w-1/2 h-full flex items-center justify-center z-[15] pointer-events-none opacity-0 transition-opacity duration-200">
-                        <div class="flex flex-col items-center gap-1 text-white">
-                            <i class="ri-rewind-mini-line text-4xl"></i>
-                            <span id="video-seek-back-label" class="text-sm font-medium">5s</span>
-                        </div>
+                <!-- Double-tap seek overlays (YouTube-style visual feedback). -->
+                <div id="video-seek-back-overlay"
+                    class="absolute left-0 top-0 w-1/2 h-full flex items-center justify-center z-[15] pointer-events-none opacity-0 transition-opacity duration-200">
+                    <div class="flex flex-col items-center gap-1 text-white">
+                        <i class="ri-rewind-mini-line text-4xl"></i>
+                        <span id="video-seek-back-label" class="text-sm font-medium">5s</span>
                     </div>
-                    <div id="video-seek-fwd-overlay"
-                        class="absolute right-0 top-0 w-1/2 h-full flex items-center justify-center z-[15] pointer-events-none opacity-0 transition-opacity duration-200">
-                        <div class="flex flex-col items-center gap-1 text-white">
-                            <i class="ri-speed-mini-line text-4xl"></i>
-                            <span id="video-seek-fwd-label" class="text-sm font-medium">5s</span>
-                        </div>
+                </div>
+                <div id="video-seek-fwd-overlay"
+                    class="absolute right-0 top-0 w-1/2 h-full flex items-center justify-center z-[15] pointer-events-none opacity-0 transition-opacity duration-200">
+                    <div class="flex flex-col items-center gap-1 text-white">
+                        <i class="ri-speed-mini-line text-4xl"></i>
+                        <span id="video-seek-fwd-label" class="text-sm font-medium">5s</span>
                     </div>
+                </div>
 
-                    <!-- Center play button — only visible while the video is paused. -->
-                    <button id="video-center-play"
-                        class="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-20 h-20 rounded-full bg-black/60 hover:bg-black/80 flex items-center justify-center text-white z-20 transition-opacity duration-200 hidden"
-                        data-i18n-aria-label="viewer.video.play" aria-label="Play">
-                        <i class="ri-play-fill text-5xl ml-1"></i>
-                    </button>
+                <!-- Center play button — only visible while the video is paused. -->
+                <button id="video-center-play"
+                    class="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-20 h-20 rounded-full bg-black/60 hover:bg-black/80 flex items-center justify-center text-white z-20 transition-opacity duration-200 hidden"
+                    data-i18n-aria-label="viewer.video.play" aria-label="Play">
+                    <i class="ri-play-fill text-5xl ml-1"></i>
+                </button>
 
-                    <!-- Buffering spinner — centered. Cold start (no frame yet) plus mid-playback waiting/seeking. -->
-                    <div id="video-spinner"
-                        class="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-20 pointer-events-none hidden">
-                        <div class="w-12 h-12 border-4 border-white/20 border-t-white rounded-full animate-spin"></div>
-                    </div>
+                <!-- Buffering spinner — centered, shown while readyState < HAVE_FUTURE_DATA. -->
+                <div id="video-spinner"
+                    class="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-20 pointer-events-none hidden">
+                    <div class="w-12 h-12 border-4 border-white/20 border-t-white rounded-full animate-spin"></div>
+                </div>
 
-                    <!-- Error overlay. -->
-                    <div id="video-error"
-                        class="absolute inset-0 z-30 hidden flex-col items-center justify-center gap-4 bg-black/80 text-white">
-                        <i class="ri-error-warning-line text-5xl text-red-400"></i>
-                        <p id="video-error-msg" class="text-sm text-white/80 max-w-xs text-center px-4"></p>
-                        <button id="video-retry-btn"
-                            class="px-4 py-2 bg-tg-blue hover:bg-tg-darkBlue rounded-lg text-sm text-white font-medium"
-                            data-i18n="viewer.video.retry">Retry</button>
-                    </div>
+                <!-- Error overlay. -->
+                <div id="video-error"
+                    class="absolute inset-0 z-30 hidden flex-col items-center justify-center gap-4 bg-black/80 text-white">
+                    <i class="ri-error-warning-line text-5xl text-red-400"></i>
+                    <p id="video-error-msg" class="text-sm text-white/80 max-w-xs text-center px-4"></p>
+                    <button id="video-retry-btn"
+                        class="px-4 py-2 bg-tg-blue hover:bg-tg-darkBlue rounded-lg text-sm text-white font-medium"
+                        data-i18n="viewer.video.retry">Retry</button>
+                </div>
                 </div>
 
                 <!-- Speed menu — opens above the speed button (docked controls). -->
@@ -4779,10 +4509,8 @@
                     <button class="speed-opt flex items-center justify-between px-3 py-1.5 hover:bg-white/10 text-sm w-full" data-speed="2"><span>2x</span></button>
                 </div>
 
-                <!-- Docked controls band below the picture. Auto-hide
-                     collapses this band (`.controls-collapsed`) so the
-                     video can reclaim the space; when visible the
-                     seekbar never covers the picture. -->
+                <!-- Docked controls below the picture. Auto-hide adds
+                     `.controls-collapsed` so the stage reclaims the space. -->
                 <div id="video-controls"
                     class="video-controls relative shrink-0 w-full bg-black/90 transition-opacity duration-200 z-40">
                     <!-- Seek bar with hover preview. Outer hit-zone is
@@ -4869,25 +4597,27 @@
                          always-visible at 80 px wide (no hover-expand
                          which used to shove time text to the right and
                          was unusable on touch). -->
-                    <div class="flex items-center px-3 py-2 gap-2">
-                        <!-- Left cluster: play + volume -->
+                    <div class="flex items-center px-2 sm:px-3 py-2 gap-1 sm:gap-2">
+                        <!-- Left cluster: play + volume. Skip ± and mute hide below
+                             sm — double-tap seeks and phones have volume keys — so the
+                             row fits a 360 px screen. -->
                         <button id="video-play-btn"
                             class="w-10 h-10 rounded-full hover:bg-white/10 flex items-center justify-center text-white transition shrink-0"
                             data-i18n-aria-label="viewer.video.play" aria-label="Play">
                             <i class="ri-play-fill text-2xl"></i>
                         </button>
                         <button id="video-skip-back"
-                            class="w-9 h-9 rounded-full hover:bg-white/10 flex items-center justify-center text-white/85 hover:text-white transition shrink-0"
+                            class="w-9 h-9 rounded-full hover:bg-white/10 hidden sm:flex items-center justify-center text-white/85 hover:text-white transition shrink-0"
                             data-i18n-title="viewer.video.skip_back" title="Skip back">
                             <i class="ri-rewind-mini-line text-lg"></i>
                         </button>
                         <button id="video-skip-fwd"
-                            class="w-9 h-9 rounded-full hover:bg-white/10 flex items-center justify-center text-white/85 hover:text-white transition shrink-0"
+                            class="w-9 h-9 rounded-full hover:bg-white/10 hidden sm:flex items-center justify-center text-white/85 hover:text-white transition shrink-0"
                             data-i18n-title="viewer.video.skip_fwd" title="Skip forward">
                             <i class="ri-speed-mini-line text-lg"></i>
                         </button>
                         <button id="video-mute-btn"
-                            class="text-white/90 hover:text-white w-9 h-9 flex items-center justify-center rounded hover:bg-white/10 shrink-0"
+                            class="text-white/90 hover:text-white w-9 h-9 hidden sm:flex items-center justify-center rounded hover:bg-white/10 shrink-0"
                             data-i18n-aria-label="viewer.video.mute" aria-label="Mute">
                             <i class="ri-volume-up-line text-lg"></i>
                         </button>
@@ -4928,7 +4658,7 @@
                          from the same WebP sprite used by hover previews.
                          Clicking a cell seeks to that timestamp.
                          JS: _renderFilmstrip() in viewer.js. -->
-                    <div id="video-filmstrip" class="hidden" aria-label="Timeline thumbnails">
+                    <div id="video-filmstrip" class="hidden" role="group" aria-label="Timeline thumbnails">
                         <div class="filmstrip-time-float" id="filmstrip-time-float"></div>
                         <div class="filmstrip-wrap">
                             <button id="filmstrip-prev" type="button" class="filmstrip-arrow" aria-label="Scroll left" tabindex="-1">
@@ -5062,23 +4792,23 @@
                             <span id="modal-group-name" class="truncate"></span>
                         </span>
                         <span class="flex-1"></span>
+                        <button id="modal-pin" data-admin-only type="button"
+                            class="hidden min-w-[44px] min-h-[40px] justify-center px-2.5 sm:px-4 py-1.5 sm:py-2 bg-tg-panel hover:bg-tg-hover rounded-lg text-xs sm:text-sm text-tg-text items-center font-medium transition"
+                            data-i18n-title="favorites.pin" title="Pin" aria-pressed="false">
+                            <i class="ri-pushpin-2-line sm:mr-1.5"></i><span class="hidden sm:inline" data-i18n="favorites.pin">Pin</span>
+                        </button>
                         <button id="modal-share" data-admin-only
-                            class="px-2.5 sm:px-4 py-1.5 sm:py-2 bg-tg-panel hover:bg-tg-hover rounded-lg text-xs sm:text-sm text-tg-text flex items-center font-medium transition"
+                            class="min-w-[44px] min-h-[40px] justify-center px-2.5 sm:px-4 py-1.5 sm:py-2 bg-tg-panel hover:bg-tg-hover rounded-lg text-xs sm:text-sm text-tg-text flex items-center font-medium transition"
                             data-i18n-title="viewer.video.share_title" title="Share with friends — link works without login">
                             <i class="ri-share-line sm:mr-1.5"></i><span class="hidden sm:inline" data-i18n="viewer.video.share">Share</span>
                         </button>
-                        <button id="modal-pin" data-admin-only
-                            class="px-2.5 sm:px-4 py-1.5 sm:py-2 bg-tg-panel hover:bg-tg-hover rounded-lg text-xs sm:text-sm text-tg-text flex items-center font-medium transition"
-                            title="Pin file">
-                            <i class="ri-pushpin-2-line sm:mr-1.5"></i><span class="hidden sm:inline">Pin</span>
-                        </button>
                         <button id="modal-delete" onclick="confirmDeleteFile()" data-admin-only
-                            class="px-2.5 sm:px-4 py-1.5 sm:py-2 bg-red-600 hover:bg-red-700 rounded-lg text-xs sm:text-sm text-white flex items-center font-medium transition"
+                            class="min-w-[44px] min-h-[40px] justify-center px-2.5 sm:px-4 py-1.5 sm:py-2 bg-red-600 hover:bg-red-700 rounded-lg text-xs sm:text-sm text-white flex items-center font-medium transition"
                             data-i18n-title="viewer.video.delete_title" title="Delete File">
                             <i class="ri-delete-bin-line sm:mr-1.5"></i><span class="hidden sm:inline" data-i18n="viewer.video.delete">Delete</span>
                         </button>
                         <a id="modal-download" href="#" download
-                            class="px-2.5 sm:px-4 py-1.5 sm:py-2 bg-tg-blue hover:bg-tg-darkBlue rounded-lg text-xs sm:text-sm text-white flex items-center font-medium transition">
+                            class="min-w-[44px] min-h-[40px] justify-center px-2.5 sm:px-4 py-1.5 sm:py-2 bg-tg-blue hover:bg-tg-darkBlue rounded-lg text-xs sm:text-sm text-white flex items-center font-medium transition">
                             <i class="ri-download-line sm:mr-1.5"></i><span class="hidden sm:inline" data-i18n="viewer.video.download">Download</span>
                         </a>
                     </div>
@@ -5106,19 +4836,16 @@
         <i class="ri-add-line" aria-hidden="true"></i>
     </button>
 
-    <!-- Bottom navigation (mobile only) — replaces the drawer-only
-         navigation pattern. Five tabs: Library / Chats / Backfill / Queue /
-         Settings. Engine is surfaced as a tappable status pill in the top
-         header; tapping it deep-links to #/settings/engine. -->
-    <nav class="bottom-nav" aria-label="Primary">
-        <a class="bottom-nav-item" href="#/viewer" data-nav="viewer" data-i18n-aria-label="nav.library" aria-label="Library">
+    <!-- Bottom navigation (mobile only) — the same four places as the
+         desktop sidebar (js/nav.js): Library / Chats / Queue / Settings.
+         Backfill is a tab of Chats; Tools a section of Settings. Engine is
+         a tappable status pill in the top header (#/settings/engine). -->
+    <nav class="bottom-nav" data-i18n-aria-label="nav.primary" aria-label="Primary">
+        <a class="bottom-nav-item" href="#/viewer" data-nav="viewer" data-library-link data-i18n-aria-label="nav.library" aria-label="Library">
             <i class="ri-gallery-line" aria-hidden="true"></i><span data-i18n="nav.library">Library</span>
         </a>
         <a class="bottom-nav-item" href="#/groups" data-nav="groups" data-admin-only data-i18n-aria-label="nav.chats" aria-label="Chats">
             <i class="ri-chat-3-line" aria-hidden="true"></i><span data-i18n="nav.chats">Chats</span>
-        </a>
-        <a class="bottom-nav-item" href="#/backfill" data-nav="backfill" data-admin-only data-i18n-aria-label="nav.backfill" aria-label="Backfill">
-            <i class="ri-history-line" aria-hidden="true"></i><span data-i18n="nav.backfill">Backfill</span>
         </a>
         <a class="bottom-nav-item" href="#/queue" data-nav="queue" data-admin-only data-i18n-aria-label="nav.queue" aria-label="Queue">
             <i class="ri-download-cloud-2-line" aria-hidden="true"></i><span data-i18n="nav.queue">Queue</span>
@@ -5141,7 +4868,13 @@
         (() => {
             try {
                 const raw = (location.hash || '').replace(/^#\/?/, '').split('?')[0].replace(/\/+$/, '');
-                const parts = raw ? raw.split('/').filter(Boolean) : [];
+                let parts = raw ? raw.split('/').filter(Boolean) : [];
+                // Tools moved under Settings (js/nav.js): #/settings/tools/<group>
+                // is #page-maintenance, …/<group>/<tool> the tool's page;
+                // old #/maintenance → Settings, #/maintenance/<tool> → its group.
+                if (parts[0] === 'maintenance') parts = parts[1] ? ['maintenance'] : ['settings'];
+                else if (parts[0] === 'settings' && parts[1] === 'tools' && parts[2])
+                    parts = parts[3] ? ['maintenance', parts[3]] : ['maintenance'];
                 let target = null;
                 for (let i = parts.length; i > 0 && !target; i--) {
                     const id = 'page-' + parts.slice(0, i).join('-');

@@ -16,15 +16,7 @@
  *   tryStart()  /  getStatus()  /  abort()
  */
 
-import {
-    findCrossClusterDuplicates,
-    recordClusterAudit,
-    kvGet,
-    kvSet,
-    getDb,
-    deleteDownloadsBy,
-    liveIdsSharingFilePath,
-} from '../db.js';
+import { findCrossClusterDuplicates, recordClusterAudit, kvGet, kvSet } from '../db.js';
 import { createJobTracker } from '../job-tracker.js';
 import { getSelfPeerId } from './identity.js';
 import fs from 'fs/promises';
@@ -166,7 +158,7 @@ export async function resolveConflict(conflictId, keep) {
     let unlinked = 0;
     let queued = 0;
     let remoteDeleted = 0;
-    const { getDb, enqueuePeerDeleteJob } = await import('../db.js');
+    const { getDb, enqueuePeerDeleteJob, rememberDeletedDownloads } = await import('../db.js');
     const { purgeThumbsForDownload } = await import('../thumbs.js');
     const { purgeSeekbarForDownload } = await import('../seekbar/index.js');
     const selfId = getSelfPeerId();
@@ -181,20 +173,18 @@ export async function resolveConflict(conflictId, keep) {
                         'SELECT sprite_path, meta_path FROM seekbar_sprites WHERE download_id = ?',
                     )
                     .get(id);
-                try {
-                    if (liveIdsSharingFilePath(loser.filePath, { exceptIds: [id] }).length === 0) {
+                // Another local row (download-time dedup) may still use the file.
+                const { idsWithFileInUse } = await import('../dedup.js');
+                if (!idsWithFileInUse([id]).has(id)) {
+                    try {
                         const { deferDelete } = await import('../deferred-delete.js');
                         deferDelete(abs);
-                    }
-                } catch {
-                    if (liveIdsSharingFilePath(loser.filePath, { exceptIds: [id] }).length === 0) {
+                    } catch {
                         await fs.unlink(abs).catch(() => {});
                     }
                 }
-                // Soft-delete via deleteDownloadsBy so faces / embeddings /
-                // pending backup jobs are wiped. Tombstone keeps
-                // isDownloaded() true after cluster dedup.
-                deleteDownloadsBy({ ids: [id] });
+                rememberDeletedDownloads([id]);
+                getDb().prepare('DELETE FROM downloads WHERE id = ?').run(id);
                 purgeThumbsForDownload(id).catch(() => {});
                 purgeSeekbarForDownload(id, seekbarRow || undefined).catch(() => {});
                 unlinked++;

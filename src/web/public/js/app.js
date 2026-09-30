@@ -5,22 +5,15 @@
 
 import { state, getGroupName, updateGroupNameCache, isUnresolvedName } from './store.js';
 import { api } from './api.js';
-import { createAvatar, escapeHtml, getFileIcon, showToast, formatBytes } from './utils.js';
-import {
-    getThumbUrl,
-    getMediaUrl,
-    getDownloadUrl,
-    isPeerRow,
-    initFileToken,
-    fileTokenQuery,
-} from './media-url.js';
-import * as Settings from './settings.js';
+import { escapeHtml, getFileIcon, showToast, formatBytes } from './utils.js';
+import { getThumbUrl, isPeerRow, initFileToken } from './media-url.js';
 import * as Viewer from './viewer.js';
 import { initEngine, handleEngineWsMessage } from './engine.js';
 import { ws } from './ws.js';
 import { initTheme, getTheme, setTheme } from './theme.js';
 import { initStatusBar } from './statusbar.js';
 import * as Notifications from './notifications.js';
+import { initCoreBanner } from './core-banner.js';
 import { initOnboarding, refreshOnboarding } from './onboarding.js';
 import { initOnboardingDismiss } from './onboarding-dismiss.js';
 import {
@@ -30,6 +23,16 @@ import {
 import { initReauthModal } from './reauth-modal.js';
 import { initShortcuts } from './shortcuts.js';
 import * as router from './router.js';
+import * as Nav from './nav.js';
+import { getGroup as getToolGroup } from './tools-catalog.js';
+import {
+    accessBadgeHtml,
+    isBlockedAccess,
+    recheckAllUnreachable,
+    removeChatsFromList,
+    stopMonitoringChats,
+    unreachableGroups,
+} from './chat-access.js';
 import { openSheet, confirmSheet } from './sheet.js';
 import {
     renderChatRow,
@@ -44,8 +47,17 @@ import {
     exitSelectMode,
     repaintSelection,
     selectAllVisible,
+    bulkDeleteTargets,
 } from './gallery-select.js';
-import { trimGalleryDOM, resetGalleryWindow } from './gallery-virtual.js';
+import {
+    configureGalleryWindow,
+    resetGalleryWindow,
+    rerenderGalleryWindow,
+    appendPositions,
+    hasPendingBelow,
+    extendBottom,
+    removeFileIndex,
+} from './gallery-virtual.js';
 import {
     initI18n,
     setLang,
@@ -54,11 +66,6 @@ import {
     t as i18nT,
     tf as i18nTf,
 } from './i18n.js';
-import {
-    showBackfillPage,
-    deepLinkFromModal as backfillDeepLink,
-    stopBackfillPage,
-} from './backfill.js';
 import * as Fonts from './fonts.js';
 import { showQueuePage, initQueue } from './queue.js';
 import { initHeaderMobile, pushLogToNotify } from './header-mobile.js';
@@ -66,6 +73,164 @@ import { setupDragDropLink } from './dragdrop-link.js';
 import { setupMiniPlayer, shrinkToMini, dismiss as dismissMiniPlayer } from './mini-player.js';
 import { wireChangelogTrigger } from './changelog-viewer.js';
 import * as WakeLock from './wake-lock.js';
+import {
+    setupGalleryToolbar,
+    syncGalleryToolbar,
+    resetGallerySearch,
+    clearGallerySearch,
+    setSearchResultCount,
+    formatResultCount,
+    pinnedQs,
+    getPinnedMode,
+    setPinnedMode,
+} from './gallery-toolbar.js';
+
+// ============ Lazy page modules ============
+//
+// settings.js (~3.3k lines + its own imports) and backfill.js only matter
+// once their page opens, so they're no longer part of the boot import
+// graph. The first navigation (or a click on one of the few always-present
+// controls that need them, e.g. sidebar Sign out) imports them; after boot
+// they're also warmed up in idle time so that first use is instant.
+// Relative dynamic imports get the server's `?v=` stamp like static ones.
+let _settingsModule = null;
+function loadSettingsModule() {
+    if (!_settingsModule) {
+        _settingsModule = import('./settings.js').catch((e) => {
+            _settingsModule = null;
+            throw e;
+        });
+    }
+    return _settingsModule;
+}
+// Wrap a settings.js export as an event handler / global that loads the
+// module on first call. Keeps `this` + arguments intact.
+function settingsCall(name) {
+    return function (...args) {
+        return loadSettingsModule().then((m) => m[name].apply(this, args));
+    };
+}
+
+let _backfillModule = null;
+let _backfillLoaded = null; // resolved module, for synchronous teardown
+function loadBackfillModule() {
+    if (!_backfillModule) {
+        _backfillModule = import('./backfill.js')
+            .then((m) => {
+                _backfillLoaded = m;
+                return m;
+            })
+            .catch((e) => {
+                _backfillModule = null;
+                throw e;
+            });
+    }
+    return _backfillModule;
+}
+
+// The one-step backfill sheet for a chat (Group Settings, empty chat
+// gallery, chat header). `limit` preselects a preset (0 = all history).
+function openBackfillFor(groupId, limit) {
+    if (!groupId) return;
+    loadBackfillModule()
+        .then((m) => m.openBackfillSheet(groupId, limit == null ? {} : { limit }))
+        .catch((e) => console.error('backfill sheet', e));
+}
+
+// Chat-only header actions (Backfill this chat) follow the open view.
+function _syncChatHeaderActions() {
+    const inChat = state.currentPage === 'viewer' && !!state.currentGroupId;
+    document.body.classList.toggle('in-chat', inChat);
+    // Inside a chat the header's avatar + name open its details (admins).
+    const head = document.getElementById('header-avatar')?.parentElement;
+    if (!head) return;
+    const on = inChat && state.role === 'admin';
+    head.classList.toggle('chat-head-link', on);
+    if (on) {
+        head.setAttribute('role', 'button');
+        head.tabIndex = 0;
+        head.setAttribute(
+            'aria-label',
+            i18nTf(
+                'chat.details.open_for',
+                { name: state.currentGroup || '' },
+                `Chat settings: ${state.currentGroup || ''}`,
+            ),
+        );
+    } else {
+        head.removeAttribute('role');
+        head.removeAttribute('tabindex');
+        head.removeAttribute('aria-label');
+    }
+}
+
+// Ways into a chat's details page from its gallery: a settings button
+// next to "Backfill this chat" (phones: a ⋮ menu row) and a tap on the
+// chat's avatar / name in the header. Added from here rather than in
+// index.html so the header markup itself stays as it is.
+function _setupChatDetailsEntry() {
+    const open = () => {
+        if (state.currentGroupId) openGroupSettings(state.currentGroupId);
+    };
+    const label = i18nT('chat.details.open', 'Chat settings');
+    const bf = document.getElementById('backfill-chat-btn');
+    if (bf && !document.getElementById('chat-details-btn')) {
+        bf.insertAdjacentHTML(
+            'beforebegin',
+            `<button id="chat-details-btn" type="button" data-admin-only data-chat-only
+                class="hidden sm:flex w-10 h-10 min-w-[44px] min-h-[44px] rounded-full hover:bg-tg-hover items-center justify-center"
+                data-i18n-aria-label="chat.details.open" aria-label="${escapeHtml(label)}"
+                data-i18n-title="chat.details.open" title="${escapeHtml(label)}">
+                <i class="ri-settings-3-line text-xl text-tg-textSecondary" aria-hidden="true"></i>
+            </button>`,
+        );
+        document.getElementById('chat-details-btn')?.addEventListener('click', open);
+    }
+    const row = document.querySelector('#header-overflow-menu [data-overflow="backfill-chat"]');
+    if (row && !document.querySelector('[data-overflow="chat-details"]')) {
+        row.insertAdjacentHTML(
+            'beforebegin',
+            `<button type="button" data-overflow="chat-details" data-admin-only data-chat-only role="menuitem">
+                <i class="ri-settings-3-line"></i>
+                <span class="vm-label" data-i18n="chat.details.open">${escapeHtml(label)}</span>
+            </button>`,
+        );
+        document
+            .querySelector('#header-overflow-menu [data-overflow="chat-details"]')
+            ?.addEventListener('click', open);
+    }
+    const head = document.getElementById('header-avatar')?.parentElement;
+    if (head) {
+        head.addEventListener('click', (e) => {
+            if (head.classList.contains('chat-head-link') && !e.target.closest('#role-pill'))
+                open();
+        });
+        head.addEventListener('keydown', (e) => {
+            if ((e.key === 'Enter' || e.key === ' ') && head.classList.contains('chat-head-link')) {
+                e.preventDefault();
+                open();
+            }
+        });
+    }
+}
+
+// The Telegram account wizard (js/account-wizard.js) is a sheet. Links to
+// #/account/add inside the dashboard open it where you are; the route
+// itself (old links, a typed URL) still works — see registerRoutes().
+function openAccountWizard() {
+    return import('./account-wizard.js')
+        .then((m) => m.openAccountWizard())
+        .catch((e) => console.error('account wizard', e));
+}
+function _setupAccountWizardLinks() {
+    document.addEventListener('click', (e) => {
+        if (e.defaultPrevented || e.button !== 0) return;
+        if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+        if (!e.target.closest?.('a[href="#/account/add"]')) return;
+        e.preventDefault();
+        openAccountWizard();
+    });
+}
 
 // ============ Render coalescing ============
 //
@@ -167,21 +332,9 @@ async function init() {
 
     Viewer.setupViewerEvents();
     Viewer.onShuffleChange(() => {
-        if (state.currentPage === 'viewer') {
-            try {
-                renderMediaGrid();
-            } catch (e) {
-                console.warn('renderMediaGrid after shuffle change:', e);
-            }
-        }
-        // Sync button chrome is already handled inside viewer; keep hasMore in sync.
-        if (Viewer.isShuffleActive()) {
-            state.hasMore = Viewer.shuffleHasMore();
-        }
+        if (state.currentPage === 'viewer') renderMediaGrid();
     });
-    document.getElementById('gallery-shuffle-btn')?.addEventListener('click', (e) => {
-        e.preventDefault();
-        e.stopPropagation();
+    document.getElementById('gallery-shuffle-btn')?.addEventListener('click', () => {
         void Viewer.toggleShuffle({ openPlayer: false });
     });
 
@@ -204,11 +357,14 @@ async function init() {
     window.saveGroupSettings = saveGroupSettings;
     window.refreshCurrentPage = refreshCurrentPage;
     window.switchGroupsTab = switchGroupsTab;
-    window.switchSettingsTab = switchSettingsTab;
-    window.toggleGroupEnabled = toggleGroupEnabled;
     window.closeSidebar = closeSidebar;
     window.confirmDeleteFile = confirmDeleteFile;
-    window.toggleFwdEnabled = toggleFwdEnabled;
+    window.openBackfillSheet = openBackfillFor;
+    document
+        .getElementById('backfill-chat-btn')
+        ?.addEventListener('click', () => openBackfillFor(state.currentGroupId));
+    _setupChatDetailsEntry();
+    _setupAccountWizardLinks();
     // Mini-player public surface — viewer.js can opt into the dock-on-
     // close behaviour by calling `window.tgdlShrinkToMini()` from the
     // modal close path. Kept on `window` (instead of imported) so the
@@ -228,44 +384,51 @@ async function init() {
         } catch {}
     });
     ws.on('group_purged', () => loadGroups());
-    ws.on('purge_all', () => {
-        loadGroups();
-        loadStats();
-    });
+    ws.on('purge_all', () => loadGroups());
+    // Footer counters ride the server's debounced `stats_update` push
+    // (fired after every download_complete / file_deleted / bulk_delete /
+    // purge / config change). Refetching /api/stats per file event, as
+    // this module used to, flooded the server during backfills and
+    // auto-prune sweeps. Re-sync once after a reconnect.
+    ws.on('stats_update', (m) => _applyStats(m?.stats || m?.payload || null));
+    ws.on('__ws_open', () => loadStats());
     // Auto-prune / disk-rotator / rescue sweeper all broadcast file_deleted —
     // drop the matching tile from the open gallery if any, otherwise just
-    // refresh stats so disk-usage / file-count chip stay current. We do
-    // this in two surgical moves to avoid a full grid re-render (which on
-    // a thousand-tile gallery is a visible jank): mutate state.files +
-    // remove the single matching DOM node by data-path. The originalIndex
-    // attribute on remaining tiles stays valid because we never re-index
-    // after removal — the viewer's index lookup falls back to filename
-    // resolution if it ever becomes stale.
+    // refresh stats so disk-usage / file-count chip stay current. Surgical
+    // (no full grid re-render, which on a thousand-tile gallery is a
+    // visible jank): splice state.files in place and let the gallery
+    // window drop the position + re-index the `data-index` of later tiles
+    // so the viewer keeps opening the right file.
     const dropFileFromView = (m) => {
         const droppedPath = m?.path;
         const droppedId = m?.id;
+        if (Viewer.isShuffleActive() && (droppedPath || droppedId != null)) {
+            Viewer.removeShuffleFile(
+                droppedId != null
+                    ? { id: droppedId, peer_id: 'self' }
+                    : { path: droppedPath },
+            );
+            return;
+        }
         if (Array.isArray(state.files) && (droppedPath || droppedId != null)) {
-            const before = state.files.length;
-            const victim =
-                state.files.find((f) => {
-                    if (droppedPath && (f.fullPath === droppedPath || f.path === droppedPath))
-                        return true;
-                    if (droppedId != null && f.id === droppedId) return true;
-                    return false;
-                }) || { path: droppedPath, fullPath: droppedPath, id: droppedId };
-            Viewer.removeShuffleFile(victim);
-            state.files = state.files.filter((f) => {
-                if (droppedPath && (f.fullPath === droppedPath || f.path === droppedPath))
-                    return false;
-                if (droppedId != null && f.id === droppedId) return false;
-                return true;
-            });
-            if (state.files.length !== before && state.currentPage === 'viewer') {
-                _removeTileFromGrid({ path: droppedPath, id: droppedId });
+            const isGallery = state.files === _galleryFilesRef;
+            for (let i = state.files.length - 1; i >= 0; i--) {
+                const f = state.files[i];
+                // Prefer the row id: rows that share one file (download-time
+                // dedup) share its path, and only this row went away.
+                const hit =
+                    droppedId != null
+                        ? f.id === droppedId && (f.peer_id || 'self') === 'self'
+                        : f.fullPath === droppedPath || f.path === droppedPath;
+                if (!hit) continue;
+                state.files.splice(i, 1);
+                if (isGallery) removeFileIndex(i);
+            }
+            if (isGallery) {
                 _renderedFileCount = state.files.length;
+                if (state.files.length === 0) renderGalleryEmptyState();
             }
         }
-        loadStats();
     };
     ws.on('file_deleted', dropFileFromView);
     // Federated gallery live-refresh (Layer 1, v2.12+). Server broadcasts
@@ -286,7 +449,6 @@ async function init() {
     });
     ws.on('bulk_delete', () => {
         if (state.currentPage === 'viewer') refreshCurrentPage();
-        loadStats();
     });
     // Rescue Mode aggregate — fires once after every sweep. The per-row
     // `file_deleted` events above already kept the gallery + stats in
@@ -302,7 +464,7 @@ async function init() {
         );
     });
     ws.on('config_updated', () => {
-        if (state.currentPage === 'settings') Settings.loadSettings();
+        if (state.currentPage === 'settings') settingsCall('loadSettings')();
         // Refresh the in-memory group cache so other pages (Backfill,
         // Sidebar, Manage Groups) see new/removed entries without a hard
         // reload. Stale `state.groups` was causing "History failed: Group
@@ -310,6 +472,49 @@ async function init() {
         // because the Backfill page kept sending an id the new config
         // accepted but the old client snapshot didn't list anymore.
         loadGroups().catch(() => {});
+    });
+    // A chat became unreachable / reachable again (polling, a download, the
+    // re-checker, a dialogs sync). Coalesced server-side; reload the list
+    // once and repaint whatever shows the badge.
+    let _accessReloadTimer = null;
+    ws.on('chat_access_changed', () => {
+        clearTimeout(_accessReloadTimer);
+        _accessReloadTimer = setTimeout(async () => {
+            await loadGroups().catch(() => {});
+            if (state.currentPage === 'groups') _paintDialogs();
+            if (state.currentPage === 'chat') {
+                loadChatDetailsModule()
+                    .then((m) => m.refreshChatAccess?.())
+                    .catch(() => {});
+            }
+        }, 400);
+    });
+    ws.on('chat_access_recheck_progress', (m) => {
+        const p = m?.progress || {};
+        state._attnBusy = 'recheck';
+        if (p.total) {
+            state._attnStatus = i18nTf(
+                'access.attention.progress',
+                { done: p.processed || 0, total: p.total },
+                `Checked ${p.processed || 0} of ${p.total}…`,
+            );
+        }
+        if (state.currentPage === 'groups' && state.groupsTab === 'attention') {
+            _paintAttentionPanel('attention');
+        }
+    });
+    ws.on('chat_access_recheck_done', async (m) => {
+        state._attnBusy = '';
+        const r = m?.result || {};
+        state._attnStatus = r.total
+            ? i18nTf(
+                  'access.attention.done',
+                  { ok: r.reachable || 0, n: r.total },
+                  `${r.reachable || 0} of ${r.total} can be reached again.`,
+              )
+            : '';
+        await loadGroups().catch(() => {});
+        if (state.currentPage === 'groups') _paintDialogs();
     });
     // NSFW review tool — server fires `nsfw_progress` every batch and
     // `nsfw_done` when the scan finishes. We refresh the Maintenance
@@ -361,8 +566,7 @@ async function init() {
                 const fresh = getGroupName(state.currentGroupId);
                 if (fresh && fresh !== state.currentGroup) {
                     state.currentGroup = fresh;
-                    const t = document.getElementById('page-title');
-                    if (t) t.textContent = fresh;
+                    _setPageRaw('title', fresh);
                 }
             }
         }
@@ -437,6 +641,7 @@ async function init() {
     const isAdmin = state.role === 'admin';
     initStatusBar();
     if (isAdmin) {
+        initCoreBanner();
         initOnboarding();
         // Must initialise AFTER initOnboarding so our monitor-status
         // subscriber lands later in the Set and runs after the banner
@@ -446,8 +651,10 @@ async function init() {
         ws.on('monitor_state', refreshOnboarding);
     }
 
-    // Global keyboard shortcuts (press ? for the cheatsheet).
+    // Global keyboard shortcuts (press ? for the cheatsheet), and the
+    // Go anywhere palette on Ctrl/Cmd+K + the header / sidebar buttons.
     initShortcuts();
+    Nav.initNav();
 
     // Mobile-friendly header chrome: overflow ⋮ menu (collapses paste-link /
     // stories / view-mode / refresh on <640 px viewports) + notification
@@ -466,20 +673,28 @@ async function init() {
     // re-acquire when the tab comes back if jobs are still in flight.
     WakeLock.attachVisibilityRefresh(() => state.activeJobsCount || 0);
 
+    // Groups feed the sidebar and the per-group route titles, so the first
+    // route waits for them. Stats (footer counters; may scan the disk on a
+    // cold cache) don't shape the first page and no longer delay it.
     await loadGroups();
-    await loadStats();
+    loadStats();
 
     // Federated gallery scope (Layer 1, v2.12+) — boot one-shot. Reads
     // /api/cluster/peers, hides the chip if no peers paired, otherwise
     // restores the operator's last-saved scope from localStorage and
     // wires the chip click handler. Admin-only: the endpoint 401s for
-    // guests, the chip itself is `data-admin-only`.
+    // guests, the chip itself is `data-admin-only`. Only a saved non-local
+    // scope changes the first gallery query, so only then does the first
+    // route wait for the peer lookup.
     if (isAdmin) {
-        try {
-            await initGalleryScope();
-        } catch (e) {
+        const scopeReady = initGalleryScope().catch((e) => {
             console.warn('gallery scope init failed', e);
-        }
+        });
+        let savedScope = null;
+        try {
+            savedScope = localStorage.getItem('tgdl-gallery-scope');
+        } catch {}
+        if (savedScope && savedScope !== 'local') await scopeReady;
     }
 
     // First-load name resolve — admin-only because it POSTs and forces a
@@ -508,6 +723,17 @@ async function init() {
     if (isAdmin) initQueue();
     router.start();
     initMaintenanceTabs();
+    // Warm the lazily-loaded page modules once the first route is up, so
+    // the first Settings / Backfill visit doesn't wait on a fetch + parse.
+    const warmPageModules = () => {
+        loadSettingsModule().catch(() => {});
+        if (isAdmin) loadBackfillModule().catch(() => {});
+    };
+    if (typeof window.requestIdleCallback === 'function') {
+        window.requestIdleCallback(warmPageModules, { timeout: 5000 });
+    } else {
+        setTimeout(warmPageModules, 2000);
+    }
 
     // Window bindings that depend on functions defined LATER in the
     // module. Pulled out from the main `window.*` block above (which
@@ -515,7 +741,6 @@ async function init() {
     // setupFab / Settings / Viewer / etc. closures further down. Safe to
     // assign post-await because no inline onclick reaches them before
     // the operator clicks something.
-    window.toggleFwdDelete = toggleFwdDelete;
     window.openDestinationPicker = openDestinationPicker;
     window.filterDialogs = filterDialogs;
     window.filterSidebarGroups = filterSidebarGroups;
@@ -593,7 +818,7 @@ async function init() {
     }
 
     // Settings globals
-    window.applyPreset = Settings.applyPreset;
+    window.applyPreset = settingsCall('applyPreset');
     // Manual Save button removed in v2.6 — auto-save handles every edit
     // 800 ms after the last change, with the inline pill + notification
     // bell entry for confirmation. The legacy `Settings.saveSettings`
@@ -601,11 +826,11 @@ async function init() {
     // console, just no longer wired to a button.
     document
         .getElementById('save-api-credentials')
-        ?.addEventListener('click', Settings.saveApiCredentials);
+        ?.addEventListener('click', settingsCall('saveApiCredentials'));
     document
         .getElementById('change-password-btn')
-        ?.addEventListener('click', Settings.changePassword);
-    document.getElementById('logout-btn')?.addEventListener('click', Settings.signOut);
+        ?.addEventListener('click', settingsCall('changePassword'));
+    document.getElementById('logout-btn')?.addEventListener('click', settingsCall('signOut'));
     // Sidebar footer sign-out — gated behind confirmSheet because the
     // button sits in always-visible chrome and is one accidental tap away
     // from booting the operator. The deeper Settings button stays no-confirm
@@ -620,10 +845,10 @@ async function init() {
             confirmLabel: i18nT('sidebar.signout', 'Sign out'),
             danger: true,
         });
-        if (ok) Settings.signOut();
+        if (ok) settingsCall('signOut')();
     });
-    document.getElementById('proxy-save')?.addEventListener('click', Settings.saveProxy);
-    document.getElementById('proxy-test')?.addEventListener('click', Settings.testProxy);
+    document.getElementById('proxy-save')?.addEventListener('click', settingsCall('saveProxy'));
+    document.getElementById('proxy-test')?.addEventListener('click', settingsCall('testProxy'));
     document.getElementById('setting-path-btn')?.addEventListener('click', () => {
         showToast(i18nT('settings.download.cli_only_toast', 'Use CLI to change path'));
     });
@@ -639,11 +864,16 @@ async function init() {
     // phase so they take precedence over app.js's per-tile delegation.
     setupGallerySelect({
         onChange: () => updateSelectionBar(),
+        onSelectMode: () => updateSelectionBar(),
+        // Every loaded file of the view, not only the tiles the DOM window
+        // holds right now.
+        allPaths: () => _selectableFiles().map((f) => f.fullPath),
         deleteSelected: () => {
             const btn = document.getElementById('selection-delete');
             if (btn) btn.click();
         },
     });
+    _setupSelectHint();
     setupToggleA11y();
 
     // Initialise i18n + the language picker. The fall-through is English so
@@ -703,18 +933,49 @@ function renderPage(page, params = {}) {
     // page we're leaving so they don't keep running invisible.
     if (state.currentPage === 'backfill' && page !== 'backfill') {
         try {
-            stopBackfillPage();
+            _backfillLoaded?.stopBackfillPage();
         } catch {}
+    }
+    // Cluster page polls /api/cluster/peers every 30 s — stop it when the
+    // page goes away (init() restarts it on the next visit). The module is
+    // already loaded, so this import resolves from the module map.
+    if (state.currentPage === 'maintenance-cluster' && page !== 'maintenance-cluster') {
+        import('./maintenance-cluster.js').then((m) => m.destroy?.()).catch(() => {});
+    }
+    const prevPage = state.currentPage;
+    // Leaving a chat's details page: send an edit that's still waiting.
+    if (prevPage === 'chat' && page !== 'chat') {
+        _chatDetailsModule?.then((m) => m.leaveChatDetails()).catch(() => {});
+    }
+    if (page === 'chat') {
+        // The page's container is created by js/chat-details.js; make sure
+        // it's there before the show/hide pass below.
+        if (!document.getElementById('page-chat')) {
+            const el = document.createElement('div');
+            el.id = 'page-chat';
+            el.className = 'hidden';
+            document.getElementById('content-area')?.appendChild(el);
+        }
+    }
+    const contentArea = document.getElementById('content-area');
+    // #content-area is shared by every page. Remember where the gallery
+    // was so coming back to the Library lands on the same tile, and
+    // start every other page at the top instead of at whatever offset
+    // the previous page was scrolled to.
+    if (contentArea && prevPage !== page) {
+        if (prevPage === 'viewer') _viewerScrollTop = contentArea.scrollTop;
+        if (prevPage === 'groups') _groupsScrollTop = contentArea.scrollTop;
+        contentArea.scrollTop = 0;
     }
     state.currentPage = page;
     document.body.dataset.page = page;
+    _syncChatHeaderActions();
+    updateSelectionBar();
     state.currentRouteParams = params;
 
-    // Allow callers to override the highlighted nav slot independent of the
-    // page section (e.g. `#/engine` is a sub-route of the Settings page but
-    // the bottom-nav Engine tab should still light up). Falls back to the
-    // page name itself when no override is supplied.
-    const navKey = params.navKey || page;
+    // The nav place (Library / Chats / Queue / Settings) the page belongs
+    // to — js/nav.js. Callers may override it (e.g. `#/engine`).
+    const navKey = Nav.navPlace(params.navKey || page);
 
     document.querySelectorAll('.nav-item').forEach((el) => el.classList.remove('active'));
     document.querySelector(`.nav-item[data-page="${navKey}"]`)?.classList.add('active');
@@ -740,100 +1001,105 @@ function renderPage(page, params = {}) {
     if (page !== 'viewer') updateHeaderAvatar(null, null);
     setHeaderPageIcon(page);
     setActiveMaintenanceTab(page);
+    Nav.syncShell(page);
 
     if (page === 'settings') {
-        Settings.loadSettings();
         // Auto-save: every Setting input is watched and a debounced
         // POST /api/config flushes 800 ms after the last edit. Manual
         // Save button still works as an early-flush escape hatch. Guests
         // can't write config so we skip the binding for them entirely.
-        if (state.role === 'admin') Settings.setupAutoSave();
+        loadSettingsModule()
+            .then((Settings) => {
+                Settings.loadSettings();
+                if (state.role === 'admin') Settings.setupAutoSave();
+            })
+            .catch((e) => console.error('settings page', e));
+        import('./settings-search.js')
+            .then((m) => m.initSettingsSearch())
+            .catch((e) => console.error('settings search', e));
+        if (state.role === 'admin') {
+            import('./tools-hub.js')
+                .then((m) => m.initToolsCard())
+                .catch((e) => console.error('tools card', e));
+        }
         // Engine controls live in the admin-only System section; guests
         // never see the card, and `initEngine` polls /api/monitor/status
         // (admin-gated) so skip it for them.
         if (state.role === 'admin') initEngine();
-        document.getElementById('page-title').textContent = i18nT(
-            'settings.page.title',
-            'Settings',
-        );
-        document.getElementById('page-subtitle').textContent = i18nT(
-            'settings.page.subtitle',
-            'System Configuration',
-        );
-        // Optional deep-link: #/settings/<section> scrolls to that section.
-        // Prefer #settings-<anchor> (unique by construction on the chip-nav
-        // wrappers) over a [data-settings-section] match — the latter can
-        // also live on inner cards (legacy attrs like rescue, video-player)
-        // and querySelector returns the first match, which may not be the
-        // section heading we want to scroll to.
+        _setPageText('title', 'settings.page.title', 'Settings');
+        _setPageText('subtitle', 'settings.page.subtitle', 'System Configuration');
+        // Optional deep-link: #/settings/<section> scrolls to that section
+        // (#settings-<anchor> first — see Nav.scrollToSettingsSection).
         if (params.section) {
-            setTimeout(() => {
-                const el =
-                    document.getElementById(`settings-${params.section}`) ||
-                    document.querySelector(`[data-settings-section="${params.section}"]`) ||
-                    document.querySelector(
-                        `#setting-${params.section}, .${params.section}-section`,
-                    );
-                if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
-            }, 80);
+            setTimeout(() => Nav.scrollToSettingsSection(params.section, { smooth: false }), 80);
         }
     } else if (page === 'groups') {
-        renderGroupsConfig();
-        document.getElementById('page-title').textContent = i18nT(
-            'groups.page.title',
-            'Manage Groups',
-        );
-        document.getElementById('page-subtitle').textContent = i18nT(
-            'groups.page.subtitle',
-            'Configure monitoring and filters',
-        );
+        renderGroupsConfig({ restoreScroll: prevPage === 'chat' });
+        _setPageText('title', 'groups.page.title', 'Chats');
+        _setPageText('subtitle', 'groups.page.subtitle', 'Pick what to monitor and backfill');
+    } else if (page === 'chat') {
+        const name = getGroupName(params.groupId);
+        _setPageRaw('title', name);
+        _setPageText('subtitle', 'chat.details.subtitle', 'Chat settings');
+        updateHeaderAvatar(params.groupId, name);
+        loadChatDetailsModule()
+            .then((m) => {
+                if (state.currentPage !== 'chat') return;
+                m.showChatDetails({
+                    ...params,
+                    // The page learned the chat's real name (not configured,
+                    // nothing downloaded yet): put it in the header too.
+                    onName: (n) => {
+                        if (state.currentPage !== 'chat') return;
+                        _setPageRaw('title', n);
+                        updateHeaderAvatar(params.groupId, n);
+                    },
+                });
+            })
+            .catch((e) => console.error('chat details', e));
     } else if (page === 'viewer') {
-        if (state.currentGroup) {
-            document.getElementById('page-title').textContent = state.currentGroup;
+        if (state.currentGroup && !params.allMedia) {
+            _setPageRaw('title', state.currentGroup);
+            // Back in a chat's gallery from another page: its avatar, not
+            // the generic gallery glyph setHeaderPageIcon() just put there.
+            updateHeaderAvatar(state.currentGroupId, state.currentGroup);
+            // Returning to an already-loaded group gallery: keep the grid
+            // and put the scroll + file count back.
+            if (prevPage !== 'viewer' && _galleryLoadedFor(_galleryViewKey())) {
+                _restoreGalleryChrome();
+            }
         } else {
-            showAllMedia();
+            const opts = _allMediaOpts;
+            _allMediaOpts = null;
+            showAllMedia(opts || undefined);
         }
     } else if (page === 'backfill') {
-        document.getElementById('page-title').textContent = i18nT(
-            'backfill.page.title',
-            'Backfill',
-        );
-        document.getElementById('page-subtitle').textContent = i18nT(
-            'backfill.page.subtitle',
-            'Pull older messages into the queue',
-        );
+        _setPageText('title', 'backfill.page.title', 'Backfill');
+        _setPageText('subtitle', 'backfill.page.subtitle', 'Pull older messages into the queue');
         // Show the page first; backfill module loads server state then renders.
-        showBackfillPage(params).catch((e) => console.error('backfill page', e));
+        loadBackfillModule()
+            .then((m) => m.showBackfillPage(params))
+            .catch((e) => console.error('backfill page', e));
     } else if (page === 'queue') {
-        document.getElementById('page-title').textContent = i18nT('queue.page.title', 'Queue');
-        document.getElementById('page-subtitle').textContent = i18nT(
+        _setPageText('title', 'queue.page.title', 'Queue');
+        _setPageText(
+            'subtitle',
             'queue.page.subtitle',
             'Active + pending + recently finished downloads',
         );
         showQueuePage(params).catch((e) => console.error('queue page', e));
     } else if (page === 'maintenance') {
-        // Hub page — single sidebar entry that lists every maintenance
-        // tool as a card. Cleans up the sidebar (used to be 5+ rows of
-        // sub-pages, now one). Power users keep the per-feature deep
-        // links: /maintenance/duplicates etc. still resolve to their
-        // dedicated pages directly.
-        document.getElementById('page-title').textContent = i18nT(
-            'maintenance.hub.title',
-            'Maintenance',
-        );
-        document.getElementById('page-subtitle').textContent = i18nT(
-            'maintenance.hub.subtitle',
-            'Catalogue, thumbnails, NSFW review, logs, backup destinations',
-        );
-        import('./maintenance-hub.js')
-            .then((m) => m.init())
-            .catch((e) => console.error('maintenance-hub', e));
+        // A Tools group page (#/settings/tools/<group>) — js/tools-hub.js.
+        const group = getToolGroup(params.group);
+        if (group) _setPageText('title', group.title[0], group.title[1]);
+        _setPageText('subtitle', 'tools.title', 'Tools');
+        import('./tools-hub.js')
+            .then((m) => m.showGroupPage(params))
+            .catch((e) => console.error('tools group', e));
     } else if (page === 'maintenance-duplicates') {
-        document.getElementById('page-title').textContent = i18nT(
-            'maintenance.duplicates.title',
-            'Find duplicate files',
-        );
-        document.getElementById('page-subtitle').textContent = i18nT(
+        _setPageText('title', 'maintenance.duplicates.title', 'Find duplicate files');
+        _setPageText(
+            'subtitle',
             'maintenance.duplicates.subtitle',
             'Hash every file and reclaim space from byte-identical copies',
         );
@@ -841,23 +1107,19 @@ function renderPage(page, params = {}) {
             .then((m) => m.init())
             .catch((e) => console.error('maintenance-duplicates', e));
     } else if (page === 'maintenance-similar') {
-        document.getElementById('page-title').textContent = i18nT(
-            'maintenance.similar.page_title',
-            'Similar clips',
-        );
-        document.getElementById('page-subtitle').textContent = i18nT(
+        _setPageText('title', 'maintenance.similar.page_title', 'Similar clips');
+        _setPageText(
+            'subtitle',
             'maintenance.similar.subtitle',
-            'Near-duplicate videos and shorter clips inside longer ones',
+            'Find near-duplicate videos and shorter clips inside longer ones.',
         );
         import('./maintenance-similar.js')
             .then((m) => m.init())
             .catch((e) => console.error('maintenance-similar', e));
     } else if (page === 'maintenance-thumbs') {
-        document.getElementById('page-title').textContent = i18nT(
-            'maintenance.thumbs.page_title',
-            'Build thumbnails',
-        );
-        document.getElementById('page-subtitle').textContent = i18nT(
+        _setPageText('title', 'maintenance.thumbs.page_title', 'Build thumbnails');
+        _setPageText(
+            'subtitle',
             'maintenance.thumbs.subtitle',
             'Generate WebP previews for older files',
         );
@@ -865,11 +1127,9 @@ function renderPage(page, params = {}) {
             .then((m) => m.init())
             .catch((e) => console.error('maintenance-thumbs', e));
     } else if (page === 'maintenance-seekbar') {
-        document.getElementById('page-title').textContent = i18nT(
-            'maintenance.seekbar.page_title',
-            'Seekbar previews',
-        );
-        document.getElementById('page-subtitle').textContent = i18nT(
+        _setPageText('title', 'maintenance.seekbar.page_title', 'Seekbar previews');
+        _setPageText(
+            'subtitle',
             'maintenance.seekbar.subtitle',
             'Generate WebP sprite sheets for video hover-preview thumbnails.',
         );
@@ -877,11 +1137,9 @@ function renderPage(page, params = {}) {
             .then((m) => m.init())
             .catch((e) => console.error('maintenance-seekbar', e));
     } else if (page === 'maintenance-video') {
-        document.getElementById('page-title').textContent = i18nT(
-            'maintenance.video.page_title',
-            'Optimise videos for streaming',
-        );
-        document.getElementById('page-subtitle').textContent = i18nT(
+        _setPageText('title', 'maintenance.video.page_title', 'Optimise videos for streaming');
+        _setPageText(
+            'subtitle',
             'maintenance.video.subtitle',
             'Rewrite MP4s with `+faststart` so the HTML5 player can seek + play audio without buffering the whole file.',
         );
@@ -889,11 +1147,9 @@ function renderPage(page, params = {}) {
             .then((m) => m.init())
             .catch((e) => console.error('maintenance-video', e));
     } else if (page === 'maintenance-nsfw') {
-        document.getElementById('page-title').textContent = i18nT(
-            'maintenance.nsfw.page_title',
-            'NSFW review',
-        );
-        document.getElementById('page-subtitle').textContent = i18nT(
+        _setPageText('title', 'maintenance.nsfw.page_title', 'NSFW review');
+        _setPageText(
+            'subtitle',
             'maintenance.nsfw.subtitle',
             "Five-tier classifier review — keep what's confidently 18+, delete what's confidently not, eyeball the borderline cases.",
         );
@@ -901,11 +1157,9 @@ function renderPage(page, params = {}) {
             .then((m) => m.init())
             .catch((e) => console.error('maintenance-nsfw', e));
     } else if (page === 'maintenance-ai') {
-        document.getElementById('page-title').textContent = i18nT(
-            'maintenance.ai.page_title',
-            'AI Face Clustering',
-        );
-        document.getElementById('page-subtitle').textContent = i18nT(
+        _setPageText('title', 'maintenance.ai.page_title', 'AI Face Clustering');
+        _setPageText(
+            'subtitle',
             'maintenance.ai.subtitle',
             'Face clustering groups people across your library — all running locally.',
         );
@@ -913,11 +1167,9 @@ function renderPage(page, params = {}) {
             .then((m) => m.init())
             .catch((e) => console.error('maintenance-ai', e));
     } else if (page === 'maintenance-logs') {
-        document.getElementById('page-title').textContent = i18nT(
-            'maintenance.logs.page_title',
-            'Log viewer',
-        );
-        document.getElementById('page-subtitle').textContent = i18nT(
+        _setPageText('title', 'maintenance.logs.page_title', 'Log viewer');
+        _setPageText(
+            'subtitle',
             'maintenance.logs.subtitle',
             'Realtime tail of every backend log source',
         );
@@ -925,11 +1177,9 @@ function renderPage(page, params = {}) {
             .then((m) => m.init())
             .catch((e) => console.error('maintenance-logs', e));
     } else if (page === 'maintenance-backup') {
-        document.getElementById('page-title').textContent = i18nT(
-            'maintenance.backup.page_title',
-            'Backup destinations',
-        );
-        document.getElementById('page-subtitle').textContent = i18nT(
+        _setPageText('title', 'maintenance.backup.page_title', 'Backup destinations');
+        _setPageText(
+            'subtitle',
             'maintenance.backup.subtitle',
             'Mirror new downloads to S3 / SFTP / local NAS storage',
         );
@@ -937,11 +1187,9 @@ function renderPage(page, params = {}) {
             .then((m) => m.init())
             .catch((e) => console.error('maintenance-backup', e));
     } else if (page === 'maintenance-cluster') {
-        document.getElementById('page-title').textContent = i18nT(
-            'maintenance.cluster.page_title',
-            'Cluster',
-        );
-        document.getElementById('page-subtitle').textContent = i18nT(
+        _setPageText('title', 'maintenance.cluster.page_title', 'Cluster');
+        _setPageText(
+            'subtitle',
             'maintenance.cluster.subtitle',
             'Federate multiple instances. Files, downloads, and dedup span every paired peer.',
         );
@@ -949,11 +1197,9 @@ function renderPage(page, params = {}) {
             .then((m) => m.init())
             .catch((e) => console.error('maintenance-cluster', e));
     } else if (page === 'maintenance-recovery') {
-        document.getElementById('page-title').textContent = i18nT(
-            'maintenance.recovery.page_title',
-            'Recovery cleanup',
-        );
-        document.getElementById('page-subtitle').textContent = i18nT(
+        _setPageText('title', 'maintenance.recovery.page_title', 'Recovery cleanup');
+        _setPageText(
+            'subtitle',
             'maintenance.recovery.subtitle',
             'Resolve, disable, or delete groups that no loaded account can access.',
         );
@@ -961,11 +1207,9 @@ function renderPage(page, params = {}) {
             .then((m) => m.init())
             .catch((e) => console.error('maintenance-recovery', e));
     } else if (page === 'maintenance-updates') {
-        document.getElementById('page-title').textContent = i18nT(
-            'update.history.title',
-            'Update history',
-        );
-        document.getElementById('page-subtitle').textContent = i18nT(
+        _setPageText('title', 'update.history.title', 'Update history');
+        _setPageText(
+            'subtitle',
             'update.history.help',
             'Audit log of every Install update click — the structured error code makes repeat failures easy to diagnose.',
         );
@@ -977,19 +1221,45 @@ function renderPage(page, params = {}) {
 
 // Register hash routes. Patterns documented in router.js.
 function registerRoutes() {
-    router.route('/viewer', () => renderPage('viewer'));
-    router.route('/viewer/:groupId', ({ params }) => {
-        // Open a specific group's gallery — match the existing openGroup()
-        // behaviour so the sidebar selection stays consistent.
-        renderPage('viewer');
-        // Always resolve through the canonical lookup so deep-linking to a
-        // group whose name was only just refreshed still picks it up.
-        openGroup(params.groupId, getGroupName(params.groupId));
+    // Tools pages + the old #/maintenance hashes (js/nav.js). First, so
+    // `/settings/tools/...` wins over `/settings/:section` below.
+    Nav.registerNavRoutes(router, renderPage);
+    // #/viewer is All Media; a chat's gallery is #/viewer/<id>.
+    router.route('/viewer', () => renderPage('viewer', { allMedia: true }));
+    router.route('/viewer/:groupId', ({ params, query }) => {
+        const id = params.groupId;
+        // Back / forward to the chat that's already loaded: keep its grid,
+        // filters and scroll position.
+        if (
+            String(state.currentGroupId) === String(id) &&
+            (state.viewerPeerScope || null) === (query.peer || null) &&
+            _galleryLoadedFor(_galleryViewKey())
+        ) {
+            renderPage('viewer');
+            return;
+        }
+        state.viewerPeerScope = query.peer || null;
+        // Resolve through the canonical lookup so deep-linking to a group
+        // whose name was only just refreshed still picks it up.
+        _showGroup(id, getGroupName(id));
     });
-    router.route('/groups', () => renderPage('groups'));
-    router.route('/groups/:groupId', ({ params }) => {
+    router.route('/groups', ({ query } = {}) => {
+        // #/groups?tab=attention — the Settings → Tools attention link.
+        if (['all', 'monitored', 'unmonitored', 'attention'].includes(query?.tab)) {
+            switchGroupsTab(query.tab);
+        }
         renderPage('groups');
-        openGroupSettings(params.groupId, getGroupName(params.groupId));
+    });
+    router.route('/groups/:groupId', ({ params }) => {
+        // Chat details page. `from` (the page we're coming from, unset on
+        // a deep link) lets its Back button step back instead of pushing.
+        const from = document.body.dataset.page || null;
+        renderPage('chat', {
+            groupId: params.groupId,
+            navKey: 'groups',
+            from,
+            fromGroup: from === 'viewer' ? state.currentGroupId || null : null,
+        });
     });
     router.route('/engine', () => renderPage('settings', { section: 'engine', navKey: 'engine' }));
     router.route('/settings', () => renderPage('settings'));
@@ -1005,20 +1275,8 @@ function registerRoutes() {
                 ...(state.currentRouteParams || {}),
                 section: params.section,
             };
-            const el =
-                document.getElementById(`settings-${params.section}`) ||
-                document.querySelector(`[data-settings-section="${params.section}"]`) ||
-                document.querySelector(`#setting-${params.section}, .${params.section}-section`);
-            if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
-            // Light up the matching chip immediately rather than waiting for
-            // the IntersectionObserver to catch up after the smooth-scroll —
-            // gives instant visual feedback even on slow scrolls.
-            document.querySelectorAll('.settings-chip').forEach((c) => {
-                c.setAttribute(
-                    'aria-selected',
-                    c.dataset.chip === params.section ? 'true' : 'false',
-                );
-            });
+            // Also lights up the matching chip straight away.
+            Nav.scrollToSettingsSection(params.section);
             return;
         }
         renderPage('settings', { section: params.section });
@@ -1037,33 +1295,37 @@ function registerRoutes() {
         // re-fires this handler and re-opens the sheet long after the
         // user moved on).
         renderPage('viewer');
+        // Drop the /stories hash so back-button doesn't re-trigger. Done
+        // BEFORE opening the sheet: the sheet pushes its own (Back-to-
+        // close) history entry, which this replace must not clobber.
+        try {
+            history.replaceState(
+                null,
+                '',
+                state.currentGroupId != null
+                    ? `#/viewer/${encodeURIComponent(String(state.currentGroupId))}`
+                    : '#/viewer',
+            );
+        } catch {
+            /* ignore */
+        }
         const btn = document.getElementById('stories-btn');
         if (btn) {
             btn.click();
         }
-        // Drop the /stories hash so back-button doesn't re-trigger.
-        try {
-            history.replaceState(null, '', '#/viewer');
-        } catch {
-            /* ignore */
-        }
     });
     router.route('/account/add', () => {
-        window.location.href = '/add-account.html';
+        // In-app sheet over Settings → Accounts (add-account.html still
+        // works for old links).
+        import('./account-wizard.js')
+            .then((m) =>
+                m.openAccountWizardFromRoute(() => renderPage('settings', { section: 'accounts' })),
+            )
+            .catch((e) => {
+                console.error('account wizard', e);
+                window.location.href = '/add-account.html';
+            });
     });
-    router.route('/maintenance', () => renderPage('maintenance'));
-    router.route('/maintenance/duplicates', () => renderPage('maintenance-duplicates'));
-    router.route('/maintenance/similar', () => renderPage('maintenance-similar'));
-    router.route('/maintenance/thumbs', () => renderPage('maintenance-thumbs'));
-    router.route('/maintenance/seekbar', () => renderPage('maintenance-seekbar'));
-    router.route('/maintenance/video', () => renderPage('maintenance-video'));
-    router.route('/maintenance/nsfw', () => renderPage('maintenance-nsfw'));
-    router.route('/maintenance/ai', () => renderPage('maintenance-ai'));
-    router.route('/maintenance/logs', () => renderPage('maintenance-logs'));
-    router.route('/maintenance/backup', () => renderPage('maintenance-backup'));
-    router.route('/maintenance/cluster', () => renderPage('maintenance-cluster'));
-    router.route('/maintenance/recovery', () => renderPage('maintenance-recovery'));
-    router.route('/maintenance/updates', () => renderPage('maintenance-updates'));
 }
 
 function closeSidebar() {
@@ -1088,6 +1350,7 @@ async function loadGroups() {
         state.groups = groups;
         state.downloads = downloads;
         renderGroupsList();
+        _paintAttentionCount();
     } catch (e) {
         console.error('Failed to load groups:', e);
         if (list) list.innerHTML = '';
@@ -1127,8 +1390,16 @@ function _buildGroupRow(g) {
         fallback: i18nT('groups.unknown_chat', 'Unknown chat'),
     });
     const stillUnresolved = isUnresolvedName(g.name, id) && !state.groupNameCache?.get?.(id);
-    if (stillUnresolved) renderGroupsList._needsResolve = true;
     const isForeign = !!g.peerId;
+    // A chat no account can read never resolves — don't keep asking the
+    // server to re-resolve every chat because of it.
+    const cfgAccess = isForeign
+        ? null
+        : (state.groups || []).find((cg) => String(cg.id) === id)?.access;
+    if (stillUnresolved && !isBlockedAccess(cfgAccess)) {
+        renderGroupsList._needsResolve = true;
+        (renderGroupsList._unresolvedIds ||= new Set()).add(id);
+    }
     const subtitle = isForeign
         ? i18nTf(
               'sidebar.group.peer_badge',
@@ -1152,10 +1423,13 @@ function _buildGroupRow(g) {
         state.role === 'admin' && cfgGroup && !cfgGroup.suspended
             ? cfgGroup.enabled !== false
             : null;
-    const sidebarPill =
-        cfgGroup?.suspended === true
-            ? { label: i18nT('groups.status.suspended', 'Suspended'), kind: 'suspended' }
-            : null;
+    // A chat no account can read: the same access badge as the Chats list
+    // and the chat page (older installs' `suspended` entries map to it).
+    const sidebarPill = isBlockedAccess(cfgGroup?.access)
+        ? { html: accessBadgeHtml(cfgGroup.access, { compact: true }) }
+        : cfgGroup?.suspended === true
+          ? { label: i18nT('groups.status.suspended', 'Suspended'), kind: 'suspended' }
+          : null;
     return renderChatRow({
         id,
         name: canonical,
@@ -1183,6 +1457,117 @@ function _renderSectionHeader(sec, monitored, total, collapsed) {
         <span class="flex-1 text-left">${sec.label}</span>
         <span class="text-[10px] font-mono tabular-nums ${monitored > 0 ? 'text-tg-green' : ''}">${countLabel}</span>
     </button>`;
+}
+
+const _sidebarSectionKey = (k) => `tgdl.sidebar.section.${k}`;
+function _isSidebarSectionCollapsed(k) {
+    return localStorage.getItem(_sidebarSectionKey(k)) === '1';
+}
+
+// One delegated listener pair on #groups-list, wired once. The rows keep
+// their DOM whenever the rendered HTML is unchanged, so attaching
+// per-row handlers on every render stacked them: after N config_updated
+// events one tap ran openGroup N times and the monitor toggle sent N PUTs.
+//
+// Click opens the group viewer; the cog opens Group Settings; the ▶/⏸
+// button toggles monitoring. Names are re-resolved at click time via
+// getGroupName() so a refreshed name wins over whatever the row was
+// rendered with. Federated foreign rows carry data-peer-id; clicking one
+// opens the per-group view filtered to that peer via the one-shot
+// `state.viewerPeerScope` field. We DO NOT overwrite the chip's scope
+// (state.galleryScope) — otherwise, navigating back to All Media after
+// viewing a peer-owned group would persist the per-peer narrowing.
+let _groupsListWired = false;
+function _wireGroupsListDelegation(list) {
+    if (_groupsListWired) return;
+    _groupsListWired = true;
+    const openRow = (row) => {
+        const id = row.dataset.id;
+        // Foreign-group click → narrow the per-group view to this peer
+        // for the duration of the view (read by _galleryScopeQs on every
+        // page fetch so pagination keeps the filter). Own group → null,
+        // so the per-group view honours the chip's scope.
+        state.viewerPeerScope = row.dataset.peerId || null;
+        openGroup(id, getGroupName(id));
+    };
+    list.addEventListener('click', async (ev) => {
+        const header = ev.target.closest?.('.sidebar-section-header');
+        if (header && list.contains(header)) {
+            ev.stopPropagation();
+            const key = header.dataset.section;
+            localStorage.setItem(
+                _sidebarSectionKey(key),
+                _isSidebarSectionCollapsed(key) ? '' : '1',
+            );
+            renderGroupsList();
+            return;
+        }
+        const row = ev.target.closest?.('.chat-row[data-id]');
+        if (!row || !list.contains(row)) return;
+        const id = row.dataset.id;
+        // Monitor toggle (▶/⏸) — short-circuit before the row navigates.
+        // PUTs `{enabled: !current}` to the existing /api/groups/:id
+        // endpoint; the WS `config_updated` broadcast triggers
+        // renderGroupsList() so the icon swaps live.
+        const monTarget = ev.target.closest?.('[data-action="monitor-toggle"]');
+        if (monTarget) {
+            ev.stopPropagation();
+            ev.preventDefault();
+            // A PUT for this button is already in flight — ignore the
+            // repeat tap instead of racing a second toggle.
+            if (monTarget.dataset.busy === '1') return;
+            monTarget.dataset.busy = '1';
+            const current = monTarget.dataset.current === '1';
+            const next = !current;
+            // Optimistic UI — flip the icon + dataset before the PUT
+            // returns so the click feels instant.
+            monTarget.dataset.current = next ? '1' : '0';
+            const ic = monTarget.querySelector('i');
+            if (ic) {
+                ic.className = `${next ? 'ri-pause-circle-line' : 'ri-play-circle-line'} text-base`;
+            }
+            monTarget.classList.toggle('text-tg-green', next);
+            monTarget.classList.toggle('text-tg-textSecondary', !next);
+            try {
+                await api.put(`/api/groups/${encodeURIComponent(id)}`, { enabled: next });
+                // Update the in-memory `state.groups` so the next
+                // renderGroupsList() pass paints the right state even
+                // before the WS reply lands.
+                const cfg = (state.groups || []).find((g) => String(g.id) === id);
+                if (cfg) cfg.enabled = next;
+            } catch (err) {
+                // Roll back the optimistic flip on failure.
+                monTarget.dataset.current = current ? '1' : '0';
+                if (ic) {
+                    ic.className = `${current ? 'ri-pause-circle-line' : 'ri-play-circle-line'} text-base`;
+                }
+                monTarget.classList.toggle('text-tg-green', current);
+                monTarget.classList.toggle('text-tg-textSecondary', !current);
+                showToast(err?.data?.error || err?.message || 'Failed', 'error');
+            } finally {
+                delete monTarget.dataset.busy;
+            }
+            return;
+        }
+        // Cog button takes precedence — short-circuit before the row
+        // navigates to the gallery.
+        if (ev.target.closest?.('[data-action="settings"]')) {
+            ev.stopPropagation();
+            ev.preventDefault();
+            openGroupSettings(id, getGroupName(id));
+            return;
+        }
+        openRow(row);
+    });
+    list.addEventListener('keydown', (e) => {
+        if (e.key !== 'Enter' && e.key !== ' ') return;
+        // Only when the row itself has focus — Enter/Space on the inner
+        // cog / monitor buttons keeps its native button behaviour.
+        const row = e.target.closest?.('.chat-row[data-id]');
+        if (!row || e.target !== row || !list.contains(row)) return;
+        e.preventDefault();
+        openRow(row);
+    });
 }
 
 function renderGroupsList() {
@@ -1219,7 +1604,9 @@ function renderGroupsList() {
     });
 
     const allGroups = Array.from(map.values());
+    _wireGroupsListDelegation(list);
     if (allGroups.length === 0) {
+        renderGroupsList._lastHtml = null;
         list.innerHTML = renderEmptyState({
             icon: 'ri-chat-3-line',
             title: i18nT('groups.empty.title', 'No groups yet'),
@@ -1235,6 +1622,7 @@ function renderGroupsList() {
 
     state.activeRings = state.activeRings || new Set();
     renderGroupsList._needsResolve = false;
+    renderGroupsList._unresolvedIds = new Set();
 
     // Classify into sections
     const buckets = {};
@@ -1250,7 +1638,7 @@ function renderGroupsList() {
     const _monitorScore = (g) => {
         const cfg = (state.groups || []).find((cg) => String(cg.id) === String(g.id));
         if (!cfg) return 2; // download-only → after paused
-        if (cfg.suspended) return 3;
+        if (cfg.suspended || isBlockedAccess(cfg.access)) return 3;
         return cfg.enabled !== false ? 0 : 1;
     };
     for (const key of Object.keys(buckets)) {
@@ -1260,9 +1648,7 @@ function renderGroupsList() {
         );
     }
 
-    // Read collapse state from localStorage
-    const _collapseKey = (k) => `tgdl.sidebar.section.${k}`;
-    const _isCollapsed = (k) => localStorage.getItem(_collapseKey(k)) === '1';
+    const _isCollapsed = _isSidebarSectionCollapsed;
 
     // Build HTML section by section
     const parts = [];
@@ -1301,20 +1687,20 @@ function renderGroupsList() {
         renderGroupsList._lastHtml = html;
         list.innerHTML = html;
         _reapplySidebarFilter();
-        // Wire section collapse toggles
-        list.querySelectorAll('.sidebar-section-header').forEach((btn) => {
-            btn.addEventListener('click', (e) => {
-                e.stopPropagation();
-                const key = btn.dataset.section;
-                const nowCollapsed = _isCollapsed(key);
-                localStorage.setItem(_collapseKey(key), nowCollapsed ? '' : '1');
-                renderGroupsList();
-            });
-        });
     }
 
-    const needsResolve = renderGroupsList._needsResolve;
+    // Ask the server to re-resolve names only when a new unresolved chat
+    // shows up (or every 10 min) — each sweep asks Telegram about every
+    // chat, and a name that can't resolve used to re-trigger it on every
+    // list render.
+    const unresolvedKey = [...(renderGroupsList._unresolvedIds || [])].sort().join(',');
+    const resolveDue =
+        unresolvedKey !== state._lastResolveKey ||
+        Date.now() - (state._lastResolveAt || 0) > 10 * 60 * 1000;
+    const needsResolve = renderGroupsList._needsResolve && resolveDue;
     if (needsResolve && !state._resolvingGroups && state.role === 'admin') {
+        state._lastResolveKey = unresolvedKey;
+        state._lastResolveAt = Date.now();
         state._resolvingGroups = true;
         api.post('/api/groups/refresh-info')
             .catch(() => {})
@@ -1322,89 +1708,6 @@ function renderGroupsList() {
                 state._resolvingGroups = false;
             });
     }
-
-    // Event delegation — click opens the group viewer; click on the
-    // cog button opens Group Settings instead. Names are re-resolved
-    // at click time via getGroupName() so a refreshed name wins over
-    // whatever the row was rendered with.
-    // Federated foreign rows carry data-peer-id; clicking one opens the
-    // per-group view filtered to that peer's files via the one-shot
-    // `state.transientPeerScope` field. We DO NOT overwrite the chip's
-    // scope (state.galleryScope) — otherwise, navigating back to All
-    // Media after viewing a peer-owned group would persist the per-peer
-    // narrowing and the merged view would be silently broken.
-    list.querySelectorAll('.chat-row[data-id]').forEach((el) => {
-        const id = el.dataset.id;
-        const peerId = el.dataset.peerId || null;
-        const fire = () => {
-            // Foreign-group click → narrow the per-group view to this
-            // peer for the duration of the view. `state.viewerPeerScope`
-            // is read by _galleryScopeQs on every page fetch (page 1, 2,
-            // 3 …) so pagination doesn't drop the filter mid-scroll.
-            // Own group click → null, so the per-group view honours
-            // the chip's scope (e.g., scope=all loads merged content).
-            state.viewerPeerScope = peerId || null;
-            openGroup(id, getGroupName(id));
-        };
-        el.addEventListener('click', async (ev) => {
-            // Monitor toggle (▶/⏸) — short-circuit before the row navigates.
-            // PUTs `{enabled: !current}` to the existing /api/groups/:id
-            // endpoint; the WS `config_updated` broadcast triggers
-            // renderGroupsList() so the icon swaps live.
-            const monTarget = ev.target.closest?.('[data-action="monitor-toggle"]');
-            if (monTarget) {
-                ev.stopPropagation();
-                ev.preventDefault();
-                const current = monTarget.dataset.current === '1';
-                const next = !current;
-                // Optimistic UI — flip the icon + dataset before the PUT
-                // returns so the click feels instant.
-                monTarget.dataset.current = next ? '1' : '0';
-                const ic = monTarget.querySelector('i');
-                if (ic) {
-                    ic.className = `${next ? 'ri-pause-circle-line' : 'ri-play-circle-line'} text-base`;
-                }
-                monTarget.classList.toggle('text-tg-green', next);
-                monTarget.classList.toggle('text-tg-textSecondary', !next);
-                try {
-                    const { api } = await import('./api.js');
-                    await api.put(`/api/groups/${encodeURIComponent(id)}`, { enabled: next });
-                    // Update the in-memory `state.groups` so the next
-                    // renderGroupsList() pass paints the right state
-                    // even before the WS reply lands.
-                    const cfg = (state.groups || []).find((g) => String(g.id) === id);
-                    if (cfg) cfg.enabled = next;
-                } catch (err) {
-                    // Roll back the optimistic flip on failure.
-                    monTarget.dataset.current = current ? '1' : '0';
-                    if (ic) {
-                        ic.className = `${current ? 'ri-pause-circle-line' : 'ri-play-circle-line'} text-base`;
-                    }
-                    monTarget.classList.toggle('text-tg-green', current);
-                    monTarget.classList.toggle('text-tg-textSecondary', !current);
-                    const { showToast } = await import('./utils.js');
-                    showToast(err?.data?.error || err?.message || 'Failed', 'error');
-                }
-                return;
-            }
-            // Cog button takes precedence — short-circuit before the
-            // row navigates to the gallery.
-            const cogTarget = ev.target.closest?.('[data-action="settings"]');
-            if (cogTarget) {
-                ev.stopPropagation();
-                ev.preventDefault();
-                openGroupSettings(id, getGroupName(id));
-                return;
-            }
-            fire();
-        });
-        el.addEventListener('keydown', (e) => {
-            if (e.key === 'Enter' || e.key === ' ') {
-                e.preventDefault();
-                fire();
-            }
-        });
-    });
 }
 
 function normalize(str) {
@@ -1414,7 +1717,18 @@ function normalize(str) {
 }
 
 // ============ Open Group / Show All ============
+// Open a chat's gallery. Goes through the hash (#/viewer/<id>, plus
+// ?peer= for a peer's chat) so the chat has its own URL: reload, Back
+// and shared links land on it. The route runs _showGroup().
 function openGroup(groupId, groupName) {
+    const peer = state.viewerPeerScope ? `?peer=${encodeURIComponent(state.viewerPeerScope)}` : '';
+    const target = `viewer/${encodeURIComponent(String(groupId))}${peer}`;
+    // Clicking the chat that's already open reloads it.
+    if (location.hash === `#/${target}`) _showGroup(groupId, groupName);
+    else navigateTo(target);
+}
+
+function _showGroup(groupId, groupName) {
     state.currentGroupId = groupId;
     // Always reconcile with the canonical store so the modal/header never
     // show a stale "Unknown" or numeric id when /api/groups/refresh-info
@@ -1430,16 +1744,13 @@ function openGroup(groupId, groupName) {
     // out everything else for the new group.
     resetGalleryFilter();
 
-    document.getElementById('page-title').textContent = state.currentGroup;
-    document.getElementById('page-subtitle').textContent = i18nT(
-        'viewer.subtitle.loading',
-        'Loading...',
-    );
+    renderPage('viewer');
+    _setPageRaw('title', state.currentGroup);
+    _setPageText('subtitle', 'viewer.subtitle.loading', 'Loading...');
     // Mirror the sidebar avatar into the header so the user sees which
-    // chat they're inside. Falls back to a coloured initial when there's
-    // no profile photo cached yet.
+    // chat they're inside (after renderPage, which sets the page glyph).
+    // Falls back to a coloured initial when there's no profile photo yet.
     updateHeaderAvatar(groupId, state.currentGroup);
-    navigateTo('viewer');
     loadGroupFiles(groupId);
 }
 
@@ -1448,7 +1759,7 @@ function openGroup(groupId, groupName) {
 // instead of all sharing the gallery glyph from the viewer page.
 const PAGE_HEADER_ICON = {
     viewer: 'ri-gallery-line',
-    groups: 'ri-group-line',
+    groups: 'ri-chat-3-line',
     backfill: 'ri-history-line',
     queue: 'ri-list-check-2',
     settings: 'ri-settings-3-line',
@@ -1563,32 +1874,163 @@ function updateHeaderAvatar(groupId, displayName) {
     el.innerHTML = `<span>${initial}</span><img src="${photo}" alt="" class="absolute inset-0 w-full h-full object-cover" onerror="this.remove()">`;
 }
 
-function showAllMedia() {
-    state.currentGroup = null;
-    state.currentGroupId = null;
+// What the gallery grid currently shows. Set when page 1 of a view lands;
+// any change to group / type filter / pinned / scope / search query
+// produces a different key, and AI-search results (which replace the
+// list) clear it.
+let _loadedViewKey = null;
+let _galleryTotal = null;
+let _viewerScrollTop = 0;
+// Bumped by every page-1 gallery load; a response whose sequence is no
+// longer current (the user typed another letter, switched tab/chat) is
+// dropped instead of painting over the newer view.
+let _galleryLoadSeq = 0;
+
+function _galleryViewKey() {
+    return [
+        state.currentGroupId || '',
+        state.currentFilter || 'all',
+        getPinnedMode(),
+        _galleryScopeQs(),
+        state.searchQuery || '',
+    ].join('|');
+}
+
+// Page title / subtitle in the header. A translated string keeps its i18n
+// key on the element, so the language loading (or switching) after the
+// first render re-translates it instead of falling back to the markup's
+// "Viewer"; a dynamic text (a chat's name, "12 files") drops the key.
+function _setPageText(which, key, fallback) {
+    const el = document.getElementById(`page-${which}`);
+    if (!el) return;
+    el.dataset.i18n = key;
+    el.dataset.i18nFallback = fallback;
+    el.textContent = i18nT(key, fallback);
+}
+function _setPageRaw(which, text) {
+    const el = document.getElementById(`page-${which}`);
+    if (!el) return;
+    el.removeAttribute('data-i18n');
+    el.removeAttribute('data-i18n-fallback');
+    el.textContent = text;
+}
+
+// Header subtitle for the gallery: "N files", or "N results" while the
+// toolbar holds a search query.
+function _setGallerySubtitle(total) {
+    if (total == null) return;
+    _setPageRaw(
+        'subtitle',
+        state.searchQuery
+            ? formatResultCount(total)
+            : i18nTf('viewer.subtitle.files', { count: total }, `${total} files`),
+    );
+}
+
+// URL for one page of the current gallery view: the chat / All Media feed,
+// or the search endpoint while the toolbar holds a query. Both honour the
+// type tab, the pinned mode and the federation scope.
+function _galleryPageUrl(groupId, opts = {}) {
+    const type = state.currentFilter && state.currentFilter !== 'all' ? state.currentFilter : 'all';
+    const common = `page=${opts.page ?? state.page}&limit=${opts.limit ?? FILES_PER_PAGE}&type=${encodeURIComponent(type)}${pinnedQs()}${_galleryScopeQs()}`;
+    if (state.searchQuery) {
+        const g = groupId ? `&groupId=${encodeURIComponent(groupId)}` : '';
+        return `/api/downloads/search?q=${encodeURIComponent(state.searchQuery)}&order=newest&${common}${g}`;
+    }
+    return groupId
+        ? `/api/downloads/${encodeURIComponent(groupId)}?${common}`
+        : `/api/downloads/all?${common}`;
+}
+
+// Refetch page 1 of whatever the gallery shows (filter / search change).
+function _reloadGallery() {
     state.page = 1;
     state.hasMore = true;
     state.files = [];
+    if (state.currentPage === 'viewer') {
+        if (state.currentGroupId) loadGroupFiles(state.currentGroupId);
+        else loadAllFiles();
+    } else {
+        renderMediaGrid();
+    }
+}
+
+// True when the grid already holds `key`'s files — and `state.files` is
+// still the gallery's list (the Queue page / review mode / search swap it
+// for their own).
+function _galleryLoadedFor(key) {
+    return (
+        _loadedViewKey === key &&
+        Array.isArray(state.files) &&
+        state.files.length > 0 &&
+        state.files === _galleryFilesRef
+    );
+}
+
+// Put back the bits of gallery chrome other pages overwrite (the subtitle
+// file count) and the scroll position the user left at.
+function _restoreGalleryChrome() {
+    _setGallerySubtitle(_galleryTotal);
+    const contentArea = document.getElementById('content-area');
+    if (contentArea) contentArea.scrollTop = _viewerScrollTop;
+    _recheckLoadMore();
+}
+
+// `opts.keepFilters` carries the type tab + search query over from a chat
+// ("Search all media" in the no-results state).
+// `opts.force` re-fetches even when the All Media grid is already loaded
+// (pull-to-refresh, purge). Plain calls — the Library tab, the sidebar
+// "All Media" row, the #/viewer route — keep the loaded grid, its type
+// filter and the scroll position when nothing that shapes the list
+// (group, filter, pinned, scope) changed; they used to throw 10k+ tiles
+// away and refetch from page 1 on every return.
+let _allMediaOpts = null; // showAllMedia() options carried across the hash change
+function showAllMedia(opts) {
+    // In a chat (#/viewer/<id>): switch the URL to #/viewer first; its
+    // route comes back here with the same options.
+    if (state.currentPage === 'viewer' && /^#\/viewer\/./.test(location.hash)) {
+        _allMediaOpts = opts || null;
+        navigateTo('viewer');
+        return;
+    }
+    const force = opts?.force === true;
+    const wasAllMedia = state.currentGroupId == null && !state.viewerPeerScope;
+    state.currentGroup = null;
+    state.currentGroupId = null;
     // Clear any per-view peer narrowing left over from a sidebar
     // foreign-group click. Without this, "All Media" after viewing a
     // peer-owned group would still be filtered to that peer.
     state.viewerPeerScope = null;
-    resetGalleryFilter();
+    _syncChatHeaderActions();
+    const reuse = !force && wasAllMedia && _galleryLoadedFor(_galleryViewKey());
+    if (!reuse) {
+        state.page = 1;
+        state.hasMore = true;
+        state.files = [];
+        // Coming from a chat: All Media starts unfiltered. Refreshing All
+        // Media itself (pull-to-refresh, purge) keeps the active type tab
+        // and search query.
+        if (!wasAllMedia && !opts?.keepFilters) resetGalleryFilter();
+    }
+    syncGalleryToolbar();
 
-    document.getElementById('page-title').textContent = i18nT(
-        'viewer.all_media.title',
-        'All Media',
-    );
-    document.getElementById('page-subtitle').textContent = i18nT(
-        'viewer.all_media.subtitle',
-        'All downloaded files',
-    );
+    _setPageText('title', 'viewer.all_media.title', 'All Media');
+    _setPageText('subtitle', 'viewer.all_media.subtitle', 'All downloaded files');
     // Header avatar back to the generic gallery glyph — switching from
     // a per-group view used to leave that chat's avatar in the header.
     updateHeaderAvatar(null, null);
 
+    if (reuse) {
+        if (state.currentPage !== 'viewer') {
+            navigateTo('viewer');
+            return; // renderPage re-enters us with the page visible
+        }
+        _restoreGalleryChrome();
+        return;
+    }
+
     const grid = document.getElementById('media-grid');
-    if (grid) grid.innerHTML = '';
+    if (grid) _clearGalleryGrid(grid);
 
     // Make sure the viewer page section is actually visible BEFORE we
     // start the fetch — clicking "All Media" while the user is on
@@ -1681,6 +2123,10 @@ async function initGalleryScope() {
             return;
         }
         _renderGalleryScopeMenu();
+        // #media-tabs is the positioned parent; on phones the chip sits in
+        // the second row (under the search box), so anchor to the chip.
+        menu.style.top = `${chip.offsetTop + chip.offsetHeight + 6}px`;
+        menu.style.marginTop = '0';
         menu.classList.remove('hidden');
         chip.setAttribute('aria-expanded', 'true');
         // Click-outside dismisses. Use `once` so the listener auto-cleans.
@@ -1694,6 +2140,12 @@ async function initGalleryScope() {
             };
             document.addEventListener('click', onDocClick);
         }, 0);
+    });
+    chip.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            chip.click();
+        }
     });
 }
 
@@ -1778,9 +2230,9 @@ function _renderGalleryScopeMenu() {
             state.page = 1;
             state.hasMore = true;
             state.files = [];
-            Viewer.clearShuffleSilent();
-            // Refresh the footer so peer counts pick up the new scope.
-            loadStats();
+            // Re-apply the footer so peer counts pick up the new scope.
+            if (_lastStats) _applyStats(_lastStats);
+            else loadStats();
             if (state.currentPage === 'viewer') {
                 if (state.currentGroupId) loadGroupFiles(state.currentGroupId);
                 else loadAllFiles();
@@ -1789,28 +2241,44 @@ function _renderGalleryScopeMenu() {
     });
 }
 
-async function loadAllFiles() {
-    // Chronological reload replaces the gallery — drop any shuffle session
-    // so we don't mix shuffled keys with a fresh page-1 fetch.
-    if (state.page === 1) Viewer.clearShuffleSilent();
+function loadAllFiles() {
+    return _loadGalleryPage(null);
+}
+
+// ============ Media Loading ============
+function loadGroupFiles(groupId) {
+    return _loadGalleryPage(groupId);
+}
+
+// One page of the gallery — a chat (groupId) or All Media (null), or the
+// search results for either while the toolbar holds a query.
+async function _loadGalleryPage(groupId) {
     state.loading = true;
-    const grid = document.getElementById('media-grid');
-    if (state.page === 1 && grid) grid.innerHTML = renderGallerySkeletons(12);
+    const seq = state.page === 1 ? ++_galleryLoadSeq : _galleryLoadSeq;
+
+    // Show 12 skeleton tiles for the very first page so users don't stare
+    // at an empty grid for the duration of the network round-trip. Page 2+
+    // adds rows so we don't replace what's already there.
+    if (state.page === 1) {
+        Viewer.clearShuffleSilent();
+        const grid = document.getElementById('media-grid');
+        if (grid) _clearGalleryGrid(grid, renderGallerySkeletons(12));
+        const contentArea = document.getElementById('content-area');
+        if (contentArea) contentArea.scrollTop = 0;
+        document.getElementById('empty-state')?.classList.add('hidden');
+    }
 
     try {
-        const type =
-            state.currentFilter && state.currentFilter !== 'all' ? state.currentFilter : 'all';
-        const pinQs = _pinnedFilterQs();
-        const pinFirstQs =
-            localStorage.getItem('tgdl-pinned-first') === '1' ? '&pinnedFirst=1' : '';
-        const scopeQs = _galleryScopeQs();
-        const res = await api.get(
-            `/api/downloads/all?page=${state.page}&limit=${FILES_PER_PAGE}&type=${encodeURIComponent(type)}${pinQs}${pinFirstQs}${scopeQs}`,
-        );
+        const viewKey = _galleryViewKey();
+        const res = await api.get(_galleryPageUrl(groupId));
+        // A newer page-1 load (another search letter, tab, chat) started
+        // while this one was in flight — its result is stale.
+        if (seq !== _galleryLoadSeq) return;
         const newFiles = res?.files || [];
 
         let appendFromIndex = 0;
         if (state.page === 1) {
+            _loadedViewKey = viewKey;
             state.files = newFiles;
         } else {
             appendFromIndex = state.files.length;
@@ -1828,86 +2296,34 @@ async function loadAllFiles() {
         // stays smooth right to the end of the list.
         if (state.page > 1) renderMediaGrid({ append: true, fromIndex: appendFromIndex });
         else renderMediaGrid();
-        document.getElementById('page-subtitle').textContent = i18nTf(
-            'viewer.subtitle.files',
-            { count: total },
-            `${total} files`,
-        );
+        _galleryTotal = total;
+        _setGallerySubtitle(total);
+        if (state.searchQuery) setSearchResultCount(total);
     } catch (e) {
-        showToast(i18nT('viewer.error.load', 'Error loading files'), 'error');
-    } finally {
-        state.loading = false;
-    }
-}
-
-// ============ Media Loading ============
-async function loadGroupFiles(groupId) {
-    state.loading = true;
-
-    // Show 12 skeleton tiles for the very first page so users don't stare
-    // at an empty grid for the duration of the network round-trip. Page 2+
-    // adds rows so we don't replace what's already there.
-    if (state.page === 1) {
-        Viewer.clearShuffleSilent();
-        const grid = document.getElementById('media-grid');
-        if (grid) grid.innerHTML = renderGallerySkeletons(12);
-        document.getElementById('empty-state')?.classList.add('hidden');
-    }
-
-    try {
-        const type =
-            state.currentFilter && state.currentFilter !== 'all' ? state.currentFilter : 'all';
-        const pinQs = _pinnedFilterQs();
-        const pinFirstQs =
-            localStorage.getItem('tgdl-pinned-first') === '1' ? '&pinnedFirst=1' : '';
-        const scopeQs = _galleryScopeQs();
-        const res = await api.get(
-            `/api/downloads/${encodeURIComponent(groupId)}?page=${state.page}&limit=${FILES_PER_PAGE}&type=${encodeURIComponent(type)}${pinQs}${pinFirstQs}${scopeQs}`,
-        );
-        const newFiles = res.files || [];
-
-        let appendFromIndex = 0;
-        if (state.page === 1) {
-            state.files = newFiles;
-        } else {
-            appendFromIndex = state.files.length;
-            state.files = state.files.concat(newFiles);
+        if (seq === _galleryLoadSeq) {
+            showToast(i18nT('viewer.error.load', 'Error loading files'), 'error');
         }
-
-        // Off-by-one safety same as loadAllFiles — short last page no
-        // longer keeps pagination armed forever.
-        const total = Number(res.total) || state.files.length;
-        state.hasMore = newFiles.length === FILES_PER_PAGE && state.files.length < total;
-        if (state.page > 1) renderMediaGrid({ append: true, fromIndex: appendFromIndex });
-        else renderMediaGrid();
-        document.getElementById('page-subtitle').textContent = i18nTf(
-            'viewer.subtitle.files',
-            { count: total },
-            `${total} files`,
-        );
-    } catch (e) {
-        showToast(i18nT('viewer.error.load', 'Error loading files'), 'error');
     } finally {
-        state.loading = false;
+        if (seq === _galleryLoadSeq) state.loading = false;
     }
 }
 
-// Track how many state.files entries are already painted as tiles in the
-// DOM. Append-only on infinite scroll: page-2+ loads add only the new
-// tail to the grid via insertAdjacentHTML rather than re-rendering the
-// whole thing. Reset on every full re-render (filter/group change).
+// Track how many state.files entries have been handed to the gallery
+// window (rendered or queued below it). Append-only on infinite scroll:
+// page-2+ loads only add the new tail. Reset on every full re-render
+// (filter/group change).
 let _renderedFileCount = 0;
 
 // Off-screen tile content unloader. `content-visibility: auto` skips
 // layout/paint for off-screen tiles, but the `<img>` element + decoded
-// bitmap stay in memory regardless — a 5000-tile gallery would hold
-// ~5000 cached thumbnails (10-30 KB each ≈ 150 MB resident). This
-// IntersectionObserver detaches the children of `.tile-thumb` for
-// tiles that are far from the viewport (stashed in a WeakMap so they
-// survive DOM moves) and reattaches them when the tile comes back
-// near. The empty `<div class="tile-thumb">` outer node stays so
-// layout + `aspect-ratio` are unaffected; only the heavy thumbnail
-// bitmap is freed.
+// bitmap stay in memory regardless. This IntersectionObserver detaches
+// the children of `.tile-thumb` for tiles that are far from the viewport
+// (stashed in a WeakMap so they survive DOM moves) and reattaches them
+// when the tile comes back near. The empty `<div class="tile-thumb">`
+// outer node stays so layout + `aspect-ratio` are unaffected; only the
+// heavy thumbnail bitmap is freed. Rooted on #content-area — the real
+// scroller — so the 1500 px buffer actually applies (with the viewport
+// as root the scroller clipped it to ~0 and tiles popped in blank).
 let _tileWindowObserver = null;
 const _tileStash = new WeakMap();
 function _ensureTileWindowObserver() {
@@ -1922,7 +2338,11 @@ function _ensureTileWindowObserver() {
         },
         // Generous buffer so a fast-flick scroll doesn't flash empty
         // tiles. 1500 px ≈ 8-12 rows in grid mode at typical viewports.
-        { rootMargin: '1500px 0px 1500px 0px', threshold: 0 },
+        {
+            root: document.getElementById('content-area'),
+            rootMargin: '1500px 0px 1500px 0px',
+            threshold: 0,
+        },
     );
     return _tileWindowObserver;
 }
@@ -1945,247 +2365,207 @@ function _restoreTile(tile) {
     _tileStash.delete(tile);
 }
 
-function renderMediaGrid(opts = {}) {
-    const grid = document.getElementById('media-grid');
-    const empty = document.getElementById('empty-state');
-    if (!grid) return;
+// Sticky inside a CSS Grid was clipping the trailing media tiles and
+// stacking multiple headers at the top of the scrollport (each header
+// sticks until the next pushes it). Plain inline header keeps each
+// section's title aligned with its row without hijacking the scroll
+// geometry. Spans the full row (gallery-virtual.js relies on that for
+// its row math).
+function _gallerySectionHeaderHtml(label) {
+    return `<h4 class="grid-section-header" style="grid-column: 1 / -1; padding: 16px 4px 8px; color: var(--tg-textSecondary, #8B9BAA); font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em;">${escapeHtml(label)}</h4>`;
+}
 
-    const append = opts.append === true;
-    const fromIndex = append ? (opts.fromIndex ?? _renderedFileCount) : 0;
-
-    if (state.files.length === 0) {
-        grid.innerHTML = '';
-        _renderedFileCount = 0;
-        renderGalleryEmptyState();
-        return;
-    }
-    if (empty) empty.classList.add('hidden');
-
-    if (!state.selected) state.selected = new Set();
-
-    // Walk only the slice we need (full list on full render, tail on
-    // append). Each file's index in the UNFILTERED list (`originalIndex`)
-    // is preserved so the viewer's `state.files[idx]` lookup stays
-    // correct under filter.
-    const slice = state.files.slice(fromIndex);
-    const filteredWithIndex = [];
-    slice.forEach((file, sliceIdx) => {
-        if (state.currentFilter === 'all' || file.type === state.currentFilter) {
-            filteredWithIndex.push({ file, originalIndex: fromIndex + sliceIdx });
-        }
-    });
-
-    // On append, skip the time-section banding entirely — the existing
-    // headers up the page stay correct visually, and re-bucketing the
-    // tail in isolation can't produce sensible relative labels anyway.
-    // Shuffle order is random, so Today/Yesterday/Older headers are nonsense.
-    const sections =
-        append || Viewer.isShuffleActive()
-            ? [['', filteredWithIndex]]
-            : groupFilesByTime(filteredWithIndex);
-
-    const html = sections
-        .map(([label, items]) => {
-            // Sticky inside a CSS Grid was clipping the trailing media tiles
-            // and stacking multiple headers at the top of the scrollport
-            // (each header sticks until the next pushes it). Plain inline
-            // header keeps each section's title aligned with its row without
-            // hijacking the scroll geometry.
-            const headerHtml = label
-                ? `<h4 class="grid-section-header" style="grid-column: 1 / -1; padding: 16px 4px 8px; color: var(--tg-textSecondary, #8B9BAA); font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em;">${escapeHtml(label)}</h4>`
-                : '';
-            const tiles = items
-                .map(({ file, originalIndex }) => {
-                    // CSS-driven selection visuals: `.media-grid.in-select-mode`
-                    // reveals the badge on every tile, and `.media-item.is-selected`
-                    // flips it to "checked". Both classes are toggled in place by
-                    // gallery-select.js — no re-render needed for selection
-                    // changes, which is what keeps the lasso smooth on a long
-                    // gallery.
-                    const checked = state.selected?.has(file.fullPath);
-                    const selectedCls = checked ? 'is-selected' : '';
-                    const checkBadge = `<div class="select-badge"><i class="ri-check-line"></i></div>`;
-                    // Rescue Mode badges. Rescued tiles win over pending (a row
-                    // shouldn't carry both, but if it does, "rescued" is the more
-                    // useful signal). Pending shows a remaining-hours estimate +
-                    // tooltip with the local-time deadline.
-                    const rescueBadge = renderRescueBadge(file);
-                    // Server-side WebP thumbnails. One ~6-12 KB image per tile
-                    // — replaces both the previous full-resolution image source
-                    // and the mobile-vs-desktop branching. v2.x collapsed the
-                    // cache to a single canonical 320-px width (see thumbs.js
-                    // ALLOWED_WIDTHS); every viewport asks for the same URL so
-                    // the cache hits 100% of the time. Server snaps any `?w=`
-                    // value to 320 via clampWidth() so legacy bookmarked tabs
-                    // still get a valid response.
-                    // Falls back to a typed-icon placeholder if the source isn't
-                    // thumbnailable (audio / document / dead source).
-                    // Federated rows (file.peer_id !== 'self') route through
-                    // the cluster thumb proxy via getThumbUrl(); see media-url.js.
-                    const thumbUrl = getThumbUrl(file, 320);
-                    // Onerror falls back to displaying nothing (the panel
-                    // background shows through), which is the desired graceful
-                    // degradation for a missing/dead file.
-                    // CSS skeleton starts img at opacity:0 and fades to 1 on `.loaded`.
-                    // Native loading="lazy" + delegated `load`/`error`
-                    // listeners on `#media-grid` (see `_wireMediaGridDelegation`)
-                    // pop the skeleton open. We used to inline `onload` /
-                    // `onerror` per-tile, but every inline handler closure
-                    // adds DOM-parse overhead and ~100 bytes of GC pressure
-                    // per row — at 5000 tiles that compounds into measurable
-                    // scroll lag. The delegated listeners run in capture
-                    // phase so the visual outcome stays identical (fade-in
-                    // on success, hide on failure).
-                    const imgFallback =
-                        `<img loading="lazy" decoding="async" class="w-full h-full object-cover" alt=""` +
-                        (thumbUrl ? ` src="${escapeHtml(thumbUrl)}"` : '') +
-                        '>';
-                    const docFallback = `<div class="w-full h-full flex flex-col items-center justify-center">
-                <i class="${getFileIcon(file.extension)} text-3xl text-tg-textSecondary"></i>
+// One gallery tile. `originalIndex` is the position in `state.files`
+// (the viewer's backing list) so a click opens the right file even
+// under a type filter.
+function _galleryTileHtml(file, originalIndex) {
+    // CSS-driven selection visuals: `.media-grid.in-select-mode`
+    // reveals the badge on every tile, and `.media-item.is-selected`
+    // flips it to "checked". Both classes are toggled in place by
+    // gallery-select.js — no re-render needed for selection
+    // changes, which is what keeps the lasso smooth on a long
+    // gallery.
+    const checked = state.selected?.has(file.fullPath);
+    const selectedCls = checked ? 'is-selected' : '';
+    const checkBadge = `<div class="select-badge"><i class="ri-check-line"></i></div>`;
+    // Rescue Mode badges. Rescued tiles win over pending (a row
+    // shouldn't carry both, but if it does, "rescued" is the more
+    // useful signal). Pending shows a remaining-hours estimate +
+    // tooltip with the local-time deadline.
+    const rescueBadge = renderRescueBadge(file);
+    // Server-side WebP thumbnails. One ~6-12 KB image per tile
+    // — replaces both the previous full-resolution image source
+    // and the mobile-vs-desktop branching. v2.x collapsed the
+    // cache to a single canonical 320-px width (see thumbs.js
+    // ALLOWED_WIDTHS); every viewport asks for the same URL so
+    // the cache hits 100% of the time. Server snaps any `?w=`
+    // value to 320 via clampWidth() so legacy bookmarked tabs
+    // still get a valid response.
+    // Falls back to a typed-icon placeholder if the source isn't
+    // thumbnailable (audio / document / dead source).
+    // Federated rows (file.peer_id !== 'self') route through
+    // the cluster thumb proxy via getThumbUrl(); see media-url.js.
+    const thumbUrl = getThumbUrl(file, 320);
+    // Onerror falls back to displaying nothing (the panel
+    // background shows through), which is the desired graceful
+    // degradation for a missing/dead file.
+    // CSS skeleton starts img at opacity:0 and fades to 1 on `.loaded`.
+    // Native loading="lazy" + delegated `load`/`error`
+    // listeners on `#media-grid` (see `_wireMediaGridDelegation`)
+    // pop the skeleton open. We used to inline `onload` /
+    // `onerror` per-tile, but every inline handler closure
+    // adds DOM-parse overhead and ~100 bytes of GC pressure
+    // per row — at 5000 tiles that compounds into measurable
+    // scroll lag. The delegated listeners run in capture
+    // phase so the visual outcome stays identical (fade-in
+    // on success, hide on failure).
+    const imgFallback =
+        `<img loading="lazy" decoding="async" class="w-full h-full object-cover" alt=""` +
+        (thumbUrl ? ` src="${escapeHtml(thumbUrl)}"` : '') +
+        '>';
+    const docFallback = `<div class="w-full h-full flex flex-col items-center justify-center">
+<i class="${getFileIcon(file.extension)} text-3xl text-tg-textSecondary"></i>
             </div>`;
-                    // Inner thumb content — the visual changes per file type (img,
-                    // video w/ play overlay, doc icon). Wrapped in `.tile-thumb`
-                    // so list-mode CSS can size it as a 56 px square cell.
-                    const durLabel =
-                        file.type === 'videos' && file.duration
-                            ? formatDuration(file.duration)
-                            : '';
-                    const durBadge = durLabel
-                        ? `<span class="video-duration">${durLabel}</span>`
-                        : '';
-                    const thumbInner =
-                        file.type === 'images'
-                            ? imgFallback
-                            : file.type === 'videos'
-                              ? `<div class="relative w-full h-full bg-black">
-                        ${thumbUrl ? imgFallback : ''}
-                        <div class="absolute inset-0 flex items-center justify-center pointer-events-none">
-                            <div class="w-10 h-10 rounded-full bg-black/55 flex items-center justify-center">
-                                <i class="ri-play-fill text-white text-xl ml-0.5"></i>
-                            </div>
-                        </div>
-                        ${durBadge}
-                       </div>`
-                              : docFallback;
-                    // Filename-under-tile fallback for non-image-non-video types
-                    // in GRID/COMPACT modes (where doc icon needs context). CSS
-                    // hides this in list mode (which has its own tile-name).
-                    const gridDocLabel =
-                        file.type !== 'images' && file.type !== 'videos'
-                            ? `<span class="absolute inset-x-0 bottom-0 text-[11px] text-tg-textSecondary truncate text-center px-2 py-1 bg-black/40">${escapeHtml(file.name || '')}</span>`
-                            : '';
-                    // List-mode metadata. `tile-text/size/date` are display:none in
-                    // grid+compact (CSS), display:flex/grid in list. Group name +
-                    // file extension in the sub line, full size + date in their
-                    // own columns. Date format = locale short.
-                    // Federated rows (file.peer_id !== 'self') get a "from {peer}"
-                    // pill appended after the group name so the operator can
-                    // tell at a glance which dashboard owns the file. The pill
-                    // is also visible in grid mode via the `tile-peer-badge`
-                    // overlay positioned bottom-right.
-                    const isPeerTile = isPeerRow(file);
-                    const peerName = isPeerTile ? file.peer_name || '' : '';
-                    const peerBadgeOverlay = isPeerTile
-                        ? `<div class="tile-peer-badge" title="${escapeHtml(
-                              i18nTf('gallery.peer_badge', { peer: peerName }, `from ${peerName}`),
-                          )}"><i class="ri-broadcast-line"></i><span>${escapeHtml(
-                              peerName || i18nT('gallery.scope.this_peer', 'peer'),
-                          )}</span></div>`
-                        : '';
-                    const peerSubInline =
-                        isPeerTile && peerName
-                            ? ` · <span class="text-tg-blue">${escapeHtml(
-                                  i18nTf(
-                                      'gallery.peer_badge',
-                                      { peer: peerName },
-                                      `from ${peerName}`,
-                                  ),
-                              )}</span>`
-                            : '';
-                    const groupLine = file.groupName || file.groupId || '';
-                    const sizeLine =
-                        file.sizeFormatted || (file.size ? formatBytes(file.size) : '');
-                    const dateLine = file.modified ? formatRelativeTime(file.modified) : '';
-                    // Pin chip — appears on hover, golden when pinned. data-tile-pin
-                    // is what the gallery delegation handler keys off below.
-                    const pinnedCls = file.pinned ? 'is-pinned' : '';
-                    const pinTitle = file.pinned
-                        ? i18nT('favorites.unpin', 'Unpin')
-                        : i18nT('favorites.pin', 'Pin');
-                    const pinIcon = file.pinned ? 'ri-pushpin-2-fill' : 'ri-pushpin-2-line';
-                    const pinChip =
-                        file.id != null && state.role === 'admin'
-                            ? `<button type="button" class="pin-chip" data-tile-pin title="${escapeHtml(pinTitle)}" aria-label="${escapeHtml(pinTitle)}">
-                       <i class="${pinIcon}"></i>
-                   </button>`
-                            : '';
-                    return `
+    // Inner thumb content — the visual changes per file type (img,
+    // video w/ play overlay, doc icon). Wrapped in `.tile-thumb`
+    // so list-mode CSS can size it as a 56 px square cell.
+    const durLabel = file.type === 'videos' && file.duration ? formatDuration(file.duration) : '';
+    const durBadge = durLabel ? `<span class="video-duration">${durLabel}</span>` : '';
+    const thumbInner =
+        file.type === 'images'
+            ? imgFallback
+            : file.type === 'videos'
+              ? `<div class="relative w-full h-full bg-black">
+        ${thumbUrl ? imgFallback : ''}
+        <div class="absolute inset-0 flex items-center justify-center pointer-events-none">
+            <div class="w-10 h-10 rounded-full bg-black/55 flex items-center justify-center">
+                <i class="ri-play-fill text-white text-xl ml-0.5"></i>
+            </div>
+        </div>
+        ${durBadge}
+       </div>`
+              : docFallback;
+    // Filename-under-tile fallback for non-image-non-video types
+    // in GRID/COMPACT modes (where doc icon needs context). CSS
+    // hides this in list mode (which has its own tile-name).
+    const gridDocLabel =
+        file.type !== 'images' && file.type !== 'videos'
+            ? `<span class="absolute inset-x-0 bottom-0 text-[11px] text-tg-textSecondary truncate text-center px-2 py-1 bg-black/40">${escapeHtml(file.name || '')}</span>`
+            : '';
+    // List-mode metadata. `tile-text/size/date` are display:none in
+    // grid+compact (CSS), display:flex/grid in list. Group name +
+    // file extension in the sub line, full size + date in their
+    // own columns. Date format = locale short.
+    // Federated rows (file.peer_id !== 'self') get a "from {peer}"
+    // pill appended after the group name so the operator can
+    // tell at a glance which dashboard owns the file. The pill
+    // is also visible in grid mode via the `tile-peer-badge`
+    // overlay positioned bottom-right.
+    const isPeerTile = isPeerRow(file);
+    const peerName = isPeerTile ? file.peer_name || '' : '';
+    const peerBadgeOverlay = isPeerTile
+        ? `<div class="tile-peer-badge" title="${escapeHtml(
+              i18nTf('gallery.peer_badge', { peer: peerName }, `from ${peerName}`),
+          )}"><i class="ri-broadcast-line"></i><span>${escapeHtml(
+              peerName || i18nT('gallery.scope.this_peer', 'peer'),
+          )}</span></div>`
+        : '';
+    const peerSubInline =
+        isPeerTile && peerName
+            ? ` · <span class="text-tg-blue">${escapeHtml(
+                  i18nTf('gallery.peer_badge', { peer: peerName }, `from ${peerName}`),
+              )}</span>`
+            : '';
+    const groupLine = file.groupName || file.groupId || '';
+    const sizeLine = file.sizeFormatted || (file.size ? formatBytes(file.size) : '');
+    const dateLine = file.modified ? formatRelativeTime(file.modified) : '';
+    // Pin chip — appears on hover, golden when pinned. data-tile-pin
+    // is what the gallery delegation handler keys off below.
+    const pinnedCls = file.pinned ? 'is-pinned' : '';
+    const pinTitle = file.pinned
+        ? i18nT('favorites.unpin', 'Unpin')
+        : i18nT('favorites.pin', 'Pin');
+    const pinIcon = file.pinned ? 'ri-pushpin-2-fill' : 'ri-pushpin-2-line';
+    const pinChip =
+        file.id != null && state.role === 'admin'
+            ? `<button type="button" class="pin-chip" data-tile-pin title="${escapeHtml(pinTitle)}" aria-label="${escapeHtml(pinTitle)}">
+       <i class="${pinIcon}"></i>
+   </button>`
+            : '';
+    return `
             <div class="media-item relative ${selectedCls} ${pinnedCls}${isPeerTile ? ' is-peer-tile' : ''}" data-index="${originalIndex}" data-path="${escapeHtml(file.fullPath)}"${file.id != null ? ` data-id="${file.id}"` : ''}${isPeerTile ? ` data-peer-id="${escapeHtml(file.peer_id)}"` : ''} tabindex="0">
-                <div class="tile-thumb relative w-full h-full overflow-hidden">
-                    ${thumbInner}
-                    ${gridDocLabel}
-                    ${peerBadgeOverlay}
-                </div>
-                ${pinChip}
-                <div class="tile-text">
-                    <div class="tile-name" title="${escapeHtml(file.name || '')}">${escapeHtml(file.name || '')}</div>
-                    <div class="tile-sub">${escapeHtml(groupLine)}${peerSubInline}</div>
-                </div>
-                <div class="tile-size">${escapeHtml(sizeLine)}</div>
-                <div class="tile-date" title="${file.modified ? new Date(file.modified).toLocaleString() : ''}">${escapeHtml(dateLine)}</div>
-                <div class="tile-actions">
-                    <button type="button" class="w-7 h-7 rounded-md hover:bg-tg-hover flex items-center justify-center text-tg-textSecondary"
-                            data-tile-open title="${escapeHtml(i18nT('viewer.open', 'Open'))}" aria-label="${escapeHtml(i18nT('viewer.open', 'Open'))}">
-                        <i class="ri-eye-line"></i>
-                    </button>
-                    <button type="button" class="w-7 h-7 rounded-md hover:bg-tg-hover flex items-center justify-center text-tg-textSecondary"
-                            data-tile-similar data-id="${file.id}"
-                            title="${escapeHtml(i18nT('viewer.find_similar', 'Find similar photos'))}"
-                            aria-label="${escapeHtml(i18nT('viewer.find_similar', 'Find similar photos'))}">
-                        <i class="ri-search-eye-line"></i>
-                    </button>
-                </div>
-                ${checkBadge}
-                ${rescueBadge}
+<div class="tile-thumb relative w-full h-full overflow-hidden">
+    ${thumbInner}
+    ${gridDocLabel}
+    ${peerBadgeOverlay}
+</div>
+${pinChip}
+<div class="tile-text">
+    <div class="tile-name" title="${escapeHtml(file.name || '')}">${escapeHtml(file.name || '')}</div>
+    <div class="tile-sub">${escapeHtml(groupLine)}${peerSubInline}</div>
+</div>
+<div class="tile-size">${escapeHtml(sizeLine)}</div>
+<div class="tile-date" title="${file.modified ? new Date(file.modified).toLocaleString() : ''}">${escapeHtml(dateLine)}</div>
+<div class="tile-actions">
+    <button type="button" class="w-7 h-7 rounded-md hover:bg-tg-hover flex items-center justify-center text-tg-textSecondary"
+            data-tile-open title="${escapeHtml(i18nT('viewer.open', 'Open'))}" aria-label="${escapeHtml(i18nT('viewer.open', 'Open'))}">
+        <i class="ri-eye-line"></i>
+    </button>
+    <button type="button" class="w-7 h-7 rounded-md hover:bg-tg-hover flex items-center justify-center text-tg-textSecondary"
+            data-tile-similar data-id="${file.id}"
+            title="${escapeHtml(i18nT('viewer.find_similar', 'Find similar photos'))}"
+            aria-label="${escapeHtml(i18nT('viewer.find_similar', 'Find similar photos'))}">
+        <i class="ri-search-eye-line"></i>
+    </button>
+</div>
+${checkBadge}
+${rescueBadge}
             </div>`;
-                })
-                .join('');
-            return headerHtml + tiles;
-        })
-        .join('');
+}
 
-    if (append) {
-        // Tail-append. insertAdjacentHTML doesn't re-parse the existing
-        // children — O(N_appended) instead of O(N_total) per scroll page,
-        // which is the difference between buttery scroll and stutter on
-        // a 1000-tile gallery.
-        grid.insertAdjacentHTML('beforeend', html);
-        // Sliding window: trim oldest tiles from top to cap DOM size.
-        trimGalleryDOM(grid);
-    } else {
-        resetGalleryWindow(grid);
-        grid.innerHTML = html;
+// The gallery DOM is a bounded window over the full list (see
+// gallery-virtual.js). Wired lazily on first render.
+let _galleryWindowWired = false;
+function _ensureGalleryWindow(grid) {
+    if (_galleryWindowWired) return;
+    _galleryWindowWired = true;
+    configureGalleryWindow({
+        grid,
+        scroller: document.getElementById('content-area'),
+        renderItem: (idx) => _galleryTileHtml(state.files[idx] || {}, idx),
+        renderHeader: (label) => _gallerySectionHeaderHtml(label),
+        onInserted: _onGalleryTilesInserted,
+        onRemoved: _onGalleryTilesRemoved,
+    });
+}
+
+// New tiles entered the DOM (full render, page append, or rows the
+// window re-inserted on scroll): wire them into the thumbnail-eviction
+// + lazy-media observers, and flag cache-hit images as loaded.
+function _onGalleryTilesInserted(nodes) {
+    const obs = _ensureTileWindowObserver();
+    const imgs = [];
+    for (const el of nodes) {
+        if (!el.classList?.contains('media-item')) continue;
+        obs.observe(el);
+        if (state.imageObserver) {
+            for (const m of el.querySelectorAll('img[data-src], video[data-src]')) {
+                state.imageObserver.observe(m);
+            }
+        }
+        const img = el.querySelector('img');
+        if (img) imgs.push(img);
     }
-    _renderedFileCount = state.files.length;
-
-    // Click handling lives on the grid itself via event delegation
-    // (wired once below). Per-tile addEventListener was the second-
-    // biggest cost on a full re-render — eliminating it keeps tab
-    // switches snappy on a thousand-tile grid.
-    _wireMediaGridDelegation(grid);
+    if (!imgs.length) return;
     // Race fix — when an image is already in the HTTP cache, the browser
-    // can fire `load` synchronously between `innerHTML =` and the
-    // delegation handler attaching above. The delegated capture-phase
-    // listener misses that event, the tile never gets `.loaded`, and the
-    // CSS rule `.media-item img { opacity: 0 }` keeps the thumb invisible
-    // (the DOM contains a valid <img src=…>, but the pixel never paints).
-    // Sweep one frame later, after the browser has run its initial layout
-    // pass on the freshly-inserted HTML, and flag every <img> whose
-    // `complete` flag is already true. naturalWidth=0 means the request
-    // 404'd from cache → fall back to `display:none` just like the
-    // delegated error path would.
+    // can fire `load` before the delegated capture-phase listener sees
+    // it, the tile never gets `.loaded`, and the CSS rule
+    // `.media-item img { opacity: 0 }` keeps the thumb invisible. Sweep
+    // one frame later and flag every <img> whose `complete` flag is
+    // already true. naturalWidth=0 means the request 404'd from cache →
+    // fall back to `display:none` just like the delegated error path.
     requestAnimationFrame(() => {
-        for (const img of grid.querySelectorAll('.media-item img')) {
+        for (const img of imgs) {
             if (!img.complete) continue;
             if (img.naturalWidth > 0) {
                 img.classList.add('loaded');
@@ -2195,30 +2575,106 @@ function renderMediaGrid(opts = {}) {
             }
         }
     });
-    _attachLazyObservers(grid);
-    _attachTileWindowObserver(grid, append, fromIndex);
+}
+
+// Tiles left the DOM (window trim / re-render) — stop observing them so
+// the observers never pin detached nodes.
+function _onGalleryTilesRemoved(nodes) {
+    for (const el of nodes) {
+        _tileWindowObserver?.unobserve(el);
+        _tileStash.delete(el);
+        if (state.imageObserver) {
+            for (const m of el.querySelectorAll?.('img, video') || []) {
+                state.imageObserver.unobserve(m);
+            }
+        }
+    }
+}
+
+// Clear the grid through the window module so its bookkeeping (spacer,
+// positions) never drifts from the DOM, then optionally paint loading
+// skeletons.
+function _clearGalleryGrid(grid, skeletonHtml = '') {
+    _ensureGalleryWindow(grid);
+    resetGalleryWindow([], new Map());
+    _galleryFilesRef = null;
+    if (skeletonHtml) grid.innerHTML = skeletonHtml;
+}
+
+// `state.files` array the grid currently renders. Other surfaces (queue
+// single-file viewer, review mode, AI search) swap `state.files` for
+// their own list; comparing identity tells us the grid is stale.
+let _galleryFilesRef = null;
+
+function renderMediaGrid(opts = {}) {
+    const grid = document.getElementById('media-grid');
+    const empty = document.getElementById('empty-state');
+    if (!grid) return;
+    _ensureGalleryWindow(grid);
+
+    const append = opts.append === true;
+    const fromIndex = append ? (opts.fromIndex ?? _renderedFileCount) : 0;
+
+    if (state.files.length === 0) {
+        resetGalleryWindow([], new Map());
+        _renderedFileCount = 0;
+        _galleryFilesRef = state.files;
+        renderGalleryEmptyState();
+        return;
+    }
+    if (empty) empty.classList.add('hidden');
+
+    if (!state.selected) state.selected = new Set();
+
+    const matches = (file) => state.currentFilter === 'all' || file.type === state.currentFilter;
+    if (append) {
+        // Page 2+: hand only the new tail to the window. No time-section
+        // banding — re-bucketing the tail in isolation can't produce
+        // sensible relative labels, and the headers up the page stay
+        // correct visually.
+        const indices = [];
+        for (let i = fromIndex; i < state.files.length; i++) {
+            if (matches(state.files[i])) indices.push(i);
+        }
+        appendPositions(indices);
+    } else {
+        // Full render. Each file keeps its index in the UNFILTERED list
+        // (`originalIndex`) so the viewer's `state.files[idx]` lookup stays
+        // correct under filter. Sections become (position → label) headers.
+        const filteredWithIndex = [];
+        state.files.forEach((file, originalIndex) => {
+            if (matches(file)) filteredWithIndex.push({ file, originalIndex });
+        });
+        const order = [];
+        const headers = new Map();
+        const sections = Viewer.isShuffleActive()
+            ? [['', filteredWithIndex]]
+            : groupFilesByTime(filteredWithIndex);
+        for (const [label, items] of sections) {
+            if (label && items.length) headers.set(order.length, label);
+            for (const it of items) order.push(it.originalIndex);
+        }
+        if (opts.keepScroll) rerenderGalleryWindow(order, headers);
+        else resetGalleryWindow(order, headers);
+    }
+    _renderedFileCount = state.files.length;
+    _galleryFilesRef = state.files;
+
+    // Click handling lives on the grid itself via event delegation
+    // (wired once below). Per-tile addEventListener was the second-
+    // biggest cost on a full re-render — eliminating it keeps tab
+    // switches snappy on a thousand-tile grid.
+    _wireMediaGridDelegation(grid);
     // Re-apply select-mode class + repaint .is-selected on tiles after
     // any full or append render so the visual state survives mutations
     // (e.g. infinite scroll, filter switch, file_deleted).
     repaintSelection();
-}
-
-// Wire every tile (or just the freshly-appended tail) into the
-// `_tileWindowObserver` so off-screen tiles drop their thumbnail
-// content under memory pressure. Idempotent: `observer.observe(el)`
-// on an already-observed node is a no-op.
-function _attachTileWindowObserver(grid, append, fromIndex) {
-    const obs = _ensureTileWindowObserver();
-    const tiles = grid.querySelectorAll('.media-item');
-    if (append) {
-        // The tail-append path adds tiles after `fromIndex`; only those
-        // need fresh observers. The earlier ones are already wired.
-        for (let i = fromIndex; i < tiles.length; i++) obs.observe(tiles[i]);
-    } else {
-        // Full re-render: previous tiles were torn out of the DOM, so
-        // the observer's references are GC-eligible. Wire everything.
-        tiles.forEach((tile) => obs.observe(tile));
-    }
+    // A short page may leave the load-more sentinel inside the prefetch
+    // margin, where the IntersectionObserver never fires again.
+    _recheckLoadMore();
+    _maybeShowSelectHint();
+    // The "N of M selected" wording depends on how much is loaded.
+    if (state.selected?.size || state.selectMode) updateSelectionBar();
 }
 
 let _gridDelegated = false;
@@ -2305,39 +2761,6 @@ function _wireMediaGridDelegation(grid) {
     });
 }
 
-// Lazy <img>/<video> observer hookup — runs after every render (full or
-// append) so newly-added tiles are picked up by the same IntersectionObserver
-// that swaps `data-src` → `src` when the tile scrolls into view. Idempotent
-// — `observer.observe(el)` is a no-op for an already-observed node.
-function _attachLazyObservers(grid) {
-    if (!state.imageObserver) return;
-    grid.querySelectorAll('img[data-src], video[data-src]').forEach((el) =>
-        state.imageObserver.observe(el),
-    );
-}
-
-// Remove a single tile from the grid in place. Saves the full
-// renderMediaGrid() pass when a WS file_deleted lands — important on a
-// big gallery, where re-painting 1000 tiles to drop one shows up as a
-// visible scroll-stutter. Falls through to a no-op if no tile matches
-// (the tile was already removed, or the gallery doesn't have it cached).
-function _removeTileFromGrid({ path, id }) {
-    const grid = document.getElementById('media-grid');
-    if (!grid) return;
-    let el = null;
-    if (path) {
-        // CSS.escape is required because file paths can carry quotes /
-        // brackets / colons that would otherwise break the selector.
-        el = grid.querySelector(`.media-item[data-path="${CSS.escape(path)}"]`);
-    }
-    if (!el && id != null) {
-        el = grid.querySelector(`.media-item[data-id="${CSS.escape(String(id))}"]`);
-    }
-    if (el) el.remove();
-    // Surface the empty-state when the last tile disappears.
-    if (state.files.length === 0) renderGalleryEmptyState();
-}
-
 /**
  * Render the gallery empty-state with actionable guidance. The default
  * copy ("No media files") doesn't tell the operator WHY the gallery is
@@ -2363,7 +2786,67 @@ function renderGalleryEmptyState() {
         body,
         icon,
         actions = [];
-    if (groupId) {
+    // What narrows the list right now ("Photos · Pinned only"). Pinned
+    // first only re-orders, so it never explains an empty result.
+    const activeFilters = [];
+    if ((state.currentFilter || 'all') !== 'all') {
+        const tab = document.querySelector(
+            `#media-tabs .tab-item[data-type="${state.currentFilter}"]`,
+        );
+        activeFilters.push(tab?.textContent.trim() || state.currentFilter);
+    }
+    if (getPinnedMode() === 'only')
+        activeFilters.push(i18nT('gallery.filter.state_only', 'Pinned only'));
+    else if (getPinnedMode() === 'unpinned')
+        activeFilters.push(i18nT('gallery.filter.state_unpinned', 'Unpinned only'));
+    const clearFiltersAction = {
+        label: i18nT('gallery.filter.clear_filters', 'Clear filters'),
+        icon: 'ri-filter-off-line',
+        onClick: () => {
+            setPinnedMode('all');
+            state.currentFilter = 'all';
+            _paintTypeTabs();
+            syncGalleryToolbar();
+            _reloadGallery();
+        },
+    };
+    if (state.searchQuery) {
+        icon = 'ri-search-line';
+        title = i18nTf(
+            'gallery.search.empty_title',
+            { q: state.searchQuery },
+            `No results for “${state.searchQuery}”`,
+        );
+        body = i18nT(
+            'gallery.search.empty_body',
+            'Search looks at file names and chat names. Check the spelling or try a shorter word.',
+        );
+        if (activeFilters.length) {
+            body += ` ${i18nTf('gallery.search.empty_filters', { filters: activeFilters.join(' · ') }, `Filters are on too: ${activeFilters.join(' · ')}.`)}`;
+        }
+        actions.push({
+            label: i18nT('gallery.search.clear', 'Clear search'),
+            icon: 'ri-close-circle-line',
+            onClick: () => clearGallerySearch(),
+        });
+        if (groupId) {
+            actions.push({
+                label: i18nT('gallery.search.everywhere', 'Search all media'),
+                icon: 'ri-gallery-line',
+                onClick: () => showAllMedia({ keepFilters: true }),
+            });
+        }
+        if (activeFilters.length) actions.push(clearFiltersAction);
+    } else if (activeFilters.length) {
+        icon = 'ri-filter-off-line';
+        title = i18nT('gallery.filter.empty_title', 'Nothing matches these filters');
+        body = i18nTf(
+            'gallery.filter.empty_body',
+            { filters: activeFilters.join(' · ') },
+            `Filters on: ${activeFilters.join(' · ')}. Clear them to see everything.`,
+        );
+        actions.push(clearFiltersAction);
+    } else if (groupId) {
         icon = 'ri-folder-open-line';
         title = i18nT('viewer.empty.group_title', 'No downloaded media for this group yet');
         body = isAdmin
@@ -2380,17 +2863,17 @@ function renderGalleryEmptyState() {
                 {
                     label: i18nT('viewer.empty.action.backfill', 'Run Backfill'),
                     icon: 'ri-history-line',
-                    onClick: () => window.navigateTo?.('backfill'),
+                    onClick: () => openBackfillFor(groupId),
                 },
                 {
-                    label: i18nT('viewer.empty.action.group_settings', 'Group Settings'),
-                    icon: 'ri-equalizer-line',
-                    onClick: () => window.openGroupSettings?.(groupId),
+                    label: i18nT('chat.details.open', 'Chat settings'),
+                    icon: 'ri-settings-3-line',
+                    onClick: () => openGroupSettings(groupId),
                 },
                 {
                     label: i18nT('viewer.empty.action.reindex', 'Re-index from disk'),
                     icon: 'ri-refresh-line',
-                    onClick: () => window.navigateTo?.('maintenance/duplicates'),
+                    onClick: () => window.navigateTo?.('settings/tools/library/duplicates'),
                 },
             ];
         }
@@ -2411,11 +2894,11 @@ function renderGalleryEmptyState() {
                 {
                     label: i18nT('viewer.empty.action.add_account', 'Add account'),
                     icon: 'ri-user-add-line',
-                    onClick: () => window.navigateTo?.('settings/accounts'),
+                    onClick: () => openAccountWizard(),
                 },
                 {
-                    label: i18nT('viewer.empty.action.groups', 'Manage groups'),
-                    icon: 'ri-group-line',
+                    label: i18nT('viewer.empty.action.groups', 'Go to Chats'),
+                    icon: 'ri-chat-3-line',
                     onClick: () => window.navigateTo?.('groups'),
                 },
             ];
@@ -2433,8 +2916,8 @@ function renderGalleryEmptyState() {
             .map(
                 (a, i) => `
             <button type="button" data-action-idx="${i}"
-                class="tg-btn-secondary text-xs px-3 py-1.5 flex items-center gap-1.5">
-                <i class="${a.icon}"></i><span>${a.label}</span>
+                class="tg-btn-secondary text-sm px-4 min-h-[44px] flex items-center gap-2">
+                <i class="${a.icon}" aria-hidden="true"></i><span>${escapeHtml(a.label)}</span>
             </button>
         `,
             )
@@ -2501,15 +2984,154 @@ function toggleSelection(path) {
     updateSelectionBar();
 }
 
+// Files of the current gallery view that can be selected (type tab applied).
+function _selectableFiles() {
+    const files = Array.isArray(state.files) ? state.files : [];
+    const f = state.currentFilter || 'all';
+    return f === 'all' ? files : files.filter((x) => x.type === f);
+}
+
+// "Select all N" beyond the loaded pages is offered up to this many files;
+// past it the list is too big to hold and act on in one go.
+const SELECT_ALL_MAX = 5000;
+
+// One bar for everything selection: shown while select mode is on (so
+// "0 selected" still explains itself and offers Done) and whenever files
+// are selected. Buttons that need a selection are disabled at 0.
 function updateSelectionBar() {
     const bar = document.getElementById('selection-bar');
     const count = state.selected ? state.selected.size : 0;
-    document.getElementById('selection-count').textContent = i18nTf(
-        'viewer.selection.count',
-        { count },
-        `${count} selected`,
-    );
-    if (bar) bar.classList.toggle('hidden', count === 0);
+    const onGallery = state.currentPage === 'viewer';
+    const show = onGallery && (count > 0 || !!state.selectMode);
+    const countEl = document.getElementById('selection-count');
+    const loaded = _selectableFiles().length;
+    const total = Number(_galleryTotal) || loaded;
+    if (countEl) {
+        if (count === 0) {
+            countEl.textContent = window.matchMedia?.('(pointer: coarse)').matches
+                ? i18nT('viewer.selection.prompt', 'Tap items to select')
+                : i18nT('viewer.selection.prompt_click', 'Click to select');
+        } else if (count >= loaded && total > count) {
+            countEl.textContent = i18nTf(
+                'viewer.selection.count_of',
+                { count: count.toLocaleString(), total: total.toLocaleString() },
+                `${count.toLocaleString()} of ${total.toLocaleString()} selected`,
+            );
+        } else {
+            countEl.textContent = i18nTf(
+                'viewer.selection.count',
+                { count: count.toLocaleString() },
+                `${count.toLocaleString()} selected`,
+            );
+        }
+    }
+    // "Select all 1,234" — every loaded file is selected but the view has
+    // more on the server.
+    const allMatching = document.getElementById('selection-all-matching');
+    if (allMatching) {
+        const offer = count > 0 && count >= loaded && total > loaded && total <= SELECT_ALL_MAX;
+        allMatching.classList.toggle('hidden', !offer);
+        if (offer && !allMatching.disabled) {
+            allMatching.textContent = i18nTf(
+                'viewer.selection.select_all_n',
+                { count: total.toLocaleString() },
+                `Select all ${total.toLocaleString()}`,
+            );
+        }
+    }
+    document
+        .getElementById('selection-all')
+        ?.classList.toggle('hidden', count > 0 && count >= loaded);
+    for (const id of ['selection-clear', 'selection-zip', 'selection-pin', 'selection-delete']) {
+        const b = document.getElementById(id);
+        if (b) b.disabled = count === 0;
+    }
+    if (bar) bar.classList.toggle('hidden', !show);
+    if (state.selectMode) _dismissSelectHint();
+}
+
+// Load every file of the current view (up to SELECT_ALL_MAX) so "Select
+// all N" really selects all of them, not just the pages scrolled so far.
+async function _selectEveryMatchingFile() {
+    const btn = document.getElementById('selection-all-matching');
+    const total = Number(_galleryTotal) || 0;
+    if (!total || total > SELECT_ALL_MAX) return;
+    const viewKey = _galleryViewKey();
+    const groupId = state.currentGroupId;
+    const LIMIT = 200;
+    const out = [];
+    const seen = new Set();
+    if (btn) btn.disabled = true;
+    try {
+        for (let p = 1; p <= Math.ceil(total / LIMIT); p++) {
+            if (btn) {
+                btn.textContent = i18nTf(
+                    'viewer.selection.loading_all',
+                    { n: out.length.toLocaleString(), total: total.toLocaleString() },
+                    `Loading ${out.length.toLocaleString()} / ${total.toLocaleString()}…`,
+                );
+            }
+            const res = await api.get(_galleryPageUrl(groupId, { page: p, limit: LIMIT }));
+            // The user switched view meanwhile — drop it.
+            if (_galleryViewKey() !== viewKey || state.currentPage !== 'viewer') return;
+            const rows = res?.files || [];
+            for (const f of rows) {
+                const k = `${f.peer_id || 'self'}|${f.id}|${f.fullPath}`;
+                if (seen.has(k)) continue;
+                seen.add(k);
+                out.push(f);
+            }
+            if (rows.length < LIMIT) break;
+        }
+        state.files = out;
+        state.hasMore = false;
+        _galleryTotal = Math.max(total, out.length);
+        renderMediaGrid({ keepScroll: true });
+        selectAllVisible();
+    } catch (e) {
+        showToast(e?.message || i18nT('viewer.error.load', 'Error loading files'), 'error');
+    } finally {
+        if (btn) btn.disabled = false;
+        updateSelectionBar();
+    }
+}
+
+// First-visit tip on touch screens: selecting several files is behind a
+// long-press, which nobody finds by accident. Dismissed with "Got it" or
+// automatically once select mode has been used; remembered per browser.
+const SELECT_HINT_KEY = 'tgdl-hint-select-seen';
+function _selectHintSeen() {
+    try {
+        return localStorage.getItem(SELECT_HINT_KEY) === '1';
+    } catch {
+        return true;
+    }
+}
+function _dismissSelectHint() {
+    const el = document.getElementById('select-hint');
+    if (el && !el.classList.contains('hidden')) el.classList.add('hidden');
+    try {
+        if (localStorage.getItem(SELECT_HINT_KEY) !== '1')
+            localStorage.setItem(SELECT_HINT_KEY, '1');
+    } catch {}
+}
+function _maybeShowSelectHint() {
+    const el = document.getElementById('select-hint');
+    if (!el || _selectHintSeen()) return;
+    const touch = window.matchMedia?.('(pointer: coarse)').matches;
+    const show =
+        touch &&
+        state.currentPage === 'viewer' &&
+        !state.selectMode &&
+        _selectableFiles().length > 1;
+    el.classList.toggle('hidden', !show);
+}
+function _setupSelectHint() {
+    document.getElementById('select-hint-dismiss')?.addEventListener('click', _dismissSelectHint);
+    document.getElementById('select-hint-try')?.addEventListener('click', () => {
+        _dismissSelectHint();
+        document.getElementById('select-mode-btn')?.click();
+    });
 }
 
 // Group files into Telegram-style time sections. Accepts an array of
@@ -2632,6 +3254,14 @@ async function setupMediaSearch() {
         updateSelectionBar();
     });
 
+    document.getElementById('selection-exit')?.addEventListener('click', () => {
+        exitSelectMode();
+        updateSelectionBar();
+    });
+    document
+        .getElementById('selection-all-matching')
+        ?.addEventListener('click', () => _selectEveryMatchingFile());
+
     selClear?.addEventListener('click', () => {
         if (state.selected) state.selected.clear();
         // Drop the visual checked-state in place — way cheaper than
@@ -2670,15 +3300,18 @@ async function setupMediaSearch() {
         // existing `bulk_delete` WS broadcast (already wired further up).
         // Final toast comes from `dedup_delete_done` (shared tracker).
         const set = new Set(paths);
+        // Own tiles go by DB id — every tile sharing a selected path; only
+        // peer tiles / rows without an id still travel as paths.
+        const body = bulkDeleteTargets(paths, state.files);
         try {
-            const r = await api.post('/api/downloads/bulk-delete', { paths });
+            const r = await api.post('/api/downloads/bulk-delete', body);
             if (!r?.started && !r?.success) throw new Error('Failed to start');
             state.selected.clear();
             state.files = (state.files || []).filter((f) => !set.has(f.fullPath));
             if (state.savedFiles)
                 state.savedFiles = state.savedFiles.filter((f) => !set.has(f.fullPath));
             updateSelectionBar();
-            renderMediaGrid();
+            renderMediaGrid({ keepScroll: true });
         } catch (e) {
             if (e?.data?.code === 'ALREADY_RUNNING') {
                 showToast(
@@ -2772,17 +3405,30 @@ async function setupMediaSearch() {
         const next = !allPinned;
         let ok = 0,
             failed = 0;
-        for (const f of items) {
+        // One request per batch (POST /api/downloads/pin) instead of one
+        // per file — a 500-file selection used to fire 500 requests.
+        const BATCH = 1000;
+        for (let i = 0; i < items.length; i += BATCH) {
+            const part = items.slice(i, i + BATCH);
             try {
-                await api.post(`/api/downloads/${encodeURIComponent(f.id)}/pin`, { pinned: next });
-                f.pinned = next;
-                const tile = document.querySelector(
-                    `.media-item[data-id="${CSS.escape(String(f.id))}"]`,
-                );
-                tile?.classList.toggle('is-pinned', next);
-                ok++;
+                const r = await api.post('/api/downloads/pin', {
+                    ids: part.map((f) => f.id),
+                    pinned: next,
+                });
+                const done = new Set((r?.ids || []).map(String));
+                for (const f of part) {
+                    if (!done.has(String(f.id))) {
+                        failed++;
+                        continue;
+                    }
+                    f.pinned = next;
+                    document
+                        .querySelector(`.media-item[data-id="${CSS.escape(String(f.id))}"]`)
+                        ?.classList.toggle('is-pinned', next);
+                    ok++;
+                }
             } catch {
-                failed++;
+                failed += part.length;
             }
         }
         showToast(
@@ -2816,22 +3462,70 @@ function _wireGalleryDedupDone() {
 }
 
 // ============ Groups Config Page ============
-async function renderGroupsConfig() {
+// The Chats rows come from js/add-sheet.js — the same rows (Monitor
+// switch, Backfill…, tap for the chat's details) as the + sheet.
+let _addSheetModule = null;
+let _addSheetLoaded = null;
+function loadAddSheetModule() {
+    if (!_addSheetModule) {
+        _addSheetModule = import('./add-sheet.js')
+            .then((m) => {
+                _addSheetLoaded = m;
+                return m;
+            })
+            .catch((e) => {
+                _addSheetModule = null;
+                throw e;
+            });
+    }
+    return _addSheetModule;
+}
+
+let _groupsScrollTop = 0;
+
+function _paintDialogs() {
+    const q = document.getElementById('groups-search')?.value || '';
+    if (q.trim()) filterDialogs(q);
+    else renderDialogsList(state.allDialogs || []);
+}
+
+async function renderGroupsConfig({ restoreScroll = false } = {}) {
     const list = document.getElementById('groups-config-list');
     if (!list) return;
+    const scroller = document.getElementById('content-area');
 
-    list.innerHTML = `<div class="text-center py-8 text-tg-textSecondary">${escapeHtml(i18nT('groups.loading_dialogs', 'Loading dialogs...'))}</div>`;
+    // Back from a chat's page (or a refresh): paint the list we already
+    // have — search text and scroll position intact — and update it
+    // quietly, instead of blanking it to "Loading dialogs…".
+    const cached = Array.isArray(state.allDialogs) && state.allDialogs.length > 0;
+    if (cached) {
+        await loadAddSheetModule().catch(() => {});
+        _paintDialogs();
+        if (restoreScroll && scroller) scroller.scrollTop = _groupsScrollTop;
+    } else {
+        list.classList.remove('cr-list');
+        list.innerHTML = `<div class="text-center py-8 text-tg-textSecondary">${escapeHtml(i18nT('groups.loading_dialogs', 'Loading dialogs...'))}</div>`;
+    }
 
     try {
-        const res = await api.get('/api/dialogs');
+        const [res] = await Promise.all([api.get('/api/dialogs'), loadAddSheetModule()]);
         const dialogs = res.dialogs || res || [];
         // Stash the account directory for chip rendering in renderDialogsList.
         // Only meaningful when 2+ accounts are linked — otherwise chips would
         // be visual noise (they all carry the same single label).
         state.dialogsAccounts = Array.isArray(res.accounts) ? res.accounts : [];
         state.allDialogs = dialogs;
-        renderDialogsList(dialogs);
+        if (state.currentPage !== 'groups') return;
+        const top = scroller?.scrollTop;
+        _paintDialogs();
+        if (cached && scroller && top != null) scroller.scrollTop = top;
     } catch (e) {
+        if (cached) return; // keep showing what we had
+        // Needs attention works from the configured chats alone.
+        if (state.groupsTab === 'attention') {
+            renderDialogsList([]);
+            return;
+        }
         // "No Telegram account configured yet" is not an error — it's a
         // first-run state. Surface a friendly empty-state pointing at the
         // Add Account flow instead of a red failure message.
@@ -2844,7 +3538,7 @@ async function renderGroupsConfig() {
                     'Add your Telegram account to load chats and start downloading.',
                 ),
                 actionLabel: i18nT('groups.no_account.cta', 'Add account'),
-                actionHref: '/add-account.html',
+                actionHref: '#/account/add',
             });
             return;
         }
@@ -2855,17 +3549,32 @@ async function renderGroupsConfig() {
 function renderDialogsList(dialogs) {
     const list = document.getElementById('groups-config-list');
     if (!list) return;
+    const rows = _addSheetLoaded;
+    if (!rows) {
+        loadAddSheetModule()
+            .then(() => renderDialogsList(dialogs))
+            .catch((e) => console.error('chat rows', e));
+        return;
+    }
 
     const tab = state.groupsTab || 'all';
+    _paintAttentionPanel(tab);
     const filtered =
         tab === 'monitored'
             ? dialogs.filter((d) => d.inConfig || d.enabled)
             : tab === 'unmonitored'
               ? dialogs.filter((d) => !d.inConfig && !d.enabled)
-              : dialogs;
+              : tab === 'attention'
+                ? _attentionChats(document.getElementById('groups-search')?.value || '')
+                : dialogs;
 
     if (filtered.length === 0) {
-        list.innerHTML = `<div class="text-center py-8 text-tg-textSecondary">${escapeHtml(i18nT('groups.none_found', 'No groups found'))}</div>`;
+        list.removeAttribute('role');
+        list.classList.remove('cr-list');
+        list.innerHTML =
+            tab === 'attention'
+                ? `<div class="attn-empty"><i class="ri-checkbox-circle-line" aria-hidden="true"></i><span>${escapeHtml(i18nT('access.attention.none', 'Every chat in your list can be reached.'))}</span></div>`
+                : `<div class="text-center py-8 text-tg-textSecondary">${escapeHtml(i18nT('groups.none_found', 'No groups found'))}</div>`;
         return;
     }
 
@@ -2885,39 +3594,10 @@ function renderDialogsList(dialogs) {
         }
     }
 
-    const rowHtml = filtered
+    list.setAttribute('role', 'list');
+    list.classList.add('cr-list');
+    list.innerHTML = filtered
         .map((d) => {
-            const typeLabel =
-                d.type === 'channel'
-                    ? i18nT('groups.type.channel', 'Channel')
-                    : d.type === 'group'
-                      ? i18nT('groups.type.group', 'Group')
-                      : d.type === 'bot'
-                        ? i18nT('groups.type.bot', 'Bot')
-                        : d.type === 'user'
-                          ? i18nT('groups.type.user', 'Direct message')
-                          : i18nT('groups.type.dialog', 'Dialog');
-            const subParts = [typeLabel];
-            if (d.members)
-                subParts.push(
-                    i18nTf('groups.members', { count: d.members }, `${d.members} members`),
-                );
-            if (d.archived) subParts.push(i18nT('groups.archived', 'archived'));
-
-            const statusPill =
-                d.inConfig && d.suspended
-                    ? { label: i18nT('groups.status.suspended', 'Suspended'), kind: 'suspended' }
-                    : d.inConfig && d.enabled
-                      ? { label: i18nT('groups.status.active', 'Active'), kind: 'active' }
-                      : d.inConfig && !d.enabled
-                        ? { label: i18nT('groups.status.paused', 'Paused'), kind: 'paused' }
-                        : { label: i18nT('groups.status.add', 'Add'), kind: 'add' };
-
-            // Canonical name — for dialogs the d.name is usually authoritative
-            // (Telegram-side title) but route through getGroupName so a config
-            // override (custom label) wins when present.
-            const dispName = getGroupName(d.id, { fallback: d.name || d.title });
-
             let accountChips = null;
             if (showChips && Array.isArray(d.accountIds) && d.accountIds.length > 0) {
                 accountChips = d.accountIds.map((id) => {
@@ -2925,30 +3605,13 @@ function renderDialogsList(dialogs) {
                     return { id, label: meta?.label || id, title: meta?.title || id };
                 });
             }
-
-            return renderChatRow({
-                id: d.id,
-                name: dispName,
-                avatarType: d.type,
-                subtitle: subParts.join(' · '),
-                statusPill,
-                accountChips,
-            });
+            return rows.renderChatResultRow(d, { accountChips });
         })
         .join('');
-    list.innerHTML = rowHtml;
-
-    // Click anywhere on the row → open the group settings sheet for that
-    // dialog. Re-resolve through the canonical store at click time.
-    list.querySelectorAll('.chat-row[data-id]').forEach((el) => {
-        const fire = () => openGroupSettings(el.dataset.id, getGroupName(el.dataset.id));
-        el.addEventListener('click', fire);
-        el.addEventListener('keydown', (e) => {
-            if (e.key === 'Enter' || e.key === ' ') {
-                e.preventDefault();
-                fire();
-            }
-        });
+    // Row taps open the chat's details page; the switch and Backfill…
+    // act in place (one delegated listener, wired once).
+    rows.wireChatResultRows(list, {
+        getChat: (id) => (state.allDialogs || []).find((d) => String(d.id) === String(id)),
     });
 }
 
@@ -3079,13 +3742,146 @@ function _setupSidebarGroupsCollapse() {
     });
 }
 
+// ---- Chats → Needs attention (chats no account can read) ------------------
+//
+// Built from the configured chats (/api/groups carries `access`), not the
+// dialogs list: a chat you left or were removed from isn't in the dialogs
+// any more, which is exactly why it needs attention.
+
+function _attentionChats(query = '') {
+    const q = String(query || '')
+        .trim()
+        .toLowerCase();
+    const dialogs = state.allDialogs || [];
+    return unreachableGroups()
+        .map((g) => {
+            const d = dialogs.find((x) => String(x.id) === String(g.id));
+            return {
+                ...(d || {}),
+                id: String(g.id),
+                name: getGroupName(g.id, { fallback: d?.name || g.name }),
+                type: d?.type || g.type || null,
+                inConfig: true,
+                enabled: g.enabled !== false,
+                access: g.access,
+            };
+        })
+        .filter((c) => !q || c.name.toLowerCase().includes(q) || c.id.includes(q));
+}
+
+function _paintAttentionCount() {
+    const el = document.getElementById('groups-attn-count');
+    if (!el) return;
+    const n = unreachableGroups().length;
+    el.textContent = n ? String(n) : '';
+    el.classList.toggle('hidden', !n);
+    el.setAttribute(
+        'aria-label',
+        i18nTf('access.attention.count', { n }, `${n} chats can't be reached`),
+    );
+}
+
+function _paintAttentionPanel(tab) {
+    const panel = document.getElementById('groups-attn-panel');
+    if (!panel) return;
+    const n = unreachableGroups().length;
+    if (!n) {
+        panel.classList.add('hidden');
+        panel.innerHTML = '';
+        return;
+    }
+    if (!panel.dataset.wired) {
+        panel.dataset.wired = '1';
+        panel.addEventListener('click', (e) => {
+            if (e.target.closest('[data-attn-go]')) {
+                switchGroupsTab('attention');
+                return;
+            }
+            const b = e.target.closest('[data-attn]');
+            if (b && !b.disabled) _onAttentionAction(b.dataset.attn);
+        });
+    }
+    if (tab !== 'attention') {
+        // The other tabs: one line pointing at the list (the tab itself can
+        // be scrolled out of view on a phone).
+        panel.className = 'attn-notice-wrap';
+        panel.innerHTML = `<button type="button" class="attn-notice" data-attn-go>
+            <i class="ri-error-warning-line" aria-hidden="true"></i>
+            <span class="attn-notice-text">${escapeHtml(i18nTf('access.attention.title', { n }, `${n} chats can't be reached`))}</span>
+            <span class="attn-notice-cta">${escapeHtml(i18nT('tools.run.review', 'Review'))}<i class="ri-arrow-right-s-line" aria-hidden="true"></i></span>
+        </button>`;
+        return;
+    }
+    const busy = state._attnBusy || '';
+    panel.className = 'attn-panel';
+    panel.innerHTML = `
+        <div class="attn-panel-title"><i class="ri-error-warning-line" aria-hidden="true"></i><span>${escapeHtml(i18nTf('access.attention.title', { n }, `${n} chats can't be reached`))}</span></div>
+        <p class="attn-panel-body">${escapeHtml(i18nT('access.attention.body', "They're paused so they don't use up Telegram's limits, and each one is checked again on its own (after 1 hour, 6 hours, then daily). Rejoin a chat in Telegram and press Check again — or stop monitoring or remove them. Downloaded files are kept."))}</p>
+        <div class="attn-panel-actions" data-admin-only>
+            <button type="button" class="tg-btn" data-attn="recheck" ${busy ? 'disabled' : ''}><i class="ri-refresh-line" aria-hidden="true"></i><span>${escapeHtml(i18nT('access.action.recheck_all', 'Check all again'))}</span></button>
+            <button type="button" class="tg-btn-secondary" data-attn="stop" ${busy ? 'disabled' : ''}><i class="ri-pause-circle-line" aria-hidden="true"></i><span>${escapeHtml(i18nT('access.action.stop_all', 'Stop monitoring all'))}</span></button>
+            <button type="button" class="tg-btn-secondary" data-attn="remove" ${busy ? 'disabled' : ''}><i class="ri-close-circle-line" aria-hidden="true"></i><span>${escapeHtml(i18nT('access.action.remove_all', 'Remove all from list'))}</span></button>
+        </div>
+        <p class="attn-panel-status" data-attn-status role="status" aria-live="polite">${escapeHtml(state._attnStatus || '')}</p>`;
+}
+
+async function _onAttentionAction(kind) {
+    const ids = unreachableGroups().map((g) => String(g.id));
+    if (!ids.length) return;
+    const n = ids.length;
+    try {
+        if (kind === 'recheck') {
+            state._attnBusy = 'recheck';
+            const r = await recheckAllUnreachable();
+            state._attnStatus = i18nTf(
+                'access.attention.checking',
+                { n: r?.total ?? n },
+                `Checking ${r?.total ?? n} chats, one every 2 seconds…`,
+            );
+        } else if (kind === 'stop') {
+            const ok = await confirmSheet({
+                title: i18nT('access.action.stop_all', 'Stop monitoring all'),
+                message: i18nTf(
+                    'access.confirm.stop_all',
+                    { n },
+                    `Turn monitoring off for ${n} chats that can't be reached? You can turn it back on any time.`,
+                ),
+                confirmLabel: i18nT('access.action.stop_all', 'Stop monitoring all'),
+            });
+            if (!ok) return;
+            await stopMonitoringChats(ids);
+        } else if (kind === 'remove') {
+            const ok = await confirmSheet({
+                title: i18nT('access.action.remove_all', 'Remove all from list'),
+                message: i18nTf(
+                    'access.confirm.remove_all',
+                    { n },
+                    `Remove ${n} chats that can't be reached from your list? Downloaded files stay in the library, and nothing changes in Telegram.`,
+                ),
+                confirmLabel: i18nT('access.action.remove_all', 'Remove all from list'),
+            });
+            if (!ok) return;
+            await removeChatsFromList(ids);
+        }
+    } catch (e) {
+        state._attnBusy = '';
+        if (e?.status === 409) {
+            state._attnStatus = i18nT('access.attention.already', 'A check is already running.');
+        } else {
+            showToast(e?.data?.error || e?.message || 'Failed', 'error');
+        }
+    }
+    await loadGroups().catch(() => {});
+    if (state.currentPage === 'groups') _paintDialogs();
+}
+
 function switchGroupsTab(tab) {
     state.groupsTab = tab;
 
     // Single source of truth: the tab id maps 1:1 to the filter slug. This
     // collapses the previous per-button if-toggle ladder into a loop, so
     // adding a future tab only requires adding it to this array.
-    const tabs = ['all', 'monitored', 'unmonitored'];
+    const tabs = ['all', 'monitored', 'unmonitored', 'attention'];
     for (const t of tabs) {
         const el = document.getElementById(`groups-tab-${t}`);
         if (!el) continue;
@@ -3094,731 +3890,49 @@ function switchGroupsTab(tab) {
         el.classList.toggle('text-tg-blue', active);
         el.classList.toggle('border-transparent', !active);
         el.classList.toggle('text-tg-textSecondary', !active);
+        el.setAttribute('aria-pressed', active ? 'true' : 'false');
+        // Phones: the tab row scrolls sideways — keep the active one in view.
+        if (active) el.scrollIntoView?.({ block: 'nearest', inline: 'nearest' });
     }
 
-    if (state.allDialogs) renderDialogsList(state.allDialogs);
+    // Needs attention lists configured chats, so it renders even before
+    // (or without) the dialogs list.
+    if (state.allDialogs || tab === 'attention') renderDialogsList(state.allDialogs || []);
 }
 
-// ============ Group Settings Modal ============
-let currentEditGroup = null;
+// ============ Chat details (was: Group Settings modal) ============
+//
+// The three-tab modal is now the chat details page at #/groups/<id>
+// (js/chat-details.js, loaded on first use). These keep the old window
+// entry points working — the sidebar cog, the Chats rows, the empty
+// gallery and any custom build / console snippet that still calls them.
 
-async function openGroupSettings(groupId, groupName) {
-    // Always resolve via the canonical store — callers may pass nothing
-    // (deep-link router) or a stale label (sidebar dataset).
-    const canonical = getGroupName(groupId, { fallback: groupName });
-    currentEditGroup = { id: groupId, name: canonical };
-    groupName = canonical;
-
-    const modal = document.getElementById('group-modal');
-    if (!modal) return;
-
-    // Load current config for this group
-    const group = state.groups.find((g) => String(g.id) === String(groupId));
-    const filters = group?.filters || {};
-    const fwd = group?.autoForward || {};
-
-    // Update toggle states
-    const enableToggle = document.getElementById('group-enable-toggle');
-    const isSuspended = group?.suspended === true;
-    if (enableToggle) {
-        enableToggle.classList.toggle('active', !isSuspended && group?.enabled !== false);
-        enableToggle.classList.toggle('opacity-50', isSuspended);
-        enableToggle.classList.toggle('pointer-events-none', isSuspended);
-    }
-    const enableLabel = enableToggle?.closest('label');
-    if (enableLabel) {
-        enableLabel.classList.toggle('opacity-60', isSuspended);
-        enableLabel.classList.toggle('cursor-not-allowed', isSuspended);
-        enableLabel.classList.toggle('cursor-pointer', !isSuspended);
-    }
-    const suspendedBanner = document.getElementById('group-suspended-banner');
-    if (suspendedBanner) suspendedBanner.classList.toggle('hidden', !isSuspended);
-
-    const fwdToggle = document.getElementById('fwd-enable-toggle');
-    if (fwdToggle) fwdToggle.classList.toggle('active', fwd.enabled === true);
-
-    const fwdDeleteToggle = document.getElementById('fwd-delete-toggle');
-    if (fwdDeleteToggle)
-        fwdDeleteToggle.classList.toggle('active', fwd.deleteAfterForward === true);
-
-    // Topics
-    const topics = group?.topics || {};
-    const topicsToggle = document.getElementById('topics-enable-toggle');
-    if (topicsToggle) topicsToggle.classList.toggle('active', topics.enabled === true);
-    const topicsInput = document.getElementById('topics-ids');
-    if (topicsInput) topicsInput.value = (topics.ids || []).join(', ');
-
-    const fwdDest = document.getElementById('fwd-destination');
-    if (fwdDest) fwdDest.value = fwd.destination || '';
-
-    // Populate account pickers
-    try {
-        const accounts = await api.get('/api/accounts');
-        const monitorSelect = document.getElementById('monitor-account');
-        const forwardSelect = document.getElementById('forward-account');
-
-        const makeLabel = (a) => {
-            let label = a.id;
-            if (a.name && a.name !== a.id) label = `${a.name} (${a.id})`;
-            if (a.username) label += ` @${a.username}`;
-            if (a.isDefault) label += ' ⭐';
-            return label;
-        };
-
-        const defaultLabel = i18nT('group.accounts.default_option_star', '(Default Account ⭐)');
-        if (monitorSelect) {
-            monitorSelect.innerHTML =
-                `<option value="">${escapeHtml(defaultLabel)}</option>` +
-                accounts
-                    .map(
-                        (a) =>
-                            `<option value="${a.id}" ${group?.monitorAccount === a.id ? 'selected' : ''}>${makeLabel(a)}</option>`,
-                    )
-                    .join('');
-        }
-        if (forwardSelect) {
-            forwardSelect.innerHTML =
-                `<option value="">${escapeHtml(defaultLabel)}</option>` +
-                accounts
-                    .map(
-                        (a) =>
-                            `<option value="${a.id}" ${group?.forwardAccount === a.id ? 'selected' : ''}>${makeLabel(a)}</option>`,
-                    )
-                    .join('');
-        }
-    } catch (e) {
-        /* accounts API not available */
-    }
-
-    // Cluster routing — populate owner / backup peer dropdowns from
-    // /api/cluster/peers. The wrapper stays hidden when no peers are
-    // paired so non-cluster operators see no change.
-    try {
-        const r = await api.get('/api/cluster/peers');
-        const peers = Array.isArray(r?.peers) ? r.peers : [];
-        const wrapper = document.getElementById('group-cluster-routing');
-        const ownerSel = document.getElementById('group-owner-peer');
-        const backupSel = document.getElementById('group-backup-peer');
-        if (wrapper) {
-            if (!peers.length) {
-                wrapper.classList.add('hidden');
-            } else {
-                wrapper.classList.remove('hidden');
-                const peerLabel = (p) => {
-                    const name = p.name || p.peerId.slice(0, 12);
-                    const status = p.status === 'online' ? '🟢' : '⚪';
-                    return `${status} ${name}`;
-                };
-                const anyOpt = i18nT('group.cluster.any_peer', '(Any peer — first online wins)');
-                const noneOpt = i18nT('group.cluster.no_backup', '(No automatic failover)');
-                if (ownerSel) {
-                    ownerSel.innerHTML =
-                        `<option value="">${escapeHtml(anyOpt)}</option>` +
-                        peers
-                            .map(
-                                (p) =>
-                                    `<option value="${escapeHtml(p.peerId)}" ${
-                                        group?.ownerPeerId === p.peerId ? 'selected' : ''
-                                    }>${escapeHtml(peerLabel(p))}</option>`,
-                            )
-                            .join('');
-                }
-                if (backupSel) {
-                    backupSel.innerHTML =
-                        `<option value="">${escapeHtml(noneOpt)}</option>` +
-                        peers
-                            .map(
-                                (p) =>
-                                    `<option value="${escapeHtml(p.peerId)}" ${
-                                        group?.backupPeerId === p.peerId ? 'selected' : ''
-                                    }>${escapeHtml(peerLabel(p))}</option>`,
-                            )
-                            .join('');
-                }
-            }
-        }
-    } catch (e) {
-        /* cluster route 401 / 404 → no peers context — leave hidden */
-    }
-
-    // Populate filter checkboxes
-    const filterOptions = document.getElementById('filter-options');
-    if (filterOptions) {
-        const types = [
-            { key: 'photos', label: i18nT('group.filter.photos', 'Photos'), icon: 'ri-image-line' },
-            { key: 'videos', label: i18nT('group.filter.videos', 'Videos'), icon: 'ri-video-line' },
-            {
-                key: 'files',
-                label: i18nT('group.filter.files', 'Files / Documents'),
-                icon: 'ri-file-line',
-            },
-            { key: 'links', label: i18nT('group.filter.links', 'Links'), icon: 'ri-link' },
-            {
-                key: 'voice',
-                label: i18nT('group.filter.voice', 'Voice Messages'),
-                icon: 'ri-mic-line',
-            },
-            { key: 'gifs', label: i18nT('group.filter.gifs', 'GIFs'), icon: 'ri-file-gif-line' },
-            {
-                key: 'stickers',
-                label: i18nT('group.filter.stickers', 'Stickers'),
-                icon: 'ri-emoji-sticker-line',
-            },
-            {
-                key: 'urls',
-                label: i18nT('group.filter.urls', 'URLs in Text'),
-                icon: 'ri-links-line',
-            },
-        ];
-
-        filterOptions.innerHTML = types
-            .map((t) => {
-                const checked = filters[t.key] !== false;
-                return `
-                <label class="flex items-center justify-between p-3 bg-tg-bg rounded-lg cursor-pointer hover:bg-tg-hover transition-colors">
-                    <div class="flex items-center gap-3">
-                        <i class="${t.icon} text-tg-textSecondary"></i>
-                        <span class="text-white text-sm">${t.label}</span>
-                    </div>
-                    <div class="tg-toggle ${checked ? 'active' : ''}" data-filter="${t.key}"
-                        onclick="event.preventDefault(); event.stopPropagation(); this.classList.toggle('active');"></div>
-                </label>
-            `;
-            })
-            .join('');
-    }
-
-    // Wire history backfill quick-shortcut buttons. Clicking a preset
-    // closes the modal and deep-links to #/backfill/<id> with the chat
-    // preselected and the limit applied — the dedicated Backfill page
-    // takes it from there (confirm + start). This keeps the modal as a
-    // discoverability handle while moving the real surface elsewhere.
-    const progressEl = document.getElementById('history-progress');
-    if (progressEl) progressEl.classList.add('hidden');
-    document.querySelectorAll('[data-history-limit]').forEach((btn) => {
-        btn.onclick = () => {
-            const raw = btn.dataset.historyLimit;
-            const parsed = parseInt(raw, 10);
-            const limit = Number.isFinite(parsed) ? parsed : 100;
-            closeGroupSettings();
-            backfillDeepLink(groupId, limit);
-        };
-    });
-
-    // Rescue Mode: populate chip group + retention input. Mode defaults to
-    // 'auto' (follow global cfg.rescue.enabled). Chip click toggles active
-    // class — the value reads back in saveGroupSettings().
-    const rescueMode =
-        group?.rescueMode === 'on' || group?.rescueMode === 'off' || group?.rescueMode === 'auto'
-            ? group.rescueMode
-            : 'auto';
-    document.querySelectorAll('#setting-rescue-mode .rescue-chip').forEach((btn) => {
-        btn.classList.toggle('active', btn.dataset.rescueValue === rescueMode);
-        btn.onclick = (ev) => {
-            ev.preventDefault();
-            document
-                .querySelectorAll('#setting-rescue-mode .rescue-chip')
-                .forEach((b) => b.classList.remove('active'));
-            btn.classList.add('active');
-        };
-    });
-    const rescueHoursEl = document.getElementById('setting-rescue-hours');
-    if (rescueHoursEl) rescueHoursEl.value = group?.rescueRetentionHours || '';
-
-    // Show media tab by default
-    switchSettingsTab('media');
-    // Wire the Data tab's action buttons once per modal open. The buttons
-    // live inside the modal so re-binding on every open is harmless.
-    _wireGroupDataActions(groupId);
-    modal.classList.remove('hidden');
-}
-
-// Idempotent — replaces handlers via .onclick so re-opening the modal
-// for a different group always re-targets the right id.
-function _wireGroupDataActions(groupId) {
-    const delBtn = document.getElementById('group-data-delete-files-btn');
-    const purgeBtn = document.getElementById('group-data-purge-btn');
-    const more = document.getElementById('group-data-loadmore');
-    if (delBtn) {
-        delBtn.onclick = async () => {
-            const { api } = await import('./api.js');
-            const { confirmSheet } = await import('./sheet.js');
-            const ok = await confirmSheet({
-                title: i18nT('group.data.delete_files', 'Delete files only'),
-                message: i18nT(
-                    'group.data.delete_files_confirm',
-                    'Drop every download row + on-disk file for this group. Group config (filters, monitor, accounts) is kept so the next pass can re-download fresh.',
-                ),
-                confirmLabel: i18nT('group.data.delete_files', 'Delete files only'),
-                danger: true,
-            });
-            if (!ok) return;
-            try {
-                await api.post(`/api/groups/${encodeURIComponent(groupId)}/delete-files`, {});
-                const { showToast } = await import('./utils.js');
-                showToast(i18nT('group.data.delete_files_started', 'Deleting files…'), 'info');
-            } catch (e) {
-                const { showToast } = await import('./utils.js');
-                showToast(e?.data?.error || e.message || 'Failed', 'error');
-            }
-        };
-    }
-    if (purgeBtn) {
-        purgeBtn.onclick = async () => {
-            const { api } = await import('./api.js');
-            const { confirmSheet } = await import('./sheet.js');
-            const ok = await confirmSheet({
-                title: i18nT('group.data.wipe_all', 'Wipe all data'),
-                message: i18nT(
-                    'group.data.wipe_all_confirm',
-                    'Removes the group from your monitor list, drops every download row, and deletes the on-disk folder. This is destructive.',
-                ),
-                confirmLabel: i18nT('group.data.wipe_all', 'Wipe all data'),
-                danger: true,
-            });
-            if (!ok) return;
-            try {
-                await api.delete(`/api/groups/${encodeURIComponent(groupId)}/purge`);
-                const { showToast } = await import('./utils.js');
-                showToast(i18nT('group.data.wipe_started', 'Wiping group…'), 'info');
-                closeGroupSettings();
-            } catch (e) {
-                const { showToast } = await import('./utils.js');
-                showToast(e?.data?.error || e.message || 'Failed', 'error');
-            }
-        };
-    }
-    if (more) {
-        more.onclick = async () => {
-            if (!_groupDataState.hasMore || _groupDataState.groupId !== groupId) return;
-            const { api } = await import('./api.js');
-            try {
-                const r = await api.get(
-                    `/api/groups/${encodeURIComponent(groupId)}/files?limit=20&offset=${_groupDataState.offset}`,
-                );
-                const filesHost = document.getElementById('group-data-files');
-                if (filesHost && r.rows && r.rows.length) {
-                    filesHost.insertAdjacentHTML('beforeend', _renderGroupFiles(r.rows));
-                    _groupDataState.offset += r.rows.length;
-                    _groupDataState.hasMore = !!r.hasMore;
-                    if (!r.hasMore) more.classList.add('hidden');
-                }
-            } catch (e) {
-                const { showToast } = await import('./utils.js');
-                showToast(e?.data?.error || e.message || 'Failed', 'error');
-            }
-        };
-    }
-}
-
-function closeGroupSettings() {
-    const modal = document.getElementById('group-modal');
-    if (modal) modal.classList.add('hidden');
-    currentEditGroup = null;
-}
-
-async function saveGroupSettings() {
-    if (!currentEditGroup) return;
-
-    const _editedGroup = state.groups.find((g) => String(g.id) === String(currentEditGroup.id));
-    const _isSuspended = _editedGroup?.suspended === true;
-    const enabled = _isSuspended
-        ? false
-        : (document.getElementById('group-enable-toggle')?.classList.contains('active') ?? true);
-
-    // Collect filters
-    const filters = {};
-    document.querySelectorAll('#filter-options .tg-toggle[data-filter]').forEach((toggle) => {
-        filters[toggle.dataset.filter] = toggle.classList.contains('active');
-    });
-
-    // Collect forward settings
-    const fwdEnabled =
-        document.getElementById('fwd-enable-toggle')?.classList.contains('active') ?? false;
-    const fwdDelete =
-        document.getElementById('fwd-delete-toggle')?.classList.contains('active') ?? false;
-    const fwdDest = document.getElementById('fwd-destination')?.value || '';
-
-    // Collect account assignments
-    const monitorAccount = document.getElementById('monitor-account')?.value || '';
-    const forwardAccount = document.getElementById('forward-account')?.value || '';
-
-    // Cluster routing — only honoured when the cluster routing wrapper
-    // is actually visible (i.e., at least one peer is paired and the
-    // dropdowns were populated). If hidden, the dropdowns hold the
-    // empty default value, and including them in the payload would
-    // erase any existing ownerPeerId/backupPeerId that the operator
-    // set previously (e.g., before a peer was revoked). Tracking the
-    // wrapper's hidden state at save time guarantees we only push
-    // these fields when the user actually saw + chose them.
-    const clusterWrapper = document.getElementById('group-cluster-routing');
-    const clusterRoutingEditable = clusterWrapper && !clusterWrapper.classList.contains('hidden');
-    const ownerPeerId = clusterRoutingEditable
-        ? document.getElementById('group-owner-peer')?.value || ''
-        : null;
-    const backupPeerId = clusterRoutingEditable
-        ? document.getElementById('group-backup-peer')?.value || ''
-        : null;
-
-    // Topics
-    const topicsEnabled =
-        document.getElementById('topics-enable-toggle')?.classList.contains('active') ?? false;
-    const topicsRaw = document.getElementById('topics-ids')?.value || '';
-    const topicIds = topicsRaw
-        .split(',')
-        .map((s) => parseInt(s.trim(), 10))
-        .filter(Number.isFinite);
-
-    // Rescue Mode read-back. Active chip wins; default to 'auto' if none
-    // (shouldn't happen, but defensive). Hours is optional — empty string
-    // sends null so the server falls back to the global retention setting.
-    const activeRescueChip = document.querySelector('#setting-rescue-mode .rescue-chip.active');
-    const rescueMode = activeRescueChip?.dataset.rescueValue || 'auto';
-    const rescueHoursRaw = document.getElementById('setting-rescue-hours')?.value;
-    const rescueHoursParsed = parseInt(rescueHoursRaw, 10);
-    const rescueRetentionHours =
-        Number.isFinite(rescueHoursParsed) && rescueHoursParsed > 0 ? rescueHoursParsed : null;
-
-    const data = {
-        name: currentEditGroup.name,
-        enabled,
-        filters,
-        autoForward: {
-            enabled: fwdEnabled,
-            destination: fwdDest,
-            deleteAfterForward: fwdDelete,
-        },
-        topics: {
-            enabled: topicsEnabled,
-            // When the user enables the filter and supplies a list, treat it
-            // as a whitelist (only those topics are monitored). Empty list
-            // with the filter on still passes everything through, matching
-            // the Topics-tab help text.
-            mode: topicsEnabled && topicIds.length > 0 ? 'whitelist' : 'all',
-            ids: topicIds,
-        },
-        monitorAccount: monitorAccount || null,
-        forwardAccount: forwardAccount || null,
-        rescueMode,
-        rescueRetentionHours,
-    };
-
-    // Cluster routing fields are only included in the payload when the
-    // cluster wrapper is visible — see clusterRoutingEditable above. If
-    // hidden (no peers paired), we do NOT send these keys so the server
-    // leaves any existing value untouched. The PUT handler already treats
-    // an empty string as "delete the field", which is the desired UX
-    // for explicit user clearing.
-    if (clusterRoutingEditable) {
-        data.ownerPeerId = ownerPeerId || null;
-        data.backupPeerId = backupPeerId || null;
-    }
-
-    try {
-        await api.put(`/api/groups/${currentEditGroup.id}`, data);
-        showToast(i18nT('group.modal.saved_toast', 'Group settings saved!'), 'success');
-        closeGroupSettings();
-        await loadGroups();
-        if (state.currentPage === 'groups') renderGroupsConfig();
-    } catch (e) {
-        showToast(
-            i18nTf('group.modal.save_failed', { msg: e.message }, 'Failed to save: ' + e.message),
-            'error',
-        );
-    }
-}
-
-function switchSettingsTab(tab) {
-    // Tab count collapsed from 5 to 3 (Filters / Routing / Data):
-    //   - Topics moved into the Filters tab
-    //   - Accounts + Cluster moved into the Routing tab
-    // The legacy `accounts` / `topics` tab IDs no longer have matching
-    // header buttons; the `?.` chain below is intentionally tolerant in
-    // case any code path or deep-link still passes them.
-    document.getElementById('content-media')?.classList.toggle('hidden', tab !== 'media');
-    document.getElementById('content-forward')?.classList.toggle('hidden', tab !== 'forward');
-    document.getElementById('content-data')?.classList.toggle('hidden', tab !== 'data');
-
-    document.getElementById('tab-media')?.classList.toggle('active', tab === 'media');
-    document.getElementById('tab-forward')?.classList.toggle('active', tab === 'forward');
-    document.getElementById('tab-data')?.classList.toggle('active', tab === 'data');
-
-    // Lazy-load the Data tab — only fetch stats + files when the operator
-    // clicks into it, so the modal stays cheap to open for groups they
-    // never look at. Use `currentEditGroup.id` (set on modal open) NOT
-    // `state.currentGroupId` (set on sidebar selection) — the two can
-    // disagree when the operator opens settings from a non-sidebar entry
-    // point (Manage Groups action sheet, deep-link, Maintenance page),
-    // which was the cause of "Recent files don't show" reports: the
-    // modal queried `/api/groups/<wrong-id>/files`, got empty rows, and
-    // rendered the empty state.
-    if (tab === 'data') {
-        const id = currentEditGroup?.id ?? state.currentGroupId;
-        if (id) _loadGroupDataTab(id).catch(() => {});
-    }
-}
-
-// State for the Data tab — limited per-modal-open scope.
-let _groupDataState = { groupId: null, offset: 0, hasMore: false };
-async function _loadGroupDataTab(groupId) {
-    if (!groupId) return;
-    _groupDataState = { groupId, offset: 0, hasMore: false };
-    const { api } = await import('./api.js');
-    const statsHost = document.getElementById('group-data-stats');
-    const filesHost = document.getElementById('group-data-files');
-    const more = document.getElementById('group-data-loadmore');
-    if (statsHost) {
-        statsHost.innerHTML = `<div class="col-span-full text-center text-xs text-tg-textSecondary py-3"><i class="ri-loader-4-line animate-spin"></i> ${_escape(i18nT('common.loading', 'Loading…'))}</div>`;
-    }
-    if (filesHost) filesHost.innerHTML = '';
-    if (more) more.classList.add('hidden');
-    try {
-        const stats = await api.get(`/api/groups/${encodeURIComponent(groupId)}/stats`);
-        if (statsHost) statsHost.innerHTML = _renderGroupStats(stats);
-        const files = await api.get(`/api/groups/${encodeURIComponent(groupId)}/files?limit=20`);
-        if (filesHost) filesHost.innerHTML = _renderGroupFiles(files.rows || []);
-        _groupDataState.offset = (files.rows || []).length;
-        _groupDataState.hasMore = !!files.hasMore;
-        if (more) more.classList.toggle('hidden', !files.hasMore);
-        // Header counter: "20 / 1,240" — quick orientation for how
-        // much of the catalogue is visible in the strip.
-        const counter = document.getElementById('group-data-files-count');
-        if (counter) {
-            const shown = (files.rows || []).length;
-            const total = Number(files.total) || shown;
-            counter.textContent = `${shown.toLocaleString()} / ${total.toLocaleString()}`;
-        }
-    } catch (e) {
-        if (statsHost) {
-            statsHost.innerHTML = `<div class="col-span-full text-center text-xs text-red-300 py-3">${_escape(e?.data?.error || e.message || 'Failed')}</div>`;
-        }
-    }
-}
-function _escape(s) {
-    return String(s || '')
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;');
-}
-function _formatBytes(n) {
-    n = Number(n) || 0;
-    if (n < 1024) return n + ' B';
-    if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
-    if (n < 1024 * 1024 * 1024) return (n / (1024 * 1024)).toFixed(1) + ' MB';
-    return (n / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
-}
-function _renderGroupStats(s) {
-    const totalFiles = (s.totalFiles || 0).toLocaleString();
-    const size = _formatBytes(s.totalBytes);
-    const last = s.lastDownloadAt
-        ? new Date(s.lastDownloadAt).toLocaleString()
-        : i18nT('common.never', 'Never');
-    const types = s.byType || {};
-    return `
-        <div class="bg-tg-bg/40 rounded-lg p-3 text-center">
-            <div class="text-[10px] uppercase text-tg-textSecondary tracking-wide" data-i18n="group.data.stat.total">Files</div>
-            <div class="text-xl font-semibold text-tg-text tabular-nums">${totalFiles}</div>
-        </div>
-        <div class="bg-tg-bg/40 rounded-lg p-3 text-center">
-            <div class="text-[10px] uppercase text-tg-textSecondary tracking-wide" data-i18n="group.data.stat.size">Size</div>
-            <div class="text-xl font-semibold text-tg-text tabular-nums">${_escape(size)}</div>
-        </div>
-        <div class="bg-tg-bg/40 rounded-lg p-3 text-center">
-            <div class="text-[10px] uppercase text-tg-textSecondary tracking-wide" data-i18n="group.data.stat.types">Types</div>
-            <div class="text-xs text-tg-text tabular-nums">${_escape(
-                ['photo', 'video', 'audio', 'document']
-                    .map((k) => `${k[0]}:${types[k] || 0}`)
-                    .join(' · '),
-            )}</div>
-        </div>
-        <div class="bg-tg-bg/40 rounded-lg p-3 text-center">
-            <div class="text-[10px] uppercase text-tg-textSecondary tracking-wide" data-i18n="group.data.stat.last">Last download</div>
-            <div class="text-[11px] text-tg-text tabular-nums">${_escape(last)}</div>
-        </div>`;
-}
-// Compact "5 min ago" style. Fall back to absolute date for older items
-// so the operator can still tell a week-old row apart from a month-old.
-function _relativeTime(unixOrIso) {
-    const t =
-        typeof unixOrIso === 'string' ? new Date(unixOrIso).getTime() : Number(unixOrIso) || 0;
-    if (!t) return '';
-    const diffSec = Math.max(0, Math.floor((Date.now() - t) / 1000));
-    if (diffSec < 60) return `${diffSec}s ago`;
-    if (diffSec < 3600) return `${Math.floor(diffSec / 60)}m ago`;
-    if (diffSec < 86400) return `${Math.floor(diffSec / 3600)}h ago`;
-    if (diffSec < 604800) return `${Math.floor(diffSec / 86400)}d ago`;
-    return new Date(t).toLocaleDateString();
-}
-
-function _renderGroupFiles(rows) {
-    if (!rows || !rows.length) {
-        return `<div class="text-center py-8">
-            <i class="ri-inbox-line text-3xl text-tg-textSecondary/40 block mb-1.5"></i>
-            <div class="text-xs text-tg-textSecondary">${_escape(i18nT('group.data.empty', 'No files yet.'))}</div>
-        </div>`;
-    }
-    return rows
-        .map((r) => {
-            const whenAbs = r.created_at ? new Date(r.created_at).toLocaleString() : '';
-            const whenRel = _relativeTime(r.created_at);
-            const fileType = r.file_type || 'document';
-            const isImage = fileType === 'photo' || fileType === 'image' || fileType === 'sticker';
-            const isVideo = fileType === 'video';
-            const isAudio = fileType === 'audio';
-            // Thumbnail container — `aspect-square rounded-md` with a subtle
-            // ring on hover. Image/video share the same shape (12×12) so
-            // rows align cleanly even when types are mixed. Audio + document
-            // get a type-tinted icon tile (no `/api/thumbs/<id>` fetch, no
-            // wasted 404).
-            const typeIcon = isAudio ? 'ri-music-2-line' : 'ri-file-text-line';
-            const typeTint = isAudio
-                ? 'bg-purple-500/15 text-purple-300'
-                : 'bg-tg-blue/15 text-tg-blue';
-            const thumb =
-                isImage || isVideo
-                    ? `<div class="relative w-12 h-12 rounded-md overflow-hidden shrink-0 bg-tg-bg/60">
-                        <img src="/api/thumbs/${r.id}?w=320" alt=""
-                          class="w-full h-full object-cover"
-                          loading="lazy" decoding="async"
-                          onerror="this.style.display='none';this.parentElement.classList.add('is-broken')">
-                        ${isVideo ? '<i class="ri-play-fill text-white text-base absolute inset-0 m-auto w-fit h-fit drop-shadow-md pointer-events-none"></i>' : ''}
-                       </div>`
-                    : `<div class="w-12 h-12 rounded-md ${typeTint} flex items-center justify-center shrink-0">
-                        <i class="${typeIcon} text-lg"></i>
-                       </div>`;
-            const nsfwChip =
-                Number(r.nsfw_score) >= 0.7
-                    ? `<span class="text-[9px] px-1 py-0.5 rounded bg-red-500/20 text-red-300 shrink-0 font-medium" title="NSFW score ${Number(r.nsfw_score).toFixed(2)}">NSFW</span>`
-                    : '';
-            // Type chip — small uppercase label so a heterogeneous list
-            // (photos + videos + audio + docs all mixed) is scannable.
-            const typeLabel = isImage
-                ? 'IMG'
-                : isVideo
-                  ? 'VID'
-                  : isAudio
-                    ? 'AUD'
-                    : (r.file_name || '').split('.').pop()?.toUpperCase()?.slice(0, 4) || 'DOC';
-            const filePath = (r.file_path || '').replace(/\\/g, '/');
-            const _ftq = fileTokenQuery();
-            const href = filePath
-                ? `/files/${encodeURI(filePath)}?inline=1${_ftq ? '&' + _ftq : ''}`
-                : null;
-            const open = href
-                ? `onclick="window.open('${_escape(href)}','_blank','noopener,noreferrer')"`
-                : '';
-            return `
-                <div class="group flex items-center gap-2.5 p-1.5 rounded-md hover:bg-tg-hover/40 cursor-pointer transition-colors" ${open} title="${_escape(whenAbs)}">
-                    ${thumb}
-                    <div class="flex-1 min-w-0">
-                        <div class="flex items-center gap-1.5">
-                            <span class="text-[9px] px-1 py-0.5 rounded bg-tg-bg/50 text-tg-textSecondary font-mono shrink-0">${_escape(typeLabel)}</span>
-                            <span class="text-xs text-tg-text truncate" title="${_escape(r.file_name || '')}">${_escape(r.file_name || '(unnamed)')}</span>
-                            ${nsfwChip}
-                        </div>
-                        <div class="text-[10px] text-tg-textSecondary tabular-nums mt-0.5 flex items-center gap-1.5">
-                            <span>${_escape(_formatBytes(r.file_size))}</span>
-                            <span class="opacity-50">·</span>
-                            <span>${_escape(whenRel)}</span>
-                        </div>
-                    </div>
-                    <i class="ri-external-link-line text-tg-textSecondary/0 group-hover:text-tg-textSecondary/70 transition-colors text-sm shrink-0"></i>
-                </div>`;
-        })
-        .join('');
-}
-
-function toggleGroupEnabled(event) {
-    event.preventDefault();
-    event.stopPropagation();
-    const toggle = document.getElementById('group-enable-toggle');
-    if (toggle) toggle.classList.toggle('active');
-}
-
-function toggleFwdEnabled(event) {
-    event.preventDefault();
-    event.stopPropagation();
-    const toggle = document.getElementById('fwd-enable-toggle');
-    if (toggle) toggle.classList.toggle('active');
-}
-
-function toggleFwdDelete(event) {
-    event.preventDefault();
-    event.stopPropagation();
-    const toggle = document.getElementById('fwd-delete-toggle');
-    if (toggle) toggle.classList.toggle('active');
-}
-
-async function openDestinationPicker() {
-    const target = document.getElementById('fwd-destination');
-    if (!target) return;
-
-    const root = document.createElement('div');
-    root.innerHTML = `
-        <input id="dest-search" type="text" placeholder="${escapeHtml(i18nT('picker.search_placeholder', 'Search by name…'))}" class="tg-input w-full text-sm mb-3" autofocus>
-        <div id="dest-list" class="text-sm overflow-y-auto" style="max-height: 60vh">
-            <div class="text-tg-textSecondary p-2">${escapeHtml(i18nT('picker.loading', 'Loading dialogs…'))}</div>
-        </div>`;
-    const handle = openSheet({
-        title: i18nT('picker.title', 'Pick a destination'),
-        content: root,
-        size: 'md',
-    });
-    const list = root.querySelector('#dest-list');
-    const search = root.querySelector('#dest-search');
-
-    let dialogs = [];
-    try {
-        const r = await api.get('/api/dialogs');
-        dialogs = r.dialogs || [];
-    } catch (e) {
-        if (e?.data?.error === 'no_account') {
-            list.innerHTML = `<div class="p-3 text-sm text-tg-textSecondary">${escapeHtml(i18nT('picker.no_account', 'Add a Telegram account first to pick a forward destination.'))} <a href="/add-account.html" class="text-tg-blue hover:underline">${escapeHtml(i18nT('groups.no_account.cta', 'Add account'))}</a></div>`;
-            return;
-        }
-        list.innerHTML = `<div class="text-red-400 p-2">${escapeHtml(i18nTf('picker.failed', { msg: e.message }, `Failed to load dialogs: ${e.message}`))}</div>`;
-        return;
-    }
-
-    const render = () => {
-        const q = search.value.trim().toLowerCase();
-        const filtered = dialogs.filter(
-            (d) => !q || (d.name || '').toLowerCase().includes(q) || String(d.id).includes(q),
-        );
-        const presets = `
-            <button data-pick="me" type="button" class="w-full text-left px-3 py-2 rounded hover:bg-tg-hover text-tg-text">
-                <span class="text-tg-blue">${escapeHtml(i18nT('picker.saved_messages', '📥 Saved Messages'))}</span>
-                <div class="text-[11px] text-tg-textSecondary">${escapeHtml(i18nT('picker.saved_messages_help', 'value: '))}<code>me</code></div>
-            </button>
-            <button data-pick="" type="button" class="w-full text-left px-3 py-2 rounded hover:bg-tg-hover text-tg-text">
-                ${escapeHtml(i18nT('picker.default_storage', 'Default storage channel'))}
-                <div class="text-[11px] text-tg-textSecondary">${escapeHtml(i18nT('picker.default_storage_help', 'leave the field empty'))}</div>
-            </button>
-            <hr class="border-tg-border my-2">`;
-        list.innerHTML =
-            presets +
-            filtered
-                .map(
-                    (d) => `
-            <button data-pick="${escapeHtml(String(d.id))}" type="button" class="w-full text-left px-3 py-2 rounded hover:bg-tg-hover text-tg-text">
-                <div class="truncate">${escapeHtml(getGroupName(d.id, { fallback: d.name || d.title }))}</div>
-                <div class="text-[11px] text-tg-textSecondary">${escapeHtml(d.type || 'chat')} · <code>${escapeHtml(String(d.id))}</code></div>
-            </button>
-        `,
-                )
-                .join('');
-        list.querySelectorAll('button[data-pick]').forEach((btn) => {
-            btn.addEventListener('click', () => {
-                target.value = btn.dataset.pick;
-                handle.close();
-            });
+let _chatDetailsModule = null;
+function loadChatDetailsModule() {
+    if (!_chatDetailsModule) {
+        _chatDetailsModule = import('./chat-details.js').catch((e) => {
+            _chatDetailsModule = null;
+            throw e;
         });
-    };
+    }
+    return _chatDetailsModule;
+}
 
-    render();
-    search.addEventListener('input', render);
-    setTimeout(() => search.focus(), 60);
+function openGroupSettings(groupId) {
+    if (groupId == null || groupId === '') return;
+    navigateTo(`groups/${encodeURIComponent(String(groupId))}`);
+}
+
+// Nothing to close any more — the page saves as you go. Kept for callers
+// like the backfill sheet's "Backfill page" link.
+function closeGroupSettings() {}
+
+function saveGroupSettings() {
+    return loadChatDetailsModule().then((m) => m.saveChatDetailsNow());
+}
+
+function openDestinationPicker() {
+    return loadChatDetailsModule().then((m) => m.openDestinationPicker());
 }
 
 // ============ Delete File ============
@@ -3837,24 +3951,52 @@ async function confirmDeleteFile() {
         return;
 
     try {
-        const deletedIdx = state.currentFileIndex;
-        await api.delete(`/api/file?path=${encodeURIComponent(file.fullPath)}`);
-        // Remove by identity rather than by index: the WS 'file_deleted' event
-        // can arrive before the HTTP response (server broadcasts first) and
-        // pre-filter state.files, making state.currentFileIndex stale and
-        // causing splice() to remove the wrong file.
-        Viewer.removeShuffleFile(file);
-        state.files = state.files.filter((f) => f !== file && f.fullPath !== file.fullPath);
-        if (Viewer.isShuffleActive()) {
-            state.hasMore = Viewer.shuffleHasMore();
+        const idQuery =
+            file.id != null && (file.peer_id || 'self') === 'self'
+                ? `&id=${encodeURIComponent(file.id)}`
+                : '';
+        await api.delete(`/api/file?path=${encodeURIComponent(file.fullPath)}${idQuery}`);
+        if (
+            Viewer.isShuffleActive() &&
+            Viewer.removeShuffleFile({
+                id: file.id,
+                path: file.fullPath || file.path,
+                fullPath: file.fullPath,
+                peer_id: file.peer_id || 'self',
+            })
+        ) {
+            showToast(i18nT('viewer.delete.success', 'File deleted'), 'success');
+            return;
         }
-        renderMediaGrid();
-        if (state.files.length > 0) {
-            // Advance to the next file, or step back when we were on the last one.
-            const nextIdx = Math.min(deletedIdx, state.files.length - 1);
-            Viewer.openMediaViewer(nextIdx);
-        } else {
+        // The server broadcasts `file_deleted` BEFORE this response lands,
+        // so dropFileFromView() may already have spliced the file out —
+        // splicing `currentFileIndex` again removed the NEXT file. Locate
+        // the file by identity (id first: rows that share one file share
+        // its path) and only remove it if it's still there.
+        const isGallery = state.files === _galleryFilesRef;
+        let idx = state.files.indexOf(file);
+        if (idx < 0) {
+            idx = state.files.findIndex((f) =>
+                file.id != null ? f.id === file.id : f.fullPath === file.fullPath,
+            );
+        }
+        if (idx >= 0) {
+            state.files.splice(idx, 1);
+            if (isGallery) {
+                // Drop just that tile — a full re-render would throw away
+                // the window + scroll position on a deep-scrolled gallery.
+                removeFileIndex(idx);
+                _renderedFileCount = state.files.length;
+            }
+        }
+        if (state.files.length === 0) {
             Viewer.closeMediaViewer();
+            if (isGallery) renderGalleryEmptyState();
+        } else {
+            // Stay in the viewer on the item that took the deleted one's
+            // place (the previous one when it was the last).
+            const from = idx >= 0 ? idx : state.currentFileIndex;
+            Viewer.openMediaViewer(Math.min(Math.max(0, from), state.files.length - 1));
         }
         showToast(i18nT('viewer.delete.success', 'File deleted'), 'success');
     } catch (e) {
@@ -3865,150 +4007,84 @@ async function confirmDeleteFile() {
     }
 }
 
-// Reset the All / Photos / Videos / Files / Audio tab back to "All"
-// and re-paint the tab UI to match. Called whenever we enter a fresh
-// gallery view (All Media or per-group) so a stale tab choice from
-// the previous view doesn't silently filter the new content.
+// Reset the All / Photos / Videos / Files / Audio tab back to "All" and
+// drop the search query, then re-paint the tab UI to match. Called
+// whenever we enter a fresh gallery view (All Media or per-group) so a
+// stale tab choice or query from the previous view doesn't silently
+// filter the new content. The pinned mode (Sort & filter) is a
+// preference and stays.
 function resetGalleryFilter() {
     state.currentFilter = 'all';
-    document.querySelectorAll('#media-tabs .tab-item').forEach((t) => {
-        t.classList.toggle('active', (t.dataset.type || 'all') === 'all');
+    _paintTypeTabs();
+    resetGallerySearch();
+}
+
+function _paintTypeTabs() {
+    const cur = state.currentFilter || 'all';
+    document.querySelectorAll('#media-tabs .tab-item[data-type]').forEach((t) => {
+        const on = (t.dataset.type || 'all') === cur;
+        t.classList.toggle('active', on);
+        t.setAttribute('aria-pressed', on ? 'true' : 'false');
     });
+}
+
+// Switch the type filter (tab click or the Sort & filter sheet). The
+// filter is applied server-side: reset pagination + re-fetch with the new
+// ?type=. Filtering client-side hid everything past the first page (the
+// "Photos shows 30" symptom).
+function setGalleryType(type) {
+    state.currentFilter = type || 'all';
+    _paintTypeTabs();
+    _reloadGallery();
 }
 
 // ============ Media Tabs ============
-/** Map state.pinnedFilter → downloads API query string. */
-function _pinnedFilterQs() {
-    if (state.pinnedFilter === 'pinned') return '&pinned=1';
-    if (state.pinnedFilter === 'unpinned') return '&pinned=0';
-    return '';
-}
-
-/** Sync the pin-filter chip DOM to state.pinnedFilter. */
-function syncPinFilterChip() {
-    const tab = document.querySelector('#media-tabs .tab-item[data-pinned-toggle]');
-    if (!tab) return;
-    const mode = state.pinnedFilter === 'pinned' || state.pinnedFilter === 'unpinned'
-        ? state.pinnedFilter
-        : 'all';
-    tab.setAttribute('data-pin-filter', mode);
-    tab.setAttribute('aria-pressed', mode === 'all' ? 'false' : 'true');
-
-    const ico = tab.querySelector('i');
-    const lbl = tab.querySelector('span');
-    if (mode === 'pinned') {
-        if (ico) ico.className = 'ri-pushpin-2-fill mr-1';
-        if (lbl) {
-            lbl.setAttribute('data-i18n', 'favorites.filter');
-            lbl.textContent = i18nT('favorites.filter', 'Pinned');
-        }
-        const title = i18nT('favorites.filter_title', 'Show only pinned items');
-        tab.title = title;
-        tab.setAttribute('aria-label', title);
-    } else if (mode === 'unpinned') {
-        if (ico) ico.className = 'ri-pushpin-2-line mr-1';
-        if (lbl) {
-            lbl.setAttribute('data-i18n', 'favorites.filter_unpinned');
-            lbl.textContent = i18nT('favorites.filter_unpinned', 'Not pinned');
-        }
-        const title = i18nT(
-            'favorites.filter_unpinned_title',
-            'Show only unpinned items',
-        );
-        tab.title = title;
-        tab.setAttribute('aria-label', title);
-    } else {
-        if (ico) ico.className = 'ri-pushpin-2-line mr-1';
-        if (lbl) {
-            lbl.setAttribute('data-i18n', 'favorites.filter');
-            lbl.textContent = i18nT('favorites.filter', 'Pinned');
-        }
-        const title = i18nT(
-            'favorites.filter_all_title',
-            'Show all — click for pinned only',
-        );
-        tab.title = title;
-        tab.setAttribute('aria-label', title);
-    }
-}
-
 function setupMediaTabs() {
-    document.querySelectorAll('#media-tabs .tab-item').forEach((tab) => {
-        tab.addEventListener('click', () => {
-            // Shuffle + scope chips have their own handlers.
-            if (tab.id === 'gallery-shuffle-btn' || tab.id === 'gallery-scope-chip') return;
-            // The pinned toggle is a chip, NOT a type tab — it stacks with
-            // the type filter instead of replacing it. Handle it separately.
-            // Cycle: all → pinned → unpinned → all.
-            if (tab.dataset.pinnedToggle !== undefined) {
-                const order = ['all', 'pinned', 'unpinned'];
-                const cur = order.includes(state.pinnedFilter) ? state.pinnedFilter : 'all';
-                const next = order[(order.indexOf(cur) + 1) % order.length];
-                state.pinnedFilter = next;
-                syncPinFilterChip();
-                state.page = 1;
-                state.hasMore = true;
-                state.files = [];
-                if (state.currentPage === 'viewer') {
-                    if (state.currentGroupId) loadGroupFiles(state.currentGroupId);
-                    else loadAllFiles();
-                } else {
-                    renderMediaGrid();
-                }
-                return;
-            }
-            document.querySelectorAll('#media-tabs .tab-item').forEach((t) => {
-                if (t.dataset.pinnedToggle !== undefined) return; // leave the chip alone
-                if (t.id === 'gallery-shuffle-btn' || t.id === 'gallery-scope-chip') return;
-                t.classList.remove('active');
-            });
-            tab.classList.add('active');
-            state.currentFilter = tab.dataset.type || 'all';
-            // Server-side filter: reset pagination + re-fetch with the new
-            // ?type=. Without this, switching tabs would only filter what
-            // we've already paginated client-side, hiding everything past
-            // the first page (the "Photos shows 30" symptom).
-            state.page = 1;
-            state.hasMore = true;
-            state.files = [];
-            if (state.currentPage === 'viewer') {
-                if (state.currentGroupId) loadGroupFiles(state.currentGroupId);
-                else loadAllFiles();
-            } else {
-                renderMediaGrid();
+    document.querySelectorAll('#media-tabs .tab-item[data-type]').forEach((tab) => {
+        tab.setAttribute('role', 'button');
+        tab.tabIndex = 0;
+        tab.addEventListener('click', () => setGalleryType(tab.dataset.type || 'all'));
+        tab.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                tab.click();
             }
         });
     });
-    syncPinFilterChip();
+    _paintTypeTabs();
+    setupGalleryToolbar({ reload: _reloadGallery, setType: setGalleryType });
 }
 
 // ============ Utils ============
 function setupLazyLoading() {
-    state.imageObserver = new IntersectionObserver((entries) => {
-        entries.forEach((e) => {
-            if (!e.isIntersecting) return;
-            const el = e.target;
-            // Reveal regardless of success/failure: a broken/404 thumb still
-            // needs to drop out of the opacity:0 skeleton state, otherwise
-            // the tile stays permanently invisible.
-            const reveal = () => el.classList.add('loaded');
-            if (el.tagName === 'VIDEO') {
-                el.preload = 'metadata';
-                el.onloadeddata = reveal;
-                el.onerror = reveal;
-            } else {
-                el.onload = reveal;
-                el.onerror = reveal;
-            }
-            el.src = el.dataset.src;
-            el.removeAttribute('data-src');
-            // Cached images can fire `load` synchronously when `src` is
-            // set, before we even get here — without this, a re-rendered
-            // grid full of cache hits would stay invisible forever.
-            if (el.tagName === 'IMG' && el.complete) reveal();
-            state.imageObserver.unobserve(el);
-        });
-    });
+    state.imageObserver = new IntersectionObserver(
+        (entries) => {
+            entries.forEach((e) => {
+                if (!e.isIntersecting) return;
+                const el = e.target;
+                // Reveal regardless of success/failure: a broken/404 thumb still
+                // needs to drop out of the opacity:0 skeleton state, otherwise
+                // the tile stays permanently invisible.
+                const reveal = () => el.classList.add('loaded');
+                if (el.tagName === 'VIDEO') {
+                    el.preload = 'metadata';
+                    el.onloadeddata = reveal;
+                    el.onerror = reveal;
+                } else {
+                    el.onload = reveal;
+                    el.onerror = reveal;
+                }
+                el.src = el.dataset.src;
+                el.removeAttribute('data-src');
+                // Cached images can fire `load` synchronously when `src` is
+                // set, before we even get here — without this, a re-rendered
+                // grid full of cache hits would stay invisible forever.
+                if (el.tagName === 'IMG' && el.complete) reveal();
+                state.imageObserver.unobserve(el);
+            });
+        },
+        { root: document.getElementById('content-area'), rootMargin: '600px 0px' },
+    );
 }
 
 function setupEventListeners() {
@@ -4076,15 +4152,19 @@ async function _runSimilarSearch(downloadId) {
             fullPath: row.file_path,
         }));
         state.files = mapped;
+        _loadedViewKey = null;
+        // Result set is complete — don't let infinite scroll append the
+        // next page of the previous view underneath it.
+        state.hasMore = false;
         try {
             renderMediaGrid();
         } catch (e) {
             console.warn('renderMediaGrid after similar search:', e);
         }
-        const title = document.getElementById('page-title');
-        if (title) {
-            title.textContent = `🔍 ${i18nT('viewer.find_similar', 'Similar')} — ${mapped.length} ${i18nT('common.results', 'results')}`;
-        }
+        _setPageRaw(
+            'title',
+            `🔍 ${i18nT('viewer.find_similar', 'Similar')} — ${mapped.length} ${i18nT('common.results', 'results')}`,
+        );
     } catch (e) {
         showToast(`${i18nT('common.error', 'Error')}: ${e.message}`, 'error');
     }
@@ -4146,6 +4226,10 @@ async function _runSemanticSearch(q) {
             fullPath: row.file_path,
         }));
         state.files = mapped;
+        _loadedViewKey = null;
+        // Result set is complete — don't let infinite scroll append the
+        // next page of the previous view underneath it.
+        state.hasMore = false;
         try {
             renderMediaGrid();
         } catch (e) {
@@ -4153,9 +4237,7 @@ async function _runSemanticSearch(q) {
         }
         // Update the page title so the operator knows they're in
         // search-results mode.
-        const title = document.getElementById('page-title');
-        if (title)
-            title.textContent = `🔍 "${q}" — ${mapped.length} ${i18nT('common.results', 'results')}`;
+        _setPageRaw('title', `🔍 "${q}" — ${mapped.length} ${i18nT('common.results', 'results')}`);
     } catch (e) {
         showToast(`${i18nT('common.error', 'Error')}: ${e.message}`, 'error');
     }
@@ -4292,80 +4374,17 @@ function setupFab() {
     applyVisibility(getMonitorStatusLatest());
     subscribeMonitorStatus(applyVisibility);
 
-
-    // Action catalogue keyed by id so the per-hint policy below can pick
-    // and order without duplicating definitions.
-    const catalog = () => ({
-        'paste-link': {
-            icon: 'ri-link-m',
-            label: i18nT('fab.paste_link', 'Paste a Telegram link'),
-            sub: i18nT('fab.paste_link_sub', 'Download from a t.me/... URL'),
-            run: () => document.getElementById('paste-url-btn')?.click(),
-        },
-        stories: {
-            icon: 'ri-camera-line',
-            label: i18nT('fab.stories', 'Stories'),
-            sub: i18nT('fab.stories_sub', "Save someone's active Stories"),
-            run: () => document.getElementById('stories-btn')?.click(),
-        },
-        'add-account': {
-            icon: 'ri-user-add-line',
-            label: i18nT('fab.add_account', 'Add Telegram account'),
-            sub: i18nT('fab.add_account_sub', 'Phone → OTP → 2FA wizard'),
-            run: () => {
-                window.location.href = '/add-account.html';
-            },
-        },
-        'browse-chats': {
-            icon: 'ri-chat-3-line',
-            label: i18nT('fab.browse_chats', 'Browse chats'),
-            sub: i18nT('fab.browse_chats_sub', 'Pick a chat to monitor or backfill'),
-            run: () => navigateTo('groups'),
-        },
-    });
-
-    // Order + filter actions by where the user is in onboarding so the
-    // first row is always the next thing that moves them forward. Keeps
-    // the sheet short on early stages instead of dumping four greyed-out
-    // actions and letting the user guess.
-    const itemsForHint = (hint) => {
-        const c = catalog();
-        if (hint === 'add-account') return [c['add-account']];
-        if (hint === 'enable-group')
-            return [c['browse-chats'], c['paste-link'], c.stories, c['add-account']];
-        return [c['paste-link'], c.stories, c['browse-chats'], c['add-account']];
-    };
-
-    fab.addEventListener('click', () => {
-        const hint = getMonitorStatusLatest()?.hint || null;
-        const items = itemsForHint(hint);
-
-        const list = document.createElement('div');
-        list.className = 'flex flex-col';
-        for (const it of items) {
-            const btn = document.createElement('button');
-            btn.type = 'button';
-            btn.className =
-                'flex items-center gap-3 px-2 py-2.5 rounded-lg hover:bg-tg-hover active:bg-tg-hover/80 text-left w-full transition-colors';
-            btn.innerHTML = `
-                <i class="${it.icon} text-2xl text-tg-blue shrink-0 w-9 text-center" aria-hidden="true"></i>
-                <div class="min-w-0 flex-1">
-                    <div class="text-tg-text font-medium text-sm">${escapeHtml(it.label)}</div>
-                    <div class="text-tg-textSecondary text-xs truncate">${escapeHtml(it.sub)}</div>
-                </div>
-                <i class="ri-arrow-right-s-line text-tg-textSecondary opacity-50 shrink-0" aria-hidden="true"></i>`;
-            btn.addEventListener('click', () => {
-                handle.close();
-                setTimeout(it.run, 80); // let the sheet close before triggering the next UI
-            });
-            list.appendChild(btn);
-        }
-        const handle = openSheet({
-            title: i18nT('fab.actions', 'Quick Actions'),
-            content: list,
-            size: 'sm',
-        });
-    });
+    // The + button opens the Add sheet (js/add-sheet.js): find a chat by
+    // name / @username / t.me link, monitor or backfill it, download a
+    // message link — plus the old quick actions (paste links, Stories,
+    // add an account, browse chats) under "More".
+    const openAdd = () =>
+        loadAddSheetModule()
+            .then((m) => m.openAddSheet())
+            .catch((e) => console.error('add sheet', e));
+    fab.addEventListener('click', openAdd);
+    // Wider screens have no FAB: the Chats page's "Add chat or link".
+    document.getElementById('groups-add-btn')?.addEventListener('click', openAdd);
 }
 
 function setupPasteUrl() {
@@ -4445,13 +4464,15 @@ function refreshCurrentPage() {
         state.page = 1;
         loadGroupFiles(state.currentGroupId);
     } else if (state.currentPage === 'viewer') {
-        showAllMedia();
+        showAllMedia({ force: true });
     } else if (state.currentPage === 'groups') {
         renderGroupsConfig();
     } else {
         loadGroups();
     }
 }
+
+const LOAD_MORE_MARGIN_PX = 1200;
 
 function setupInfiniteScroll() {
     const sentinel = document.getElementById('load-more-sentinel');
@@ -4460,80 +4481,135 @@ function setupInfiniteScroll() {
     // `rootMargin: '1200px'` makes the IntersectionObserver fire when
     // the sentinel is still ~1200 px BELOW the visible area, so the
     // next batch is requested long before the user actually runs out
-    // of rows. Combined with FILES_PER_PAGE = 100, the gallery feels
-    // smooth even on a fast flick scroll: by the time the user nears
-    // the end of the current batch, the next 100 files have usually
-    // already arrived.
+    // of rows. The root must be #content-area — the element that
+    // actually scrolls. With the viewport as root the scroller clipped
+    // the margin to ~0 and the next page only loaded once the sentinel
+    // was already on screen.
     const observer = new IntersectionObserver(
         (entries) => {
-            if (!entries[0].isIntersecting || state.loading || !state.hasMore) return;
-            // currentGroupId === null on the All-Media surface — page through
-            // /api/downloads/all instead of the per-group endpoint.
-            if (state.currentPage !== 'viewer') return;
-            // Shuffle mode: hydrate the next playlist window instead of
-            // fetching chronological pages.
-            if (Viewer.isShuffleActive()) {
-                state.loading = true;
-                const fromIndex = state.files.length;
-                Viewer.loadMoreShuffle()
-                    .then((grew) => {
-                        if (grew) renderMediaGrid({ append: true, fromIndex });
-                        state.hasMore = Viewer.shuffleHasMore();
-                    })
-                    .finally(() => {
-                        state.loading = false;
-                    });
-                return;
-            }
-            state.page++;
-            if (state.currentGroupId) loadGroupFiles(state.currentGroupId);
-            else loadAllFiles();
+            if (entries[0].isIntersecting) _galleryNearBottom();
         },
-        { rootMargin: '1200px 0px 1200px 0px' },
+        {
+            root: document.getElementById('content-area'),
+            rootMargin: `${LOAD_MORE_MARGIN_PX}px 0px ${LOAD_MORE_MARGIN_PX}px 0px`,
+        },
     );
     observer.observe(sentinel);
 }
 
-async function loadStats() {
-    try {
-        const stats = await api.get('/api/stats');
-        const diskEl = document.getElementById('disk-usage');
-        const filesEl = document.getElementById('total-files');
-        if (diskEl)
-            diskEl.textContent = stats.diskUsageFormatted || formatBytes(stats.diskUsage || 0);
-        // Federated footer total. When the gallery scope is 'all' or a
-        // specific peer, the footer file count should reflect what the
-        // user is currently looking at — otherwise "1234 files" + a
-        // gallery showing 5,000 tiles read as a contradiction.
-        // peerStats is empty on non-cluster installs and for guest
-        // sessions, so the local-only path stays unchanged.
-        if (filesEl) {
-            const local = Number(stats.totalFiles) || 0;
-            const peers = Array.isArray(stats.peerStats) ? stats.peerStats : [];
-            const peerTotal = peers.reduce((s, p) => s + (Number(p.totalFiles) || 0), 0);
-            const scope = state.galleryScope || 'local';
-            if (scope === 'all' && peerTotal > 0) {
-                filesEl.textContent = i18nTf(
-                    'footer.files.merged',
-                    { local, peers: peerTotal },
-                    `${local} + ${peerTotal} peers`,
-                );
-                filesEl.title = peers
-                    .map(
-                        (p) =>
-                            `${p.peerName}: ${p.totalFiles} ${p.totalSizeFormatted ? `(${p.totalSizeFormatted})` : ''}${p.online ? '' : ' (offline)'}`,
-                    )
-                    .join('\n');
-            } else if (scope !== 'local' && scope !== 'all') {
-                const p = peers.find((x) => String(x.peerId) === String(scope));
-                filesEl.textContent = String(p?.totalFiles ?? 0);
-                filesEl.title = p ? `${p.peerName}${p.online ? '' : ' (offline)'}` : '';
-            } else {
-                filesEl.textContent = String(local);
-                filesEl.title = '';
-            }
+// The bottom of the gallery is near the viewport: first re-render rows the
+// DOM window trimmed earlier (already in memory), otherwise fetch the next
+// page. currentGroupId === null on the All-Media surface — page through
+// /api/downloads/all instead of the per-group endpoint.
+function _galleryNearBottom() {
+    if (state.currentPage !== 'viewer' || state.loading) return;
+    if (Viewer.isShuffleActive()) {
+        if (Viewer.shuffleHasMore()) {
+            const before = state.files.length;
+            state.loading = true;
+            Viewer.loadMoreShuffle()
+                .then((added) => {
+                    if (added) renderMediaGrid({ append: true, fromIndex: before });
+                })
+                .finally(() => {
+                    state.loading = false;
+                    _recheckLoadMore();
+                });
+        } else if (hasPendingBelow()) {
+            extendBottom();
+            _recheckLoadMore();
         }
-    } catch (e) {}
+        return;
+    }
+    if (hasPendingBelow()) {
+        extendBottom();
+        _recheckLoadMore();
+        return;
+    }
+    if (!state.hasMore) return;
+    state.page++;
+    if (state.currentGroupId) loadGroupFiles(state.currentGroupId);
+    else loadAllFiles();
+}
+
+// IntersectionObserver only reports *changes*. When a page (or a chunk
+// re-rendered from memory) is too short to push the sentinel back out of
+// the prefetch margin, no further callback fires and paging stalls — so
+// re-check the geometry once per frame after every render.
+let _recheckLoadMoreQueued = false;
+function _recheckLoadMore() {
+    if (_recheckLoadMoreQueued) return;
+    _recheckLoadMoreQueued = true;
+    requestAnimationFrame(() => {
+        _recheckLoadMoreQueued = false;
+        const sentinel = document.getElementById('load-more-sentinel');
+        const root = document.getElementById('content-area');
+        if (!sentinel || !root || sentinel.getClientRects().length === 0) return;
+        const r = root.getBoundingClientRect();
+        const b = sentinel.getBoundingClientRect();
+        if (b.top < r.bottom + LOAD_MORE_MARGIN_PX && b.bottom > r.top - LOAD_MORE_MARGIN_PX) {
+            _galleryNearBottom();
+        }
+    });
+}
+
+// Latest /api/stats payload (HTTP or `stats_update` push) — kept so a
+// gallery-scope change can re-render the footer without a refetch.
+let _lastStats = null;
+let _statsInFlight = null;
+
+// One-shot fetch (boot, WS reconnect, explicit refresh). Concurrent calls
+// share the in-flight request instead of stacking.
+function loadStats() {
+    if (_statsInFlight) return _statsInFlight;
+    _statsInFlight = api
+        .get('/api/stats')
+        .then((stats) => _applyStats(stats))
+        .catch(() => {})
+        .finally(() => {
+            _statsInFlight = null;
+        });
+    return _statsInFlight;
+}
+
+function _applyStats(stats) {
+    if (!stats || typeof stats !== 'object') return;
+    _lastStats = stats;
+    const diskEl = document.getElementById('disk-usage');
+    const filesEl = document.getElementById('total-files');
+    if (diskEl) diskEl.textContent = stats.diskUsageFormatted || formatBytes(stats.diskUsage || 0);
+    // Federated footer total. When the gallery scope is 'all' or a
+    // specific peer, the footer file count should reflect what the
+    // user is currently looking at — otherwise "1234 files" + a
+    // gallery showing 5,000 tiles read as a contradiction.
+    // peerStats is empty on non-cluster installs and for guest
+    // sessions, so the local-only path stays unchanged.
+    if (filesEl) {
+        const local = Number(stats.totalFiles) || 0;
+        const peers = Array.isArray(stats.peerStats) ? stats.peerStats : [];
+        const peerTotal = peers.reduce((s, p) => s + (Number(p.totalFiles) || 0), 0);
+        const scope = state.galleryScope || 'local';
+        if (scope === 'all' && peerTotal > 0) {
+            filesEl.textContent = i18nTf(
+                'footer.files.merged',
+                { local, peers: peerTotal },
+                `${local} + ${peerTotal} peers`,
+            );
+            filesEl.title = peers
+                .map(
+                    (p) =>
+                        `${p.peerName}: ${p.totalFiles} ${p.totalSizeFormatted ? `(${p.totalSizeFormatted})` : ''}${p.online ? '' : ' (offline)'}`,
+                )
+                .join('\n');
+        } else if (scope !== 'local' && scope !== 'all') {
+            const p = peers.find((x) => String(x.peerId) === String(scope));
+            filesEl.textContent = String(p?.totalFiles ?? 0);
+            filesEl.title = p ? `${p.peerName}${p.online ? '' : ' (offline)'}` : '';
+        } else {
+            filesEl.textContent = String(local);
+            filesEl.title = '';
+        }
+    }
 }
 
 // ============ Purge Functions ============
@@ -4570,7 +4646,7 @@ function _wirePurgeWs() {
         );
         const purgedId = m?.groupId;
         if (purgedId && String(state.currentGroupId) === String(purgedId)) {
-            showAllMedia();
+            showAllMedia({ force: true });
         }
         loadStats();
     });
@@ -4598,7 +4674,7 @@ function _wirePurgeWs() {
         state.allFiles = [];
         renderGroupsList();
         if (state.currentPage === 'groups') renderGroupsConfig();
-        if (state.currentPage === 'viewer') showAllMedia();
+        if (state.currentPage === 'viewer') showAllMedia({ force: true });
         loadStats();
     });
 }
@@ -4675,7 +4751,8 @@ async function purgeAll() {
 
     try {
         showToast(i18nT('purge.all.deleting', 'Deleting all data...'), 'info');
-        const r = await api.delete('/api/purge/all');
+        // The server refuses a factory reset without this exact phrase.
+        const r = await api.delete('/api/purge/all', { confirm: 'DELETE ALL' });
         if (!r?.started && !r?.success) throw new Error('Failed to start');
         // Final toast + state reset come from `purge_all_done` WS event.
     } catch (e) {

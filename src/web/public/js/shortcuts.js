@@ -26,6 +26,12 @@ const SHORTCUTS = [
         def: 'Open this shortcuts cheatsheet',
     },
     {
+        id: 'palette',
+        keys: 'Ctrl/⌘ K',
+        k: 'shortcuts.palette',
+        def: 'Go anywhere — pages, settings, tools, chats',
+    },
+    {
         id: 'close_modal',
         keys: 'Esc',
         k: 'shortcuts.close_modal',
@@ -39,7 +45,7 @@ const SHORTCUTS = [
         id: 'focus_search',
         keys: '/',
         k: 'shortcuts.focus_search',
-        def: 'Focus the gallery search box',
+        def: 'Search this page (gallery, settings, queue, chats)',
     },
     {
         id: 'open_paste',
@@ -167,6 +173,24 @@ function isTyping(e) {
     return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || t.isContentEditable;
 }
 
+// The search box of the page that's open — gallery, Settings, Queue,
+// Chats, Backfill. Returns false when the page has none (or it's hidden).
+const PAGE_SEARCH = {
+    viewer: 'gallery-search-input',
+    settings: 'settings-search-input',
+    queue: 'queue-search',
+    groups: 'groups-search',
+    backfill: 'backfill-group-search',
+};
+export function focusPageSearch() {
+    const id = PAGE_SEARCH[document.body.dataset.page || ''];
+    const el = id ? document.getElementById(id) : null;
+    if (!el || el.offsetParent === null) return false;
+    el.focus();
+    el.select?.();
+    return true;
+}
+
 function dispatchG(letter) {
     const map = { v: 'viewer', g: 'groups', e: 'engine', s: 'settings' };
     const target = map[letter];
@@ -210,6 +234,10 @@ function _runAction(id) {
     if (id === 'focus_search') {
         return;
     }
+    if (id === 'palette') {
+        import('./nav.js').then((m) => m.openPalette()).catch(() => {});
+        return;
+    }
     if (id === 'go_library') {
         dispatchG('v');
         return;
@@ -249,6 +277,10 @@ export function initShortcuts() {
         if (e.key === '?' || (e.key === '/' && e.shiftKey)) {
             e.preventDefault();
             show();
+            return;
+        }
+        if (e.key === '/') {
+            if (focusPageSearch()) e.preventDefault();
             return;
         }
         if (e.key === 'l' || e.key === 'L') {

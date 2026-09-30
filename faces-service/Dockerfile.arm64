@@ -38,21 +38,17 @@ RUN apt-get update \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/
-
 WORKDIR /build
 
-COPY pyproject.toml uv.lock README.md ./
+COPY pyproject.toml README.md ./
+COPY tgdl_faces ./tgdl_faces
 
 # Base onnxruntime ships CPU + OpenVINO EPs on aarch64; no CUDA available.
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-dev --no-install-project
-
-COPY tgdl_faces ./tgdl_faces
+RUN pip install --user --no-cache-dir .
 
 # Pre-download buffalo_l at build time so the runtime image boots offline.
 ENV TGDL_FACES_MODELS_DIR=/root/.cache/tgdl-faces/models
-RUN .venv/bin/python -c "\
+RUN python -c "\
 from insightface.app import FaceAnalysis; \
 a = FaceAnalysis(name='buffalo_l', root='/root/.cache/tgdl-faces/models', \
     providers=['CPUExecutionProvider']); \
@@ -72,13 +68,13 @@ RUN apt-get update \
         wget \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /build/.venv /app/.venv
+COPY --from=builder /root/.local /root/.local
 COPY --from=builder /root/.cache/tgdl-faces/models /root/.cache/tgdl-faces/models
 
 WORKDIR /app
 COPY tgdl_faces /app/tgdl_faces
 
-ENV PATH="/app/.venv/bin:${PATH}" \
+ENV PATH="/root/.local/bin:${PATH}" \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     TGDL_FACES_HOST=0.0.0.0 \
@@ -97,7 +93,7 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --retries=3 \
 
 LABEL org.opencontainers.image.title="tgdl-faces-arm64" \
       org.opencontainers.image.description="Face detection + 512-dim embedding sidecar (ARM64 / Pi variant)" \
-      org.opencontainers.image.version="0.2.0" \
+      org.opencontainers.image.version="0.5.0" \
       org.opencontainers.image.source="https://github.com/botnick/telegram-media-downloader" \
       org.opencontainers.image.licenses="MIT" \
       com.centurylinklabs.watchtower.enable="true"

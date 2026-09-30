@@ -24,6 +24,9 @@ eslint.config.js
 coverage
 .claude
 CLAUDE.md
-# Host-built sidecar artefacts — the image compiles its own binary.
+# Local Go builds; the image compiles tgdl-core itself.
+core-service/bin
+core-service/dist
+# Host-built seekbar binaries. The image compiles its own.
 seekbar-service/bin
 seekbar-service/data

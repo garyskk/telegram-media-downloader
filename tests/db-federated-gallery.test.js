@@ -292,15 +292,15 @@ describe('getAllDownloadsFederated', () => {
             fileSize: 100,
             createdAt: '2026-04-01 12:00:00',
         });
-        db.prepare(`UPDATE downloads SET pinned = 1 WHERE id = 1`).run();
+        db.prepare('UPDATE downloads SET pinned = 1 WHERE id = 1').run();
         seedLocal({
             id: 2,
             groupId: '-100',
             groupName: 'A',
             fileName: 'own-unpinned.jpg',
             fileType: 'photo',
-            fileSize: 150,
-            createdAt: '2026-04-01 13:00:00',
+            fileSize: 100,
+            createdAt: '2026-04-03 12:00:00',
         });
         seedPeer({
             peerId: 'peer-B',
@@ -317,9 +317,15 @@ describe('getAllDownloadsFederated', () => {
             include: 'peers',
             unpinnedOnly: true,
         });
-        const names = r.files.map((f) => f.file_name).sort();
-        expect(names).toEqual(['own-unpinned.jpg', 'peer.jpg']);
-        expect(r.files.every((f) => !f.pinned)).toBe(true);
+        expect(r.files.map((f) => f.file_name).sort()).toEqual(['own-unpinned.jpg', 'peer.jpg']);
+        expect(r.total).toBe(2);
+
+        const group = api.getDownloadsForGroupFederated('-100', 50, 0, 'all', {
+            include: 'peers',
+            unpinnedOnly: true,
+        });
+        expect(group.files.map((f) => f.file_name).sort()).toEqual(['own-unpinned.jpg', 'peer.jpg']);
+        expect(group.total).toBe(2);
     });
 
     it('falls back to local-only when no peer rows exist (zero-cluster install)', () => {

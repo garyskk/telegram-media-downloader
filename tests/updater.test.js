@@ -111,10 +111,13 @@ describe('_pingWatchtower', () => {
         expect(r.status).toBe(200);
     });
 
-    it('returns ok=true on a 405 (HEAD on POST-only route)', async () => {
-        globalThis.fetch = vi.fn(async () => ({ status: 405, ok: false }));
+    it('returns ok=true on a 404 and never touches /v1/update', async () => {
+        globalThis.fetch = vi.fn(async () => ({ status: 404, ok: false }));
         const r = await ping();
         expect(r.ok).toBe(true);
+        const [url, init] = globalThis.fetch.mock.calls[0];
+        expect(url).not.toMatch(/v1\/update/);
+        expect(init.method).toBe('GET');
     });
 
     it('classifies 401 as WATCHTOWER_UNAUTHENTICATED', async () => {
@@ -312,9 +315,26 @@ describe('runAutoUpdate', () => {
         });
     });
 
+    it('treats a POST timeout after a good ping as triggered', async () => {
+        _fakeDockerEnv = true;
+        let n = 0;
+        globalThis.fetch = vi.fn(async () => {
+            n += 1;
+            if (n === 1) return { status: 404, ok: false };
+            const err = new Error('aborted');
+            err.name = 'AbortError';
+            throw err;
+        });
+        const r = await updater.runAutoUpdate();
+        expect(r.success).toBe(true);
+        try {
+            fs.unlinkSync(r.backup.path);
+        } catch {}
+    });
+
     it('threads TRIGGER_FAILED when ping passes but POST fails', async () => {
         _fakeDockerEnv = true;
-        // First call (HEAD) succeeds, second call (POST) returns 5xx.
+        // First call (ping) succeeds, second call (POST) returns 5xx.
         let n = 0;
         globalThis.fetch = vi.fn(async () => {
             n += 1;
@@ -353,5 +373,40 @@ describe('runAutoUpdate', () => {
         try {
             fs.unlinkSync(r.backup.path);
         } catch {}
+    });
+});
+
+describe('watchtower token resolution', () => {
+    const ORIG = { ...process.env };
+    afterEach(() => {
+        process.env = { ...ORIG };
+    });
+
+    it('prefers the env token over the file', async () => {
+        const { _internals: u } = await import('../src/core/updater.js');
+        process.env.WATCHTOWER_URL = 'http://watchtower:8080/';
+        process.env.WATCHTOWER_HTTP_API_TOKEN = ' from-env ';
+        expect(u._watchtowerEndpoint()).toEqual({
+            url: 'http://watchtower:8080',
+            token: 'from-env',
+        });
+    });
+
+    it('generates a token file once and reuses it when env is unset', async () => {
+        const { _internals: u } = await import('../src/core/updater.js');
+        fs.rmSync(u.WT_TOKEN_FILE, { force: true });
+        delete process.env.WATCHTOWER_HTTP_API_TOKEN;
+        process.env.WATCHTOWER_URL = 'http://watchtower:8080';
+        const t1 = u._resolveWatchtowerToken();
+        expect(t1).toMatch(/^[0-9a-f]{64}$/);
+        expect(fs.readFileSync(u.WT_TOKEN_FILE, 'utf8')).toBe(t1);
+        expect(u._resolveWatchtowerToken()).toBe(t1);
+        expect(u._watchtowerEndpoint().token).toBe(t1);
+    });
+
+    it('has no endpoint without WATCHTOWER_URL', async () => {
+        const { _internals: u } = await import('../src/core/updater.js');
+        delete process.env.WATCHTOWER_URL;
+        expect(u._watchtowerEndpoint()).toBeNull();
     });
 });

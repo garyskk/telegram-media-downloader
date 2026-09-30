@@ -32,7 +32,8 @@
 
 import { existsSync } from 'fs';
 
-import { getSidecarUrl } from './faces-client.js';
+import { clusterFlat, dbscanFlat, packPoints } from './dbscan.js';
+import { getSidecarUrl, SidecarUnavailableError } from './faces-client.js';
 
 // ArcFace 512-dim embeddings are L2-normalised to unit length, so the
 // Euclidean distance between two unit vectors maps to cosine similarity
@@ -72,11 +73,17 @@ let _warnedNoSidecar = false;
  *     stamps `ai_indexed_at` and moves on so the loop doesn't re-spin.
  *   - `[]` when the sidecar replied but found no faces.
  *   - `[{x, y, w, h, score, embedding: Float32Array, landmarks?}, …]` on success.
+ *
+ * `opts.throwOnUnavailable` — throw `SidecarUnavailableError` instead of
+ * returning null when the sidecar (not the file) is the problem, so the
+ * caller can leave the row for a later scan.
  */
-export async function detectFaces(absPath, cfg = {}, onLog) {
+export async function detectFaces(absPath, cfg = {}, onLog, opts = {}) {
     if (!absPath || !existsSync(absPath)) return null;
+    const strict = opts?.throwOnUnavailable === true;
     const url = getSidecarUrl();
     if (!url) {
+        if (strict) throw new SidecarUnavailableError('sidecar URL unset');
         if (!_warnedNoSidecar) {
             _warnedNoSidecar = true;
             try {
@@ -98,8 +105,9 @@ export async function detectFaces(absPath, cfg = {}, onLog) {
     let detected;
     try {
         const mod = await import('./faces-client.js');
-        detected = await mod.detectFaces(absPath, cfg, onLog);
+        detected = await mod.detectFaces(absPath, cfg, onLog, { throwOnUnavailable: strict });
     } catch (e) {
+        if (strict && e?.code === 'SIDECAR_UNAVAILABLE') throw e;
         try {
             if (typeof onLog === 'function') {
                 onLog({
@@ -182,20 +190,19 @@ export function centroid(vecs, weights = null) {
     return out;
 }
 
-/**
- * Region-query: indices of every point within `eps` of point[idx].
- * O(N) per call; the full DBSCAN is O(N²). Acceptable for libraries up
- * to ~50k faces — beyond that an approximate-NN structure (HNSW, vp-tree)
- * would be the next move.
- */
-function _regionQuery(points, idx, eps) {
-    const out = [];
-    const p = points[idx];
-    for (let j = 0; j < points.length; j++) {
-        if (j === idx) continue;
-        if (euclidean(p, points[j]) <= eps) out.push(j);
-    }
-    return out;
+// DBSCAN itself lives in `dbscan.js` (flat Float32Array, queue-once
+// expansion, early-exit distance) so it can run inside a worker thread.
+// The two wrappers below keep the historical array-of-vectors API and
+// produce label-for-label identical output.
+
+function _resolveClusterOpts(opts = {}) {
+    return {
+        eps: Number.isFinite(opts.eps) ? opts.eps : FACE_DEFAULTS.facesEpsilon,
+        minPts: Math.max(
+            2,
+            Number.isFinite(opts.minPts) ? opts.minPts : FACE_DEFAULTS.facesMinPoints,
+        ),
+    };
 }
 
 /**
@@ -205,41 +212,14 @@ function _regionQuery(points, idx, eps) {
  *
  * `opts.eps`     — neighborhood radius (default `FACE_DEFAULTS.facesEpsilon`).
  * `opts.minPts`  — minimum cluster size (default `FACE_DEFAULTS.facesMinPoints`).
+ *
+ * O(N²·dim) — runs on the calling thread. The scan runner uses
+ * `clusterFacesOffThread()` instead so Phase B never blocks the event loop.
  */
 export function dbscan(points, opts = {}) {
-    const eps = Number.isFinite(opts.eps) ? opts.eps : FACE_DEFAULTS.facesEpsilon;
-    const minPts = Math.max(
-        2,
-        Number.isFinite(opts.minPts) ? opts.minPts : FACE_DEFAULTS.facesMinPoints,
-    );
-    const N = points?.length || 0;
-    const labels = new Array(N).fill(-2); // -2 = unvisited, -1 = noise, >=0 = cluster id
-    let cluster = -1;
-
-    for (let i = 0; i < N; i++) {
-        if (labels[i] !== -2) continue;
-        const neighbors = _regionQuery(points, i, eps);
-        if (neighbors.length + 1 < minPts) {
-            labels[i] = -1;
-            continue;
-        }
-        cluster++;
-        labels[i] = cluster;
-        const stack = neighbors.slice();
-        while (stack.length) {
-            const j = stack.shift();
-            if (labels[j] === -1) labels[j] = cluster; // border point
-            if (labels[j] !== -2) continue;
-            labels[j] = cluster;
-            const sub = _regionQuery(points, j, eps);
-            if (sub.length + 1 >= minPts) {
-                for (const k of sub) {
-                    if (labels[k] === -2) stack.push(k);
-                }
-            }
-        }
-    }
-    return labels;
+    if (!points?.length) return [];
+    const { data, n, dim } = packPoints(points);
+    return Array.from(dbscanFlat(data, n, dim, _resolveClusterOpts(opts)));
 }
 
 /**
@@ -252,32 +232,67 @@ export function dbscan(points, opts = {}) {
  * first" heuristic works without a second sort.
  */
 export function clusterFaces(faces, opts = {}) {
-    const points = faces.map((f) => f.embedding);
-    const labels = dbscan(points, opts);
-    const groups = new Map();
-    const noise = [];
-    labels.forEach((label, idx) => {
-        if (label < 0) {
-            noise.push(idx);
-            return;
-        }
-        if (!groups.has(label)) groups.set(label, []);
-        groups.get(label).push(idx);
-    });
-    const clusters = [...groups.values()]
-        .map((memberIdxs) => {
-            const memberVecs = memberIdxs.map((i) => points[i]);
-            const memberWeights = memberIdxs.map((i) =>
-                Number.isFinite(faces[i].qualityScore) ? faces[i].qualityScore : 1.0,
-            );
-            return {
-                memberIdxs,
-                centroid: centroid(memberVecs, memberWeights),
-                faceCount: memberIdxs.length,
-            };
-        })
-        .sort((a, b) => b.faceCount - a.faceCount);
-    return { clusters, noise };
+    if (!faces?.length) return { clusters: [], noise: [] };
+    const { data, n, dim } = packPoints(faces.map((f) => f.embedding));
+    const weights = Float64Array.from(faces, (f) =>
+        Number.isFinite(f.qualityScore) ? f.qualityScore : Number.NaN,
+    );
+    return clusterFlat(data, n, dim, weights, _resolveClusterOpts(opts));
+}
+
+// The old worker path only reported progress from this many points up
+// (smaller inputs ran inline, silently); the scan log keeps that.
+const PROGRESS_MIN_POINTS = 256;
+
+/**
+ * Cluster pre-packed embeddings in tgdl-core (Go, all cores) so a large
+ * library (O(N²)) can't starve the event loop, which is what the
+ * container healthcheck watches. Label-for-label and byte-for-byte the
+ * same result as `clusterFlat()` (a faithful port of dbscan.js).
+ *
+ * Rejects with an AbortError when `signal` fires (tgdl-core stops too),
+ * and with a GoCoreError (status 503, message with the fix) when
+ * tgdl-core isn't available.
+ *
+ * @param {{data: Float32Array, n: number, dim: number, weights?: Float64Array}} flat
+ * @param {object} opts  `{ eps, minPts, signal?, onProgress?(done, n) }`
+ * @returns {Promise<{clusters: {memberIdxs: Int32Array, centroid: Float32Array, faceCount: number}[], noiseCount: number}>}
+ */
+export async function clusterFacesOffThread(flat, opts = {}) {
+    const { eps, minPts } = _resolveClusterOpts(opts);
+    const { data, n, dim } = flat;
+    const weights = flat.weights || null;
+    const signal = opts.signal || null;
+    const onProgress =
+        typeof opts.onProgress === 'function' && n >= PROGRESS_MIN_POINTS ? opts.onProgress : null;
+    if (signal?.aborted) throw _abortError();
+
+    await import('../gocore/spawn.js'); // supervision + start-on-first-use
+    const { dbscan: coreDbscan } = await import('../gocore/client.js');
+    let r;
+    try {
+        r = await coreDbscan({ data, n, dim, weights, eps, minPts }, { onProgress, signal });
+    } catch (e) {
+        if (signal?.aborted || e?.kind === 'aborted') throw _abortError();
+        throw e;
+    }
+    // Unpack: members concatenated in cluster order + offsets.
+    const clusters = [];
+    for (let c = 0; c < r.count; c++) {
+        const memberIdxs = r.members.subarray(r.starts[c], r.starts[c + 1]);
+        clusters.push({
+            memberIdxs,
+            centroid: r.centroids.slice(c * dim, (c + 1) * dim),
+            faceCount: memberIdxs.length,
+        });
+    }
+    return { clusters, noiseCount: r.noiseCount };
+}
+
+function _abortError() {
+    const e = new Error('clustering aborted');
+    e.name = 'AbortError';
+    return e;
 }
 
 /** Reset module-local state — for tests only. */

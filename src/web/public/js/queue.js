@@ -45,12 +45,29 @@ const RENDER_COALESCE_MS = 60; // collapse WS bursts into one rAF tick
 // downloader flagged as duplicates) — surfaces the rows that produced no
 // new bytes on disk, so the operator can see "what got skipped today".
 const STATUS_FILTERS = [
+    // Default view: everything that still has work to do. Finished rows
+    // (done / failed / duplicates) are one tap away.
+    {
+        id: 'current',
+        i18n: 'queue.chip.current',
+        fallback: 'Active',
+        match: (j) => j.status === 'active' || j.status === 'queued' || j.status === 'paused',
+    },
+    {
+        id: 'failed',
+        i18n: 'queue.chip.failed',
+        fallback: 'Failed',
+        match: (j) => j.status === 'failed',
+    },
+    { id: 'done', i18n: 'queue.chip.done', fallback: 'Done', match: (j) => j.status === 'done' },
     { id: 'all', i18n: 'queue.chip.all', fallback: 'All', match: () => true },
+    // Narrower views, after a divider.
     {
         id: 'active',
         i18n: 'queue.chip.active',
-        fallback: 'Active',
+        fallback: 'Downloading',
         match: (j) => j.status === 'active',
+        secondary: true,
     },
     {
         id: 'queued',
@@ -64,13 +81,6 @@ const STATUS_FILTERS = [
         fallback: 'Paused',
         match: (j) => j.status === 'paused',
     },
-    {
-        id: 'failed',
-        i18n: 'queue.chip.failed',
-        fallback: 'Failed',
-        match: (j) => j.status === 'failed',
-    },
-    { id: 'done', i18n: 'queue.chip.done', fallback: 'Done', match: (j) => j.status === 'done' },
     {
         id: 'dupe',
         i18n: 'queue.chip.dupe',
@@ -93,13 +103,21 @@ const store = new Map();
 // O(1) status counts for the chips. Patched by upsert/remove so the
 // header chip render is always cheap.
 const statusCounts = new Map();
+// Bumped on every change that can alter the filtered / sorted row set
+// (add, remove, status flip) so getFilteredSorted() only re-sorts then.
+let _storeVersion = 0;
+// Finished rows (done / failed) are history, not work. Keep the newest
+// MAX_FINISHED so a long session with a busy monitor doesn't grow the
+// store (and every O(n) chip / aggregate pass) without bound.
+const MAX_FINISHED = 500;
+let _finishedCount = 0;
 let globalPaused = false;
 let engineRunning = false;
 let maxSpeedConfig = null;
 
 // View state — survives across navigations to the same page.
 const view = {
-    filter: 'all',
+    filter: 'current', // default: downloading + queued + paused
     sort: 'addedAt', // 'addedAt' | 'size' | 'progress' | 'group' | 'filename'
     sortDir: 'desc',
     search: '',
@@ -142,13 +160,16 @@ function scheduleRender() {
         _renderScheduled = false;
         _renderStructural = false;
         requestAnimationFrame(() => {
-            if (view.visible) {
-                if (structural) renderRows();
-                else patchRenderedRows();
-            }
+            // The nav badge is the only Queue UI outside #page-queue. While
+            // the page is hidden, skip everything else — chips, totals,
+            // sparkline, row patches, full re-sorts — showQueuePage()
+            // repaints it all from the store on the next visit.
+            updateNavBadge();
+            if (!view.visible) return;
+            if (structural) renderRows();
+            else patchRenderedRows();
             renderChips();
             renderAggregate();
-            updateNavBadge();
             // Refresh batch-action button state alongside other toolbar
             // counters — cheap (looks at statusCounts) and always
             // surfaces "Retry all" the moment a job lands in `failed`.
@@ -168,6 +189,10 @@ function scheduleStructuralRender() {
 
 function bumpStatus(status, delta) {
     if (!status) return;
+    _storeVersion++;
+    if (status === 'done' || status === 'failed') {
+        _finishedCount = Math.max(0, _finishedCount + delta);
+    }
     const cur = statusCounts.get(status) || 0;
     const next = Math.max(0, cur + delta);
     if (next === 0) statusCounts.delete(status);
@@ -187,12 +212,28 @@ function upsert(entry) {
         store.set(entry.key, { ...entry });
         bumpStatus(entry.status, 1);
     }
+    if (_finishedCount > MAX_FINISHED + 50) _pruneFinished();
+}
+
+// Drop the oldest finished rows (by finish / add time) down to
+// MAX_FINISHED. Runs in batches (the +50 slack above) so the sort isn't
+// paid on every completion.
+function _pruneFinished() {
+    const finished = [];
+    for (const j of store.values()) {
+        if (j.status === 'done' || j.status === 'failed') finished.push(j);
+    }
+    if (finished.length <= MAX_FINISHED) return;
+    finished.sort((a, b) => (a.finishedAt || a.addedAt || 0) - (b.finishedAt || b.addedAt || 0));
+    for (let i = 0; i < finished.length - MAX_FINISHED; i++) remove(finished[i].key);
+    scheduleStructuralRender();
 }
 
 function remove(key) {
     const prev = store.get(key);
     if (!prev) return;
     bumpStatus(prev.status, -1);
+    _storeVersion++;
     store.delete(key);
     // A removed row can never be acted on again — drop it from the
     // selection so the floating-bar count and "select all" tri-state
@@ -431,6 +472,8 @@ async function loadSnapshot() {
         // Wipe local state and rebuild from the authoritative server snapshot.
         store.clear();
         statusCounts.clear();
+        _finishedCount = 0;
+        _storeVersion++;
         globalPaused = !!snap.globalPaused;
         engineRunning = !!snap.engineRunning;
         maxSpeedConfig = snap.maxSpeed ?? null;
@@ -494,6 +537,19 @@ function handleWs(msg) {
         }
         if (p.op === 'clear-finished') {
             for (const [k, v] of store) if (v.status === 'done' || v.status === 'failed') remove(k);
+            scheduleStructuralRender();
+            return;
+        }
+        // A chat that can't be reached any more: its queued jobs were
+        // dropped server-side (they'd all fail).
+        if (p.op === 'drop-group' && p.groupId != null) {
+            for (const [k, v] of store) {
+                if (
+                    String(v.groupId) === String(p.groupId) &&
+                    (v.status === 'queued' || v.status === 'paused')
+                )
+                    remove(k);
+            }
             scheduleStructuralRender();
             return;
         }
@@ -635,7 +691,7 @@ let _filteredCache = null;
 let _filteredCacheTag = '';
 
 function getFilteredSorted() {
-    const tag = `${view.filter}|${view.sort}|${view.sortDir}|${view.search}|${store.size}`;
+    const tag = `${view.filter}|${view.sort}|${view.sortDir}|${view.search}|${_storeVersion}`;
     if (tag === _filteredCacheTag && _filteredCache) return _filteredCache;
     const filterFn = (STATUS_FILTERS.find((f) => f.id === view.filter) || STATUS_FILTERS[0]).match;
     const q = view.search.trim().toLowerCase();
@@ -682,47 +738,71 @@ function invalidateFilterCache() {
 }
 
 // ============ Render ============
+// Chips are built once (per language) with a single delegated click
+// listener; later renders only patch the counts via textContent and flip
+// the active classes. Rebuilding them via innerHTML on every 150 ms tick
+// re-created 8 buttons and re-attached 8 listeners each time.
+const CHIP_ACTIVE_CLS = ['bg-tg-blue/20', 'text-tg-blue', 'border-tg-blue/40'];
+const CHIP_IDLE_CLS = [
+    'bg-tg-bg/40',
+    'text-tg-textSecondary',
+    'border-transparent',
+    'hover:text-tg-text',
+];
+let _chipsLang = null;
+let _chipsWired = false;
+
+function _chipCounts() {
+    // `deduped` is a cross-cutting flag, not a status — statusCounts tracks
+    // active/queued/paused/failed/done only. Count it by sweeping the store
+    // (O(n), n bounded by MAX_FINISHED + live jobs). Without this the
+    // "Duplicate" chip always showed 0 even when rows carried the badge.
+    let dupe = 0;
+    for (const j of store.values()) {
+        if (j.deduped === true) dupe += 1;
+    }
+    const active = statusCounts.get('active') || 0;
+    const queued = statusCounts.get('queued') || 0;
+    const paused = statusCounts.get('paused') || 0;
+    return {
+        current: active + queued + paused,
+        all: store.size,
+        active,
+        queued,
+        paused,
+        failed: statusCounts.get('failed') || 0,
+        done: statusCounts.get('done') || 0,
+        dupe,
+    };
+}
+
 function renderChips() {
     const host = document.getElementById('queue-chips');
     if (!host) return;
-    const total = store.size;
-    // `deduped` is a cross-cutting flag, not a status — statusCounts tracks
-    // active/queued/paused/failed/done only. Count it by sweeping the store
-    // at render time (O(n) where n = store.size, capped by sliding window).
-    // Without this the "Duplicate" chip always showed 0 even when rows
-    // carried the orange Duplicate badge.
-    let dupeCount = 0;
-    for (const j of store.values()) {
-        if (j.deduped === true) dupeCount += 1;
-    }
-    const counts = {
-        all: total,
-        active: statusCounts.get('active') || 0,
-        queued: statusCounts.get('queued') || 0,
-        paused: statusCounts.get('paused') || 0,
-        failed: statusCounts.get('failed') || 0,
-        done: statusCounts.get('done') || 0,
-        dupe: dupeCount,
-    };
-    host.innerHTML = STATUS_FILTERS.map((f) => {
-        const active = view.filter === f.id;
-        const cls = active
-            ? 'bg-tg-blue/20 text-tg-blue border-tg-blue/40'
-            : 'bg-tg-bg/40 text-tg-textSecondary border-transparent hover:text-tg-text';
-        return `<button type="button" data-chip="${f.id}"
-            class="px-2.5 py-1 text-xs rounded-full border ${cls} flex items-center gap-1.5">
+    const lang = i18nT('queue.chip.all', 'All');
+    if (_chipsLang !== lang || host.children.length !== STATUS_FILTERS.length) {
+        _chipsLang = lang;
+        host.innerHTML = STATUS_FILTERS.map(
+            (f) => `<button type="button" data-chip="${f.id}" aria-pressed="false"
+            class="queue-chip${f.secondary ? ' queue-chip--divider' : ''} px-3 text-xs rounded-full border flex items-center gap-1.5 shrink-0">
             <span>${escapeHtml(i18nT(f.i18n, f.fallback))}</span>
-            <span class="tabular-nums opacity-80">${counts[f.id] ?? 0}</span>
-        </button>`;
-    }).join('');
-    host.querySelectorAll('[data-chip]').forEach((btn) => {
-        btn.addEventListener('click', () => {
+            <span data-chip-count class="tabular-nums opacity-80">0</span>
+        </button>`,
+        ).join('');
+    }
+    if (!_chipsWired) {
+        _chipsWired = true;
+        host.addEventListener('click', (ev) => {
+            const btn = ev.target.closest('[data-chip]');
+            if (!btn || !host.contains(btn)) return;
             view.filter = btn.dataset.chip;
             invalidateFilterCache();
             // Update the URL without re-dispatching the route handler so
             // back/forward still work but we don't churn the page.
             const target =
-                view.filter === 'all' ? '#/queue' : `#/queue/${encodeURIComponent(view.filter)}`;
+                view.filter === 'current'
+                    ? '#/queue'
+                    : `#/queue/${encodeURIComponent(view.filter)}`;
             if (location.hash !== target) history.replaceState(null, '', target);
             renderChips();
             // Filter changed → row set changed → full re-render. Reset
@@ -734,7 +814,65 @@ function renderChips() {
             const vp = document.getElementById('queue-viewport');
             if (vp) vp.scrollTop = 0;
         });
-    });
+    }
+    const counts = _chipCounts();
+    for (const btn of host.children) {
+        const id = btn.dataset.chip;
+        const active = view.filter === id;
+        for (const c of CHIP_ACTIVE_CLS) btn.classList.toggle(c, active);
+        btn.setAttribute('aria-pressed', active ? 'true' : 'false');
+        for (const c of CHIP_IDLE_CLS) btn.classList.toggle(c, !active);
+        const countEl = btn.querySelector('[data-chip-count]');
+        const n = String(counts[id] ?? 0);
+        if (countEl && countEl.textContent !== n) countEl.textContent = n;
+    }
+}
+
+// Empty state for the current filter: an empty queue, an empty filter
+// (with a Show all shortcut), or a search with no match.
+function _renderEmpty() {
+    const title = document.getElementById('queue-empty-title');
+    const body = document.getElementById('queue-empty-body');
+    const btn = document.getElementById('queue-empty-show-all');
+    if (!title || !body) return;
+    let t;
+    let b;
+    let showAll = view.filter !== 'all' && store.size > 0;
+    if (store.size === 0) {
+        t = i18nT('queue.empty.title', 'Queue is empty');
+        b = i18nT(
+            'queue.empty.body',
+            'Start the engine or kick off a backfill — every download flows through here.',
+        );
+    } else if (view.search) {
+        t = i18nTf(
+            'queue.empty.search_title',
+            { q: view.search },
+            `No downloads match “${view.search}”`,
+        );
+        b = i18nT('queue.empty.search_body', 'Search looks at file names and chat names.');
+        showAll = view.filter !== 'all';
+    } else if (view.filter === 'current') {
+        t = i18nT('queue.empty.current_title', 'Nothing downloading right now');
+        b = i18nT(
+            'queue.empty.current_body',
+            'Finished, failed and skipped downloads are under Done, Failed and All.',
+        );
+    } else {
+        t = i18nT('queue.empty.filter_title', 'Nothing here');
+        b = i18nT('queue.empty.filter_body', 'No downloads match this filter.');
+    }
+    title.textContent = t;
+    body.textContent = b;
+    if (btn) {
+        btn.classList.toggle('hidden', !showAll);
+        if (!btn.dataset.wired) {
+            btn.dataset.wired = '1';
+            btn.addEventListener('click', () => {
+                document.querySelector('#queue-chips [data-chip="all"]')?.click();
+            });
+        }
+    }
 }
 
 // Full re-render — wipes the rows host, paints INITIAL_RENDER rows, and
@@ -752,6 +890,7 @@ function renderRows() {
     if (rows.length === 0) {
         rowsHost.innerHTML = '';
         view.rendered = 0;
+        _renderEmpty();
         if (empty) empty.classList.remove('hidden');
         if (sentinel) sentinel.classList.add('hidden');
         return;
@@ -958,8 +1097,13 @@ function patchRenderedRows() {
     // there are any (e.g. monitor just started a fresh download), force
     // a structural re-render so they appear.
     const filtered = getFilteredSorted();
+    // The DOM holds the window [from, view.rendered) — appendNextPage()
+    // drops rows off the top past MAX_DOM_ROWS. Compare against that
+    // window only; comparing against [0, view.rendered) made every tick
+    // after a trim look "diverged" and snap the list back to the top.
+    const from = Math.max(0, view.rendered - _renderedKeys.size);
     const filteredKeys = new Set();
-    for (let i = 0; i < Math.min(filtered.length, view.rendered); i++) {
+    for (let i = from; i < Math.min(filtered.length, view.rendered); i++) {
         filteredKeys.add(filtered[i].key);
     }
     // If the rendered window's set of keys diverged from the filtered
@@ -976,7 +1120,7 @@ function patchRenderedRows() {
     }
     // Patch in place. Each `[data-key]` row has a small set of named
     // child nodes the patcher knows about; update only those.
-    for (const job of filtered.slice(0, view.rendered)) {
+    for (const job of filtered.slice(from, view.rendered)) {
         const rowEl = rowsHost.querySelector(`[data-key="${CSS.escape(job.key)}"]`);
         if (!rowEl) continue;
         _patchRowNode(rowEl, job);
@@ -1080,7 +1224,7 @@ function renderRow(j) {
     // bytes. Suppressed for jobs queued before multi-account routing
     // landed (no accountName) so legacy rows don't render an empty pill.
     const accountChip = j.accountName
-        ? `<span class="text-[10px] px-1.5 py-0.5 rounded-full bg-tg-blue/10 text-tg-blue ml-1.5 inline-flex items-center gap-0.5" title="${escapeHtml(i18nTf('queue.account.tooltip', { name: j.accountName }, `Pulled via account: ${j.accountName}`))}"><i class="ri-user-3-line"></i><span>${escapeHtml(j.accountName)}</span></span>`
+        ? `<span class="text-[10px] px-1.5 py-0.5 rounded-full bg-tg-blue/10 text-tg-blue ml-1.5 inline-flex items-center gap-0.5 shrink-0 max-w-[45%]" title="${escapeHtml(i18nTf('queue.account.tooltip', { name: j.accountName }, `Pulled via account: ${j.accountName}`))}"><i class="ri-user-3-line shrink-0"></i><span class="truncate">${escapeHtml(j.accountName)}</span></span>`
         : '';
 
     // Click-to-view: a finished row whose filePath we know becomes a link
@@ -1194,7 +1338,7 @@ function renderRow(j) {
             ${thumb}
             <div class="min-w-0 flex-1 md:contents">
             <div class="min-w-0">
-                <div class="text-sm text-tg-text truncate" title="${escapeHtml(name)}">${escapeHtml(name)}${accountChip}</div>
+                <div class="text-sm text-tg-text flex items-center min-w-0" title="${escapeHtml(name)}"><span class="truncate min-w-0">${escapeHtml(name)}</span>${accountChip}</div>
                 <div class="text-[11px] text-tg-textSecondary truncate flex items-center gap-1.5 flex-wrap">
                     <span class="truncate">${escapeHtml(groupName)}</span>
                     ${metaLine.map((s) => `<span class="text-tg-textSecondary/40">·</span>${s}`).join('')}
@@ -1211,7 +1355,7 @@ function renderRow(j) {
                     <span class="text-[10px] text-tg-textSecondary tabular-nums">${escapeHtml(sizeStr)}</span>
                     <span data-row-meta class="text-[10px] text-tg-textSecondary tabular-nums">${escapeHtml(speedStr !== '—' ? speedStr : '')}</span>
                     <span data-row-status data-status="${escapeHtml(j.status)}" class="text-[10px] px-1.5 py-0.5 rounded-full ${pillCls} ml-auto">${escapeHtml(pillLabel)}</span>
-                    ${actions.length ? `<span class="flex items-center gap-0.5">${actions.join('')}</span>` : ''}
+                    ${actions.length ? `<span class="flex items-center gap-1.5">${actions.join('')}</span>` : ''}
                 </div>
                 <div data-row-pct class="hidden md:block text-[10px] text-tg-textSecondary tabular-nums mt-0.5">${escapeHtml(pctLabel)}</div>
             </div>
@@ -1223,9 +1367,11 @@ function renderRow(j) {
         </div>`;
 }
 
+// 36 px on touch layouts (was 28 px — too small / too close together to
+// hit reliably next to each other), the compact 28 px on the md+ table.
 function actionBtn(action, icon, label, extraCls = '') {
     return `<button type="button" data-row-action="${action}"
-        class="w-7 h-7 rounded flex items-center justify-center text-tg-textSecondary hover:text-tg-text hover:bg-tg-bg/60 ${extraCls}"
+        class="w-9 h-9 md:w-7 md:h-7 rounded flex items-center justify-center text-tg-textSecondary hover:text-tg-text hover:bg-tg-bg/60 ${extraCls}"
         title="${escapeHtml(label)}" aria-label="${escapeHtml(label)}"><i class="${icon}"></i></button>`;
 }
 
@@ -1288,7 +1434,8 @@ function _pushSpeed(bps) {
 
 function _speedSparkline() {
     const len = _speedHistory.length;
-    const max = Math.max(1, ...Array.from(_speedHistory));
+    let max = 1;
+    for (const v of _speedHistory) if (v > max) max = v;
     const w = 120;
     const h = 24;
     const step = w / (len - 1);
@@ -1494,6 +1641,66 @@ export async function showQueuePage(params = {}) {
     updateNavBadge();
 }
 
+// The ⋮ menu holds the speed limit, the global actions (Pause all …
+// Cancel queued) below 1440 px and the sort picker on phones — moved, not
+// copied, so their ids and listeners stay the same. Wide screens show them
+// inline next to the search box.
+function wireMoreMenu() {
+    const btn = document.getElementById('queue-more-btn');
+    const menu = document.getElementById('queue-more-menu');
+    if (!btn || !menu) return;
+    const close = () => {
+        menu.classList.remove('open');
+        btn.setAttribute('aria-expanded', 'false');
+    };
+    btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const open = menu.classList.toggle('open');
+        btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+    });
+    // A tap on an action runs it and closes the menu; the slider stays.
+    menu.addEventListener('click', (e) => {
+        if (e.target.closest('#queue-global-actions button')) close();
+    });
+    document.addEventListener('click', (e) => {
+        if (!menu.classList.contains('open')) return;
+        if (menu.contains(e.target) || btn.contains(e.target)) return;
+        close();
+    });
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && menu.classList.contains('open')) {
+            close();
+            btn.focus();
+        }
+    });
+    const moves = [
+        // [element id, inline slot, menu slot, media query for "inline"]
+        [
+            'queue-global-actions',
+            'queue-actions-inline',
+            'queue-actions-menu-slot',
+            '(min-width: 1440px)',
+        ],
+        ['queue-sort', 'queue-sort-inline', 'queue-sort-menu-slot', '(min-width: 640px)'],
+    ];
+    for (const [id, inlineId, menuId, query] of moves) {
+        const el = document.getElementById(id);
+        const mq = window.matchMedia(query);
+        const place = () => {
+            const slot = document.getElementById(mq.matches ? inlineId : menuId);
+            if (el && slot && el.parentElement !== slot) slot.appendChild(el);
+            // Hide the empty wrapper so it adds no divider / gap.
+            document
+                .getElementById(menuId)
+                ?.closest('[data-menu-slot]')
+                ?.classList.toggle('hidden', mq.matches);
+            document.getElementById(inlineId)?.classList.toggle('hidden', !mq.matches);
+        };
+        place();
+        mq.addEventListener?.('change', place);
+    }
+}
+
 let _toolbarWired = false;
 function wireOnce() {
     if (_toolbarWired) return;
@@ -1533,6 +1740,7 @@ function wireOnce() {
         .getElementById('queue-clear-finished')
         ?.addEventListener('click', () => runGlobalAction('clear-finished'));
     document.getElementById('queue-retry-all')?.addEventListener('click', () => runRetryAll());
+    wireMoreMenu();
 
     // Header "select all visible" checkbox. Tri-state: empty / partial /
     // full. Clicking from any state goes to "full"; clicking when already

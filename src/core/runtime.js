@@ -219,10 +219,6 @@ class Runtime extends EventEmitter {
         };
     }
 
-    decrementDiskUsage(bytes) {
-        this._downloader?.decrementDiskUsage(bytes);
-    }
-
     status() {
         const out = {
             state: this.state,

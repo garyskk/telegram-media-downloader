@@ -10,6 +10,7 @@ Two ingress paths:
   injected via ``TGDL_FACES_ALLOW_ROOTS``.
 
 * :func:`load_image_from_b64` — Node ships the bytes as base64.
+* :func:`load_image_from_bytes` — Node ships the raw bytes (``/detect/upload``).
   Used in the Docker compose deployment where the sidecar container
   doesn't share a volume with the Node container, and as a fallback
   whenever path mode trips the allow-list.
@@ -24,8 +25,9 @@ import base64
 import binascii
 import logging
 import os
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Callable, Iterator
+from typing import Any
 
 import cv2
 import numpy as np
@@ -87,24 +89,17 @@ def _is_under(path: str, root: str) -> bool:
     return common == root
 
 
-def _apply_exif_orientation(bgr: np.ndarray, raw_bytes: bytes) -> np.ndarray:
-    """Rotate/flip ``bgr`` to match the EXIF orientation tag in ``raw_bytes``.
+# Decode flags for every cv2 path. ``cv2.imdecode`` has applied the EXIF
+# Orientation tag itself since OpenCV 4.x (verified on 4.10 and 4.13, the
+# range pinned in pyproject.toml); the sidecar used to rotate the result a
+# second time, so a phone portrait (orientation 6/8) reached the detector
+# sideways and an orientation-3 shot upside down. Decode the raw pixels
+# and apply the tag exactly once, below.
+_IMREAD_FLAGS = cv2.IMREAD_COLOR | cv2.IMREAD_IGNORE_ORIENTATION
 
-    ``cv2.imdecode`` ignores EXIF rotation tags (orientations 3, 6, 8),
-    which causes portrait photos taken on phones to appear sideways or
-    upside-down when fed directly to the face detector.  Pillow reads EXIF
-    reliably on all platforms (including Windows where libjpeg-turbo can
-    behave differently), so we use it as the authority for the rotation.
 
-    Orientations:
-      1 — normal (no-op)
-      3 — 180° rotation
-      6 — 90° clockwise (270° counter-clockwise)
-      8 — 90° counter-clockwise (270° clockwise)
-
-    All other values are treated as no-op to avoid breaking unusual EXIF
-    data.
-    """
+def _exif_orientation(raw_bytes: bytes) -> int:
+    """EXIF Orientation tag (1-8) of an encoded image; 1 when absent."""
     try:
         from PIL import Image  # noqa: PLC0415
         import io as _io  # noqa: PLC0415
@@ -113,19 +108,36 @@ def _apply_exif_orientation(bgr: np.ndarray, raw_bytes: bytes) -> np.ndarray:
             exif = pil_img.getexif() if hasattr(pil_img, "getexif") else {}
             # Tag 0x0112 is Orientation
             orientation = exif.get(0x0112, 1) if exif else 1
+        return int(orientation) if orientation in range(1, 9) else 1
     except Exception:
-        # Pillow not importable, image has no EXIF, or EXIF is unreadable —
-        # return the image as-is so we don't silently break non-JPEG inputs.
-        return bgr
+        # Pillow not importable, image has no EXIF, or EXIF is unreadable.
+        return 1
 
+
+def _apply_exif_orientation(bgr: np.ndarray, raw_bytes: bytes) -> np.ndarray:
+    """Rotate/flip raw decoded pixels to match the EXIF orientation tag.
+
+    ``bgr`` must be the *un-oriented* decode (``_IMREAD_FLAGS`` or
+    Pillow). Pillow reads EXIF reliably on every platform, so it is the
+    authority for the tag. Same transforms as OpenCV / browsers:
+
+      2 mirror · 3 rotate 180° · 4 flip vertical · 5 transpose
+      6 rotate 90° CW · 7 transverse · 8 rotate 90° CCW
+    """
+    orientation = _exif_orientation(raw_bytes)
+    if orientation == 2:
+        return cv2.flip(bgr, 1)
     if orientation == 3:
-        # 180° rotation
         return cv2.rotate(bgr, cv2.ROTATE_180)
+    if orientation == 4:
+        return cv2.flip(bgr, 0)
+    if orientation == 5:
+        return cv2.transpose(bgr)
     if orientation == 6:
-        # 90° clockwise
         return cv2.rotate(bgr, cv2.ROTATE_90_CLOCKWISE)
+    if orientation == 7:
+        return cv2.rotate(cv2.transpose(bgr), cv2.ROTATE_180)
     if orientation == 8:
-        # 90° counter-clockwise
         return cv2.rotate(bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)
     return bgr
 
@@ -180,7 +192,7 @@ def load_image_from_path(path: str, allow_roots: list[str]) -> np.ndarray:
         raise FileNotFoundError(f"file {path!r} is empty")
 
     buf = np.frombuffer(raw, dtype=np.uint8)
-    img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+    img = cv2.imdecode(buf, _IMREAD_FLAGS)
     if img is None:
         # cv2 fails on animated WebP and some uncommon encodings — try Pillow.
         # For animated images (animated WebP, APNG, GIF) the image object
@@ -203,120 +215,16 @@ def load_image_from_path(path: str, allow_roots: list[str]) -> np.ndarray:
     return _apply_exif_orientation(img, raw)
 
 
-# Fixed sampling constants (see docs/requirements.md §4.1) — deliberately
-# NOT scaled by video duration. A 10-second clip and a 4-hour video are
-# walked with identical logic; only the *number* of windows differs.
-#
-#   DEFAULT_WINDOW_SEC         is the real recall-latency driver: motion is
-#                              re-checked every window against the last kept
-#                              sample, so this is how fast a brief on-screen
-#                              appearance gets noticed.
-#   DEFAULT_FLOOR_INTERVAL_SEC is only a backstop for stretches where
-#                              nothing ever triggers motion (a genuinely
-#                              static scene) — looser than window_sec is
-#                              fine since it isn't the recall mechanism.
-#   DEFAULT_MOTION_THRESHOLD   is the sensitivity dial: how much luma
-#                              change (0-255 scale, on a downscaled
-#                              signature) counts as "the picture changed".
-DEFAULT_WINDOW_SEC = 0.4
-DEFAULT_FLOOR_INTERVAL_SEC = 3.0
-DEFAULT_MOTION_THRESHOLD = 6.0
-
-_ACTIVITY_SIZE = (160, 90)  # (width, height) of the downscaled luma signature — the
-# actual full-resolution frame is still used for detection; this only feeds the
-# cheap motion/sharpness signal that decides *which* frames to keep. Kept larger
-# than a typical motion-detector proxy would use so a small/distant face entering
-# frame still perturbs enough cells to register — still trivially cheap next to
-# the ArcFace/RetinaFace inference cost that dominates this pipeline regardless.
-
-
-def _activity_signature(frame: np.ndarray, size: tuple[int, int] = _ACTIVITY_SIZE) -> np.ndarray:
-    """Cheap per-frame signature for motion/scene-change comparison.
-
-    Pure-NumPy nearest-neighbour downsample + luma grayscale. Deliberately
-    avoids a second cv2 call per frame (the caller already paid for one
-    decode) — a coarse ~48x27 signal is plenty to tell "the picture
-    changed" apart from "identical scene" without pixel-perfect comparison,
-    and staying in NumPy keeps this testable independent of cv2's own
-    resize/color-convert behaviour.
-    """
-    h, w = frame.shape[:2]
-    tw, th = size
-    xs = np.clip((np.arange(tw) * w) // max(1, tw), 0, w - 1)
-    ys = np.clip((np.arange(th) * h) // max(1, th), 0, h - 1)
-    small = frame[ys][:, xs]  # th x tw x 3, BGR (cv2 decode order)
-    b = small[..., 0].astype(np.float32)
-    g = small[..., 1].astype(np.float32)
-    r = small[..., 2].astype(np.float32)
-    return b * 0.114 + g * 0.587 + r * 0.299
-
-
-def _activity_diff(a: np.ndarray, b: np.ndarray) -> float:
-    """Mean absolute difference between two activity signatures (0..255 scale)."""
-    return float(np.abs(a - b).mean())
-
-
-def _sharpness(sig: np.ndarray) -> float:
-    """Cheap sharpness proxy: variance of the signature's local gradient.
-
-    Computed on the already-downscaled activity signature so picking the
-    least motion-blurred frame within a sampling window costs nothing
-    beyond the diff signature every frame already needs.
-    """
-    if sig.shape[0] < 2 or sig.shape[1] < 2:
-        return 0.0
-    gx = np.diff(sig, axis=1)
-    gy = np.diff(sig, axis=0)
-    return float(gx.var() + gy.var())
-
-
 def extract_video_frames(
     path: str,
     allow_roots: list[str],
     max_frames: int = 120,
-    *,
-    window_sec: float = DEFAULT_WINDOW_SEC,
-    floor_interval_sec: float = DEFAULT_FLOOR_INTERVAL_SEC,
-    motion_threshold: float = DEFAULT_MOTION_THRESHOLD,
-    progress_cb: Callable[[int, int], None] | None = None,
-) -> Iterator[np.ndarray]:
-    """Yield content-adaptive frames from a video via one sequential decode.
+) -> list[np.ndarray]:
+    """Extract evenly-spaced frames from a video using cv2.VideoCapture.
 
-    Replaces the previous evenly-spaced-by-duration-band sampler. Uniform
-    time sampling misses any face whose on-screen appearance is shorter
-    than the sampling interval, and ``cv2``'s ``CAP_PROP_POS_FRAMES`` seek
-    is unreliable on long-GOP H.264/HEVC (it lands on the nearest keyframe,
-    not the requested index). This walks the video exactly once, start to
-    end — no seeking — and decides on the fly which frames are worth
-    keeping, using **fixed** constants that do not scale with video
-    duration (see docs/requirements.md §4.1):
-
-    - The video is split into ``window_sec`` windows. Within each window,
-      the least motion-blurred frame (cheapest-possible sharpness proxy on
-      a downscaled luma signature) is that window's candidate.
-    - A candidate is *kept* when it differs from the previously kept
-      sample by more than ``motion_threshold`` — the picture actually
-      changed — checked at every window boundary, which is what lets a
-      brief appearance get caught regardless of video length.
-    - A candidate is also kept if ``floor_interval_sec`` has elapsed since
-      the last kept sample, even with zero detected motion — a backstop
-      for genuinely static scenes, not the primary recall mechanism.
-    - ``max_frames`` is a hard ceiling — a runaway-safety net, not a
-      duration-based budget. It should rarely bind for real videos.
-
-    Frames are yielded as in-memory BGR ndarrays in temporal order — no
-    temp files written to disk, no seeking. This is a generator so a
-    caller that detects-and-discards each frame as it arrives (the
-    streaming pipeline in docs/requirements.md §4.2) never holds more than
-    a handful of decoded frames in memory regardless of video length.
-
-    ``progress_cb``, when given, is called as ``progress_cb(idx, total_frames)``
-    once per decoded frame (``idx`` is the 0-based position in the raw
-    stream, not the count of *kept* samples) so a caller can report
-    "how far through the video are we" — see ``video_progress.py`` and
-    ``GET /detect/video/status/{job_id}`` — without needing to know
-    ``total_frames`` ahead of time. Not called on the ``total_frames <= 0``
-    fallback branch below, since there's nothing meaningful to report.
+    Frames are returned as in-memory BGR ndarrays — no temp files written.
+    Sample count adapts to video duration so short clips get at least one
+    frame and very long videos stay under ``max_frames``.
 
     Raises
     ------
@@ -324,6 +232,26 @@ def extract_video_frames(
         ``path`` falls outside TGDL_FACES_ALLOW_ROOTS.
     FileNotFoundError
         ``path`` is missing or cv2 cannot open it as a video.
+    """
+    return list(iter_video_frames(path, allow_roots, max_frames=max_frames))
+
+
+def iter_video_frames(
+    path: str,
+    allow_roots: list[str],
+    max_frames: int = 120,
+    with_time: bool = False,
+) -> Iterator[Any]:
+    """Streaming form of :func:`extract_video_frames`.
+
+    Validation and ``VideoCapture`` open happen eagerly (same exceptions),
+    but frames are decoded one at a time as the caller iterates, so a
+    120-frame 4K sample never sits in memory at once (~3 GB as a list).
+    The capture is released when the iterator is exhausted or closed.
+
+    ``with_time=True`` yields ``(seconds, frame)`` pairs — the position of
+    each sampled frame, which the Node side stores so a face crop can seek
+    straight back to it.
     """
     if not allow_roots:
         raise PathNotAllowedError(
@@ -337,7 +265,10 @@ def extract_video_frames(
     cap = cv2.VideoCapture(target)
     if not cap.isOpened():
         raise FileNotFoundError(f"cv2 cannot open video {path!r}")
+    return _frames_from_capture(cap, max_frames, with_time)
 
+
+def _frames_from_capture(cap: Any, max_frames: int, with_time: bool = False) -> Iterator[Any]:
     try:
         raw_fps = cap.get(cv2.CAP_PROP_FPS)
         fps = raw_fps if raw_fps and raw_fps > 0 else 25.0
@@ -347,51 +278,37 @@ def extract_video_frames(
             # Some containers don't report frame count — grab one frame.
             ret, frame = cap.read()
             if ret and frame is not None:
-                yield frame, 0, 0.0
+                yield (0.0, frame) if with_time else frame
             return
 
-        window_frames = max(1, round(fps * window_sec))
-        floor_frames = max(window_frames, round(fps * floor_interval_sec))
+        duration = total_frames / fps
 
-        prev_sig: np.ndarray | None = None
-        last_kept_idx = -floor_frames
-        kept = 0
+        # Adaptive sample count: more frames for short clips, fewer for long.
+        if duration < 30:
+            n_samples = min(3, total_frames)
+        elif duration < 300:       # < 5 min
+            n_samples = min(30, max_frames)
+        elif duration < 1800:      # < 30 min
+            n_samples = min(60, max_frames)
+        else:
+            n_samples = max_frames
 
-        best_sharp = -1.0
-        best_frame: np.ndarray | None = None
-        best_sig: np.ndarray | None = None
-        best_idx = 0
-        window_start = 0
+        n_samples = max(1, min(n_samples, total_frames))
 
-        for idx in range(total_frames):
+        if n_samples == 1:
+            indices = [total_frames // 2]
+        else:
+            step = (total_frames - 1) / (n_samples - 1)
+            indices = [
+                min(int(round(i * step)), total_frames - 1)
+                for i in range(n_samples)
+            ]
+
+        for idx in indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, float(idx))
             ret, frame = cap.read()
-            if not ret or frame is None:
-                break
-            if progress_cb is not None:
-                progress_cb(idx, total_frames)
-            sig = _activity_signature(frame)
-            sharp = _sharpness(sig)
-            if sharp > best_sharp:
-                best_sharp, best_frame, best_sig, best_idx = sharp, frame, sig, idx
-
-            at_window_end = (idx - window_start + 1) >= window_frames
-            at_video_end = idx == total_frames - 1
-            if best_frame is not None and (at_window_end or at_video_end):
-                motion = (
-                    _activity_diff(prev_sig, best_sig)
-                    if prev_sig is not None
-                    else float("inf")
-                )
-                hit_floor = (best_idx - last_kept_idx) >= floor_frames
-                if prev_sig is None or motion >= motion_threshold or hit_floor:
-                    yield best_frame, best_idx, best_idx / fps
-                    prev_sig = best_sig
-                    last_kept_idx = best_idx
-                    kept += 1
-                    if kept >= max_frames:
-                        return
-                best_sharp, best_frame, best_sig = -1.0, None, None
-                window_start = idx + 1
+            if ret and frame is not None:
+                yield (idx / fps, frame) if with_time else frame
     finally:
         cap.release()
 
@@ -423,8 +340,23 @@ def load_image_from_b64(data: str) -> np.ndarray:
     if not raw:
         raise Base64DecodeError("image_b64 decoded to zero bytes")
 
+    return load_image_from_bytes(raw, what="image_b64 bytes")
+
+
+def load_image_from_bytes(raw: bytes, what: str = "uploaded bytes") -> np.ndarray:
+    """Decode encoded image bytes (JPEG, PNG, WebP, …) into a BGR ndarray.
+
+    Applies the EXIF Orientation tag once, like every other load path.
+
+    Raises
+    ------
+    ImageDecodeError
+        The bytes aren't a recognised image format.
+    """
+    if not raw:
+        raise ImageDecodeError(f"{what}: empty")
     buf = np.frombuffer(raw, dtype=np.uint8)
-    img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+    img = cv2.imdecode(buf, _IMREAD_FLAGS)
     if img is None:
-        raise ImageDecodeError("image_b64 bytes could not be decoded as an image")
+        raise ImageDecodeError(f"{what} could not be decoded as an image")
     return _apply_exif_orientation(img, raw)

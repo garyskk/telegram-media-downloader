@@ -29,6 +29,11 @@ This README is for contributors who want to run the sidecar from source.
 | `POST` | `/detect` | `{ path \| image_b64, min_score?, min_box_px?, ar_range? }` | `{ faces[], image_w, image_h }` |
 | `POST` | `/detect-embed` | _alias of `/detect` — same body, same response_ | — |
 | `POST` | `/detect/batch` | `{ files: string[], min_score?, min_box_px?, ar_range? }` | `{ results[], total_files, total_faces }` |
+| `POST` | `/detect/upload` | raw image bytes; `?min_score=&min_box_px=&ar_lo=&ar_hi=` (0.5.1+) | same as `/detect` |
+
+`/health` lists `features` (0.5.1+; `upload` = `/detect/upload` exists) and
+`max_upload_bytes`. With `TGDL_FACES_API_TOKEN` set, every route but
+`/health` needs `X-API-Token: <token>` or `Authorization: Bearer <token>`.
 
 ### `/health` response format
 
@@ -38,7 +43,7 @@ Matches the seekbar health response shape:
 {
   "ok": true,
   "service": "faces-service",
-  "version": "0.1.0",
+  "version": "0.5.1",
   "platform": "linux",
   "arch": "x86_64",
   "ready": true,
@@ -137,10 +142,16 @@ curl -X POST http://127.0.0.1:8011/detect/batch-b64 \
 | `TGDL_FACES_ALLOW_ROOTS` | _empty_ | Comma-separated absolute paths the sidecar may read from. If empty, path-mode is rejected (403); only base64 works. |
 | `TGDL_FACES_PROVIDERS` | `auto` | onnxruntime provider hint. Shorthand aliases: `auto`, `cpu`, `cuda`, `coreml`, `directml`, `openvino`. Or a comma-separated list of full provider names: `CUDAExecutionProvider,CPUExecutionProvider`. |
 | `TGDL_FACES_DETECTOR_MODEL` | `buffalo_l` | insightface model pack name. |
-| `TGDL_FACES_DET_SIZE` | `480` | Detector input size. Raise to `640` for better recall on small/distant faces. |
-| `TGDL_FACES_MAX_CONCURRENCY` | `2` (CPU) / `8` (GPU) | Max parallel detection requests. Auto-scales when GPU is detected. |
+| `TGDL_FACES_DET_SIZE` | `640` | Detector input size. `480` is the Pi 4 sweet spot. |
+| `TGDL_FACES_MAX_CONCURRENCY` | `2` (CPU, ≤ CPU budget) / `24` (GPU) | Max parallel detection requests. Auto-scales when GPU is detected. |
+| `TGDL_FACES_CPU_THREADS` | effective CPUs − reserve | CPU provider: total inference threads, split across `TGDL_FACES_MAX_CONCURRENCY`. "Effective" honours cgroup quota and affinity, unlike `os.cpu_count()` in a container. |
+| `TGDL_FACES_RESERVE_CPUS` | `0` | Cores left for co-located processes. The Node app sets `1` when it auto-spawns the sidecar. |
+| `TGDL_FACES_INTRA_OP_THREADS` | budget ÷ concurrency | Explicit onnxruntime intra-op threads per session. |
+| `TGDL_FACES_ORT_SPIN` | `0` | `1` re-enables onnxruntime busy-wait spinning (off by default on CPU so idle threads don't burn cores). |
 | `TGDL_FACES_SKIP_QUALITY` | _empty_ | Set to `1` to skip per-face quality score computation for higher throughput. |
 | `TGDL_FACES_LOG_LEVEL` | `INFO` | Standard Python `logging` level. |
+| `TGDL_FACES_API_TOKEN` | _empty_ | Require this token on every route but `/health`. |
+| `TGDL_FACES_MAX_UPLOAD_MB` | `64` | Cap for `/detect/upload` bodies (413 above it). |
 
 ### GPU provider auto-detection (`TGDL_FACES_PROVIDERS=auto`)
 
@@ -155,25 +166,24 @@ curl -X POST http://127.0.0.1:8011/detect/batch-b64 \
 
 ```bash
 cd faces-service
+python -m venv .venv
+# Windows
+.venv\Scripts\activate
+# Unix / macOS
+source .venv/bin/activate
 
-# Install deps into .venv (CPU variant by default)
-uv sync --group dev
-
-# GPU / DirectML / OpenVINO variants (pick one — they replace onnxruntime):
-# uv sync --group dev --extra gpu
-# uv sync --group dev --extra directml
-# uv sync --group dev --extra openvino
+pip install -e ".[test]"
 
 # Auto-detect platform and install the matching onnxruntime EP
 # (DirectML on Windows, CUDA on NVIDIA Linux, OpenVINO on Intel Linux,
 # CoreML on macOS — uninstalls any conflicting wheel first).
-uv run python -m tgdl_faces.install        # or: uv run tgdl-faces-install
+python -m tgdl_faces.install        # or: tgdl-faces-install
 # Flags: --dry-run | --force {cpu,gpu,directml,openvino} | --no-uninstall
 
 # Run the sidecar on 127.0.0.1:8011
 # The model pre-loads in a background thread — /health.ready becomes true
 # a few seconds after startup.
-uv run python -m tgdl_faces
+python -m tgdl_faces
 ```
 
 In a second terminal:
@@ -206,17 +216,16 @@ curl -X POST http://127.0.0.1:8011/detect \
     -d "{\"image_b64\": \"$B64\"}"
 ```
 
-## Dependency variants
+## Requirements files
 
-| Install command | Use |
+| File | Use |
 |---|---|
-| `uv sync` | CPU-only (default) |
-| `uv sync --extra gpu` | NVIDIA CUDA (Linux/Windows) |
-| `uv sync --extra directml` | DirectML (Windows, any DX12 GPU) |
-| `uv sync --extra openvino` | Intel OpenVINO |
+| `requirements.txt` | CPU-only (default) |
+| `requirements-cuda.txt` | NVIDIA CUDA (Linux/Windows) |
+| `requirements-directml.txt` | DirectML (Windows, any DX12 GPU) |
 
 The onnxruntime variants share the `onnxruntime` module name and cannot coexist — install
-only one per environment. Exact versions are pinned in `uv.lock`.
+only one per environment.
 
 ## Docker
 

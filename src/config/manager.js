@@ -12,6 +12,48 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const LEGACY_CONFIG_PATH = path.join(__dirname, '../../data/config.json');
 const KV_KEY = 'config';
 
+// Default Content-Security-Policy directives (data, not code). Order is the
+// order the header is emitted in. `web.csp.directives` in the stored config
+// replaces this wholesale; a missing `web.csp` means these defaults.
+// Not part of DEFAULT_CONFIG on purpose: keeping it out of the persisted tree
+// means later releases can change the defaults for installs that never
+// customised them.
+export const DEFAULT_CSP_DIRECTIVES = Object.freeze({
+    'default-src': ["'self'"],
+    'base-uri': ["'self'"],
+    'font-src': ["'self'", 'data:', 'https://fonts.gstatic.com', 'https://cdn.jsdelivr.net'],
+    'form-action': ["'self'"],
+    'frame-ancestors': ["'self'"],
+    'img-src': ["'self'", 'data:', 'blob:'],
+    'object-src': ["'none'"],
+    'script-src': [
+        "'self'",
+        "'unsafe-inline'",
+        'https://cdn.jsdelivr.net',
+        'https://cdnjs.cloudflare.com',
+    ],
+    'script-src-attr': ["'unsafe-inline'"],
+    'style-src': [
+        "'self'",
+        "'unsafe-inline'",
+        'https://cdn.jsdelivr.net',
+        'https://cdnjs.cloudflare.com',
+        'https://fonts.googleapis.com',
+    ],
+    'style-src-attr': ["'unsafe-inline'"],
+    'media-src': ["'self'", 'blob:'],
+    'connect-src': ["'self'", 'ws:', 'wss:'],
+    'frame-src': ["'self'"],
+});
+
+export function getDefaultCsp() {
+    return {
+        enabled: true,
+        reportOnly: false,
+        directives: JSON.parse(JSON.stringify(DEFAULT_CSP_DIRECTIVES)),
+    };
+}
+
 const DEFAULT_CONFIG = {
     telegram: {
         apiId: '',
@@ -72,9 +114,6 @@ const DEFAULT_CONFIG = {
             // Idle worker sleep when no job is available. Lower = snappier
             // pickup of new jobs at the cost of a bit more CPU.
             idleSleepMs: 200,
-            // History (priority 2) queue length above which new jobs spill
-            // to disk instead of growing RAM. Realtime never spills.
-            spilloverThreshold: 2000,
         },
         history: {
             // Backfill pauses iteration when the downloader queue is above
@@ -157,8 +196,9 @@ const DEFAULT_CONFIG = {
             hwaccel: null,
         },
         // Similar clips (near-duplicate videos + partial-clip detection).
-        // Similar-clips PDQ fingerprints are a separate ffmpeg walk from
-        // hover sprites. Hover knobs stay under `seekbar.*`.
+        // PDQ fingerprints are a separate ffmpeg walk from hover sprites.
+        // Hover knobs stay under `seekbar.*`. Saved values are not rewritten
+        // on upgrade; env `TGDL_SIMILAR_*` wins over this block, then defaults.
         similarClips: {
             similarThreshold: 50,
             durationTolerance: 0.1,
@@ -511,9 +551,8 @@ const DEFAULT_CONFIG = {
                 // Aspect-ratio window for valid face boxes.
                 arRange: [0.5, 2.0],
                 // Sidecar input size — bigger = better recall on small
-                // faces, slower per image. 480 balances speed vs recall;
-                // raise to 640 if distant faces are being missed.
-                detSize: 480,
+                // faces, slower per image. 480 is the Pi 4 sweet spot.
+                detSize: 640,
                 // buffalo_l native embedding dim. Informational only — the
                 // sidecar enforces this on its end.
                 embedDim: 512,
@@ -609,15 +648,6 @@ const DEFAULT_CONFIG = {
                 // are biometric data. Alias of the legacy `federateFaces`
                 // flat key.
                 federate: false,
-
-                // ===== Video face scan (Node scan-runner) =====
-                // Off by default — opt in via Maintenance toggle. Limit /
-                // nice are also editable in the UI; do not pin them via
-                // compose env with a `:-0` default or the UI value is
-                // silently overridden (env beats kv — see faces-config.js).
-                scanVideos: false,
-                videoScanLimit: 0, // 0 = unlimited videos per scan run
-                videoNice: 0, // Unix nice bump during video phase; 0 = off
             },
         },
     },

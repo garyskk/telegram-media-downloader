@@ -28,7 +28,6 @@ afterAll(() => {
 });
 
 afterEach(() => {
-    delete process.env.TGDL_SIMILAR_FINGERPRINT_FPS;
     delete process.env.TGDL_SIMILAR_THRESHOLD;
     delete process.env.TGDL_SIMILAR_PARTIAL_FRAME_THRESHOLD;
     delete process.env.TGDL_SIMILAR_SCENE_THRESHOLD;
@@ -57,8 +56,7 @@ describe('getSimilarClipsConfig', () => {
         expect(cfg.floorIntervalSec).toBe(5);
     });
 
-    it('does not expose leftover fingerprintFps from env', () => {
-        process.env.TGDL_SIMILAR_FINGERPRINT_FPS = '0.5';
+    it('does not expose a fingerprintFps knob', () => {
         const cfg = getSimilarClipsConfig();
         expect(cfg.fingerprintFps).toBeUndefined();
         expect(SIMILAR_CLIPS_DEFAULTS.sceneThreshold).toBe(0.1);

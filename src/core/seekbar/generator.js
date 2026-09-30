@@ -1,18 +1,19 @@
 /**
  * Seekbar sprite generator. One ffmpeg call per video → WebP sprite
  * sheet + JSON sidecar. Deterministic: same source bytes + same config
- * always produce the same on-disk artefacts.
+ * always produce the same on-disk artefacts, so the cache-friendliness
+ * promise in the spec holds.
  *
  * Algorithm (per-clip):
  *   1. ffprobe → duration.
- *   2. Pick a frame count from duration tiers, capped by maxTiles.
+ *   2. Pick a frame count: `clamp(ceil(duration / interval), 12, maxTiles)`.
  *      Recompute `interval = duration / frames` so the last sample lands
  *      on the clip's final second.
  *   3. Lay tiles out as `cols × ceil(frames / cols)`.
- *   4. ffmpeg `-vf` fps=1/interval, scale=W:-2, tile → .webp
- *      libwebp present → encode hover in-process. libwebp missing →
- *      tiled JPEG then sharp WebP (mirrors thumbs.js).
- *   5. Atomic .tmp → final rename for the sprite and the JSON.
+ *   4. ffmpeg `fps=1/interval, scale=W:-2, tile=COLS×ROWS` → single .webp.
+ *      libwebp present → encode in-process. libwebp missing → render a
+ *      tiled JPEG and let sharp re-encode to WebP (mirrors thumbs.js).
+ *   5. Atomic .tmp → final rename for both the sprite and the JSON.
  */
 
 import { spawn } from 'child_process';
@@ -23,7 +24,7 @@ import path from 'path';
 import sharp from 'sharp';
 
 import { loadConfig } from '../../config/manager.js';
-import { resetNsfwVideoResult, upsertSeekbarSprite } from '../db.js';
+import { upsertSeekbarSprite } from '../db.js';
 import {
     ffmpegHasLibwebp,
     hasFfmpeg,
@@ -32,10 +33,19 @@ import {
     runFfmpegArgs,
 } from '../thumbs.js';
 import {
+    cancelJob as sidecarCancelJob,
+    deleteSprite as sidecarDeleteSprite,
+    downloadSprite as sidecarDownloadSprite,
+    fromSidecarPath,
+    getJob as sidecarGetJob,
     getSidecarUrl,
+    hasFeature as sidecarHasFeature,
+    isSourceNotFound,
     submitOne as sidecarSubmitOne,
-    waitForJob as sidecarWaitForJob,
+    toSidecarPath,
+    uploadSource as sidecarUploadSource,
 } from './client.js';
+import { resetNsfwVideoResult } from '../db.js';
 import { getDataDir, getDownloadsDir } from '../paths.js';
 
 const DATA_DIR = getDataDir();
@@ -55,38 +65,6 @@ export const SEEKBAR_DEFAULTS = Object.freeze({
     maxRetries: 3,
     hwaccel: null,
 });
-
-/** Floor so a cold ffmpeg + dense short clip still has headroom. */
-export const SPRITE_TIMEOUT_FLOOR_MS = 5 * 60_000;
-/** Cap so a wedged encode cannot hold a worker forever. */
-export const SPRITE_TIMEOUT_CAP_MS = 60 * 60_000;
-
-/**
- * Wall-clock budget for one sprite encode: 1× realtime, clamped to
- * 5 min … 60 min. Used for both the sidecar job poll and the Node
- * ffmpeg fallback. Thumbs keep their own 120s kill.
- */
-export function spriteTimeoutMs(durationSec) {
-    const d = Number(durationSec);
-    if (!Number.isFinite(d) || d <= 0) return SPRITE_TIMEOUT_FLOOR_MS;
-    return Math.min(SPRITE_TIMEOUT_CAP_MS, Math.max(SPRITE_TIMEOUT_FLOOR_MS, Math.ceil(d * 1000)));
-}
-
-function _sidecarJobId(r) {
-    if (!r || typeof r !== 'object') return null;
-    const id = r.id || r.job_id || r.jobId;
-    return id != null && String(id) ? String(id) : null;
-}
-
-async function _awaitSidecarJob(submitted, { timeoutMs, signal } = {}) {
-    const status = String(submitted?.status || '').toLowerCase();
-    if (status === 'done' || status === 'failed' || status === 'error' || status === 'cancelled') {
-        return submitted;
-    }
-    const jobId = _sidecarJobId(submitted);
-    if (!jobId) return submitted;
-    return sidecarWaitForJob(jobId, { timeoutMs, signal });
-}
 
 export function getSeekbarConfig() {
     let stored = {};
@@ -208,56 +186,6 @@ export function planSprite(durationSec, cfg) {
     return { frames, intervalSec: interval, cols, rows, tileW };
 }
 
-/**
- * ffmpeg argv for a hover-only sprite encode (binary not included).
- */
-export function buildSpriteFilter(plan, scaleVf = null) {
-    const hoverScale = scaleVf ? scaleVf(plan.tileW) : `scale=${plan.tileW}:-2:flags=fast_bilinear`;
-    return `fps=1/${plan.intervalSec},${hoverScale},tile=${plan.cols}x${plan.rows}`;
-}
-
-export function buildSpriteFfmpegArgs({
-    srcAbs,
-    dstTmp,
-    plan,
-    useWebp,
-    quality,
-    hwArgs = [],
-    scaleVf = null,
-}) {
-    const q = Math.max(1, Math.min(100, Number(quality) || 70));
-    const args = [
-        '-hide_banner',
-        '-loglevel',
-        'error',
-        '-y',
-        ...hwArgs,
-        '-i',
-        srcAbs,
-        '-frames:v',
-        '1',
-        '-an',
-        '-vf',
-        buildSpriteFilter(plan, scaleVf),
-    ];
-    if (useWebp) {
-        args.push(
-            '-c:v',
-            'libwebp',
-            '-quality',
-            String(q),
-            '-compression_level',
-            '6',
-            '-f',
-            'webp',
-            dstTmp,
-        );
-    } else {
-        args.push('-q:v', String(Math.max(2, Math.min(31, Math.round(31 - q / 4)))), dstTmp);
-    }
-    return args;
-}
-
 async function _writeAtomic(absPath, body) {
     const tmp = absPath + '.tmp.' + crypto.randomBytes(4).toString('hex');
     await fs.writeFile(tmp, body);
@@ -267,38 +195,77 @@ async function _writeAtomic(absPath, body) {
 async function _runSpriteFfmpeg({ srcAbs, dstAbs, plan, cfg, timeoutMs }) {
     const useWebp =
         (cfg.format === 'webp' || !cfg.format) && ffmpegHasLibwebp() && dstAbs.endsWith('.webp');
+    // Upload pipeline: GPU accelerates decode (frames land on CPU for the fps
+    // SW filter), then each selected frame is uploaded to GPU for scale and
+    // downloaded before the tile SW filter. Falls back to pure SW scale when
+    // no GPU scaler is available for the configured backend.
     const { inputArgs: hwa, scaleVf } = hwaccelUploadPipeline(cfg.hwaccel ?? null);
+    const swScale = `scale=${plan.tileW}:-2:flags=fast_bilinear`;
     const tmp = dstAbs + '.tmp.' + crypto.randomBytes(4).toString('hex');
-    const common = {
-        srcAbs,
-        plan,
-        quality: cfg.quality,
-        hwArgs: hwa,
-        scaleVf,
+    const run = {
+        timeoutMs,
+        timeoutMessage: `ffmpeg sprite timed out after ${Math.round(timeoutMs / 1000)} s — will retry on the next scan`,
     };
-    const _cleanupTmp = async () => {
-        try {
-            if (existsSync(tmp)) await fs.unlink(tmp);
-        } catch {}
-    };
+    const filterChain = `fps=1/${plan.intervalSec},${scaleVf ? scaleVf(plan.tileW) : swScale},tile=${plan.cols}x${plan.rows}`;
     if (useWebp) {
+        const args = [
+            '-hide_banner',
+            '-loglevel',
+            'error',
+            ...hwa,
+            '-i',
+            srcAbs,
+            '-frames:v',
+            '1',
+            '-an',
+            '-vf',
+            filterChain,
+            '-c:v',
+            'libwebp',
+            '-quality',
+            String(Math.max(1, Math.min(100, Number(cfg.quality) || 70))),
+            '-compression_level',
+            '6',
+            '-f',
+            'webp',
+            '-y',
+            tmp,
+        ];
         try {
-            await runFfmpegArgs(
-                buildSpriteFfmpegArgs({ ...common, dstTmp: tmp, useWebp: true }),
-                timeoutMs ? { timeoutMs } : {},
-            );
-            await fs.rename(tmp, dstAbs);
+            await runFfmpegArgs(args, run);
         } catch (e) {
-            await _cleanupTmp();
+            try {
+                if (existsSync(tmp)) await fs.unlink(tmp);
+            } catch {}
             throw e;
         }
+        await fs.rename(tmp, dstAbs);
         return;
     }
+    // JPEG fallback: render a tiled JPEG, optionally re-encode to WebP via
+    // sharp so callers asking for `format:'webp'` on a libwebp-less ffmpeg
+    // still get a WebP sprite.
     const jpgTmp = tmp + '.jpg';
     try {
         await runFfmpegArgs(
-            buildSpriteFfmpegArgs({ ...common, dstTmp: jpgTmp, useWebp: false }),
-            timeoutMs ? { timeoutMs } : {},
+            [
+                '-hide_banner',
+                '-loglevel',
+                'error',
+                ...hwa,
+                '-i',
+                srcAbs,
+                '-frames:v',
+                '1',
+                '-an',
+                '-vf',
+                filterChain,
+                '-q:v',
+                String(Math.max(2, Math.min(31, Math.round(31 - (Number(cfg.quality) || 70) / 4)))),
+                '-y',
+                jpgTmp,
+            ],
+            run,
         );
         if (!existsSync(jpgTmp)) throw new Error('ffmpeg produced no sprite');
         if (dstAbs.endsWith('.webp')) {
@@ -316,7 +283,9 @@ async function _runSpriteFfmpeg({ srcAbs, dstAbs, plan, cfg, timeoutMs }) {
         try {
             if (existsSync(jpgTmp)) await fs.unlink(jpgTmp);
         } catch {}
-        await _cleanupTmp();
+        try {
+            if (existsSync(tmp)) await fs.unlink(tmp);
+        } catch {}
     }
 }
 
@@ -337,6 +306,142 @@ async function _notifyNsfwSpriteReady(downloadId) {
     } catch {
         /* best-effort — NSFW re-queue is non-critical */
     }
+}
+
+// Errors that mean this file can't produce a sprite at all — the scan marks
+// such rows failed and never retries them. Anything else (timeouts, sidecar
+// hiccups) is retried by the next scan.
+const PERMANENT_ERROR_RE =
+    /does not contain any stream|no video stream|Invalid data found|Invalid NAL|moov atom not found/i;
+
+export function isPermanentSeekbarError(msg) {
+    return PERMANENT_ERROR_RE.test(String(msg || ''));
+}
+
+/**
+ * How long one sprite encode may take. A sprite pass decodes the whole
+ * clip, so this scales with it: 1× the duration, clamped to 5–60 min.
+ */
+export function spriteBudgetMs(durationSec) {
+    const ms = (Number(durationSec) || 0) * 1000;
+    return Math.min(60 * 60_000, Math.max(5 * 60_000, ms));
+}
+
+// Sidecar job polling starts quick (short clips finish in a second or two)
+// and backs off to every 5 s for long encodes.
+const POLL_FIRST_MS = 500;
+const POLL_MAX_MS = 5000;
+
+function _sleep(ms, signal) {
+    return new Promise((resolve) => {
+        const done = () => {
+            clearTimeout(t);
+            signal?.removeEventListener('abort', done);
+            resolve();
+        };
+        const t = setTimeout(done, ms);
+        signal?.addEventListener('abort', done, { once: true });
+    });
+}
+
+/**
+ * Wait for a job the sidecar accepted to settle, polling
+ * `GET /v1/jobs/:id`. Returns the final job, or null if `signal` aborts.
+ * `budgetMs` applies to the time spent queued and, afresh, to the encode
+ * once it runs. Throws a retryable error when the budget runs out or the
+ * sidecar no longer knows the job (404: it keeps only its last 1000 jobs,
+ * and none across a restart).
+ */
+async function _waitForSidecarJob(job, budgetMs, signal) {
+    let deadline = Date.now() + budgetMs;
+    let running = false;
+    let delay = POLL_FIRST_MS;
+    while (job.status === 'pending' || job.status === 'running') {
+        if (job.status === 'running' && !running) {
+            running = true;
+            deadline = Date.now() + budgetMs;
+        }
+        if (Date.now() >= deadline) {
+            sidecarCancelJob(job.id).catch(() => {}); // only cancels a still-queued job
+            throw new Error(
+                `seekbar sidecar still busy after ${Math.round(budgetMs / 1000)} s — will retry on the next scan`,
+            );
+        }
+        await _sleep(delay, signal);
+        delay = Math.min(delay * 2, POLL_MAX_MS);
+        if (signal?.aborted) {
+            sidecarCancelJob(job.id).catch(() => {});
+            return null;
+        }
+        try {
+            job = await sidecarGetJob(job.id, signal);
+        } catch (e) {
+            if (signal?.aborted) return null;
+            if (e?.status === 404) {
+                throw new Error(
+                    'seekbar sidecar no longer tracks the job (restarted?) — will retry on the next scan',
+                );
+            }
+            throw new Error(`seekbar sidecar poll failed: ${e?.message || e}`);
+        }
+    }
+    return job;
+}
+
+// One hint per process: a remote sidecar that can't read our videos and
+// can't take uploads leaves the work to local ffmpeg.
+let _cantReachHintLogged = false;
+
+function _spriteFormatOf(job, fallback) {
+    const f = String(job?.format || '').toLowerCase();
+    if (f === 'jpg' || f === 'jpeg') return 'jpeg';
+    if (f === 'webp') return 'webp';
+    const ext = path.extname(String(job?.sprite_path || '')).toLowerCase();
+    if (ext === '.jpg' || ext === '.jpeg') return 'jpeg';
+    if (ext === '.webp') return 'webp';
+    return fallback;
+}
+
+function _samePath(a, b) {
+    const n = (p) => path.resolve(p).replace(/\\/g, '/');
+    return process.platform === 'win32' ? n(a).toLowerCase() === n(b).toLowerCase() : n(a) === n(b);
+}
+
+function _sizeOf(p) {
+    try {
+        return statSync(p).size;
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * Put the sidecar's finished sprite at `dstAbs`. In order:
+ *   - it already wrote there (local sidecar, or a shared output dir —
+ *     mapped, or unmapped but byte-for-byte the job's size);
+ *   - its output path is visible here through the path map → copy;
+ *   - otherwise download it (`GET /sprite/:id`, any sidecar version) and
+ *     drop the sidecar's staging copy.
+ * Throws a retryable error when none works, so the row isn't recorded
+ * with a sprite the app can't serve.
+ */
+async function _collectSidecarSprite(job, id, dstAbs, signal) {
+    const local = job.sprite_path ? fromSidecarPath(job.sprite_path) : null;
+    if (local && _samePath(local, dstAbs) && existsSync(dstAbs)) return;
+    if (local && existsSync(local)) {
+        await fs.copyFile(local, dstAbs);
+        return;
+    }
+    const size = _sizeOf(dstAbs);
+    if (size && Number(job.bytes) > 0 && size === Number(job.bytes)) return;
+    try {
+        await sidecarDownloadSprite(job.video_id ?? String(id), dstAbs, { signal });
+    } catch (e) {
+        throw new Error(
+            `seekbar sidecar: sprite not reachable from the app (${e?.message || e}) — will retry on the next scan`,
+        );
+    }
+    sidecarDeleteSprite(job.video_id ?? String(id)).catch(() => {});
 }
 
 /**
@@ -421,134 +526,146 @@ export async function generateForDownload(row, cfg = null, opts = {}) {
 
     const plan = planSprite(duration, conf);
     await _ensureSeekbarDir();
-    const timeoutMs = spriteTimeoutMs(duration);
 
-    // Prefer the Go sidecar when a URL is configured. Submit async and
-    // poll GET /v1/jobs/:id for the duration-scaled budget so a 1h+
-    // encode is not killed by the sidecar's 60s sync wait or by a
-    // second local ffmpeg. Fall through to in-process ffmpeg only when
-    // submit itself fails (sidecar down / network) — never while a job
-    // is still pending or running.
+    // Prefer the Go sidecar when it's healthy — same on-disk layout, but
+    // benefits from the multi-arch hwaccel matrix and the dedicated
+    // worker pool. Only a failed submit falls back to in-process ffmpeg
+    // (so `npm start` works without the binary): once the sidecar has
+    // accepted the job it owns the encode, and a second, local ffmpeg on
+    // the same video would just double the work.
+    let job = null;
     if (getSidecarUrl()) {
-        let submitted = false;
+        // A meta file whose sprite is gone would let the sidecar's own
+        // cache check (seekbar-service < 0.4.0 shares this file) answer
+        // "done" without writing a sprite.
+        if (!existsSync(dstAbs) && existsSync(metaAbs)) {
+            try {
+                await fs.unlink(metaAbs);
+            } catch {}
+        }
+        let submitErr = null;
         try {
-            const initial = await sidecarSubmitOne({
+            job = await sidecarSubmitOne({
                 videoId: String(id),
-                srcPath: srcAbs,
+                srcPath: toSidecarPath(srcAbs),
                 async: true,
                 cfg: conf,
+                // We already decided the sprite is stale (our own cache
+                // check above); don't let the sidecar's cache disagree.
+                overwrite: 'always',
                 signal: opts.signal || null,
             });
-            submitted = true;
-            const r = await _awaitSidecarJob(initial, {
-                timeoutMs,
-                signal: opts.signal || null,
-            });
-            const status = String(r?.status || '').toLowerCase();
-            const errMsg = String(r?.error || '');
-            if (status === 'error' || status === 'failed' || status === 'cancelled') {
-                if (
-                    /does not contain any stream|no video stream|Invalid data found|Invalid NAL|moov atom not found|exit status/i.test(
-                        errMsg,
-                    )
-                ) {
-                    throw new Error(`ffmpeg: ${errMsg || status}`);
-                }
-                throw new Error(errMsg || `sidecar ${status}`);
-            }
-            if (status === 'done' && (r.sprite_path || existsSync(dstAbs))) {
-                const sidecarMeta = {
-                    version: 1,
-                    download_id: id,
-                    sprite_url: `/api/seekbar/sprite/${id}`,
-                    meta_url: `/api/seekbar/meta/${id}`,
-                    duration_sec: r.duration ?? duration,
-                    frames: r.frames ?? plan.frames,
-                    cols: r.cols ?? plan.cols,
-                    rows: r.rows ?? plan.rows,
-                    tile_w: r.tile_w ?? plan.tileW,
-                    tile_h: r.tile_h ?? null,
-                    interval_sec: r.interval_sec ?? plan.intervalSec,
-                    format: r.format || format,
-                    bytes: r.bytes ?? null,
-                    source_size: sourceStat.size,
-                    source_mtime: sourceStat.mtime,
-                    generated_at: Date.now(),
-                };
-                if (r.sprite_path && r.sprite_path !== dstAbs && existsSync(r.sprite_path)) {
-                    try {
-                        await fs.copyFile(r.sprite_path, dstAbs);
-                    } catch {
-                        /* leave sprite at sidecar path; we still record it */
-                    }
-                }
-                await _writeAtomic(metaAbs, JSON.stringify(sidecarMeta, null, 0));
-                upsertSeekbarSprite({
-                    downloadId: id,
-                    spritePath: existsSync(dstAbs) ? dstAbs : r.sprite_path,
-                    metaPath: metaAbs,
-                    durationSec: sidecarMeta.duration_sec,
-                    frames: sidecarMeta.frames,
-                    cols: sidecarMeta.cols,
-                    rows: sidecarMeta.rows,
-                    tileW: sidecarMeta.tile_w,
-                    tileH: sidecarMeta.tile_h,
-                    intervalSec: sidecarMeta.interval_sec,
-                    format: sidecarMeta.format,
-                    bytes: sidecarMeta.bytes,
-                    sourceSize: sourceStat.size,
-                    sourceMtime: sourceStat.mtime,
-                    generatedAt: sidecarMeta.generated_at,
-                });
-                await _notifyNsfwSpriteReady(id);
-                return sidecarMeta;
-            }
-            throw new Error(errMsg || `sidecar status ${status || 'unknown'}`);
         } catch (e) {
-            const msg = String(e?.message || e);
-            // Permanent ffmpeg errors (corrupt video) — throw immediately
-            // so scan-runner marks the row as failed. Falling through to
-            // local ffmpeg would just repeat the same failure.
-            if (
-                /does not contain any stream|no video stream|Invalid data found|Invalid NAL|moov atom not found/i.test(
-                    msg,
-                )
-            ) {
-                throw e;
+            submitErr = e;
+        }
+        // A sidecar on another host can't read the file: send it over
+        // (0.4.0+), in chunks small enough for any reverse proxy.
+        if (!job && isSourceNotFound(submitErr) && sidecarHasFeature('upload')) {
+            try {
+                const uploadId = await sidecarUploadSource(srcAbs, { signal: opts.signal || null });
+                job = await sidecarSubmitOne({
+                    videoId: String(id),
+                    uploadId,
+                    async: true,
+                    cfg: conf,
+                    overwrite: 'always',
+                    signal: opts.signal || null,
+                });
+                submitErr = null;
+            } catch (e) {
+                submitErr = e;
             }
-            // Job was accepted — do not start a second ffmpeg. Includes
-            // poll timeouts (`ffmpeg timeout Ns`) and sidecar-side fails.
-            if (submitted) throw e;
-            // Transient sidecar errors (network, URL unset race) — fall
-            // through to the in-process ffmpeg path.
+        }
+        if (!job && submitErr) {
+            if (opts.signal?.aborted) return null;
+            if (isSourceNotFound(submitErr) && !_cantReachHintLogged) {
+                _cantReachHintLogged = true;
+                console.warn(
+                    "[seekbar-generator] the seekbar sidecar can't read the app's videos — set a path mapping for a shared mount, or run seekbar-service 0.4.0+ so videos are uploaded to it. Using local ffmpeg meanwhile.",
+                );
+            }
             console.warn(
                 '[seekbar-generator] sidecar submit failed, falling back to local ffmpeg:',
-                msg.slice(0, 160),
+                String(submitErr?.message || submitErr).slice(0, 160),
             );
         }
     }
+    if (job?.id) {
+        const r = await _waitForSidecarJob(job, spriteBudgetMs(duration), opts.signal);
+        if (!r) return null; // cancelled by the caller
+        if (r.status === 'failed') {
+            const errMsg = String(r.error || 'unknown error');
+            // A bad file stays bad — let the scan mark it. Anything else
+            // (hwaccel hiccup, disk full, …) is retried by the next scan.
+            if (isPermanentSeekbarError(errMsg)) throw new Error(`ffmpeg: ${errMsg}`);
+            throw new Error(`seekbar sidecar: ${errMsg}`);
+        }
+        if (r.status !== 'done' || !r.sprite_path) {
+            throw new Error(`seekbar sidecar job ended as '${r.status}' without a sprite`);
+        }
+        // The sidecar's own settings may differ from ours (older remote
+        // sidecars ignore per-job params) — store under what it produced.
+        const outFormat = _spriteFormatOf(r, format);
+        const outAbs = _spritePath(id, outFormat);
+        await _collectSidecarSprite(r, id, outAbs, opts.signal);
+        if (outAbs !== dstAbs && existsSync(dstAbs)) {
+            try {
+                await fs.unlink(dstAbs); // stale sprite in the other format
+            } catch {}
+        }
+        const outBytes = _sizeOf(outAbs);
+        const sidecarMeta = {
+            version: 1,
+            download_id: id,
+            sprite_url: `/api/seekbar/sprite/${id}`,
+            meta_url: `/api/seekbar/meta/${id}`,
+            duration_sec: r.duration ?? duration,
+            frames: r.frames ?? plan.frames,
+            cols: r.cols ?? plan.cols,
+            rows: r.rows ?? plan.rows,
+            tile_w: r.tile_w ?? plan.tileW,
+            tile_h: r.tile_h ?? null,
+            interval_sec: r.interval_sec ?? plan.intervalSec,
+            format: outFormat,
+            bytes: outBytes ?? r.bytes ?? null,
+            source_size: sourceStat.size,
+            source_mtime: sourceStat.mtime,
+            generated_at: Date.now(),
+        };
+        await _writeAtomic(metaAbs, JSON.stringify(sidecarMeta, null, 0));
+        upsertSeekbarSprite({
+            downloadId: id,
+            spritePath: outAbs,
+            metaPath: metaAbs,
+            durationSec: sidecarMeta.duration_sec,
+            frames: sidecarMeta.frames,
+            cols: sidecarMeta.cols,
+            rows: sidecarMeta.rows,
+            tileW: sidecarMeta.tile_w,
+            tileH: sidecarMeta.tile_h,
+            intervalSec: sidecarMeta.interval_sec,
+            format: sidecarMeta.format,
+            bytes: sidecarMeta.bytes,
+            sourceSize: sourceStat.size,
+            sourceMtime: sourceStat.mtime,
+            generatedAt: sidecarMeta.generated_at,
+        });
+        await _notifyNsfwSpriteReady(id);
+        return sidecarMeta;
+    }
 
-    const _permanentFfmpegError = (msg) =>
-        /does not contain any stream|no video stream|Invalid data found|Invalid NAL|moov atom not found/i.test(
-            msg,
-        );
-
+    const timeoutMs = spriteBudgetMs(duration);
     let lastErr = null;
     for (let attempt = 0; attempt < Math.max(1, Number(conf.maxRetries) || 1) + 1; attempt++) {
         try {
-            await _runSpriteFfmpeg({
-                srcAbs,
-                dstAbs,
-                plan,
-                cfg: conf,
-                timeoutMs,
-            });
+            await _runSpriteFfmpeg({ srcAbs, dstAbs, plan, cfg: conf, timeoutMs });
             lastErr = null;
             break;
         } catch (e) {
             lastErr = e;
-            if (_permanentFfmpegError(e?.message || '')) break;
-            if (/ffmpeg timeout /i.test(e?.message || '')) break;
+            // Neither a bad file nor a clip too long for the budget gets
+            // better by running it again right away.
+            if (isPermanentSeekbarError(e?.message) || e?.timedOut) break;
             await new Promise((r) => setTimeout(r, 50 + attempt * 100));
         }
     }

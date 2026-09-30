@@ -1,6 +1,6 @@
-// Integrity sweep: confirms the boot/periodic prune walks every row, soft-
-// deletes the ones whose file is missing on disk, and — most importantly —
-// chunks the UPDATE so a sweep with >999 dead rows doesn't blow up on
+// Integrity sweep: confirms the boot/periodic prune walks every row, deletes
+// the ones whose file is missing on disk, and — most importantly — chunks
+// the DELETE statement so a sweep with >999 dead rows doesn't blow up on
 // SQLite's SQLITE_LIMIT_VARIABLE_NUMBER cap (default 999 on older builds).
 
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
@@ -9,6 +9,7 @@ import fs from 'fs';
 import os from 'os';
 
 const DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'tgdl-integrity-'));
+const DL_DIR = path.join(DATA_DIR, 'downloads');
 
 let dbApi;
 let integrity;
@@ -31,7 +32,17 @@ afterAll(() => {
 
 beforeEach(() => {
     db.exec('DELETE FROM downloads');
+    fs.mkdirSync(DL_DIR, { recursive: true });
 });
+
+function insertPath(i, rel, size = 4) {
+    db.prepare(
+        `INSERT INTO downloads
+         (group_id, group_name, message_id, file_name, file_size, file_type, file_path)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).run('-1002', 'safety', 10_000 + i, path.basename(rel), size, 'document', rel);
+}
+const count = () => db.prepare('SELECT COUNT(*) AS n FROM downloads').get().n;
 
 function insertRow(i, { withFile } = {}) {
     // file_path is relative to data/downloads/. We don't actually create the
@@ -46,7 +57,7 @@ function insertRow(i, { withFile } = {}) {
 }
 
 describe('integrity.sweep', () => {
-    it('chunks soft-delete so >999 dead rows do not hit SQLITE_LIMIT_VARIABLE_NUMBER', async () => {
+    it('chunks DELETE so >999 dead rows do not hit SQLITE_LIMIT_VARIABLE_NUMBER', async () => {
         // Insert 1500 rows whose files don't exist on disk. Pre-fix, the
         // sweep built a single `DELETE WHERE id IN (?,?,…)` with 1500
         // placeholders and threw "too many SQL variables" on builds where
@@ -57,15 +68,8 @@ describe('integrity.sweep', () => {
         expect(r.scanned).toBe(1500);
         expect(r.pruned).toBe(1500);
 
-        // Soft-delete keeps tombstones so isDownloaded() blocks re-fetch.
         const remaining = db.prepare('SELECT COUNT(*) AS n FROM downloads').get().n;
-        expect(remaining).toBe(1500);
-        const live = db
-            .prepare(
-                `SELECT COUNT(*) AS n FROM downloads WHERE user_deleted IS NULL OR user_deleted = 0`,
-            )
-            .get().n;
-        expect(live).toBe(0);
+        expect(remaining).toBe(0);
     });
 
     it('reports counts when every file is missing', async () => {
@@ -75,28 +79,48 @@ describe('integrity.sweep', () => {
         expect(r.pruned).toBe(5);
     });
 
-    it('wipes faces when the source file is missing on disk', async () => {
-        insertRow(1);
-        const id = db.prepare('SELECT id FROM downloads WHERE message_id = 1').get().id;
-        dbApi.insertFace({
-            downloadId: id,
-            x: 0,
-            y: 0,
-            w: 1,
-            h: 1,
-            embeddingBlob: Buffer.alloc(8, 9),
-        });
-        expect(db.prepare('SELECT COUNT(*) AS n FROM faces WHERE download_id = ?').get(id).n).toBe(
-            1,
-        );
-
+    it('prunes nothing when the downloads dir is unavailable (unmounted disk)', async () => {
+        for (let i = 0; i < 5; i++) insertRow(i);
+        fs.rmSync(DL_DIR, { recursive: true, force: true });
         const r = await integrity.sweep();
+        expect(r.skipped).toBe(true);
+        expect(r.pruned).toBe(0);
+        expect(count()).toBe(5);
+    });
+
+    it('automatic runs refuse to prune when most of the library looks missing', async () => {
+        fs.writeFileSync(path.join(DL_DIR, 'present.bin'), 'data');
+        insertPath(0, 'present.bin');
+        for (let i = 1; i <= 30; i++) insertRow(i);
+        const auto = await integrity.sweep(null, { auto: true });
+        expect(auto.pruned).toBe(0);
+        expect(auto.reason).toBe('too_many_missing');
+        expect(count()).toBe(31);
+        // A manual Verify files run still prunes.
+        const manual = await integrity.sweep();
+        expect(manual.pruned).toBe(30);
+        expect(count()).toBe(1);
+    });
+
+    it('automatic runs still prune a few genuinely missing files', async () => {
+        for (let i = 0; i < 30; i++) {
+            fs.writeFileSync(path.join(DL_DIR, `ok_${i}.bin`), 'data');
+            insertPath(i, `ok_${i}.bin`);
+        }
+        insertRow(100);
+        const r = await integrity.sweep(null, { auto: true });
         expect(r.pruned).toBe(1);
-        expect(db.prepare('SELECT user_deleted FROM downloads WHERE id = ?').get(id).user_deleted).toBe(
-            1,
-        );
-        expect(db.prepare('SELECT COUNT(*) AS n FROM faces WHERE download_id = ?').get(id).n).toBe(
-            0,
-        );
+        expect(count()).toBe(30);
+    });
+
+    it('keeps federated-dedup rows and rows stored outside the downloads dir', async () => {
+        const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'tgdl-integrity-outside-'));
+        fs.writeFileSync(path.join(outside, 'custom.bin'), 'data');
+        insertPath(0, '_clusterref/peer-1/42');
+        insertPath(1, path.relative(DL_DIR, path.join(outside, 'custom.bin')));
+        const r = await integrity.sweep();
+        expect(r.pruned).toBe(0);
+        expect(count()).toBe(2);
+        fs.rmSync(outside, { recursive: true, force: true });
     });
 });

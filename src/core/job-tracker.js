@@ -101,6 +101,15 @@ export function createJobTracker({ kind, broadcast, log, eventPrefix } = {}) {
         return _running;
     }
 
+    // A run's last progress tick can carry its own `running: true` (dedup
+    // sends it on every tick). Drop it once the run settles so a caller that
+    // flattens progress next to the snapshot can't report a finished job as
+    // still running.
+    function _settledProgress() {
+        const { running: _r, ...rest } = _state.progress || {};
+        return rest;
+    }
+
     /**
      * Attempt to start a new run. If a run is already in flight, returns
      * `{ started:false, code:'ALREADY_RUNNING', snapshot }` so the
@@ -138,7 +147,6 @@ export function createJobTracker({ kind, broadcast, log, eventPrefix } = {}) {
         // contract. Errors are captured into state, never thrown out here.
         (async () => {
             try {
-                let logFirstProgress = true;
                 const onProgress = (p) => {
                     if (!_running) return; // post-cancel suppress
                     const merged = p && typeof p === 'object' ? p : {};
@@ -154,8 +162,7 @@ export function createJobTracker({ kind, broadcast, log, eventPrefix } = {}) {
                         ...merged, // expose flat fields for legacy WS subs
                     });
                     const now = Date.now();
-                    if (logFirstProgress || now - _lastProgressLogAt > PROGRESS_LOG_INTERVAL_MS) {
-                        logFirstProgress = false;
+                    if (now - _lastProgressLogAt > PROGRESS_LOG_INTERVAL_MS) {
                         _lastProgressLogAt = now;
                         const desc = _shortProgress(merged);
                         _safeLog({
@@ -171,13 +178,7 @@ export function createJobTracker({ kind, broadcast, log, eventPrefix } = {}) {
                     ..._state,
                     running: false,
                     stage: 'done',
-                    // Clear accumulated progress fields — leaving the last
-                    // onProgress payload in place would let stale keys
-                    // (e.g. a caller-supplied `running: true`) survive
-                    // into every future getStatus()/status-endpoint read
-                    // until the next tryStart(), silently contradicting
-                    // the authoritative `running: false` set above.
-                    progress: {},
+                    progress: _settledProgress(),
                     finishedAt,
                     durationMs: finishedAt - startedAt,
                     result: result && typeof result === 'object' ? result : (result ?? null),
@@ -202,9 +203,7 @@ export function createJobTracker({ kind, broadcast, log, eventPrefix } = {}) {
                     ..._state,
                     running: false,
                     stage: 'error',
-                    // See the success-path comment above — must not leak a
-                    // stale `progress.running`/etc. into future reads.
-                    progress: {},
+                    progress: _settledProgress(),
                     finishedAt,
                     durationMs: finishedAt - startedAt,
                     error: msg,
@@ -242,77 +241,25 @@ export function createJobTracker({ kind, broadcast, log, eventPrefix } = {}) {
         return true;
     }
 
-    /**
-     * Hard-reset internal state and broadcast a done event with `aborted:true`.
-     * Use only as a last resort when `cancel()` has been called but the runFn
-     * is stuck (e.g. hanging I/O) and has not exited within a grace period.
-     * The runFn may still be executing in the background after this call; this
-     * just unblocks the tracker so new runs can start.
-     */
-    function forceReset() {
-        if (!_running) return false;
-        _running = false;
-        _abort = null;
-        const finishedAt = Date.now();
-        _state = {
-            ..._state,
-            running: false,
-            stage: 'error',
-            // See tryStart()'s success/error paths — must not leak a stale
-            // progress payload (which may contain a caller-supplied
-            // `running: true`) into future getStatus()/status-endpoint reads.
-            progress: {},
-            finishedAt,
-            durationMs: finishedAt - (_state.startedAt || finishedAt),
-            error: 'force reset — scan took too long to stop',
-            failures: (_state.failures || 0) + 1,
-        };
-        _safeBroadcast({
-            type: `${_prefix}_done`,
-            aborted: true,
-            forceReset: true,
-            durationMs: _state.durationMs,
-            kind,
-        });
-        _safeLog({ source: kind, level: 'warn', msg: `${kind} force-reset after cancel` });
-        return true;
-    }
+    return { tryStart, cancel, getStatus, isRunning };
+}
 
-    return { tryStart, cancel, forceReset, getStatus, isRunning };
+/**
+ * Status payload for endpoints that also expose progress fields flat
+ * (`processed`, `total`, …) for older clients. Snapshot fields win, so
+ * `running` / `stage` / `error` always describe the run as the tracker
+ * sees it, never a stale progress tick.
+ */
+export function flattenStatus(snap) {
+    return { ...(snap?.progress || {}), ...snap };
 }
 
 function _shortProgress(p) {
     if (!p || typeof p !== 'object') return '';
     const parts = [];
-    // Callers use two different field names for "items done so far" —
-    // most (dedup.js, integrity.js, faststart.js, server.js admin actions)
-    // emit `processed`, but scan-runner.js's AI/faces scan emits `scanned`.
-    // Prefer `processed` when both are present; fall back to `scanned` so
-    // this generic formatter doesn't silently print "0/N" forever for
-    // trackers that use the other convention.
-    const done = Number.isFinite(p.processed) ? p.processed : p.scanned;
-    if (Number.isFinite(done) || Number.isFinite(p.total)) {
-        parts.push(`${done ?? 0}/${p.total ?? 0}`);
+    if (Number.isFinite(p.processed) || Number.isFinite(p.total)) {
+        parts.push(`${p.processed ?? 0}/${p.total ?? 0}`);
     }
     if (p.stage) parts.push(p.stage);
-    // Video scan progress reporting: scan-runner.js sets `currentVideo` while
-    // a `/detect/video` request is mid-flight (see faces-client.js job_id
-    // polling). Surface it in the same 5s-throttled log line so a 2-hour
-    // video's decode position is visible in `docker compose logs` even when
-    // nobody has the dashboard open / the tab is stale.
-    const cv = p.currentVideo;
-    if (cv && typeof cv === 'object' && cv.name) {
-        const pctPart = Number.isFinite(cv.pct) ? ` ${cv.pct}%` : '';
-        const framesPart =
-            Number.isFinite(cv.framesDecoded) && Number.isFinite(cv.totalFrames)
-                ? ` (${cv.framesDecoded}/${cv.totalFrames} frames)`
-                : '';
-        parts.push(`video: ${cv.name}${pctPart}${framesPart}`);
-    }
     return parts.join(' ');
 }
-
-// Test-only: pure formatter, no timing/state involved — exported so the
-// `processed`-vs-`scanned` field-name fallback can be unit tested directly
-// instead of only through the real 5s-throttled periodic log line.
-export { _shortProgress };

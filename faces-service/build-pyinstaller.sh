@@ -20,8 +20,8 @@
 #        tgdl-faces-darwin-arm64
 #
 # Requirements:
-#   uv sync --group build
-#   uv sync (or --extra gpu etc for the chosen variant)
+#   pip install pyinstaller
+#   pip install -e . (or -e .[gpu] etc for the chosen variant)
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
@@ -92,21 +92,20 @@ fi
 echo "=== Installing tgdl-faces[$VARIANT] ==="
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-UV_SYNC=(uv sync --group build)
 if [[ "$VARIANT" == "cpu" ]]; then
-    :
+    pip install -e "$SCRIPT_DIR"
 elif [[ "$VARIANT" == "gpu" ]]; then
-    UV_SYNC+=(--extra gpu)
+    pip install -e "$SCRIPT_DIR[gpu]"
 elif [[ "$VARIANT" == "directml" ]]; then
-    UV_SYNC+=(--extra directml)
+    pip install -e "$SCRIPT_DIR[directml]"
 elif [[ "$VARIANT" == "openvino" ]]; then
-    UV_SYNC+=(--extra openvino)
+    pip install -e "$SCRIPT_DIR[openvino]"
 else
     echo "Unknown variant: $VARIANT (expected cpu|gpu|directml|openvino)" >&2
     exit 1
 fi
 
-(cd "$SCRIPT_DIR" && "${UV_SYNC[@]}")
+pip install pyinstaller
 
 # ---------------------------------------------------------------------------
 # Optionally pre-download the model
@@ -115,7 +114,7 @@ MODEL_DIR="${TGDL_FACES_MODELS_DIR:-${HOME}/.cache/tgdl-faces/models}"
 
 if [[ "$WITH_MODEL" -eq 1 ]]; then
     echo "=== Pre-downloading buffalo_l model to $MODEL_DIR ==="
-    uv run python -c "
+    python -c "
 from insightface.app import FaceAnalysis
 import os, pathlib
 d = pathlib.Path('$MODEL_DIR')
@@ -164,7 +163,7 @@ if [[ "$WITH_MODEL" -eq 1 ]] && [[ -d "$MODEL_DIR/models/buffalo_l" ]]; then
     export TGDL_FACES_MODELS_DIR="insightface_models"
 fi
 
-uv run pyinstaller \
+pyinstaller \
     --onefile \
     --name "$BINARY_NAME" \
     --distpath "$OUTPUT_DIR" \

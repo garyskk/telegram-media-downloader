@@ -14,6 +14,9 @@ beforeEach(() => {
         if (k.startsWith('TGDL_FACES_')) delete process.env[k];
     }
     client._resetForTests();
+    // The client talks to the sidecar through its own undici instance;
+    // route it via globalThis.fetch so the spies below can intercept.
+    client._setFetchForTests((...args) => globalThis.fetch(...args));
 });
 
 afterEach(() => {
@@ -254,28 +257,11 @@ describe('detectFacesInVideo', () => {
         await client.detectFacesInVideo('/tmp/video.mp4', {});
         expect(capturedUrl).toBe('http://host:8011/detect/video');
         expect(capturedBody.path).toBe('/tmp/video.mp4');
-        // Pure safety-ceiling default (§4.1/§5) — not a density control.
-        expect(capturedBody.max_frames).toBe(20000);
+        expect(capturedBody.max_frames).toBe(120);
         expect(Number.isFinite(capturedBody.min_score)).toBe(true);
         expect(Number.isFinite(capturedBody.min_box_px)).toBe(true);
         expect(Array.isArray(capturedBody.ar_range)).toBe(true);
         expect(capturedBody.ar_range).toHaveLength(2);
-        expect(capturedBody.nice).toBe(0);
-    });
-
-    it('forwards faces.videoNice as body.nice so UI can override sidecar env', async () => {
-        client.setSidecarUrl('http://host:8011');
-        let capturedBody = null;
-        vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, init) => {
-            capturedBody = JSON.parse(init.body);
-            return {
-                ok: true,
-                status: 200,
-                json: async () => ({ faces: [], image_w: 0, image_h: 0 }),
-            };
-        });
-        await client.detectFacesInVideo('/tmp/video.mp4', { faces: { videoNice: 12 } });
-        expect(capturedBody.nice).toBe(12);
     });
 
     it('returns Float32Array embeddings on success', async () => {
@@ -359,7 +345,7 @@ describe('detectFacesInVideo', () => {
         expect(capturedBody.max_frames).toBe(60);
     });
 
-    it('clamps max_frames to 200000 max', async () => {
+    it('clamps max_frames to 500 max', async () => {
         client.setSidecarUrl('http://host:8011');
         let capturedBody = null;
         vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, init) => {
@@ -370,348 +356,254 @@ describe('detectFacesInVideo', () => {
                 json: async () => ({ faces: [], image_w: 0, image_h: 0 }),
             };
         });
-        await client.detectFacesInVideo('/tmp/video.mp4', { faces: { videoMaxFrames: 999_999 } });
-        expect(capturedBody.max_frames).toBe(200_000);
-    });
-
-    it('resolves videoMaxFrames via TGDL_FACES_VIDEO_MAX_FRAMES env override', async () => {
-        client.setSidecarUrl('http://host:8011');
-        process.env.TGDL_FACES_VIDEO_MAX_FRAMES = '333';
-        let capturedBody = null;
-        vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, init) => {
-            capturedBody = JSON.parse(init.body);
-            return {
-                ok: true,
-                status: 200,
-                json: async () => ({ faces: [], image_w: 0, image_h: 0 }),
-            };
-        });
-        await client.detectFacesInVideo('/tmp/video.mp4', {});
-        expect(capturedBody.max_frames).toBe(333);
+        await client.detectFacesInVideo('/tmp/video.mp4', { faces: { videoMaxFrames: 9999 } });
+        expect(capturedBody.max_frames).toBe(500);
     });
 });
 
-// Video scan progress reporting — a `job_id` in the POST body lets the
-// sidecar's GET /detect/video/status/{job_id} be polled while the main
-// request is in flight (see docs/AI.md). Polling is opt-in: it only
-// happens when the caller passes an `onVideoProgress` callback.
-describe('detectFacesInVideo — job_id progress polling', () => {
-    afterEach(() => {
-        vi.useRealTimers();
+describe('throwOnUnavailable — outages are not "no faces"', () => {
+    const okBatch = (results) => ({ ok: true, status: 200, json: async () => ({ results }) });
+
+    it('network error: default returns nulls, strict throws SIDECAR_UNAVAILABLE', async () => {
+        client.setSidecarUrl('http://host:8011');
+        vi.spyOn(globalThis, 'fetch').mockRejectedValue(
+            Object.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNREFUSED' } }),
+        );
+        expect(await client.detectFacesBatch(['/a.jpg'], {})).toEqual([null]);
+        await expect(
+            client.detectFacesBatch(['/a.jpg'], {}, null, null, { throwOnUnavailable: true }),
+        ).rejects.toMatchObject({ code: 'SIDECAR_UNAVAILABLE' });
     });
 
-    function _mockFetchWithStatusPolling() {
-        let resolveMain;
-        const mainPromise = new Promise((resolve) => {
-            resolveMain = resolve;
+    it('503 model_loading throws in strict mode; 400 stays all-null', async () => {
+        client.setSidecarUrl('http://host:8011');
+        const fetchSpy = vi.spyOn(globalThis, 'fetch');
+        fetchSpy.mockResolvedValueOnce({ ok: false, status: 503, json: async () => ({}) });
+        await expect(
+            client.detectFacesBatch(['/a.jpg'], {}, null, null, { throwOnUnavailable: true }),
+        ).rejects.toSatisfy(client.isSidecarUnavailable);
+        fetchSpy.mockResolvedValueOnce({ ok: false, status: 400, json: async () => ({}) });
+        expect(
+            await client.detectFacesBatch(['/a.jpg'], {}, null, null, { throwOnUnavailable: true }),
+        ).toEqual([null]);
+    });
+
+    it('unset URL throws in strict mode', async () => {
+        await expect(
+            client.detectFacesBatch(['/a.jpg'], {}, null, null, { throwOnUnavailable: true }),
+        ).rejects.toMatchObject({ code: 'SIDECAR_UNAVAILABLE' });
+    });
+
+    it('a cancelled scan is not reported as an outage', async () => {
+        client.setSidecarUrl('http://host:8011');
+        const ctrl = new AbortController();
+        ctrl.abort();
+        vi.spyOn(globalThis, 'fetch').mockRejectedValue(
+            Object.assign(new Error('aborted'), { name: 'AbortError' }),
+        );
+        expect(
+            await client.detectFacesBatch(['/a.jpg'], {}, null, ctrl.signal, {
+                throwOnUnavailable: true,
+            }),
+        ).toEqual([null]);
+    });
+
+    it('per-file soft errors stay [] and exif_oriented is carried onto faces', async () => {
+        client.setSidecarUrl('http://host:8011');
+        vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+            okBatch([
+                { file: '/a.jpg', faces: [], error: 'decode_failed' },
+                {
+                    file: '/b.jpg',
+                    exif_oriented: true,
+                    faces: [{ x: 1, y: 2, w: 3, h: 4, score: 0.9, embedding: [1, 0] }],
+                },
+                {
+                    file: '/c.jpg',
+                    faces: [{ x: 1, y: 2, w: 3, h: 4, score: 0.9, embedding: [0, 1] }],
+                },
+            ]),
+        );
+        const out = await client.detectFacesBatch(['/a.jpg', '/b.jpg', '/c.jpg'], {}, null, null, {
+            throwOnUnavailable: true,
         });
-        let statusCallCount = 0;
-        const statusCalls = [];
-        vi.spyOn(globalThis, 'fetch').mockImplementation(async (url) => {
-            if (String(url).includes('/detect/video/status/')) {
-                statusCallCount++;
-                statusCalls.push(String(url));
+        expect(out[0]).toEqual([]);
+        expect(out[1][0].exifOriented).toBe(true);
+        expect(out[2][0].exifOriented).toBeUndefined();
+    });
+
+    it('does not leak abort listeners onto the scan signal', async () => {
+        client.setSidecarUrl('http://host:8011');
+        vi.spyOn(globalThis, 'fetch').mockResolvedValue(okBatch([{ file: '/a.jpg', faces: [] }]));
+        const ctrl = new AbortController();
+        const add = vi.spyOn(ctrl.signal, 'addEventListener');
+        const remove = vi.spyOn(ctrl.signal, 'removeEventListener');
+        for (let i = 0; i < 5; i++) {
+            await client.detectFacesBatch(['/a.jpg'], {}, null, ctrl.signal);
+        }
+        expect(add).toHaveBeenCalledTimes(5);
+        expect(remove).toHaveBeenCalledTimes(5);
+    });
+});
+
+describe('waitForSidecarReady', () => {
+    it('waits through "model loading" until ready', async () => {
+        client.setSidecarUrl('http://host:8011');
+        const fetchSpy = vi.spyOn(globalThis, 'fetch');
+        fetchSpy
+            .mockResolvedValueOnce({
+                ok: true,
+                status: 200,
+                json: async () => ({ ok: true, ready: false }),
+            })
+            .mockResolvedValueOnce({
+                ok: true,
+                status: 200,
+                json: async () => ({ ok: true, ready: true }),
+            });
+        const t0 = Date.now();
+        expect(await client.waitForSidecarReady({ timeoutMs: 10_000 })).toBe(true);
+        expect(fetchSpy).toHaveBeenCalledTimes(2);
+        expect(Date.now() - t0).toBeLessThan(5000);
+    });
+
+    it('treats a /health without `ready` (older sidecars) as ready', async () => {
+        client.setSidecarUrl('http://host:8011');
+        vi.spyOn(globalThis, 'fetch').mockResolvedValue({
+            ok: true,
+            status: 200,
+            json: async () => ({ ok: true }),
+        });
+        expect(await client.waitForSidecarReady({ timeoutMs: 1000 })).toBe(true);
+    });
+
+    it('gives up after the timeout and returns false', async () => {
+        vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('ECONNREFUSED'));
+        client.setSidecarUrl('http://host:8011');
+        expect(await client.waitForSidecarReady({ timeoutMs: 50 })).toBe(false);
+    });
+
+    it('returns promptly when the signal aborts', async () => {
+        const ctrl = new AbortController();
+        const p = client.waitForSidecarReady({ timeoutMs: 60_000, signal: ctrl.signal });
+        setTimeout(() => ctrl.abort(), 20);
+        const t0 = Date.now();
+        expect(await p).toBe(false);
+        expect(Date.now() - t0).toBeLessThan(2000);
+    });
+});
+
+describe('real HTTP through the undici client', () => {
+    it('talks to a live server (no fetch mock) and parses the batch reply', async () => {
+        const http = await import('node:http');
+        const server = http.createServer((req, res) => {
+            let body = '';
+            req.on('data', (c) => {
+                body += c;
+            });
+            req.on('end', () => {
+                const { files } = JSON.parse(body);
+                // Slow-ish reply: the answer arrives well after the request.
+                setTimeout(() => {
+                    res.setHeader('content-type', 'application/json');
+                    res.end(
+                        JSON.stringify({
+                            results: files.map((file) => ({
+                                file,
+                                exif_oriented: true,
+                                faces: [
+                                    { x: 1, y: 1, w: 90, h: 90, score: 0.9, embedding: [1, 0] },
+                                ],
+                            })),
+                        }),
+                    );
+                }, 150);
+            });
+        });
+        await new Promise((r) => server.listen(0, '127.0.0.1', r));
+        try {
+            client._setFetchForTests(); // back to the real undici client
+            client.setSidecarUrl(`http://127.0.0.1:${server.address().port}`);
+            const out = await client.detectFacesBatch(['/x.jpg'], {}, null, null, {
+                throwOnUnavailable: true,
+            });
+            expect(out).toHaveLength(1);
+            expect(out[0][0].embedding).toBeInstanceOf(Float32Array);
+            expect(out[0][0].exifOriented).toBe(true);
+        } finally {
+            server.close();
+        }
+    });
+});
+
+describe('external sidecar (no shared filesystem)', () => {
+    it('file_not_found from the sidecar → resend as bytes, then stay in b64 mode', async () => {
+        const fsMod = await import('node:fs');
+        const osMod = await import('node:os');
+        const pathMod = await import('node:path');
+        const file = pathMod.join(osMod.tmpdir(), `tgdl-ext-${process.pid}.jpg`);
+        fsMod.writeFileSync(file, Buffer.from([0xff, 0xd8, 0xff, 0xd9]));
+        client.setSidecarUrl('http://remote:8011');
+        const bodies = [];
+        vi.spyOn(globalThis, 'fetch').mockImplementation(async (url, init) => {
+            const body = JSON.parse(init.body);
+            bodies.push({ url: String(url), body });
+            if (String(url).endsWith('/detect/batch')) {
+                // Allow-list accepts the path, but the file isn't on this host.
                 return {
                     ok: true,
                     status: 200,
                     json: async () => ({
-                        job_id: 'fake-job',
-                        frames_decoded: statusCallCount * 10,
-                        total_frames: 100,
-                        pct: statusCallCount * 10,
-                        elapsed_sec: statusCallCount,
+                        results: body.files.map((f) => ({
+                            file: f,
+                            faces: [],
+                            error: 'file_not_found',
+                        })),
                     }),
                 };
             }
-            return mainPromise;
+            // /detect with image_b64
+            return {
+                ok: true,
+                status: 200,
+                clone() {
+                    return this;
+                },
+                json: async () => ({
+                    faces: [{ x: 1, y: 1, w: 90, h: 90, score: 0.9, embedding: [1, 0] }],
+                    exif_oriented: true,
+                }),
+            };
         });
-        return {
-            resolveMain: (body) =>
-                resolveMain({ ok: true, status: 200, json: async () => body }),
-            statusCalls,
-            getStatusCallCount: () => statusCallCount,
-        };
-    }
+        try {
+            const out = await client.detectFacesBatch([file], {}, null, null, {
+                throwOnUnavailable: true,
+            });
+            expect(out[0]).toHaveLength(1); // not stored as "no faces"
+            expect(bodies[1].body.image_b64).toBeTruthy();
+            expect(bodies[1].body.path).toBeUndefined();
+            // Next batch goes straight to bytes — no more path attempts.
+            bodies.length = 0;
+            await client.detectFacesBatch([file], {}, null, null, { throwOnUnavailable: true });
+            expect(bodies.map((b) => b.url.replace('http://remote:8011', ''))).toEqual(['/detect']);
+        } finally {
+            fsMod.rmSync(file, { force: true });
+        }
+    });
 
-    it('omits job_id and never polls when onVideoProgress is not provided', async () => {
-        client.setSidecarUrl('http://host:8011');
-        let capturedBody = null;
+    it('sends the configured API token and treats 401 as fatal', async () => {
+        client.setSidecarUrl('http://remote:8011');
+        client.applyFacesCfg({ sidecarToken: 's3cret' });
+        const seen = [];
         vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, init) => {
-            capturedBody = JSON.parse(init.body);
-            return {
-                ok: true,
-                status: 200,
-                json: async () => ({ faces: [], image_w: 0, image_h: 0 }),
-            };
+            seen.push(init?.headers?.['X-API-Token']);
+            return { ok: false, status: 401, json: async () => ({ code: 'unauthorized' }) };
         });
-        await client.detectFacesInVideo('/tmp/video.mp4', {});
-        expect(capturedBody.job_id).toBeUndefined();
-        expect(globalThis.fetch).toHaveBeenCalledTimes(1);
-    });
-
-    it('includes a job_id in the POST body when onVideoProgress is provided', async () => {
-        client.setSidecarUrl('http://host:8011');
-        let capturedBody = null;
-        vi.spyOn(globalThis, 'fetch').mockImplementation(async (url, init) => {
-            if (String(url).endsWith('/detect/video')) capturedBody = JSON.parse(init.body);
-            return {
-                ok: true,
-                status: 200,
-                json: async () => ({ faces: [], image_w: 0, image_h: 0 }),
-            };
-        });
-        await client.detectFacesInVideo('/tmp/video.mp4', {}, null, null, () => {});
-        expect(typeof capturedBody.job_id).toBe('string');
-        expect(capturedBody.job_id.length).toBeGreaterThan(0);
-    });
-
-    it('polls the status endpoint every videoProgressPollMs and forwards parsed fields', async () => {
-        client.setSidecarUrl('http://host:8011');
-        vi.useFakeTimers();
-        const { resolveMain, getStatusCallCount } = _mockFetchWithStatusPolling();
-
-        const progressCalls = [];
-        const resultPromise = client.detectFacesInVideo(
-            '/tmp/video.mp4',
-            {},
-            null,
-            null,
-            (p) => progressCalls.push(p),
-        );
-
-        await vi.advanceTimersByTimeAsync(5000);
-        await vi.advanceTimersByTimeAsync(5000);
-
-        expect(getStatusCallCount()).toBe(2);
-        expect(progressCalls).toHaveLength(2);
-        expect(progressCalls[0]).toMatchObject({
-            path: '/tmp/video.mp4',
-            frames_decoded: 10,
-            total_frames: 100,
-            pct: 10,
-        });
-        expect(progressCalls[1].frames_decoded).toBe(20);
-
-        resolveMain({ faces: [], image_w: 0, image_h: 0 });
-        await resultPromise;
-    });
-
-    it('stops polling once the main request settles', async () => {
-        client.setSidecarUrl('http://host:8011');
-        vi.useFakeTimers();
-        const { resolveMain, getStatusCallCount } = _mockFetchWithStatusPolling();
-
-        const progressCalls = [];
-        const resultPromise = client.detectFacesInVideo(
-            '/tmp/video.mp4',
-            {},
-            null,
-            null,
-            (p) => progressCalls.push(p),
-        );
-
-        await vi.advanceTimersByTimeAsync(5000);
-        expect(getStatusCallCount()).toBe(1);
-
-        resolveMain({ faces: [], image_w: 0, image_h: 0 });
-        await resultPromise;
-
-        const countAfterSettle = getStatusCallCount();
-        await vi.advanceTimersByTimeAsync(30000);
-        expect(getStatusCallCount()).toBe(countAfterSettle);
-    });
-
-    it('a poll failure is swallowed and never affects the returned faces', async () => {
-        client.setSidecarUrl('http://host:8011');
-        vi.useFakeTimers();
-
-        let resolveMain;
-        const mainPromise = new Promise((resolve) => {
-            resolveMain = resolve;
-        });
-        vi.spyOn(globalThis, 'fetch').mockImplementation(async (url) => {
-            if (String(url).includes('/detect/video/status/')) {
-                throw new Error('ECONNRESET');
-            }
-            return mainPromise;
-        });
-
-        const progressCalls = [];
-        const resultPromise = client.detectFacesInVideo(
-            '/tmp/video.mp4',
-            {},
-            null,
-            null,
-            (p) => progressCalls.push(p),
-        );
-
-        await vi.advanceTimersByTimeAsync(5000);
-        expect(progressCalls).toHaveLength(0);
-
-        resolveMain({ ok: true, status: 200, json: async () => ({ faces: [], image_w: 0, image_h: 0 }) });
-        const out = await resultPromise;
-        expect(out).toEqual([]);
-    });
-
-    it('a 404 status response (job already gone) is swallowed, not surfaced', async () => {
-        client.setSidecarUrl('http://host:8011');
-        vi.useFakeTimers();
-
-        let resolveMain;
-        const mainPromise = new Promise((resolve) => {
-            resolveMain = resolve;
-        });
-        vi.spyOn(globalThis, 'fetch').mockImplementation(async (url) => {
-            if (String(url).includes('/detect/video/status/')) {
-                return { ok: false, status: 404, json: async () => ({ error: 'not_found' }) };
-            }
-            return mainPromise;
-        });
-
-        const progressCalls = [];
-        const resultPromise = client.detectFacesInVideo(
-            '/tmp/video.mp4',
-            {},
-            null,
-            null,
-            (p) => progressCalls.push(p),
-        );
-
-        await vi.advanceTimersByTimeAsync(5000);
-        expect(progressCalls).toHaveLength(0);
-
-        resolveMain({ ok: true, status: 200, json: async () => ({ faces: [], image_w: 0, image_h: 0 }) });
-        await resultPromise;
-    });
-
-    it('resolves a custom videoProgressPollMs from cfg', async () => {
-        client.setSidecarUrl('http://host:8011');
-        vi.useFakeTimers();
-        const { resolveMain, getStatusCallCount } = _mockFetchWithStatusPolling();
-
-        const resultPromise = client.detectFacesInVideo(
-            '/tmp/video.mp4',
-            { faces: { videoProgressPollMs: 2000 } },
-            null,
-            null,
-            () => {},
-        );
-
-        await vi.advanceTimersByTimeAsync(2000);
-        expect(getStatusCallCount()).toBe(1);
-        await vi.advanceTimersByTimeAsync(2000);
-        expect(getStatusCallCount()).toBe(2);
-
-        resolveMain({ faces: [], image_w: 0, image_h: 0 });
-        await resultPromise;
-    });
-
-    it('resolves videoProgressPollMs via TGDL_FACES_VIDEO_PROGRESS_POLL_MS env override', async () => {
-        client.setSidecarUrl('http://host:8011');
-        process.env.TGDL_FACES_VIDEO_PROGRESS_POLL_MS = '3000';
-        vi.useFakeTimers();
-        const { resolveMain, getStatusCallCount } = _mockFetchWithStatusPolling();
-
-        const resultPromise = client.detectFacesInVideo(
-            '/tmp/video.mp4',
-            {},
-            null,
-            null,
-            () => {},
-        );
-
-        await vi.advanceTimersByTimeAsync(2999);
-        expect(getStatusCallCount()).toBe(0);
-        await vi.advanceTimersByTimeAsync(1);
-        expect(getStatusCallCount()).toBe(1);
-
-        resolveMain({ faces: [], image_w: 0, image_h: 0 });
-        await resultPromise;
-    });
-
-    it('clamps a too-small videoProgressPollMs to a 1000ms floor', async () => {
-        client.setSidecarUrl('http://host:8011');
-        vi.useFakeTimers();
-        const { resolveMain, getStatusCallCount } = _mockFetchWithStatusPolling();
-
-        const resultPromise = client.detectFacesInVideo(
-            '/tmp/video.mp4',
-            { faces: { videoProgressPollMs: 10 } },
-            null,
-            null,
-            () => {},
-        );
-
-        await vi.advanceTimersByTimeAsync(999);
-        expect(getStatusCallCount()).toBe(0);
-        await vi.advanceTimersByTimeAsync(1);
-        expect(getStatusCallCount()).toBe(1);
-
-        resolveMain({ faces: [], image_w: 0, image_h: 0 });
-        await resultPromise;
-    });
-});
-
-// Regression coverage for the undici default headers/body timeout (300s,
-// hardcoded, independent of our own AbortController timeout) silently
-// killing long-running requests with a generic "fetch failed" — see the
-// comment above `_dispatcherFor`'s definition in faces-client.js. Every
-// fetch whose own intended timeout can exceed 300s must pass a `dispatcher`
-// with matching headers/body timeouts, or undici's ceiling wins first.
-describe('_dispatcherFor — undici timeout ceiling fix', () => {
-    it('caches one Agent per distinct timeout value', () => {
-        const a = client._dispatcherFor(60_000);
-        const b = client._dispatcherFor(60_000);
-        const c = client._dispatcherFor(120_000);
-        expect(a).toBe(b);
-        expect(a).not.toBe(c);
-    });
-
-    it('/detect/video passes a dispatcher matching the 2h video timeout floor', async () => {
-        client.setSidecarUrl('http://host:8011');
-        let capturedInit = null;
-        vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, init) => {
-            capturedInit = init;
-            return {
-                ok: true,
-                status: 200,
-                json: async () => ({ faces: [], image_w: 0, image_h: 0 }),
-            };
-        });
-        await client.detectFacesInVideo('/tmp/video.mp4', {});
-        expect(capturedInit.dispatcher).toBeTruthy();
-        expect(capturedInit.dispatcher).toBe(client._dispatcherFor(2 * 60 * 60 * 1000));
-    });
-
-    it('/detect/batch passes a dispatcher scaled with file count', async () => {
-        client.setSidecarUrl('http://host:8011');
-        let capturedInit = null;
-        vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, init) => {
-            capturedInit = init;
-            return {
-                ok: true,
-                status: 200,
-                json: async () => ({ results: [] }),
-            };
-        });
-        // _requestTimeoutMs defaults to 60000 (unset by _resetForTests in beforeEach).
-        await client.detectFacesBatch(['/tmp/a.jpg', '/tmp/b.jpg'], {});
-        // batchTimeoutMs = max(2 * 60000, 120000) = 120000
-        expect(capturedInit.dispatcher).toBe(client._dispatcherFor(120_000));
-    });
-
-    it('/detect (single image, via _postWithRetry) passes a dispatcher matching requestTimeoutMs', async () => {
-        client.setSidecarUrl('http://host:8011');
-        let capturedInit = null;
-        vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, init) => {
-            capturedInit = init;
-            return {
-                ok: true,
-                status: 200,
-                json: async () => ({ faces: [] }),
-            };
-        });
-        await client.detectFaces('/tmp/a.jpg', {});
-        expect(capturedInit.dispatcher).toBe(client._dispatcherFor(60_000));
+        await expect(
+            client.detectFacesBatch(['/a.jpg'], {}, null, null, { throwOnUnavailable: true }),
+        ).rejects.toMatchObject({ code: 'SIDECAR_UNAVAILABLE', fatal: true });
+        expect(seen[0]).toBe('s3cret');
+        // X-API-Token, not Authorization — a reverse proxy may use that one.
+        expect(client.sidecarAuthHeaders()).toEqual({ 'X-API-Token': 's3cret' });
     });
 });

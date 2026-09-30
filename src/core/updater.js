@@ -3,7 +3,7 @@
  *
  * The dashboard never touches `/var/run/docker.sock` — that would make
  * an RCE in the web UI equivalent to root on the host. Instead, the
- * official `containrrr/watchtower` image runs as a sidecar container
+ * `nickfedor/watchtower` image (maintained fork of containrrr/watchtower) runs as a sidecar container
  * with the socket and an authenticated HTTP API; this module is a thin
  * client that runs the following ordered pre-flight + handoff:
  *
@@ -47,7 +47,8 @@
  */
 
 import path from 'path';
-import { existsSync, promises as fs } from 'fs';
+import { existsSync, promises as fs, readFileSync, writeFileSync, mkdirSync } from 'fs';
+import { randomBytes } from 'crypto';
 import { fileURLToPath } from 'url';
 import { createRequire } from 'module';
 import { getDb } from './db.js';
@@ -88,11 +89,44 @@ const SNAPSHOT_TIMEOUT_MS = _envInt('UPDATE_SNAPSHOT_TIMEOUT_MS', 60_000);
 // link speed. Tunable via UPDATE_OVERLAY_STALL_MS.
 const OVERLAY_STALL_MS = _envInt('UPDATE_OVERLAY_STALL_MS', 120_000);
 
+// Auto-generated token shared with the watchtower sidecar. Lives in its own
+// subfolder so the sidecar can mount ONLY this folder (read-only), never the
+// DB / sessions in the rest of the data dir.
+const WT_TOKEN_FILE = path.resolve(DATA_DIR, 'watchtower', 'api-token');
+
+/**
+ * Token resolution: an explicit WATCHTOWER_HTTP_API_TOKEN wins (unchanged
+ * behaviour); otherwise read the generated file, creating it once when
+ * missing. Returns '' when neither is available.
+ */
+function _resolveWatchtowerToken() {
+    const env = (process.env.WATCHTOWER_HTTP_API_TOKEN || '').trim();
+    if (env) return env;
+    try {
+        return readFileSync(WT_TOKEN_FILE, 'utf8').trim();
+    } catch {
+        /* not created yet */
+    }
+    try {
+        mkdirSync(path.dirname(WT_TOKEN_FILE), { recursive: true });
+        // 'wx' = never overwrite a token another process just wrote.
+        writeFileSync(WT_TOKEN_FILE, randomBytes(32).toString('hex'), { flag: 'wx', mode: 0o644 });
+    } catch {
+        /* lost a race or read-only FS; re-read below */
+    }
+    try {
+        return readFileSync(WT_TOKEN_FILE, 'utf8').trim();
+    } catch {
+        return '';
+    }
+}
+
 // Watchtower endpoint defaults match docker-compose.yml's service name.
 function _watchtowerEndpoint() {
     const url = process.env.WATCHTOWER_URL;
-    const token = process.env.WATCHTOWER_HTTP_API_TOKEN;
-    if (!url || !token) return null;
+    if (!url) return null;
+    const token = _resolveWatchtowerToken();
+    if (!token) return null;
     // Strip trailing slash so we can string-concat the path.
     return { url: url.replace(/\/+$/, ''), token };
 }
@@ -139,11 +173,12 @@ const TRIGGER_TIMEOUT_MS = 15_000;
 
 /**
  * Confirm the watchtower sidecar is reachable BEFORE we touch the DB.
- * A bare HEAD against `/v1/update` is enough — watchtower has no health
- * endpoint, but any HTTP response (incl. 405 Method Not Allowed for HEAD
- * on a POST-only route) means the host is up. Connection refused / DNS
- * failure / timeout = sidecar down. 5 s cap so a hung gateway doesn't
- * stall the operator click.
+ * A GET on `/` is enough — watchtower has no health endpoint, but any
+ * HTTP response (its 404 for an unknown path included) means the host is
+ * up. Never ping `/v1/update`: watchtower ignores the method, so even a
+ * HEAD there runs a full update and blocks until the pull finishes.
+ * Connection refused / DNS failure / timeout = sidecar down. 5 s cap so a
+ * hung gateway doesn't stall the operator click.
  */
 async function _pingWatchtower() {
     const ep = _watchtowerEndpoint();
@@ -153,8 +188,8 @@ async function _pingWatchtower() {
     const ctrl = new AbortController();
     const t = setTimeout(() => ctrl.abort(), PING_TIMEOUT_MS);
     try {
-        const res = await fetch(`${ep.url}/v1/update`, {
-            method: 'HEAD',
+        const res = await fetch(`${ep.url}/`, {
+            method: 'GET',
             headers: { Authorization: `Bearer ${ep.token}` },
             signal: ctrl.signal,
         });
@@ -380,12 +415,11 @@ async function _snapshotDb() {
 // ---- Watchtower client -----------------------------------------------------
 
 /**
- * POST watchtower's `/v1/update` with bearer auth. Watchtower returns
- * 200 immediately and does the work asynchronously, so we don't await
- * the actual swap — the browser detects it via the WS disconnect.
- *
- * Wrap the fetch in a 30 s AbortController so a misconfigured
- * WATCHTOWER_URL doesn't hang the request indefinitely.
+ * POST watchtower's `/v1/update` with bearer auth. Watchtower answers
+ * only after it has pulled the new image, which can take minutes, so we
+ * don't await the swap — the browser detects it via the WS disconnect.
+ * The ping just proved the sidecar is up, so hitting the timeout means
+ * watchtower is still pulling, not that the update failed.
  */
 async function _triggerWatchtower() {
     const ep = _watchtowerEndpoint();
@@ -405,6 +439,9 @@ async function _triggerWatchtower() {
         // Watchtower's response body is empty / "Updates triggered." —
         // return what we know.
         return { triggered: true };
+    } catch (e) {
+        if (e?.name === 'AbortError') return { triggered: true, pending: true };
+        throw e;
     } finally {
         clearTimeout(t);
     }
@@ -446,7 +483,7 @@ export async function runAutoUpdate(opts = {}) {
     if (!status.available) {
         const why = !status.inDocker
             ? 'Auto-update only works inside Docker (the dashboard process is not running in a container).'
-            : 'Watchtower sidecar is not configured. Enable the `auto-update` profile in docker-compose.yml and set WATCHTOWER_HTTP_API_TOKEN in .env.';
+            : 'Watchtower sidecar is not configured. Use the bundled docker-compose.yml (it includes the watchtower service) and set WATCHTOWER_HTTP_API_TOKEN in .env.';
         const err = new Error(why);
         err.code = 'AUTO_UPDATE_UNAVAILABLE';
         throw err;
@@ -461,7 +498,7 @@ export async function runAutoUpdate(opts = {}) {
         const code = ping.code || 'WATCHTOWER_UNREACHABLE';
         const hint =
             code === 'WATCHTOWER_UNAUTHENTICATED'
-                ? 'Re-generate WATCHTOWER_HTTP_API_TOKEN in .env (it must match the watchtower sidecar) and restart the auto-update profile.'
+                ? 'Re-generate WATCHTOWER_HTTP_API_TOKEN in .env (it must match the watchtower sidecar) and recreate the watchtower service.'
                 : 'The sidecar may be down or the WATCHTOWER_URL / token is wrong.';
         const err = new Error(`Watchtower preflight failed — ${ping.msg}. ${hint}`);
         err.code = code;
@@ -527,9 +564,26 @@ export async function runAutoUpdate(opts = {}) {
     return { success: true, backup, ping, integrity, verify };
 }
 
+/**
+ * Create the shared token file at boot so the sidecar can read it. The
+ * folder is made even when the token comes from the env: Synology's Docker
+ * won't start a container whose bind-mount source folder is missing.
+ */
+export function ensureWatchtowerToken() {
+    if (!process.env.WATCHTOWER_URL) return;
+    try {
+        mkdirSync(path.dirname(WT_TOKEN_FILE), { recursive: true });
+    } catch {
+        /* read-only FS; the token still resolves from the env */
+    }
+    _resolveWatchtowerToken();
+}
+
 export const _internals = {
     _snapshotDb,
     _watchtowerEndpoint,
+    _resolveWatchtowerToken,
+    WT_TOKEN_FILE,
     _pingWatchtower,
     _verifyDbIntegrity,
     _verifySnapshot,

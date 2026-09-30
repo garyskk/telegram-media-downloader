@@ -13,14 +13,12 @@ import {
     insertDownload,
     isDownloaded as dbIsDownloaded,
     fileAlreadyStored,
+    getTotalSizeBytes,
     kvGet,
     kvSet,
-    pushQueueBacklog,
-    popQueueBacklog,
-    queueBacklogSize,
-    getTotalSizeBytes,
 } from './db.js';
-import { sha256OfFile, sha256OfFileViaPool } from './checksum.js';
+import { sha256OfFile } from './checksum.js';
+import { accessOf, classifyChatError, isBlocked, recordResult } from './chat-access.js';
 import { pregenerateThumb } from './thumbs.js';
 import { optimizeDownloadInBackground as faststartInBackground } from './faststart.js';
 import { pregenerateNsfw } from './nsfw.js';
@@ -32,6 +30,8 @@ import { getDataDir, getDownloadsDir, resolveConfigDownloadPath } from './paths.
 const DATA_DIR = getDataDir();
 const DOWNLOADS_DIR = getDownloadsDir();
 const LOGS_DIR = path.join(DATA_DIR, 'logs');
+// How long the quota check reuses SUM(file_size) — see getDiskUsage().
+const CATALOGUE_SIZE_TTL_MS = 60_000;
 
 // Windows reserved device names — both bare and with any extension are
 // rejected by the OS (`CON.jpg` is just as bad as `CON`). Match
@@ -167,19 +167,11 @@ export async function migrateFolders(downloadPath) {
                 db.prepare(`
                     UPDATE downloads SET file_path = ? || substr(file_path, ?)
                      WHERE file_path LIKE ? ESCAPE '\\'
-                `).run(
-                    newPosix,
-                    oldPosix.length + 1,
-                    oldPosix.replace(/%/g, '\\%').replace(/_/g, '\\_') + '%',
-                );
+                `).run(newPosix, oldPosix.length + 1, oldPosix.replace(/[\\%_]/g, '\\$&') + '%');
                 db.prepare(`
                     UPDATE downloads SET file_path = ? || substr(file_path, ?)
                      WHERE file_path LIKE ? ESCAPE '\\'
-                `).run(
-                    newPrefix,
-                    oldPrefix.length + 1,
-                    oldPrefix.replace(/%/g, '\\%').replace(/_/g, '\\_') + '%',
-                );
+                `).run(newPrefix, oldPrefix.length + 1, oldPrefix.replace(/[\\%_]/g, '\\$&') + '%');
             } catch {
                 /* DB update is best-effort */
             }
@@ -202,7 +194,6 @@ const MIN_CONCURRENCY = 3;
 const MAX_CONCURRENCY = 20;
 const DEFAULT_SCALER_INTERVAL_MS = 5000;
 const DEFAULT_IDLE_SLEEP_MS = 200;
-const DEFAULT_SPILLOVER_THRESHOLD = 2000;
 
 export class DownloadManager extends EventEmitter {
     constructor(client, config, rateLimiter) {
@@ -212,9 +203,9 @@ export class DownloadManager extends EventEmitter {
         this.rateLimiter = rateLimiter;
         // Two-lane queue. Realtime (priority 1) jobs land in `_high` and
         // are drained first by every worker; history backfill (priority 2)
-        // lands in `queue`. Disk spillover only ever displaces history —
-        // realtime always stays in RAM. External code reads `pendingCount`
-        // (the sum) rather than `queue.length` directly.
+        // lands in `queue` (bounded by the history walker's backpressure).
+        // External code reads `pendingCount` (the sum) rather than
+        // `queue.length` directly.
         this._high = [];
         this.queue = [];
         this.active = new Map(); // Key -> Promise/Status
@@ -401,17 +392,6 @@ export class DownloadManager extends EventEmitter {
         // Check DB
         if (this.isDownloaded(job.groupId, job.message.id)) return false;
 
-        // --- DYNAMIC DEFENSE: DISK SPILLOVER ---
-        // Only history (priority 2) ever spills; realtime stays in RAM so
-        // a long backfill can't push live messages off the front of the queue.
-        const spillover =
-            Number(this.config?.advanced?.downloader?.spilloverThreshold) ||
-            DEFAULT_SPILLOVER_THRESHOLD;
-        if (priority === 2 && this.queue.length > spillover) {
-            await this.spillToDisk(job);
-            return true;
-        }
-
         if (priority === 2)
             this.queue.push(job); // history: FIFO normal lane
         else if (priority === 0)
@@ -594,35 +574,6 @@ export class DownloadManager extends EventEmitter {
         };
     }
 
-    // --- SPILLOVER LOGIC ---
-    // Backed by the queue_backlog SQLite table (was data/logs/queue_backlog.jsonl
-    // pre-v2.7). The kv-backed store gives us atomic appends, FIFO-by-id
-    // pops, and a transactional rehydrate that can't double-deliver a job
-    // if the process is killed mid-batch — none of which the JSONL file
-    // could guarantee. Methods stay async for caller compatibility.
-    async spillToDisk(job) {
-        try {
-            pushQueueBacklog(job);
-        } catch (e) {
-            // SQLite write failed — fall back to keeping the job in memory
-            // so it isn't silently lost. This is the same posture the file
-            // path took for an EIO from the disk.
-            this.queue.push(job);
-        }
-    }
-
-    async rehydrateFromDisk() {
-        try {
-            if (queueBacklogSize() === 0) return false;
-            const popped = popQueueBacklog(1000);
-            if (!popped.length) return false;
-            for (const job of popped) this.queue.push(job);
-            return true;
-        } catch {
-            return false;
-        }
-    }
-
     async runWorker(id) {
         while (this.running) {
             // 0. Globally paused? Spin without touching the lanes so resume
@@ -633,17 +584,9 @@ export class DownloadManager extends EventEmitter {
             }
 
             // 1. Drain high-priority (realtime) lane first, then history.
-            let job = this._high.shift() || this.queue.shift();
+            const job = this._high.shift() || this.queue.shift();
 
-            // 2. If RAM empty, check Disk Backlog
-            if (!job) {
-                const hasMore = await this.rehydrateFromDisk();
-                if (hasMore) {
-                    job = this._high.shift() || this.queue.shift();
-                }
-            }
-
-            // 3. Still empty? Sleep.
+            // 2. Empty? Sleep.
             if (!job) {
                 const idle =
                     Number(this.config?.advanced?.downloader?.idleSleepMs) || DEFAULT_IDLE_SLEEP_MS;
@@ -651,12 +594,23 @@ export class DownloadManager extends EventEmitter {
                 continue;
             }
 
-            // 4. Per-job pause: shove it to the back of the matching lane
+            // 3. Per-job pause: shove it to the back of the matching lane
             //    so other queued work keeps draining. Snapshot still shows
             //    it as 'paused' (see snapshot()).
             if (this._paused.has(job.key)) {
                 this.queue.push(job);
                 await this.sleep(150);
+                continue;
+            }
+
+            // The chat was marked unreachable after this job was queued —
+            // don't spend a download call (and five retries) on it.
+            if (job.groupId != null && isBlocked(job.groupId)) {
+                this._jobs.delete(job.key);
+                const st = accessOf(job.groupId).state;
+                const reason = `Skipped — chat can't be reached (${st})`;
+                await this.reportFailure(job, reason);
+                this.emit('error', { job, error: reason, access: st });
                 continue;
             }
 
@@ -682,6 +636,56 @@ export class DownloadManager extends EventEmitter {
         }
     }
 
+    /**
+     * Build the error for a download refused because the chat is gone for
+     * this account, and report it once. With the realtime monitor wired
+     * (it listens for `access_error`) the other accounts get a try before
+     * the chat is paused; without it (standalone downloader) the answer is
+     * recorded directly.
+     */
+    _accessFailure(job, cls) {
+        const err = new Error(`Chat can't be reached (${cls.state}: ${cls.code})`);
+        err.accessError = cls;
+        err.errorMessage = cls.code;
+        try {
+            if (this.listenerCount('access_error') > 0) {
+                this.emit('access_error', { job, cls });
+            } else if (job?.groupId != null) {
+                recordResult(job.groupId, job.accountId ?? null, cls);
+            }
+        } catch {
+            /* bookkeeping only */
+        }
+        return err;
+    }
+
+    /**
+     * Drop every queued (not yet started) job of a chat that can't be
+     * reached — they'd all fail. Returns how many were dropped. Running
+     * downloads finish or fail on their own.
+     */
+    dropGroup(groupId, state = null) {
+        const gid = String(groupId);
+        const drop = [];
+        const keep = (j) => {
+            if (String(j.groupId) === gid) {
+                drop.push(j);
+                return false;
+            }
+            return true;
+        };
+        this._high = this._high.filter(keep);
+        this.queue = this.queue.filter(keep);
+        if (!drop.length) return 0;
+        for (const j of drop) {
+            this._jobs.delete(j.key);
+            this._paused.delete(j.key);
+        }
+        this.emit('queue', this.pendingCount);
+        this.emit('queue_changed', { op: 'drop-group', groupId: gid, count: drop.length, state });
+        return drop.length;
+    }
+
     async reportFailure(job, reason) {
         DebugLogger.error(new Error(reason), `Download Failed: ${job.key}`);
         // ALSO print to stdout so the user can see it in `docker logs`
@@ -700,10 +704,9 @@ export class DownloadManager extends EventEmitter {
         const maxRetries = this.config.download?.retries || 5;
 
         try {
-            // 1. Check Disk Quota — use a live DB sum (excludes user_deleted rows)
-            // rather than the filesystem cache which is never decremented on deletion.
+            // 1. Check Disk Quota
             if (this.config.diskManagement?.maxTotalSize) {
-                const usage = getTotalSizeBytes();
+                const usage = await this.getDiskUsage();
                 const limit = this.parseSize(this.config.diskManagement.maxTotalSize);
                 if (usage > limit) {
                     throw new Error(`Disk Quota Exceeded: ${usage} / ${limit} bytes`);
@@ -881,6 +884,16 @@ export class DownloadManager extends EventEmitter {
                 return; // swallow — runWorker treats absence of throw as "done"
             }
 
+            // Already classified on a nested attempt — pass it up untouched.
+            if (error?.accessError) throw error;
+
+            // The chat itself is gone for this account (left, banned,
+            // private, deleted, restricted). Retrying can't help — fail now
+            // instead of spending five more calls, and report it so the
+            // monitor can try the other accounts / pause the chat.
+            const accessCls = classifyChatError(job.groupId, error);
+            if (accessCls.definite) throw this._accessFailure(job, accessCls);
+
             if (error.errorMessage === 'FLOOD_WAIT' || error.message?.includes('FLOOD_WAIT')) {
                 const seconds = error.seconds || 60;
                 this.throttle(); // Dynamic: reduce concurrency on flood
@@ -902,21 +915,41 @@ export class DownloadManager extends EventEmitter {
                 );
             }
 
+            // A stale media location (expired/invalid file reference, or
+            // LOCATION_INVALID after the media changed) only heals by
+            // re-fetching the message; retrying the old one fails the same way.
             if (
-                error.message?.includes('FILE_REFERENCE_EXPIRED') ||
-                error.errorMessage === 'FILE_REFERENCE_EXPIRED'
+                /FILE_REFERENCE_(EXPIRED|INVALID)|LOCATION_INVALID/.test(
+                    `${error.errorMessage || ''} ${error.message || ''}`,
+                )
             ) {
                 if (attempt < maxRetries) {
+                    let refreshed = false;
+                    let fresh;
                     try {
                         const refreshClient = job.client || this.client;
                         const messages = await refreshClient.getMessages(job.message.peerId, {
                             ids: [job.message.id],
                         });
-                        if (messages && messages.length > 0) {
-                            job.message = messages[0];
-                            return this.download(job, attempt + 1);
-                        }
-                    } catch (e) {}
+                        fresh = messages?.[0];
+                        refreshed = true;
+                    } catch (e) {
+                        if (e?.accessError) throw e;
+                        // Refreshing the file reference is where a lost chat
+                        // usually shows up (CHANNEL_PRIVATE on getMessages).
+                        const cls = classifyChatError(job.groupId, e);
+                        if (cls.definite) throw this._accessFailure(job, cls);
+                    }
+                    if (fresh?.media) {
+                        job.message = fresh;
+                        return this.download(job, attempt + 1);
+                    }
+                    // The message or its media is gone — no retry can fetch it.
+                    if (refreshed) {
+                        throw new Error(
+                            `Media no longer available on Telegram (${error.errorMessage || error.message})`,
+                        );
+                    }
                 }
             }
 
@@ -951,14 +984,9 @@ export class DownloadManager extends EventEmitter {
         let storedSize = size;
         let bytesAddedToDisk = size;
         try {
-            // Hash on a worker thread so the main event loop stays free
-            // during multi-GB post-write hashing. Falls back automatically
-            // to the in-process streamer if the pool is disabled.
-            try {
-                fileHash = await sha256OfFileViaPool(filePath);
-            } catch {
-                fileHash = await sha256OfFile(filePath);
-            }
+            // tgdl-core hashes it, so the main event loop stays free
+            // during multi-GB post-write hashing.
+            fileHash = await sha256OfFile(filePath);
             // Match on hash AND size — size match guards against the
             // (vanishingly improbable) SHA-256 collision and rejects rows
             // with a NULL/zero size from older downloader versions.
@@ -1028,8 +1056,12 @@ export class DownloadManager extends EventEmitter {
             }
         } catch (e) {
             // Hash failed (very rare — file disappeared between rename and
-            // open). Fall through and store the row with the new file path.
-            console.warn('[downloader] dedup hash failed:', e?.message || e);
+            // open — or tgdl-core isn't running, which the [go-core] log and
+            // the dashboard banner already report). Fall through and store
+            // the row with the new file path.
+            if (e?.kind !== 'unavailable') {
+                console.warn('[downloader] dedup hash failed:', e?.message || e);
+            }
         }
 
         // Fallback dedup: same filename + size in the same group catches
@@ -1212,7 +1244,42 @@ export class DownloadManager extends EventEmitter {
         return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
     }
 
+    /**
+     * Bytes counted against `diskManagement.maxTotalSize`.
+     *
+     * Two measures, each too high in a different way:
+     *   - the persisted counter (seeded by a disk walk, bumped only by new
+     *     bytes, so a dedup-shared file counts once) never went down when
+     *     files were deleted or rotated away;
+     *   - SUM(file_size) over the catalogue drops with every delete, but
+     *     counts a file shared by several rows (download-time dedup) once
+     *     per row.
+     * Whenever the SUM is the smaller one, the counter is pulled down to it
+     * and keeps counting new bytes from there. So usage is never above the
+     * old counter (no new "quota exceeded"), never above what the disk
+     * rotator measures (rotating / deleting always lets downloads resume),
+     * and shared files added after that point still count once. The SUM is
+     * a covering-index scan (~40 ms per million rows), re-read at most once
+     * a minute.
+     */
     async getDiskUsage() {
+        const counter = await this._getDiskUsageCounter();
+        const now = Date.now();
+        if (!this._catalogueSize || now - this._catalogueSize.at > CATALOGUE_SIZE_TTL_MS) {
+            try {
+                this._catalogueSize = { size: getTotalSizeBytes(), at: now };
+            } catch {
+                return counter;
+            }
+        }
+        if (this._catalogueSize.size < counter) {
+            this._diskUsageCache.size = this._catalogueSize.size;
+            this.saveDiskUsageCache();
+        }
+        return this._diskUsageCache.size;
+    }
+
+    async _getDiskUsageCounter() {
         if (this._diskUsageCache) return this._diskUsageCache.size;
 
         try {
@@ -1273,13 +1340,8 @@ export class DownloadManager extends EventEmitter {
     incrementDiskUsage(bytes) {
         if (!this._diskUsageCache) this._diskUsageCache = { size: 0, timestamp: Date.now() };
         this._diskUsageCache.size += bytes;
-        if (this._saveTimeout) clearTimeout(this._saveTimeout);
-        this._saveTimeout = setTimeout(() => this.saveDiskUsageCache(), 10000);
-    }
-
-    decrementDiskUsage(bytes) {
-        if (!this._diskUsageCache) return;
-        this._diskUsageCache.size = Math.max(0, this._diskUsageCache.size - bytes);
+        // Keep the cached catalogue total current between re-reads.
+        if (this._catalogueSize) this._catalogueSize.size += bytes;
         if (this._saveTimeout) clearTimeout(this._saveTimeout);
         this._saveTimeout = setTimeout(() => this.saveDiskUsageCache(), 10000);
     }

@@ -9,6 +9,8 @@ Endpoints (see ``docs/AI.md`` on the Node side for the full contract):
 * ``POST /detect``        — detect & embed faces from a path or base64 blob.
 * ``POST /detect-embed``  — alias of ``/detect``.
 * ``POST /detect/batch``  — batch variant accepting multiple file paths.
+* ``POST /detect/upload`` — raw image bytes as the body (no base64); for
+  callers on another host. Thresholds as query parameters.
 
 Error payload shape (used by every non-2xx response):
 
@@ -19,15 +21,17 @@ The Node client switches on ``code``; the human text is for logs.
 
 from __future__ import annotations
 
-import itertools
+import asyncio
+import hmac
 import logging
 import os
 import time
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from typing import Annotated, Any
 
 import numpy as np
-from fastapi import FastAPI, Request, Response, status
+from fastapi import FastAPI, Query, Request, Response, status
 from fastapi.concurrency import run_in_threadpool
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -39,11 +43,14 @@ from .insight import (
     EMBEDDING_DIM,
     MODEL_NAME,
     arch_tag,
+    cpu_budget,
     detect_and_embed,
+    effective_cpu_count,
     get_app,  # returns the FaceAnalysis singleton — used only in /info to read live providers
     get_stats,
     gpu_available,
     gpu_provider,
+    intra_op_threads,
     is_ready,
     preload_named_model,
     preload_status,
@@ -57,17 +64,14 @@ from .insight import (
     _resolve_models_dir,
 )
 from .io import (
-    DEFAULT_FLOOR_INTERVAL_SEC,
-    DEFAULT_MOTION_THRESHOLD,
-    DEFAULT_WINDOW_SEC,
     Base64DecodeError,
     ImageDecodeError,
     PathNotAllowedError,
-    extract_video_frames,
+    iter_video_frames,
     load_image_from_b64,
+    load_image_from_bytes,
     load_image_from_path,
 )
-from . import video_progress
 
 
 _LOG = logging.getLogger(__name__)
@@ -171,12 +175,6 @@ class Face(BaseModel):
         le=1.0,
         description="Composite quality (det_score + size + sharpness + landmarks + pose)",
     )
-    landmark_regularity: float = Field(
-        default=0.5,
-        ge=0.0,
-        le=1.0,
-        description="Hard-gate signal: eye/nose/mouth symmetry (0–1); used by video track confirmation",
-    )
     embedding: list[float] = Field(
         ...,
         description=f"L2-normalised {EMBEDDING_DIM}-dim float vector",
@@ -187,8 +185,7 @@ class Face(BaseModel):
     )
     frame_time_sec: float | None = Field(
         default=None,
-        ge=0.0,
-        description="Source video timestamp (seconds) for video-sourced faces; null for photos",
+        description="Video faces only: seconds into the clip of the frame the face came from.",
     )
 
 
@@ -196,6 +193,11 @@ class DetectResponse(BaseModel):
     faces: list[Face]
     image_w: int
     image_h: int
+    # True when face coordinates are in the EXIF-oriented frame (what a
+    # browser displays). Sidecars before this field existed double-applied
+    # the Orientation tag, so the Node side keeps its legacy crop path for
+    # rows that don't carry the flag.
+    exif_oriented: bool = False
 
 
 class BatchDetectItem(BaseModel):
@@ -206,6 +208,7 @@ class BatchDetectItem(BaseModel):
     image_w: int = 0
     image_h: int = 0
     error: str | None = None
+    exif_oriented: bool = True
 
 
 class BatchDetectResponse(BaseModel):
@@ -214,56 +217,19 @@ class BatchDetectResponse(BaseModel):
     total_faces: int
 
 
-def _default_max_frames() -> int:
-    """Read ``TGDL_FACES_VIDEO_MAX_FRAMES`` (§5) for the request-body
-    default — falls back to 20000 (the doc's safety-ceiling default) if
-    unset/invalid. Only affects requests that omit ``max_frames``
-    entirely; an explicit request value always wins."""
-    raw = os.environ.get("TGDL_FACES_VIDEO_MAX_FRAMES", "").strip()
-    if raw:
-        try:
-            v = int(raw)
-            if v >= 1:
-                return v
-        except ValueError:
-            pass
-    return 20000
-
-
 class VideoDetectRequest(BaseModel):
     """Body for ``POST /detect/video``.
 
     ``path`` must resolve under TGDL_FACES_ALLOW_ROOTS (same rule as
-    ``/detect/batch``). ``max_frames`` is a pure runaway-safety ceiling
-    (docs/requirements.md §4.1/§6) — not a density control — defaulting
-    to 20000 (env-overridable via ``TGDL_FACES_VIDEO_MAX_FRAMES``); it
-    should essentially never bind for a real-world video given the
-    streaming pipeline in `_do_detect_video_sync`.
+    ``/detect/batch``). ``max_frames`` caps how many evenly-spaced frames
+    are sampled — the default 120 covers a 2-hour video at 1 frame/min.
     """
 
     path: str = Field(..., description="Absolute path to a video file on disk.")
     min_score: float | None = Field(default=None, ge=0.0, le=1.0)
     min_box_px: int | None = Field(default=None, ge=1)
     ar_range: tuple[float, float] | None = Field(default=None)
-    max_frames: int = Field(default_factory=_default_max_frames, ge=1, le=200_000)
-    job_id: str | None = Field(
-        default=None,
-        description=(
-            "Opaque caller-supplied id used to poll decode progress via "
-            "GET /detect/video/status/{job_id} while this request is in "
-            "flight. Optional — omit for the old fire-and-forget behavior."
-        ),
-    )
-    nice: int | None = Field(
-        default=None,
-        ge=0,
-        le=19,
-        description=(
-            "Optional per-request Unix nice increment (0 = off). When set, "
-            "overrides TGDL_FACES_VIDEO_NICE so the dashboard Video CPU "
-            "priority control can drive the sidecar without a restart."
-        ),
-    )
+    max_frames: int = Field(default=120, ge=1, le=500)
 
     @model_validator(mode="after")
     def _validate_ar_range(self) -> "VideoDetectRequest":
@@ -287,9 +253,75 @@ app = FastAPI(
 )
 
 
+# What this build supports. The Node client reads it from /health and only
+# uses an endpoint that is listed, so older sidecars keep working.
+FEATURES = ["path", "b64", "batch_b64", "video", "auth", "upload"]
+
+
+def _max_upload_bytes() -> int:
+    """Cap for ``/detect/upload`` bodies (``TGDL_FACES_MAX_UPLOAD_MB``, default 64)."""
+    raw = os.environ.get("TGDL_FACES_MAX_UPLOAD_MB", "").strip()
+    try:
+        mb = int(raw) if raw else 64
+    except ValueError:
+        mb = 64
+    return max(1, mb) * 1024 * 1024
+
+
 def _allow_roots() -> list[str]:
     raw = os.environ.get("TGDL_FACES_ALLOW_ROOTS", "")
     return [p.strip() for p in raw.split(",") if p and p.strip()]
+
+
+# Process-wide admission gate for image work (decode + detect), shared by
+# every endpoint. The inference semaphore in insight.py only bounds
+# onnxruntime; without this, N concurrent batch requests each decoded
+# their own images up front (a 12 MP JPEG is ~36 MB as BGR) and parked
+# a thread per request. One slot above the inference limit keeps the
+# next image decoding while the current ones infer.
+_ADMISSION: tuple[Any, int, asyncio.Semaphore] | None = None
+
+
+def _admission() -> asyncio.Semaphore:
+    # asyncio primitives bind to one event loop; uvicorn runs exactly one,
+    # but test clients may spin up several — rebuild per loop. Also rebuilt
+    # when the limit changes (the GPU tier is only known after model load);
+    # holders of the old semaphore simply release into it.
+    global _ADMISSION
+    loop = asyncio.get_running_loop()
+    limit = _resolve_max_concurrency() + 1
+    if _ADMISSION is None or _ADMISSION[0] is not loop or _ADMISSION[1] != limit:
+        _ADMISSION = (loop, limit, asyncio.Semaphore(limit))
+    return _ADMISSION[2]
+
+
+def _not_ready_response() -> JSONResponse | None:
+    """503 while the model is loading / after it failed, else None."""
+    if last_error() is not None:
+        return _error(
+            f"model failed to load: {last_error()}",
+            code="model_load_failed",
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+    if not is_ready():
+        return _error(
+            "model is still loading, retry shortly",
+            code="model_loading",
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+    return None
+
+
+def _filter_kwargs(body: Any) -> dict[str, Any]:
+    """detect_and_embed kwargs from a request body; defaults left to insight."""
+    kwargs: dict[str, Any] = {}
+    if body.min_score is not None:
+        kwargs["min_score"] = float(body.min_score)
+    if body.min_box_px is not None:
+        kwargs["min_box_px"] = int(body.min_box_px)
+    if body.ar_range is not None:
+        kwargs["ar_range"] = (float(body.ar_range[0]), float(body.ar_range[1]))
+    return kwargs
 
 
 def _error(message: str, code: str, status_code: int) -> JSONResponse:
@@ -326,6 +358,38 @@ async def _request_logging(
     return response
 
 
+# Liveness stays open so container healthchecks / uptime probes work
+# without the secret.
+_PUBLIC_PATHS = frozenset({"/health"})
+
+
+@app.middleware("http")
+async def _require_api_token(
+    request: Request,
+    call_next: Any,
+) -> Response:
+    """Optional shared-secret auth for a sidecar exposed beyond localhost.
+
+    ``TGDL_FACES_API_TOKEN`` unset (the default) = no auth, as before. When
+    set, every endpoint except ``/health`` needs ``Authorization: Bearer
+    <token>`` or ``X-API-Token: <token>`` — otherwise anyone who can reach
+    the port can burn its CPU/GPU or read files under the allow-list. The
+    Node side sends it from ``faces.sidecarToken`` / ``TGDL_FACES_SIDECAR_TOKEN``.
+    """
+    token = os.environ.get("TGDL_FACES_API_TOKEN", "").strip()
+    if token and request.url.path not in _PUBLIC_PATHS:
+        auth = request.headers.get("authorization", "")
+        got = auth[7:].strip() if auth[:7].lower() == "bearer " else ""
+        got = got or request.headers.get("x-api-token", "").strip()
+        if not hmac.compare_digest(got.encode("utf-8"), token.encode("utf-8")):
+            return _error(
+                "missing or invalid API token",
+                code="unauthorized",
+                status_code=status.HTTP_401_UNAUTHORIZED,
+            )
+    return await call_next(request)
+
+
 # --- exception handlers -----------------------------------------------------
 
 
@@ -356,8 +420,13 @@ async def _base64_decode_handler(
 
 
 @app.get("/health")
-def health() -> JSONResponse:
+async def health() -> JSONResponse:
     """Liveness + readiness probe matching the seekbar health response format.
+
+    ``async`` on purpose: it only reads in-memory state, and running it on
+    the event loop keeps it answering instantly while every threadpool
+    worker is busy with inference. A slow /health used to trip the Node
+    health monitor into killing a sidecar that was merely busy.
 
     Always returns HTTP 200 — the Node-side polling loop must inspect
     the ``ok`` flag rather than the HTTP status to determine real health.
@@ -381,6 +450,8 @@ def health() -> JSONResponse:
                 "uptime_sec": uptime_sec(),
                 "error": f"{type(err).__name__}: {err}",
                 "stats": get_stats(),
+                "features": FEATURES,
+                "max_upload_bytes": _max_upload_bytes(),
             },
         )
     return JSONResponse(
@@ -398,12 +469,14 @@ def health() -> JSONResponse:
             "providers": resolved_providers(),
             "uptime_sec": uptime_sec(),
             "stats": get_stats(),
+            "features": FEATURES,
+            "max_upload_bytes": _max_upload_bytes(),
         },
     )
 
 
 @app.get("/config")
-def config() -> JSONResponse:
+async def config() -> JSONResponse:
     """Return the effective runtime configuration.
 
     Useful for operators to verify env vars are applied correctly without
@@ -420,6 +493,9 @@ def config() -> JSONResponse:
             "gpu_provider": gpu_provider(),
             "gpu_available": gpu_available(),
             "max_concurrency": _resolve_max_concurrency(),
+            "effective_cpus": effective_cpu_count(),
+            "cpu_budget": cpu_budget(),
+            "intra_op_threads": intra_op_threads(),
             "model_dir": str(_resolve_models_dir()),
             "allow_roots": _allow_roots(),
             "host": os.environ.get("TGDL_FACES_HOST", "127.0.0.1"),
@@ -434,7 +510,7 @@ def config() -> JSONResponse:
 
 
 @app.get("/info")
-def info() -> JSONResponse:
+async def info() -> JSONResponse:
     """Static model card. Cheap; used by the Node side at boot."""
     providers = resolved_providers()
     # If the model has already been loaded, prefer the live FaceAnalysis
@@ -649,31 +725,20 @@ def _do_detect_sync(body: DetectRequest) -> JSONResponse:
             content={"faces": [], "error": "decode_failed"},
         )
 
-    # Guard: model must be loaded. Return 503 during the brief window while
-    # preload_model() is still running, but only after input is validated.
-    if last_error() is not None:
-        return _error(
-            f"model failed to load: {last_error()}",
-            code="model_load_failed",
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-        )
-    if not is_ready():
-        return _error(
-            "model is still loading, retry shortly",
-            code="model_loading",
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-        )
-
     # Build the filter kwargs without overwriting defaults when the
     # caller didn't supply them — keeps the wire format compact for the
     # common case (Node defers everything to the sidecar defaults).
-    kwargs: dict[str, Any] = {}
-    if body.min_score is not None:
-        kwargs["min_score"] = float(body.min_score)
-    if body.min_box_px is not None:
-        kwargs["min_box_px"] = int(body.min_box_px)
-    if body.ar_range is not None:
-        kwargs["ar_range"] = (float(body.ar_range[0]), float(body.ar_range[1]))
+    return _detect_loaded(img, _filter_kwargs(body))
+
+
+def _detect_loaded(img: Any, kwargs: dict[str, Any]) -> JSONResponse:
+    """Detect + embed on an already-decoded image (shared by /detect and
+    /detect/upload)."""
+    # Guard: model must be loaded. Return 503 during the brief window while
+    # preload_model() is still running, but only after input is validated.
+    not_ready = _not_ready_response()
+    if not_ready is not None:
+        return not_ready
 
     try:
         faces = detect_and_embed(img, **kwargs)
@@ -692,7 +757,8 @@ def _do_detect_sync(body: DetectRequest) -> JSONResponse:
             faces=[Face(**f) for f in faces],
             image_w=w_img,
             image_h=h_img,
-        ).model_dump(),
+            exif_oriented=True,
+        ).model_dump(exclude_none=True),
     )
 
 
@@ -718,7 +784,65 @@ async def detect(body: Annotated[DetectRequest, ...]) -> JSONResponse:
     other requests (``/health``, concurrent ``/detect``) are served
     promptly while a detection is in flight.
     """
-    return await run_in_threadpool(_do_detect_sync, body)
+    async with _admission():
+        return await run_in_threadpool(_do_detect_sync, body)
+
+
+@app.post("/detect/upload")
+async def detect_upload(
+    request: Request,
+    min_score: Annotated[float | None, Query(ge=0.0, le=1.0)] = None,
+    min_box_px: Annotated[int | None, Query(ge=1)] = None,
+    ar_lo: Annotated[float | None, Query(gt=0.0)] = None,
+    ar_hi: Annotated[float | None, Query(gt=0.0)] = None,
+) -> JSONResponse:
+    """Detect & embed faces in the raw request body (image bytes).
+
+    Same response as ``/detect``. For callers that can't share their
+    files with the sidecar: no base64 inflation and no JSON parsing of a
+    multi-megabyte string. Capped by ``TGDL_FACES_MAX_UPLOAD_MB`` (413).
+    """
+    limit = _max_upload_bytes()
+    declared = request.headers.get("content-length", "")
+    if declared.isdigit() and int(declared) > limit:
+        return _error("image too large", code="too_large", status_code=413)
+    buf = bytearray()
+    async for chunk in request.stream():
+        buf.extend(chunk)
+        if len(buf) > limit:
+            return _error("image too large", code="too_large", status_code=413)
+    if not buf:
+        return _error("empty body", code="bad_request", status_code=status.HTTP_400_BAD_REQUEST)
+    if (ar_lo is None) != (ar_hi is None) or (
+        ar_lo is not None and ar_hi is not None and ar_lo >= ar_hi
+    ):
+        return _error(
+            "ar_lo and ar_hi go together, with ar_lo < ar_hi",
+            code="bad_request",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+    kwargs: dict[str, Any] = {}
+    if min_score is not None:
+        kwargs["min_score"] = float(min_score)
+    if min_box_px is not None:
+        kwargs["min_box_px"] = int(min_box_px)
+    if ar_lo is not None and ar_hi is not None:
+        kwargs["ar_range"] = (float(ar_lo), float(ar_hi))
+    raw = bytes(buf)
+    del buf
+
+    def _run() -> JSONResponse:
+        try:
+            img = load_image_from_bytes(raw)
+        except ImageDecodeError:
+            return JSONResponse(
+                status_code=status.HTTP_200_OK,
+                content={"faces": [], "error": "decode_failed"},
+            )
+        return _detect_loaded(img, kwargs)
+
+    async with _admission():
+        return await run_in_threadpool(_run)
 
 
 @app.post("/detect-embed")
@@ -729,7 +853,8 @@ async def detect_embed(body: Annotated[DetectRequest, ...]) -> JSONResponse:
     combined detect + embed call" semantics; keeping both endpoints
     lets either side be refactored without breaking the other.
     """
-    return await run_in_threadpool(_do_detect_sync, body)
+    async with _admission():
+        return await run_in_threadpool(_do_detect_sync, body)
 
 
 def _resolve_throttle_ms() -> float:
@@ -751,92 +876,46 @@ def _resolve_throttle_ms() -> float:
     return max(0.0, v)
 
 
-def _do_batch_sync(body: BatchDetectRequest) -> JSONResponse:
-    """Synchronous inner implementation for batch detection."""
-    if last_error() is not None:
-        return _error(
-            f"model failed to load: {last_error()}",
-            code="model_load_failed",
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-        )
-    if not is_ready():
-        return _error(
-            "model is still loading, retry shortly",
-            code="model_loading",
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-        )
-
-    kwargs: dict[str, Any] = {}
-    if body.min_score is not None:
-        kwargs["min_score"] = float(body.min_score)
-    if body.min_box_px is not None:
-        kwargs["min_box_px"] = int(body.min_box_px)
-    if body.ar_range is not None:
-        kwargs["ar_range"] = (float(body.ar_range[0]), float(body.ar_range[1]))
-
-    throttle_sec = _resolve_throttle_ms() / 1000.0
-    max_workers = _resolve_max_concurrency()
-
-    def _process_one(file_path: str) -> dict[str, Any]:
-        if throttle_sec > 0:
-            time.sleep(throttle_sec)
-        img, err_code = _load_image(file_path, None)
-        if img is None:
-            return {
-                "file": file_path,
-                "faces": [],
-                "image_w": 0,
-                "image_h": 0,
-                "error": err_code,
-            }
-        try:
-            faces = detect_and_embed(img, **kwargs)
-        except Exception as exc:
-            _LOG.exception("detect_and_embed failed for %s", file_path)
-            return {
-                "file": file_path,
-                "faces": [],
-                "image_w": 0,
-                "image_h": 0,
-                "error": f"detect_failed: {type(exc).__name__}",
-            }
-        h_img, w_img = int(img.shape[0]), int(img.shape[1])
-        face_objs = [Face(**f).model_dump() for f in faces]
+def _process_batch_file(
+    file_path: str, kwargs: dict[str, Any], throttle_sec: float
+) -> dict[str, Any]:
+    """Load + detect one ``/detect/batch`` entry (runs in the threadpool)."""
+    if throttle_sec > 0:
+        time.sleep(throttle_sec)
+    img, err_code = _load_image(file_path, None)
+    if img is None:
         return {
             "file": file_path,
-            "faces": face_objs,
-            "image_w": w_img,
-            "image_h": h_img,
-            "error": None,
+            "faces": [],
+            "image_w": 0,
+            "image_h": 0,
+            "error": err_code,
         }
-
-    # Process files in parallel up to the concurrency limit. The semaphore
-    # inside detect_and_embed() still governs GPU/model access, but image
-    # loading and pre/post-processing now overlap with inference.
-    indexed_results: dict[int, dict[str, Any]] = {}
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = {
-            pool.submit(_process_one, fp): idx
-            for idx, fp in enumerate(body.files)
+    try:
+        faces = detect_and_embed(img, **kwargs)
+    except Exception as exc:
+        _LOG.exception("detect_and_embed failed for %s", file_path)
+        return {
+            "file": file_path,
+            "faces": [],
+            "image_w": 0,
+            "image_h": 0,
+            "error": f"detect_failed: {type(exc).__name__}",
         }
-        for fut in as_completed(futures):
-            indexed_results[futures[fut]] = fut.result()
-
-    results = [indexed_results[i] for i in range(len(body.files))]
-    total_faces = sum(len(r["faces"]) for r in results)
-
-    return JSONResponse(
-        status_code=status.HTTP_200_OK,
-        content={
-            "results": results,
-            "total_files": len(results),
-            "total_faces": total_faces,
-        },
-    )
+    h_img, w_img = int(img.shape[0]), int(img.shape[1])
+    face_objs = [Face(**f).model_dump(exclude_none=True) for f in faces]
+    return {
+        "file": file_path,
+        "faces": face_objs,
+        "image_w": w_img,
+        "image_h": h_img,
+        "error": None,
+        "exif_oriented": True,
+    }
 
 
 @app.post("/detect/batch")
-async def detect_batch(body: BatchDetectRequest) -> JSONResponse:
+async def detect_batch(body: BatchDetectRequest, request: Request) -> JSONResponse:
     """Detect faces in multiple files in a single HTTP round-trip.
 
     Accepts ``{"files": ["/abs/path/img1.jpg", ...]}`` and returns a
@@ -847,11 +926,44 @@ async def detect_batch(body: BatchDetectRequest) -> JSONResponse:
     Model-not-ready and model-load-failed conditions are still returned
     as top-level 503 errors because no results can be produced.
 
-    The entire batch runs in a single threadpool slot so the semaphore
-    in :func:`detect_and_embed` governs concurrency across simultaneous
-    batch requests — no separate locking is needed here.
+    Files go through the shared admission gate one at a time, so
+    concurrent batch requests interleave fairly instead of each spinning
+    up its own pool. Once the client has gone away (Node timed out or the
+    scan was cancelled) the remaining files are skipped instead of being
+    computed for nobody.
     """
-    return await run_in_threadpool(_do_batch_sync, body)
+    not_ready = _not_ready_response()
+    if not_ready is not None:
+        return not_ready
+
+    kwargs = _filter_kwargs(body)
+    throttle_sec = _resolve_throttle_ms() / 1000.0
+
+    async def _one(file_path: str) -> dict[str, Any]:
+        async with _admission():
+            if await request.is_disconnected():
+                return {
+                    "file": file_path,
+                    "faces": [],
+                    "image_w": 0,
+                    "image_h": 0,
+                    "error": "cancelled",
+                }
+            return await run_in_threadpool(
+                _process_batch_file, file_path, kwargs, throttle_sec
+            )
+
+    results = list(await asyncio.gather(*(_one(fp) for fp in body.files)))
+    total_faces = sum(len(r["faces"]) for r in results)
+
+    return JSONResponse(
+        status_code=status.HTTP_200_OK,
+        content={
+            "results": results,
+            "total_files": len(results),
+            "total_faces": total_faces,
+        },
+    )
 
 
 class BatchB64DetectRequest(BaseModel):
@@ -881,59 +993,45 @@ class BatchB64DetectRequest(BaseModel):
         return self
 
 
-def _do_batch_b64_sync(body: BatchB64DetectRequest) -> JSONResponse:
-    """Process multiple b64 images in parallel — GPU-optimised."""
-    if last_error() is not None:
-        return _error(
-            f"model failed to load: {last_error()}",
-            code="model_load_failed",
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-        )
-    if not is_ready():
-        return _error(
-            "model is still loading, retry shortly",
-            code="model_loading",
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-        )
+def _process_b64_frame(b64: str, kwargs: dict[str, Any]) -> dict[str, Any]:
+    try:
+        img = load_image_from_b64(b64)
+    except (Base64DecodeError, ImageDecodeError):
+        return {"faces": [], "error": "decode_failed"}
+    try:
+        faces = detect_and_embed(img, **kwargs)
+    except Exception:
+        return {"faces": [], "error": "detect_failed"}
+    return {"faces": faces, "error": None}
 
-    kwargs: dict[str, Any] = {}
-    if body.min_score is not None:
-        kwargs["min_score"] = float(body.min_score)
-    if body.min_box_px is not None:
-        kwargs["min_box_px"] = int(body.min_box_px)
-    if body.ar_range is not None:
-        kwargs["ar_range"] = (float(body.ar_range[0]), float(body.ar_range[1]))
-    # Quality scoring re-enabled per docs/requirements.md §4.4/Phase 2 — the
-    # video track-confirmation logic needs real quality_score values to
-    # enforce the singleton/confirmed-track quality floors.
 
-    max_workers = _resolve_max_concurrency()
+@app.post("/detect/batch-b64")
+async def detect_batch_b64(body: BatchB64DetectRequest, request: Request) -> JSONResponse:
+    """Detect faces in multiple base64 images — GPU-pipelined.
 
-    def _process_one(idx: int, b64: str) -> dict[str, Any]:
-        try:
-            img = load_image_from_b64(b64)
-        except (Base64DecodeError, ImageDecodeError):
-            return {"idx": idx, "faces": [], "error": "decode_failed"}
-        try:
-            faces = detect_and_embed(img, **kwargs)
-        except Exception:
-            return {"idx": idx, "faces": [], "error": "detect_failed"}
-        return {"idx": idx, "faces": faces, "error": None}
+    Optimised for the Node-side video b64 fallback: accepts an array of
+    frames as base64, processes them in parallel on GPU, and returns all
+    results in one response. Skips quality-score computation for throughput.
+    """
+    not_ready = _not_ready_response()
+    if not_ready is not None:
+        return not_ready
 
-    indexed_results: dict[int, dict[str, Any]] = {}
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = {
-            pool.submit(_process_one, i, b64): i
-            for i, b64 in enumerate(body.images)
-        }
-        for fut in as_completed(futures):
-            r = fut.result()
-            indexed_results[r["idx"]] = r
+    kwargs = _filter_kwargs(body)
+    # Skip quality for throughput — video frames don't need per-face quality scores
+    kwargs["_skip_quality_score"] = True
+
+    async def _one(b64: str) -> dict[str, Any]:
+        async with _admission():
+            if await request.is_disconnected():
+                return {"faces": [], "error": "cancelled"}
+            return await run_in_threadpool(_process_b64_frame, b64, kwargs)
+
+    items = await asyncio.gather(*(_one(b64) for b64 in body.images))
 
     results = []
     total_faces = 0
-    for i in range(len(body.images)):
-        item = indexed_results.get(i, {"faces": [], "error": "missing"})
+    for item in items:
         faces = item["faces"]
         total_faces += len(faces)
         results.append({
@@ -954,419 +1052,128 @@ def _do_batch_b64_sync(body: BatchB64DetectRequest) -> JSONResponse:
     )
 
 
-@app.post("/detect/batch-b64")
-async def detect_batch_b64(body: BatchB64DetectRequest) -> JSONResponse:
-    """Detect faces in multiple base64 images — GPU-pipelined.
+def _dedupe_video_faces(all_faces: list[dict]) -> list[dict]:
+    """Return one best face per unique identity across video frames.
 
-    Optimised for the Node-side video b64 fallback: accepts an array of
-    frames as base64, processes them in parallel on GPU, and returns all
-    results in one response. Skips quality-score computation for throughput.
+    Insightface embeddings are L2-normalised so the dot product equals
+    cosine similarity. Faces above the 0.50 threshold are considered the
+    same person; the candidate with the highest detection score is kept.
+    O(N²) over unique identities — in practice N ≤ a handful per video.
     """
-    return await run_in_threadpool(_do_batch_b64_sync, body)
-
-
-_TRACK_MATCH_THRESHOLD = 0.50  # unchanged from the old greedy dedup
-_TRACK_MAX_REPRESENTATIVES = 3
-_TRACK_POSE_DEDUP_THRESHOLD = 0.85
-
-
-def _resolve_video_sampling_params() -> tuple[float, float, float]:
-    """Read the §4.1/§5 sampling knobs from env.
-
-    Returns ``(window_sec, floor_interval_sec, motion_threshold)``. Node's
-    ffmpeg-fallback continuous `select` filter has no equivalent windowing
-    concept and uses ffmpeg's own (differently-scaled) `scene` score
-    instead of a luma-diff threshold, so only ``floor_interval_sec`` has a
-    matching `videoFloorIntervalSec` knob on the Node side (§4.5) — see
-    ``src/core/ai/faces-client.js`` and docs/requirements.md §5.
-    """
-
-    def _float_env(name: str, default: float) -> float:
-        raw = os.environ.get(name, "").strip()
-        if not raw:
-            return default
-        try:
-            return float(raw)
-        except ValueError:
-            return default
-
-    return (
-        _float_env("TGDL_FACES_VIDEO_WINDOW_SEC", DEFAULT_WINDOW_SEC),
-        _float_env("TGDL_FACES_VIDEO_FLOOR_INTERVAL_SEC", DEFAULT_FLOOR_INTERVAL_SEC),
-        _float_env("TGDL_FACES_VIDEO_MOTION_THRESHOLD", DEFAULT_MOTION_THRESHOLD),
-    )
-
-
-def _resolve_video_track_thresholds() -> tuple[float, float, float, float, float]:
-    """Read the §4.4/§5 track-confirmation thresholds from env.
-
-    Returns ``(singleton_min_score, singleton_min_quality,
-    confirmed_min_quality, confirmed_min_score, min_landmark_regularity)``.
-    Mirrored in ``src/core/ai/faces-client.js`` for the Node fallback path —
-    keep both in sync if these defaults ever change.
-    """
-
-    def _float_env(name: str, default: float) -> float:
-        raw = os.environ.get(name, "").strip()
-        if not raw:
-            return default
-        try:
-            return float(raw)
-        except ValueError:
-            return default
-
-    return (
-        _float_env("TGDL_FACES_VIDEO_SINGLETON_MIN_SCORE", 0.75),
-        _float_env("TGDL_FACES_VIDEO_SINGLETON_MIN_QUALITY", 0.55),
-        _float_env("TGDL_FACES_VIDEO_CONFIRMED_MIN_QUALITY", 0.35),
-        _float_env("TGDL_FACES_VIDEO_CONFIRMED_MIN_SCORE", 0.50),
-        _float_env("TGDL_FACES_VIDEO_MIN_LANDMARK_REGULARITY", 0.15),
-    )
-
-
-def _select_diverse_representatives(
-    faces: list[dict],
-    limit: int = _TRACK_MAX_REPRESENTATIVES,
-    *,
-    min_quality: float = 0.0,
-    min_score: float = 0.0,
-    min_regularity: float = 0.0,
-) -> list[dict]:
-    """Pick up to *limit* faces from one confirmed track, highest score
-    first, skipping any pose that's a near-duplicate (cosine similarity
-    >= 0.85) of an already-kept face — preserves angle/pose diversity
-    instead of collapsing the whole track down to one embedding.
-
-    Only faces clearing *min_quality*, *min_score*, and *min_regularity*
-    are eligible — a track may pass admission on its best face while
-    weaker frames in the same track are dropped here.
-    """
-    eligible = [
-        f
-        for f in faces
-        if float(f.get("quality_score", 0.0)) >= min_quality
-        and float(f.get("score", 0.0)) >= min_score
-        and float(f.get("landmark_regularity", 0.5)) >= min_regularity
-    ]
-    ordered = sorted(eligible, key=lambda f: f["score"], reverse=True)
-    kept: list[dict] = []
-    kept_embs: list[np.ndarray] = []
-    for face in ordered:
+    THRESHOLD = 0.50
+    unique_embs: list[np.ndarray] = []
+    unique_faces: list[dict] = []
+    for face in all_faces:
         emb = np.array(face["embedding"], dtype=np.float32)
-        if any(
-            float(np.dot(emb, k_emb)) >= _TRACK_POSE_DEDUP_THRESHOLD
-            for k_emb in kept_embs
-        ):
-            continue
-        kept.append(face)
-        kept_embs.append(emb)
-        if len(kept) >= limit:
-            break
-    return kept
+        matched = False
+        for i, u_emb in enumerate(unique_embs):
+            if float(np.dot(emb, u_emb)) >= THRESHOLD:
+                if face["score"] > unique_faces[i]["score"]:
+                    unique_embs[i] = emb
+                    unique_faces[i] = face
+                matched = True
+                break
+        if not matched:
+            unique_embs.append(emb)
+            unique_faces.append(face)
+    return unique_faces
 
 
-def _build_face_tracks(frames_faces: list[list[dict]]) -> list[dict]:
-    """Merge per-frame detections into per-identity tracks and return the
-    faces worth keeping, per docs/requirements.md §4.4.
-
-    Replaces the old greedy ``_dedupe_video_faces`` (single "keep highest
-    score" per identity, no temporal-confirmation/quality distinction).
-
-    ``frames_faces`` is one detection list per *sampled frame*, in temporal
-    order — this is what lets a track's hit-count reflect "how many
-    distinct frames corroborated this identity" rather than a raw
-    detection count. Faces are merged into a track via cosine similarity
-    (>= 0.50, unchanged from the old dedup threshold) against that track's
-    running mean embedding (insightface embeddings are L2-normalised, so
-    the dot product equals cosine similarity).
-
-    - A track confirmed by >= 2 frames is kept only if at least one of its
-      faces clears ``TGDL_FACES_VIDEO_CONFIRMED_MIN_QUALITY`` (default
-      0.35), ``TGDL_FACES_VIDEO_CONFIRMED_MIN_SCORE`` (default 0.50), and
-      ``TGDL_FACES_VIDEO_MIN_LANDMARK_REGULARITY`` (default 0.15) —
-      defends against a *systematic* false positive (the detector
-      consistently misfiring on the same non-face texture across the whole
-      scene) that mere repetition would otherwise wave through.
-    - A track seen in exactly 1 frame is kept only if that face clears the
-      stricter ``TGDL_FACES_VIDEO_SINGLETON_MIN_SCORE`` /
-      ``_MIN_QUALITY`` bars (0.75 / 0.55 by default) plus the landmark
-      regularity floor — otherwise dropped as unconfirmed noise.
-    - Confirmed tracks return up to 3 representative faces, see
-      :func:`_select_diverse_representatives`.
-
-    O(frames x faces-per-frame x tracks) — in practice tiny (a handful of
-    identities per video).
-    """
-    singleton_min_score, singleton_min_quality, confirmed_min_quality, confirmed_min_score, min_landmark_regularity = (
-        _resolve_video_track_thresholds()
-    )
-
-    tracks: list[dict[str, Any]] = []
-    for frame_faces in frames_faces:
-        for face in frame_faces:
-            emb = np.array(face["embedding"], dtype=np.float32)
-            best_i, best_sim = -1, -1.0
-            for i, tr in enumerate(tracks):
-                mean = tr["emb_sum"] / max(1, tr["hits"])
-                norm = float(np.linalg.norm(mean))
-                sim = float(np.dot(emb, mean) / norm) if norm > 1e-9 else -1.0
-                if sim > best_sim:
-                    best_i, best_sim = i, sim
-            if best_i >= 0 and best_sim >= _TRACK_MATCH_THRESHOLD:
-                tr = tracks[best_i]
-                tr["faces"].append(face)
-                tr["emb_sum"] = tr["emb_sum"] + emb
-                tr["hits"] += 1
-            else:
-                tracks.append({"faces": [face], "emb_sum": emb.copy(), "hits": 1})
-
-    kept: list[dict] = []
-    for tr in tracks:
-        faces = tr["faces"]
-        if tr["hits"] >= 2:
-            best_quality = max(float(f.get("quality_score", 0.0)) for f in faces)
-            best_score = max(float(f.get("score", 0.0)) for f in faces)
-            best_regularity = max(float(f.get("landmark_regularity", 0.5)) for f in faces)
-            if (
-                best_quality < confirmed_min_quality
-                or best_score < confirmed_min_score
-                or best_regularity < min_landmark_regularity
-            ):
-                continue
-            kept.extend(
-                _select_diverse_representatives(
-                    faces,
-                    min_quality=confirmed_min_quality,
-                    min_score=confirmed_min_score,
-                    min_regularity=min_landmark_regularity,
-                )
-            )
-        else:
-            face = faces[0]
-            if (
-                float(face["score"]) >= singleton_min_score
-                and float(face.get("quality_score", 0.0)) >= singleton_min_quality
-                and float(face.get("landmark_regularity", 0.5)) >= min_landmark_regularity
-            ):
-                kept.append(face)
-    return kept
-
-
-def _resolve_video_nice(override: int | None = None) -> int:
-    """Resolve Unix nice for /detect/video.
-
-    Precedence: per-request ``override`` (from the Node dashboard config)
-    > ``TGDL_FACES_VIDEO_NICE`` env > ``0`` (off). Explicit ``0`` from the
-    request must win over a compose env default, otherwise the UI cannot
-    turn nice off.
-    """
-
-    if override is not None:
-        try:
-            return max(0, min(19, int(override)))
-        except (TypeError, ValueError):
-            return 0
-    raw = os.environ.get("TGDL_FACES_VIDEO_NICE", "").strip()
-    if not raw:
-        return 0
-    try:
-        v = int(raw)
-    except ValueError:
-        return 0
-    return max(0, min(19, v))
+def _stamp_time(face_dicts: list[dict], t: float) -> list[dict]:
+    for f in face_dicts:
+        f["frame_time_sec"] = round(float(t), 3)
+    return face_dicts
 
 
 def _do_detect_video_sync(body: VideoDetectRequest) -> JSONResponse:
-    """Synchronous inner implementation for video face detection."""
-    if last_error() is not None:
-        return _error(
-            f"model failed to load: {last_error()}",
-            code="model_load_failed",
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-        )
-    if not is_ready():
-        return _error(
-            "model is still loading, retry shortly",
-            code="model_loading",
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-        )
+    """Synchronous inner implementation for video face detection.
 
-    nice_inc = _resolve_video_nice(body.nice)
-    try:
-        if nice_inc > 0:
-            try:
-                os.nice(nice_inc)
-            except OSError:
-                nice_inc = 0
-
-        return _do_detect_video_sync_inner(body)
-    finally:
-        if nice_inc > 0:
-            try:
-                os.nice(-nice_inc)
-            except OSError:
-                pass
-
-
-def _do_detect_video_sync_inner(body: VideoDetectRequest) -> JSONResponse:
-    """Inner body for video detection — separated so nice wrap stays clean."""
-    # A `job_id` lets the Node client poll GET /detect/video/status/{job_id}
-    # for decode-position progress while this (potentially very long)
-    # request is in flight (docs/requirements.md — video scan progress
-    # reporting). The `finally` below guarantees the registry entry is
-    # removed on every exit path (success, soft-error, or exception) so
-    # nothing outlives this request.
-    def _progress_cb(idx: int, total_frames: int) -> None:
-        video_progress.report(
-            body.job_id,
-            path=body.path,
-            frames_decoded=idx + 1,
-            total_frames=total_frames,
-        )
-
-    try:
-        try:
-            # `extract_video_frames` is a generator (see docs/requirements.md
-            # §4.2/§4.4) — calling it just builds the generator object without
-            # running any code, so pulling the first frame (to validate there
-            # *is* a video and to read its dimensions) has to happen inside
-            # this try block for path/file errors raised from within the
-            # generator body to be catchable here. Everything after this is
-            # streamed: at most `max_workers` decoded frames are ever held in
-            # memory at once, regardless of video length (§4.2, §8 memory-bound
-            # acceptance criterion) — no `list(...)` materialisation.
-            window_sec, floor_interval_sec, motion_threshold = _resolve_video_sampling_params()
-            # `iter(...)` tolerates callers/mocks that return a plain list
-            # instead of a real generator (e.g. `test_video_no_frames_extracted`).
-            gen = iter(
-                extract_video_frames(
-                    body.path,
-                    _allow_roots(),
-                    max_frames=body.max_frames,
-                    window_sec=window_sec,
-                    floor_interval_sec=floor_interval_sec,
-                    motion_threshold=motion_threshold,
-                    progress_cb=_progress_cb if body.job_id else None,
-                )
-            )
-            first_frame = next(gen)
-        except PathNotAllowedError:
-            return _error(
-                "path falls outside TGDL_FACES_ALLOW_ROOTS",
-                code="path_not_allowed",
-                status_code=status.HTTP_403_FORBIDDEN,
-            )
-        except FileNotFoundError:
-            return JSONResponse(
-                status_code=status.HTTP_200_OK,
-                content={"faces": [], "error": "file_not_found", "image_w": 0, "image_h": 0},
-            )
-        except StopIteration:
-            return JSONResponse(
-                status_code=status.HTTP_200_OK,
-                content={"faces": [], "error": "no_frames", "image_w": 0, "image_h": 0},
-            )
-
-        return _detect_video_frames(body, gen, first_frame)
-    finally:
-        if body.job_id:
-            video_progress.finish(body.job_id)
-
-
-def _normalize_video_sample(sample: Any) -> tuple["np.ndarray", int, float]:
-    """Unpack a frame sample from ``extract_video_frames``.
-
-    The generator yields ``(frame, frame_index, time_sec)`` tuples. Plain
-    ndarrays (legacy mocks in tests) are treated as frame 0 at t=0.
+    Frames are streamed from the decoder and dropped as soon as they have
+    been through the detector, so memory stays at a frame or two (GPU: a
+    small in-flight window) instead of the whole 120-frame sample — 4K
+    frames are ~25 MB each.
     """
-    if isinstance(sample, tuple):
-        if len(sample) >= 3:
-            return sample[0], int(sample[1]), float(sample[2])
-        if len(sample) == 2:
-            return sample[0], int(sample[1]), 0.0
-    return sample, 0, 0.0
+    not_ready = _not_ready_response()
+    if not_ready is not None:
+        return not_ready
 
+    try:
+        frames = iter_video_frames(
+            body.path, _allow_roots(), max_frames=body.max_frames, with_time=True
+        )
+    except PathNotAllowedError:
+        return _error(
+            "path falls outside TGDL_FACES_ALLOW_ROOTS",
+            code="path_not_allowed",
+            status_code=status.HTTP_403_FORBIDDEN,
+        )
+    except FileNotFoundError:
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content={"faces": [], "error": "file_not_found", "image_w": 0, "image_h": 0},
+        )
 
-def _detect_video_frames(
-    body: VideoDetectRequest, gen: Any, first_frame: Any
-) -> JSONResponse:
-    """Runs detection over the already-opened frame generator and builds
-    the final response. Split out of `_do_detect_video_sync` purely for
-    readability — it's still covered by that function's try/finally
-    (job-progress cleanup) since the caller returns this call's result
-    from inside that try block."""
-    kwargs: dict[str, Any] = {}
-    if body.min_score is not None:
-        kwargs["min_score"] = float(body.min_score)
-    if body.min_box_px is not None:
-        kwargs["min_box_px"] = int(body.min_box_px)
-    if body.ar_range is not None:
-        kwargs["ar_range"] = (float(body.ar_range[0]), float(body.ar_range[1]))
-    # Quality scoring re-enabled per §4.4 — track confirmation needs real
-    # quality_score values to enforce the singleton/confirmed-track floors.
+    kwargs = _filter_kwargs(body)
+    # Skip quality for video frames — throughput matters more than per-face scores
+    kwargs["_skip_quality_score"] = True
 
-    first_arr, _, _ = _normalize_video_sample(first_frame)
-    image_h, image_w = int(first_arr.shape[0]), int(first_arr.shape[1])
+    image_w = image_h = 0
+    n_frames = 0
+    all_faces_raw: list[dict] = []
+    try:
+        if gpu_available():
+            # GPU mode: a bounded window of frames in flight keeps the
+            # device busy without materialising the whole sample.
+            max_workers = _resolve_max_concurrency()
 
-    def _iter_samples():
-        yield _normalize_video_sample(first_frame)
-        for sample in gen:
-            yield _normalize_video_sample(sample)
+            def _detect_frame(t: float, frame: "np.ndarray") -> list[dict]:
+                try:
+                    return _stamp_time(detect_and_embed(frame, **kwargs), t)
+                except Exception:
+                    return []
 
-    def _detect_sample(item: tuple["np.ndarray", int, float]) -> tuple[int, list[dict]]:
-        frame, frame_idx, time_sec = item
-        try:
-            faces = detect_and_embed(frame, _video_mode=True, **kwargs)
-            for face in faces:
-                face["frame_time_sec"] = round(float(time_sec), 4)
-            return frame_idx, faces
-        except Exception:
-            _LOG.exception(
-                "detect_and_embed failed on frame %d (t=%.3fs) of %s",
-                frame_idx,
-                time_sec,
-                body.path,
-            )
-            return frame_idx, []
+            pending: deque[Any] = deque()
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                for t, frame in frames:
+                    if n_frames == 0:
+                        image_h, image_w = int(frame.shape[0]), int(frame.shape[1])
+                    n_frames += 1
+                    pending.append(pool.submit(_detect_frame, t, frame))
+                    if len(pending) >= max_workers * 2:
+                        all_faces_raw.extend(pending.popleft().result())
+                while pending:
+                    all_faces_raw.extend(pending.popleft().result())
+        else:
+            # CPU mode: sequential with optional throttle.
+            throttle_sec = _resolve_throttle_ms() / 1000.0
+            for i, (t, frame) in enumerate(frames):
+                if n_frames == 0:
+                    image_h, image_w = int(frame.shape[0]), int(frame.shape[1])
+                n_frames += 1
+                if throttle_sec > 0 and i > 0:
+                    time.sleep(throttle_sec)
+                try:
+                    face_dicts = detect_and_embed(frame, **kwargs)
+                except Exception:
+                    _LOG.exception("detect_and_embed failed on frame %d of %s", i, body.path)
+                    continue
+                all_faces_raw.extend(_stamp_time(face_dicts, t))
+    finally:
+        close = getattr(frames, "close", None)
+        if callable(close):
+            close()
 
-    results_by_idx: dict[int, list[dict]] = {}
-    if gpu_available():
-        # Bounded sliding window: never more than `max_workers` frames
-        # in flight (decoded + awaiting detection) at once, so peak memory
-        # is tied to concurrency, not to how many frames the video yields.
-        max_workers = _resolve_max_concurrency()
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            pending: set = set()
-            sample_iter = _iter_samples()
+    if n_frames == 0:
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content={"faces": [], "error": "no_frames", "image_w": 0, "image_h": 0},
+        )
 
-            def _fill() -> None:
-                while len(pending) < max_workers:
-                    item = next(sample_iter, None)
-                    if item is None:
-                        return
-                    pending.add(pool.submit(_detect_sample, item))
-
-            _fill()
-            while pending:
-                done, pending = wait(pending, return_when=FIRST_COMPLETED)
-                for fut in done:
-                    idx, faces = fut.result()
-                    results_by_idx[idx] = faces
-                _fill()
-    else:
-        throttle_sec = _resolve_throttle_ms() / 1000.0
-        for i, item in enumerate(_iter_samples()):
-            if throttle_sec > 0 and i > 0:
-                time.sleep(throttle_sec)
-            idx, faces = _detect_sample(item)
-            results_by_idx[idx] = faces
-
-    frames_faces = [results_by_idx[i] for i in sorted(results_by_idx)]
-    kept_faces = _build_face_tracks(frames_faces)
+    unique_faces = _dedupe_video_faces(all_faces_raw)
     return JSONResponse(
         status_code=status.HTTP_200_OK,
         content=DetectResponse(
-            faces=[Face(**f) for f in kept_faces],
+            faces=[Face(**f) for f in unique_faces],
             image_w=image_w,
             image_h=image_h,
         ).model_dump(),
@@ -1377,38 +1184,18 @@ def _detect_video_frames(
 async def detect_video(body: VideoDetectRequest) -> JSONResponse:
     """Detect & embed faces from a video file.
 
-    Streams content-adaptive frames via ``extract_video_frames`` (see
-    docs/requirements.md §4.1) with bounded in-flight concurrency — no
-    temp files, no full-video frame buffering — then merges detections
-    across frames into per-identity tracks via ``_build_face_tracks``
-    (§4.4): a track needs either >=2 corroborating frames (plus a quality
-    floor) or one very confident single-frame hit to be kept, and survives
-    with up to 3 diverse representative embeddings.
+    Extracts evenly-spaced frames via cv2.VideoCapture (no temp files),
+    runs face detection on each frame, then deduplicates faces across
+    frames so the same person appearing in multiple frames produces only
+    one embedding — the one with the highest detection score.
 
     Response shape matches ``/detect``: ``{faces, image_w, image_h}``.
     Faces stored from this endpoint cluster with photo-source faces in
     the same DBSCAN pass, so the same person in a video and a photo
     lands in the same "Person" group automatically.
     """
-    return await run_in_threadpool(_do_detect_video_sync, body)
-
-
-@app.get("/detect/video/status/{job_id}")
-def detect_video_status(job_id: str) -> JSONResponse:
-    """Poll decode progress for an in-flight ``POST /detect/video`` call.
-
-    Only meaningful when that call's body included a matching ``job_id``.
-    Returns ``404`` once the request has finished (or if ``job_id`` was
-    never registered) — callers should treat that as "nothing to report",
-    not as an error, since this is best-effort progress telemetry.
-    """
-    job = video_progress.get(job_id)
-    if job is None:
-        return JSONResponse(
-            status_code=status.HTTP_404_NOT_FOUND,
-            content={"error": "not_found", "code": "job_not_found"},
-        )
-    return JSONResponse(content=job)
+    async with _admission():
+        return await run_in_threadpool(_do_detect_video_sync, body)
 
 
 # ---------------------------------------------------------------------------

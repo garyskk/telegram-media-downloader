@@ -5,7 +5,7 @@
 
 import express from 'express';
 import helmet from 'helmet';
-import rateLimit from 'express-rate-limit';
+import rateLimit, { MemoryStore as RateLimitMemoryStore } from 'express-rate-limit';
 import net from 'net';
 import { WebSocketServer } from 'ws';
 import { createServer } from 'http';
@@ -13,9 +13,8 @@ import fs from 'fs/promises';
 import fsSync, { existsSync } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { createRequire } from 'module';
-import { TelegramClient } from 'telegram';
-import { StringSession } from 'telegram/sessions/index.js';
+import { TelegramClient, Api as TgApi, utils as tgUtils } from 'telegram';
+import { DedupStringSession } from '../core/telegram-session.js';
 import crypto from 'crypto';
 import sharp from 'sharp';
 
@@ -33,6 +32,10 @@ import {
     getAllDownloads,
     getAllDownloadsFederated,
     getDownloadsForGroupFederated,
+    listDownloadIds,
+    listDownloadIdsForGroup,
+    getDownloadsByIds,
+    getPeerDownloadsByKeys,
     searchDownloadsFederated,
     getStatsFederated,
     getStats as getDbStats,
@@ -43,8 +46,8 @@ import {
     backfillGroupNames,
     searchDownloads,
     deleteDownloadsBy,
-    liveIdsSharingFilePath,
-    pruneDownloadsForMissingPath,
+    rememberDeletedDownloads,
+    findDownloadsByPaths,
     purgeOrphanPeople,
     createShareLink,
     getShareLinkForServe,
@@ -63,30 +66,46 @@ import {
     getNsfwBlocklistCount,
     clearNsfwBlocklist,
     getDownloadHashesForIds,
+    getSimilarScanStats,
+    listSimilarGroups,
+    addSimilarIgnore,
+    listSimilarIgnores,
+    deleteSimilarIgnore,
+    purgeSimilarClipsRecords,
+    purgeSimilarAnalyzeRecords,
     setDownloadPinned,
+    setDownloadsPinned,
     getDownloadById,
-    listDownloadIds,
-    listDownloadIdsForGroup,
-    getDownloadsByIds,
-    getPeerDownloadsByKeys,
     kvGet,
     kvSet,
     recordUpdateAttempt,
     recordUpdateFailure,
     listUpdateHistory,
     getUnindexedAiBatch,
+    planDeferredIndexBuilds,
+    buildDeferredIndex,
 } from '../core/db.js';
 import { sanitizeName } from '../core/downloader.js';
 import { SecureSession } from '../core/security.js';
-import { AccountManager } from '../core/accounts.js';
-import { loadConfig, saveConfig } from '../config/manager.js';
+import { AccountManager, hasAccountSessions } from '../core/accounts.js';
+import { loadConfig, saveConfig, watchConfig, getDefaultCsp } from '../config/manager.js';
+import { SIMILAR_CLIPS_DEFAULTS } from '../core/similar/config.js';
+import {
+    analyzeSimilarClips,
+    scanSimilarClips,
+    unlinkLeftoverFingerprintRaws,
+} from '../core/similar/index.js';
+import { buildSecurityHeaders, validateCsp } from './lib/security-headers.js';
 import { runtime } from '../core/runtime.js';
 import { getDiskRotator } from '../core/disk-rotator.js';
 import * as integrity from '../core/integrity.js';
 import {
     findDuplicates as dedupFindDuplicates,
     deleteByIds as dedupDeleteByIds,
-    getDuplicateSets as dedupGetSets,
+    buildDuplicateSets,
+    expandToSharedRefs,
+    idsWithFileInUse,
+    removeGroupFolder,
 } from '../core/dedup.js';
 import {
     ensureShareSecret,
@@ -96,6 +115,7 @@ import {
     applyShareLimits,
     verifyFileToken,
     mintFileToken,
+    getShareSecretForFront,
 } from '../core/share.js';
 import {
     getOrCreateThumb,
@@ -109,7 +129,14 @@ import {
     DEFAULT_WIDTH as THUMB_DEFAULT_WIDTH,
     thumbKindTypes,
     hasCachedThumb,
+    resolveFfmpegBin,
+    THUMB_CACHE_CONTROL,
 } from '../core/thumbs.js';
+import { createFaceCropper } from '../core/ai/face-crops.js';
+import {
+    detectFacesInImage as aiDetectFacesInImage,
+    sidecarAuthHeaders as aiSidecarAuthHeaders,
+} from '../core/ai/faces-client.js';
 import {
     buildAllSeekbar,
     getMetaForDownload as getSeekbarMetaForDownload,
@@ -124,6 +151,7 @@ import {
 import {
     getSidecarStatus as getSeekbarSidecarStatus,
     refreshSidecar as refreshSeekbarSidecar,
+    resolveRemoteSettings as resolveSeekbarRemote,
     setBroadcast as setSeekbarBroadcast,
     SIDECAR_VERSION as SEEKBAR_SIDECAR_VERSION,
     startSidecar as startSeekbarSidecar,
@@ -132,25 +160,24 @@ import {
     health as seekbarClientHealth,
     probeHwaccel as probeSeekbarHwaccel,
 } from '../core/seekbar/client.js';
+import { diskUsage as coreDiskUsage } from '../core/gocore/fs.js';
 import {
-    scanSimilarClips,
-    analyzeSimilarClips,
-    unlinkLeftoverFingerprintRaws,
-    shutdownAlignPool,
-    SIMILAR_CLIPS_DEFAULTS,
-} from '../core/similar/index.js';
+    getCoreBanner,
+    getGoCoreStatus,
+    requireGoCore,
+    startGoCore,
+    stopGoCore,
+} from '../core/gocore/spawn.js';
 import {
-    countSeekbarSprites,
-    countVideoDownloads,
-    getSeekbarSprite,
-    getSimilarScanStats,
-    listSimilarGroups,
-    listSimilarIgnores,
-    addSimilarIgnore,
-    deleteSimilarIgnore,
-    purgeSimilarClipsRecords,
-    purgeSimilarAnalyzeRecords,
-} from '../core/db.js';
+    frontStats,
+    frontToken,
+    getFrontStatus,
+    pushFrontState,
+    startFront,
+    stopFront,
+} from '../core/gocore/front.js';
+import { countSeekbarSprites, countVideoDownloads, getSeekbarSprite } from '../core/db.js';
+import { normalizeSidecarUrl, probeSidecar } from '../core/sidecar-remote.js';
 import {
     startScan as nsfwStartScan,
     cancelScan as nsfwCancelScan,
@@ -161,6 +188,8 @@ import {
     classifierReady as nsfwClassifierReady,
     setBlocklistDeleteCallback as nsfwSetBlocklistDeleteCallback,
     initNsfwSidecar,
+    getNsfwSidecarInfo,
+    getNsfwSidecarSources,
     NSFW_DEFAULTS,
     getNsfwStats,
     getNsfwDeleteCandidates,
@@ -182,31 +211,29 @@ import {
 // survives. The stub constants that used to live here (aiStartEmbedScan,
 // aiStartTagsScan, aiEmbedText, aiTopK, aiLoadVecOnce, AI_EMBED_DEFAULTS,
 // …) were deleted along with the routes that called them.
-import { runAutoUpdate, autoUpdateStatus } from '../core/updater.js';
+import { runAutoUpdate, autoUpdateStatus, ensureWatchtowerToken } from '../core/updater.js';
+
+ensureWatchtowerToken();
 import { getRescueSweeper } from '../core/rescue.js';
 import { getRescueStats } from '../core/db.js';
 import {
     getAiCounts,
     listPeople,
+    resolvePeopleSort,
     listPhotosForPerson,
-    listFacesForPerson,
-    listUnclassifiedFaces,
-    suggestPeopleForFace,
-    suggestPeopleForPerson,
-    splitFacePerson,
-    deleteFace,
     renamePerson,
     deletePerson,
-    excludePerson,
-    listExcludedPeople,
-    deleteExcludedPerson,
-    setPersonCoverFace,
     resetAllAiData,
     setFaceQualityScore,
     getDb as aiGetDb,
 } from '../core/db.js';
 import * as backup from '../core/backup/index.js';
-import { parseTelegramUrl, parseUrlList, UrlParseError } from '../core/url-resolver.js';
+import {
+    parseTelegramUrl,
+    parseUrlList,
+    parseChatQuery,
+    UrlParseError,
+} from '../core/url-resolver.js';
 import { listUserStories, listAllStories, storyToJob } from '../core/stories.js';
 import { metrics } from '../core/metrics.js';
 import {
@@ -224,7 +251,7 @@ import {
     startSessionGc,
 } from '../core/web-auth.js';
 import { suppressNoise, wrapConsoleMethod, NATIVE_LOAD_FAIL } from '../core/logger.js';
-import { createJobTracker } from '../core/job-tracker.js';
+import { createJobTracker, flattenStatus } from '../core/job-tracker.js';
 import {
     getSelfPeerId,
     getSelfPeerName,
@@ -234,6 +261,7 @@ import {
     setClusterToken,
     getSelfIdentity,
     issuePairingCode,
+    pairingKeysFor,
 } from '../core/cluster/identity.js';
 import { verifyRequest as verifyPeerHmac } from '../core/cluster/hmac.js';
 import {
@@ -268,6 +296,27 @@ import { publishConfigChange } from '../core/cluster/config-sync.js';
 import { listDiscoveredPeers } from '../core/db.js';
 import WebSocketLib from 'ws';
 import { getOwnerPeerForGroup, isLocalGroup } from '../core/cluster/router.js';
+import { createSwrCache } from './lib/swr-cache.js';
+import { lookupEntityAcrossClients } from './lib/entity-lookup.js';
+import * as chatAccess from '../core/chat-access.js';
+import { destinationKey } from '../core/forwarder.js';
+import { createWsBroadcaster, runtimeEventMessage } from './lib/ws-broadcaster.js';
+import { lruCap } from '../core/util/streaming.js';
+import { compressionLevelFromEnv, createCompression } from './lib/http-compression.js';
+import {
+    VIA_FRONT,
+    captureHeaders,
+    frontNotifyHandler,
+    frontRequestMiddleware,
+    installClientAddressView,
+    stripFrontHeaders,
+} from './lib/front-bridge.js';
+import {
+    bodyParserErrorResponse,
+    isUnsatisfiableRange,
+    rangeNotSatisfiableOf,
+    sendRangeNotSatisfiable,
+} from './lib/http-errors.js';
 import {
     recordClusterAudit,
     listClusterAudit,
@@ -382,6 +431,7 @@ process.on('uncaughtException', (err) => {
     console.error('Uncaught exception:', err);
     try {
         server.close();
+        _publicServer?.close();
     } catch {}
     setTimeout(() => process.exit(1), 5000).unref();
 });
@@ -392,6 +442,11 @@ const DOWNLOADS_DIR = getDownloadsDir();
 const PHOTOS_DIR = path.join(DATA_DIR, 'photos');
 const SESSION_PATH = path.join(DATA_DIR, 'session.enc');
 const SESSION_PASSWORD = getOrGenerateSecret();
+
+// libvips' operation cache (default 50 MB) only pays off when the same
+// image is processed repeatedly; thumbnails are generated once and cached
+// on disk, so it would just hold decoded pixels.
+sharp.cache(false);
 
 const app = express();
 const server = createServer(app);
@@ -408,36 +463,45 @@ server.requestTimeout = 120_000;
 // accepts every connection including unauthenticated ones.
 const wss = new WebSocketServer({ noServer: true });
 const clients = new Set();
+// Coalesces high-rate engine events, skips backed-up sockets and runs the
+// 30 s ping/terminate heartbeat — see lib/ws-broadcaster.js. `broadcast()`
+// below is the only writer.
+const _wsBroadcaster = createWsBroadcaster({
+    getClients: () => clients,
+    onTerminate: (ws) => clients.delete(ws),
+});
+_wsBroadcaster.startHeartbeat();
 
 // Recursive directory size — used by /api/stats as the fallback when the DB
 // catalogue is empty. We can't trust `data/disk_usage.json` alone because
 // older builds wrote it sparingly and never invalidated on `Purge all`, so a
 // purged dashboard would footer-report a multi-week-old "930 KB" snapshot.
+//
+// tgdl-core walks the tree: every directory entered (links to directories
+// are not), every other entry fs.stat'ed and counted when it is a file,
+// unreadable directories and vanished files skipped. Resolves null when
+// tgdl-core can't answer, so the caller keeps its current figure.
+let _diskScanWarned = '';
 async function scanDirectorySize(dir) {
-    let total = 0;
-    async function walk(current) {
-        let entries;
-        try {
-            entries = await fs.readdir(current, { withFileTypes: true });
-        } catch {
-            return;
+    try {
+        return await coreDiskUsage(dir, { readyWaitMs: 3_000 });
+    } catch (e) {
+        const msg = String(e?.message || e);
+        if (msg !== _diskScanWarned) {
+            _diskScanWarned = msg;
+            console.warn('[stats] disk-usage scan unavailable:', msg);
         }
-        for (const entry of entries) {
-            const fullPath = path.join(current, entry.name);
-            if (entry.isDirectory()) {
-                await walk(fullPath);
-                continue;
-            }
-            try {
-                const st = await fs.stat(fullPath);
-                if (st.isFile()) total += st.size;
-            } catch {
-                /* file disappeared mid-scan */
-            }
-        }
+        return null;
     }
-    await walk(dir);
-    return total;
+}
+
+/** Last disk-usage figure written by writeDiskUsageCache / the downloader. */
+function readDiskUsageCache() {
+    try {
+        return Number(kvGet('disk_usage')?.size) || 0;
+    } catch {
+        return 0;
+    }
 }
 
 function writeDiskUsageCache(size) {
@@ -467,7 +531,11 @@ function parseCookieHeader(header) {
     return out;
 }
 
-server.on('upgrade', async (req, socket, head) => {
+server.on('upgrade', _onUpgrade);
+async function _onUpgrade(req, socket, head) {
+    // Requests tunnelled by the tgdl-core front server carry two private
+    // headers; nothing below looks at the client address, so just drop them.
+    stripFrontHeaders(req);
     try {
         // Cluster WS channel — peer-to-peer, HMAC-authenticated via
         // signed query-string. Skip the cookie/session check entirely.
@@ -481,6 +549,10 @@ server.on('upgrade', async (req, socket, head) => {
                     socket.destroy();
                     return;
                 }
+                // A paired peer is talking to us: make sure the channel's
+                // dashboard relay (and the other engines) are up, so its
+                // events reach the dashboard and not just the DB.
+                _ensureClusterEngines();
                 wss.handleUpgrade(req, socket, head, (ws) => {
                     ws._clusterPeer = verifiedPeer;
                     clusterWs.registerInboundWs(verifiedPeer, ws);
@@ -527,7 +599,7 @@ server.on('upgrade', async (req, socket, head) => {
             socket.destroy();
         } catch {}
     }
-});
+}
 
 // Telegram client
 let telegramClient = null;
@@ -564,13 +636,33 @@ if (_trustProxyRaw === undefined) {
     );
 }
 
+// tgdl-core front server (src/core/gocore/front.js): requests it proxies
+// arrive from 127.0.0.1 with the client's socket address in a private,
+// token-checked header. This must stay the first middleware — it removes
+// those headers — and req.ip / req.protocol / req.hostname then evaluate
+// the `trust proxy` setting above against the real client, exactly as if
+// it had connected here directly (see lib/front-bridge.js).
+installClientAddressView(app);
+app.use(frontRequestMiddleware(frontToken));
+// What tgdl-core tells Node after answering a request itself: only Node
+// writes the database (renewSession, the auto-prune of a missing file).
+app.use(
+    frontNotifyHandler(frontToken, {
+        renew: (token) => {
+            const session = validateSession(token);
+            if (session) slideSession(token, session);
+        },
+        missing: (reqPath) => pruneMissingDownload(reqPath),
+    }),
+);
+
 // Force HTTPS — opt-in via config.web.forceHttps (default off, plain HTTP).
 // Skips localhost so it doesn't lock you out of local dev. `req.secure`
 // honours `X-Forwarded-Proto` only when `trust proxy` is set above, so
 // reverse-proxy users must export TRUST_PROXY=1 for this to work.
 // Non-GET/HEAD requests get a 403 instead of a 308 — clients shouldn't
 // silently retry mutations on a different scheme.
-app.use(async (req, res, next) => {
+const _forceHttpsMw = async (req, res, next) => {
     const config = await readConfigSafe();
     if (!config.web?.forceHttps) {
         // Clear HSTS so browsers that previously cached the 1-year policy
@@ -594,40 +686,22 @@ app.use(async (req, res, next) => {
     const host = req.headers.host;
     if (!host) return res.status(400).end();
     return res.redirect(308, `https://${host}${req.originalUrl}`);
-});
+};
+app.use(_forceHttpsMw);
 
-// Optional gzip/deflate/br compression for text responses (HTML / JS / CSS /
-// JSON / SVG). The middleware ships as a separate npm package so we
-// `createRequire` it here and silently skip when the host hasn't installed
-// it (e.g. an old `node_modules/`). When present, configure to skip
-// already-compressed media (image/* / video/* / audio/*) and tunable level
-// via `COMPRESSION_LEVEL` (1-9, default 6 — the same default the package
-// uses, exposed for operators on slow CPUs who want a lower setting).
-try {
-    const _localRequire = createRequire(import.meta.url);
-    const compression = _localRequire('compression');
-    const lvlEnv = parseInt(process.env.COMPRESSION_LEVEL, 10);
-    const level = Number.isFinite(lvlEnv) && lvlEnv >= 0 && lvlEnv <= 9 ? lvlEnv : 6;
-    app.use(
-        compression({
-            level,
-            // Skip already-compressed payloads — gzipping a JPEG or MP4 burns
-            // CPU for a fraction of a percent of size win and breaks
-            // range-request semantics that the video player depends on.
-            filter: (req, res) => {
-                if (req.headers['x-no-compression']) return false;
-                const ct = String(res.getHeader('Content-Type') || '');
-                if (/^(image|video|audio)\//i.test(ct)) return false;
-                return compression.filter(req, res);
-            },
-        }),
-    );
-    if (process.env.TGDL_DEBUG === '1') {
-        console.log(`[startup] compression middleware enabled (level=${level})`);
+// gzip/deflate/br for text responses (see lib/http-compression.js for what
+// is skipped: raw file routes, Range requests, media types). Level via
+// `COMPRESSION_LEVEL` (1-9, default 6 — the package default, exposed for
+// operators on slow CPUs); `0` turns the middleware off entirely.
+{
+    const level = compressionLevelFromEnv(process.env.COMPRESSION_LEVEL);
+    const mw = createCompression(level);
+    if (mw) {
+        app.use(mw);
+        if (process.env.TGDL_DEBUG === '1') {
+            console.log(`[startup] compression middleware enabled (level=${level})`);
+        }
     }
-} catch {
-    // Module not installed — fine, dashboard runs uncompressed (Cloudflare /
-    // a reverse proxy in front will usually handle it instead).
 }
 
 // Security headers. CSP is on but allows the SPA's two CDN dependencies
@@ -643,69 +717,32 @@ try {
 // `frame-src: 'self'` lets the viewer's PDF container point an iframe
 // at `/files/<path>?inline=1#toolbar=1` so the browser's native PDF
 // viewer renders it without leaving the dashboard.
-app.use(
-    helmet({
-        // HSTS managed by the forceHttps middleware above — helmet must not
-        // override the max-age=0 clear header when the operator disables HTTPS.
-        hsts: false,
-        contentSecurityPolicy: {
-            useDefaults: true,
-            directives: {
-                'default-src': ["'self'"],
-                'script-src': [
-                    "'self'",
-                    "'unsafe-inline'",
-                    'https://cdn.tailwindcss.com',
-                    'https://cdn.jsdelivr.net',
-                    'https://cdnjs.cloudflare.com',
-                ],
-                // The SPA uses inline onclick / oninput handlers in index.html
-                // (toggle UI, range-slider value updaters, modal close-buttons).
-                // Helmet's defaults set script-src-attr to 'none' which would
-                // block them; allow inline here until the markup is migrated to
-                // addEventListener.
-                'script-src-attr': ["'unsafe-inline'"],
-                'style-src': [
-                    "'self'",
-                    "'unsafe-inline'",
-                    'https://cdn.jsdelivr.net',
-                    'https://cdnjs.cloudflare.com',
-                    'https://fonts.googleapis.com',
-                ],
-                'style-src-attr': ["'unsafe-inline'"],
-                'font-src': [
-                    "'self'",
-                    'data:',
-                    'https://fonts.gstatic.com',
-                    'https://cdn.jsdelivr.net',
-                ],
-                'img-src': ["'self'", 'data:', 'blob:'],
-                'media-src': ["'self'", 'blob:'],
-                'connect-src': ["'self'", 'ws:', 'wss:'],
-                'object-src': ["'none'"],
-                'frame-src': ["'self'"],
-                'frame-ancestors': ["'self'"],
-                'upgrade-insecure-requests': null,
-            },
-        },
-        crossOriginEmbedderPolicy: false,
-        crossOriginResourcePolicy: { policy: 'same-origin' },
-    }),
-);
-
-// Dynamic CSP: re-inject upgrade-insecure-requests only when forceHttps is
-// active and the response is already on a secure channel. Helmet's static
-// middleware can't vary per-request, so we patch the header after it runs.
-app.use(async (req, res, next) => {
-    const config = await readConfigSafe();
-    if (config.web?.forceHttps && req.secure) {
-        const orig = res.getHeader('Content-Security-Policy');
-        if (orig && !String(orig).includes('upgrade-insecure-requests')) {
-            res.setHeader('Content-Security-Policy', `${orig};upgrade-insecure-requests`);
-        }
-    }
-    next();
+// The CSP itself is built by lib/security-headers.js from web.csp (defaults
+// live in config/manager.js) so the operator can edit it live from Settings.
+const _helmet = helmet({
+    // HSTS managed by the forceHttps middleware above — helmet must not
+    // override the max-age=0 clear header when the operator disables HTTPS.
+    hsts: false,
+    contentSecurityPolicy: false,
+    // X-Frame-Options is set together with the CSP below so it can be
+    // dropped when frame-ancestors is customised.
+    xFrameOptions: false,
+    crossOriginEmbedderPolicy: false,
+    crossOriginResourcePolicy: { policy: 'same-origin' },
 });
+app.use(_helmet);
+
+// CSP + X-Frame-Options. Read per request (config cache is invalidated on
+// save), so edits apply on the next request. `upgrade-insecure-requests` is
+// added only when forceHttps is on and the request is already secure.
+const _cspMw = async (req, res, next) => {
+    const config = await readConfigSafe();
+    const { csp, xFrameOptions } = buildSecurityHeaders(config, { secure: req.secure });
+    if (csp) res.setHeader(csp.name, csp.value);
+    if (xFrameOptions) res.setHeader('X-Frame-Options', xFrameOptions);
+    next();
+};
+app.use(_cspMw);
 
 // HTTP caching policy. Browsers (and intermediaries like Cloudflare) will
 // happily serve a 200 from disk for several seconds even on responses with
@@ -722,7 +759,7 @@ app.use(async (req, res, next) => {
 //
 // Sits BEFORE the static handlers so res.setHeader wins over express.static's
 // default ETag/Last-Modified-only behaviour.
-app.use((req, res, next) => {
+const _cachePolicyMw = (req, res, next) => {
     const p = req.path;
     if (p.startsWith('/api/')) {
         // Auth-dependent — vary on the session cookie so a shared cache
@@ -773,7 +810,14 @@ app.use((req, res, next) => {
         res.setHeader('Cache-Control', 'public, max-age=3600, must-revalidate');
     }
     next();
-});
+};
+app.use(_cachePolicyMw);
+
+// The middlewares above that put headers on every response. tgdl-core
+// answers /files, /photos and thumbnail hits itself with the headers this
+// chain produces for them — captured from these functions at every state
+// push (config change), never copied into Go (_frontState).
+const _frontHeaderChain = [_forceHttpsMw, _helmet, _cspMw, _cachePolicyMw];
 
 // Defense-in-depth: a coarse global rate limit on every API path. The login
 // endpoint has its own stricter limiter below (which is NOT user-toggleable
@@ -789,6 +833,18 @@ app.use((req, res, next) => {
 // after POST /api/config so toggling in the UI takes effect without a
 // restart. The skip + limit functions read this in-memory cache to stay
 // sync (express-rate-limit's hooks don't accept async).
+//
+// Module-level config cache (definition; the `readConfigSafe` helper that
+// uses it is declared further down). Declared ABOVE the first module-load
+// caller — the refreshRateLimitConfig() call just below and the
+// share-secret bootstrap IIFE — because both call `readConfigSafe()`
+// synchronously up to its first internal await, and inside the helper we
+// read `_configCache.value` immediately. Declared any later it would be in
+// TDZ at that read ("Cannot access '_configCache' before initialization"):
+// the share secret bootstrap was deferred (`[share] secret bootstrap
+// deferred`) and the configured API rate limit ignored until the first
+// 30 s refresh.
+let _configCache = { at: 0, value: null };
 const RATE_LIMIT_DEFAULT_RPM = 10000;
 let _rateLimitConfig = { enabled: false, perMinute: RATE_LIMIT_DEFAULT_RPM };
 
@@ -797,11 +853,15 @@ async function refreshRateLimitConfig() {
         const config = await readConfigSafe();
         const cfg = config.web?.rateLimit || {};
         const rpm = parseInt(cfg.perMinute, 10);
+        const wasEnabled = _rateLimitConfig.enabled;
         _rateLimitConfig = {
             enabled: cfg.enabled === true,
             perMinute:
                 Number.isFinite(rpm) && rpm >= 10 ? Math.min(1000000, rpm) : RATE_LIMIT_DEFAULT_RPM,
         };
+        // The tgdl-core front server answers thumbnail hits itself only
+        // while this limiter is off; tell it at once.
+        if (wasEnabled !== _rateLimitConfig.enabled) pushFrontState();
     } catch {
         /* keep last-known-good */
     }
@@ -875,16 +935,6 @@ app.use((req, res, next) => {
 // Rolling expiry-cleanup for session tokens. Unref'd so it doesn't keep the
 // process alive on shutdown.
 startSessionGc();
-
-// Module-level config cache (definition; the `readConfigSafe` helper that
-// uses it is declared further down). Hoisted to ABOVE the share-secret
-// bootstrap IIFE because that IIFE awaits `readConfigSafe()` synchronously
-// up to its first internal await, and inside the helper we read
-// `_configCache.value` immediately — if the `let` below were still in its
-// original position (after the IIFE) it would be in TDZ at that read,
-// crashing module load with "Cannot access '_configCache' before
-// initialization". Logged in the wild as `[share] secret bootstrap deferred`.
-let _configCache = { at: 0, value: null };
 
 // Bootstrap the share-link HMAC secret + apply runtime limits from
 // config. Lazy-generated secret on first boot, persisted to
@@ -1121,6 +1171,19 @@ function isPublicPath(p) {
     return PUBLIC_PATH_PREFIXES.some((pre) => p === pre || p.startsWith(pre));
 }
 
+// Sliding renewal: extend the session if less than 25% of its original TTL
+// remains. Returns that TTL when it did (for the cookie), else 0. tgdl-core
+// asks for the same when it serves a request in that window itself.
+function slideSession(token, session) {
+    const originalTtl = session.expiresAt - session.issuedAt;
+    const remaining = session.expiresAt - Date.now();
+    if (originalTtl > 0 && remaining < originalTtl * 0.25) {
+        renewSession(token, Date.now() + originalTtl);
+        return originalTtl;
+    }
+    return 0;
+}
+
 async function checkAuth(req, res, next) {
     const config = await readConfigSafe();
     const enabled = config.web?.enabled !== false; // default ON
@@ -1142,10 +1205,12 @@ async function checkAuth(req, res, next) {
     if (isPublicPath(req.path)) return next();
 
     // Bearer-token auth for /files/ — lets the URL work without a session
-    // cookie (e.g. after a Cloudflare redirect to a direct DDNS host).
-    if (req.path.startsWith('/files/') && req.query.token) {
-        if (verifyFileToken(req.query.token)) {
-            req.role = 'admin';
+    // cookie (e.g. after a Cloudflare redirect to a direct DDNS host). The
+    // token carries the role of the session that minted it.
+    if (req.path.startsWith('/files/')) {
+        const tokenRole = verifyFileToken(req.query.token);
+        if (tokenRole) {
+            req.role = tokenRole;
             return next();
         }
     }
@@ -1154,13 +1219,9 @@ async function checkAuth(req, res, next) {
     const session = validateSession(token);
     if (session) {
         req.role = session.role;
-        // Sliding renewal: extend if less than 25% of the original TTL remains.
-        const originalTtl = session.expiresAt - session.issuedAt;
-        const remaining = session.expiresAt - Date.now();
-        if (originalTtl > 0 && remaining < originalTtl * 0.25) {
-            const newExpiry = Date.now() + originalTtl;
-            renewSession(token, newExpiry);
-            res.cookie('tg_dl_session', token, { ...SESSION_COOKIE_OPTS, maxAge: originalTtl });
+        const renewedTtl = slideSession(token, session);
+        if (renewedTtl) {
+            res.cookie('tg_dl_session', token, { ...SESSION_COOKIE_OPTS, maxAge: renewedTtl });
         }
         return next();
     }
@@ -1201,7 +1262,7 @@ const GUEST_GET_ALLOW = [
 ];
 const GUEST_OTHER_ALLOW = new Set([
     'POST /api/logout',
-    'POST /api/downloads/by-ids', // hydrate shuffle playlist slots (same media guests can already list)
+    'POST /api/downloads/by-ids', // hydrate shuffle playlist slots guests can already list
 ]);
 
 function isGuestAllowed(req) {
@@ -1669,17 +1730,36 @@ function _cmpSemver(a, b) {
     return 0;
 }
 
+// The repo also publishes sidecar releases (faces-v*, nsfw-v*, seekbar-v*),
+// and GitHub's "latest release" can point at one of them — so list the
+// recent releases and take the highest app tag (vX.Y.Z) instead.
+const APP_RELEASE_TAG = /^v\d+\.\d+\.\d+$/;
+
 async function _fetchLatestRelease() {
     if (typeof fetch !== 'function') return null;
     const ctrl = new AbortController();
     const t = setTimeout(() => ctrl.abort(), 5000);
     try {
-        const r = await fetch(`https://api.github.com/repos/${UPDATE_CHECK_REPO}/releases/latest`, {
-            headers: { Accept: 'application/vnd.github+json', 'User-Agent': 'tgdl-update-check' },
-            signal: ctrl.signal,
-        });
+        const r = await fetch(
+            `https://api.github.com/repos/${UPDATE_CHECK_REPO}/releases?per_page=100`,
+            {
+                headers: {
+                    Accept: 'application/vnd.github+json',
+                    'User-Agent': 'tgdl-update-check',
+                },
+                signal: ctrl.signal,
+            },
+        );
         if (!r.ok) return null;
-        const j = await r.json();
+        const list = await r.json();
+        let j = null;
+        for (const rel of Array.isArray(list) ? list : []) {
+            if (rel?.draft || rel?.prerelease || !APP_RELEASE_TAG.test(rel?.tag_name || '')) {
+                continue;
+            }
+            if (!j || _cmpSemver(rel.tag_name, j.tag_name) > 0) j = rel;
+        }
+        if (!j) return null;
         return {
             tag: j.tag_name,
             name: j.name || j.tag_name,
@@ -1752,11 +1832,35 @@ app.get('/api/version/check', async (req, res) => {
 // `data/backups/`, then signals the watchtower sidecar to pull + recreate
 // this container. Returns 200 immediately; the actual swap happens out of
 // band moments later (the SPA's WS reconnect logic detects the cycle).
+//
+// Every route here is registered before the global checkAuth / guestGate, so
+// each one gates itself through `_updateRouteSession()`: no session → 401.
+// The capability probe stays readable by guests — the "Update available"
+// chooser in the status bar is shown to every session and reads it. The
+// job status, the audit log and the kickoff are admin-only (the SPA only
+// uses them on the admin-only Maintenance pages).
+function _updateRouteSession(req, res, { adminOnly = false } = {}) {
+    const session = validateSession(req.cookies?.tg_dl_session);
+    if (!session) {
+        res.status(401).json({ error: 'Unauthorized' });
+        return null;
+    }
+    if (adminOnly && session.role !== 'admin') {
+        res.status(403).json({ error: 'Admin only', adminRequired: true });
+        return null;
+    }
+    return session;
+}
+
 app.get('/api/update/status', async (req, res) => {
+    if (!_updateRouteSession(req, res)) return;
     res.json(autoUpdateStatus());
 });
 
 app.post('/api/update', async (req, res) => {
+    // An update snapshots the DB and asks watchtower to recreate the
+    // container — admin sessions only.
+    if (!_updateRouteSession(req, res, { adminOnly: true })) return;
     const tracker = _jobTrackers.autoUpdate;
     const fromVersion = _readCurrentVersion();
     const r = tracker.tryStart(async () => {
@@ -1803,6 +1907,7 @@ app.post('/api/update', async (req, res) => {
 });
 
 app.get('/api/auto-update/status', async (req, res) => {
+    if (!_updateRouteSession(req, res, { adminOnly: true })) return;
     res.json(_jobTrackers.autoUpdate.getStatus());
 });
 
@@ -1810,6 +1915,7 @@ app.get('/api/auto-update/status', async (req, res) => {
 // "Recent updates" panel in the maintenance UI + lets operators spot
 // repeat failures (e.g. watchtower mis-token on every retry).
 app.get('/api/update/history', async (req, res) => {
+    if (!_updateRouteSession(req, res, { adminOnly: true })) return;
     try {
         const limit = Math.max(1, Math.min(200, parseInt(req.query.limit, 10) || 25));
         res.json({ history: listUpdateHistory({ limit }) });
@@ -1852,6 +1958,9 @@ async function getAccountManager() {
     }
     _accountManager = new AccountManager(config);
     await _accountManager.loadAll();
+    // loadAll() may just have migrated data/session.enc into sessions/ —
+    // close the legacy client so that key isn't used on two connections.
+    await dropLegacyClientIfOwned();
     return _accountManager;
 }
 
@@ -1864,7 +1973,17 @@ async function getAccountManager() {
 async function refreshAccountsAndEngine() {
     try {
         const am = await getAccountManager();
+        const before = new Set([...am.clients.keys()].map(String));
         await am.reloadAccounts();
+        // Answers from a removed account no longer count; a new account
+        // gets a (one-per-minute) re-check of every chat that can't be
+        // reached — it may be a member.
+        try {
+            const now = [...am.clients.keys()].map(String);
+            chatAccess.accountsChanged(now, { added: now.some((id) => !before.has(id)) });
+        } catch {
+            /* bookkeeping only */
+        }
         if (runtime?.state === 'running' && am.count > 0) {
             await runtime.restart({ config: loadConfig(), accountManager: am });
         }
@@ -1890,14 +2009,7 @@ app.get('/sw.js', (req, res) => {
     // Don't let intermediaries cache an old SW — the SW is the thing that
     // controls cache behaviour for everything else, so it must update fast.
     res.set('Cache-Control', 'no-cache, no-store, must-revalidate');
-    let src = fsSync.readFileSync(path.join(__dirname, 'public', 'sw.js'), 'utf8');
-    // Cache names must change when the package version changes, otherwise
-    // a rebuild that only touches HTML/JS keeps serving the previous
-    // shell/CSS from Cache Storage until someone remembers to bump the
-    // hardcoded VERSION in sw.js.
-    const ver = String(_readCurrentVersion()).replace(/[^0-9A-Za-z.+-]/g, '') || 'dev';
-    src = src.replace(/const VERSION = '[^']*'/, `const VERSION = '${ver}'`);
-    res.send(src);
+    res.sendFile(path.join(__dirname, 'public', 'sw.js'));
 });
 
 app.get('/manifest.webmanifest', (req, res) => {
@@ -1934,43 +2046,62 @@ app.get('/metrics', (req, res) => {
 // behave identically to /files/*). Cache-Control: no-store keeps a
 // shared CDN/proxy from hijacking the bytes for the next visitor.
 //
-// express-rate-limit v7 does not support function values for windowMs/limit,
-// so we use static defaults and rebuild the limiter on config change.
-const _shareRateCfg = { windowMs: 60_000, limit: 60 };
+// `advanced.share.rateLimitMax` / `rateLimitWindowMs` are applied the way
+// the global API limit is (see refreshRateLimitConfig): read from config
+// at boot, every 30 s and right after POST /api/config, into an in-memory
+// copy the limiter reads per request. The route calls the current limiter
+// through a wrapper — it used to capture the boot-time instance, so a
+// rebuilt one never took effect and the configured values were ignored.
+// express-rate-limit v7 takes a function for `limit` but not for
+// `windowMs` (its MemoryStore is built with it), so a new window swaps in
+// a fresh limiter + store; a new limit alone keeps the counters.
+const SHARE_RATE_DEFAULTS = { windowMs: 60_000, limit: 60 };
+const _shareRateCfg = { ...SHARE_RATE_DEFAULTS };
+let _shareLimiterStore = null;
 function _buildShareLimiter() {
+    try {
+        _shareLimiterStore?.shutdown();
+    } catch {
+        /* old store's timer — nothing to keep */
+    }
+    _shareLimiterStore = new RateLimitMemoryStore();
     return rateLimit({
         windowMs: _shareRateCfg.windowMs,
-        limit: _shareRateCfg.limit,
+        limit: () => _shareRateCfg.limit,
+        store: _shareLimiterStore,
         standardHeaders: 'draft-7',
         legacyHeaders: false,
         message: { error: 'Too many requests — slow down.' },
     });
 }
-let shareLimiter = _buildShareLimiter();
+let _shareLimiter = _buildShareLimiter();
+const shareLimiter = (req, res, next) => _shareLimiter(req, res, next);
 
-// Tiny cache around the last-loaded config so the rate-limit getters
-// don't sync-read disk on every share request. Refreshed by the
-// config_updated WS broadcast handler below + on first use.
-let _shareConfigCache = null;
-function _currentShareConfig() {
-    if (!_shareConfigCache) {
-        try {
-            _shareConfigCache = loadConfig().advanced?.share || {};
-        } catch {
-            _shareConfigCache = {};
-        }
-    }
-    return _shareConfigCache;
-}
-function _invalidateShareConfigCache() {
-    _shareConfigCache = null;
-    const sh = _currentShareConfig();
+function _applyShareRateLimit(sh = {}) {
     const ms = Number(sh.rateLimitWindowMs);
     const lim = Number(sh.rateLimitMax);
-    _shareRateCfg.windowMs = Number.isFinite(ms) && ms > 0 ? ms : 60_000;
-    _shareRateCfg.limit = Number.isFinite(lim) && lim > 0 ? lim : 60;
-    shareLimiter = _buildShareLimiter();
+    const windowMs = Number.isFinite(ms) && ms > 0 ? Math.floor(ms) : SHARE_RATE_DEFAULTS.windowMs;
+    _shareRateCfg.limit =
+        Number.isFinite(lim) && lim > 0 ? Math.floor(lim) : SHARE_RATE_DEFAULTS.limit;
+    if (windowMs !== _shareRateCfg.windowMs) {
+        _shareRateCfg.windowMs = windowMs;
+        _shareLimiter = _buildShareLimiter();
+    }
 }
+
+// Re-read on every call (the periodic refresh must see edits made
+// elsewhere — CLI, cluster config sync). Sync on purpose: called at module
+// load, where an awaited continuation could run before later
+// declarations (the TDZ trap refreshRateLimitConfig fell into).
+function _refreshShareRateLimit() {
+    try {
+        _applyShareRateLimit(loadConfig().advanced?.share || {});
+    } catch {
+        /* keep last-known-good */
+    }
+}
+_refreshShareRateLimit();
+setInterval(_refreshShareRateLimit, 30 * 1000).unref();
 
 // v2 URL shape: `/share/<linkId>?s=<sig>` (or `/share/<linkId>/<filename>?s=<sig>`
 // when `buildShareUrlPath()` was called with a friendly slug). The signature
@@ -2024,9 +2155,6 @@ app.get(['/share/:linkId', '/share/:linkId/:fileName'], shareLimiter, async (req
             return res.status(404).type('text/plain').send('File not found');
         }
 
-        // Bump access counter — cheap, non-blocking on errors.
-        bumpShareLinkAccess(linkId);
-
         // Anti-CDN cache + don't allow shared caches to cache. Bytes are
         // gated per-token; if the token is later revoked, no cache layer
         // should keep handing the file out.
@@ -2037,6 +2165,18 @@ app.get(['/share/:linkId', '/share/:linkId/:fileName'], shareLimiter, async (req
         // here, but a video tag in an iframe could fingerprint the user).
         res.setHeader('X-Frame-Options', 'DENY');
         res.setHeader('Referrer-Policy', 'no-referrer');
+
+        // A Range the file can't satisfy is refused before the access is
+        // counted (sendFile would answer the same 416 below, but after the
+        // bump).
+        const size = (await fs.stat(r.real).catch(() => null))?.size;
+        if (Number.isFinite(size) && isUnsatisfiableRange(req, size)) {
+            res.setHeader('Accept-Ranges', 'bytes');
+            return sendRangeNotSatisfiable(res, `bytes */${size}`);
+        }
+
+        // Bump access counter — cheap, non-blocking on errors.
+        bumpShareLinkAccess(linkId);
 
         // Force download when ?download=1, otherwise let the browser pick
         // (mirrors /files/* semantics so an image/video plays inline by
@@ -2164,14 +2304,24 @@ app.use((req, res, next) => {
     next();
 });
 
-app.use(express.static(path.join(__dirname, 'public')));
-app.use('/photos', express.static(PHOTOS_DIR));
+// Nothing under public/ lives at /api/* or /files/*, but express.static
+// would still stat() a candidate file for every such request — every API
+// call and every 64 KB video range request — on the shared libuv pool.
+const _publicStatic = express.static(path.join(__dirname, 'public'));
+app.use((req, res, next) => {
+    if (req.path.startsWith('/api/') || req.path.startsWith('/files/')) return next();
+    return _publicStatic(req, res, next);
+});
+// /photos is served by tgdl-core's front server (avatars, express.static's
+// semantics); what it declines — a missing file, a directory, a dotfile —
+// falls through to the 404 page below, as static always did.
+app.use('/photos', requireFront);
 
 // Serve CHANGELOG.md from the project root for the in-app changelog
 // viewer (changelog-viewer.js). Read on every request so a `git pull`
 // without a process restart picks up the new content. Cap at a sane
-// size so we never accidentally try to stream a 50 MB file. 1 hour
-// browser cache is fine — the SPA invalidates it via the `?v=` token.
+// size so we never accidentally try to stream a 50 MB file. The viewer
+// fetches with `cache: 'no-cache'`, so the max-age never hides a release.
 app.get('/CHANGELOG.md', async (req, res) => {
     try {
         const p = path.resolve(__dirname, '../../CHANGELOG.md');
@@ -2350,7 +2500,8 @@ app.delete('/api/accounts/:id', async (req, res) => {
 // authenticated WebSocket clients.
 
 runtime.on('state', (s) => broadcast({ type: 'monitor_state', state: s.state, error: s.error }));
-runtime.on('event', (e) => broadcast({ type: 'monitor_event', ...e }));
+// Engine events go out under their own type (see runtimeEventMessage).
+runtime.on('event', (e) => broadcast(runtimeEventMessage(e)));
 
 // Catch-up backfill — fired by monitor when boot-time inspection finds a
 // group whose newest stored message_id lags Telegram's current top by
@@ -2412,6 +2563,12 @@ async function _buildMonitorStatusSnapshot() {
               : (config.groups || []).filter((g) => g.enabled).length === 0
                 ? 'enable-group'
                 : null;
+    // tgdl-core can't run (missing binary, unsupported platform, …):
+    // the dashboard shows a persistent banner with the fix. Only present
+    // while there is a problem, so the status shape is otherwise unchanged.
+    // Same banner when only its front server can't be kept running.
+    const coreBanner = getCoreBanner() || _frontBanner();
+    if (coreBanner) status.core = coreBanner;
     return status;
 }
 
@@ -2615,6 +2772,18 @@ app.post('/api/history', async (req, res) => {
                 jobId: _activeBackfillsByGroup.get(groupKey),
             });
         }
+        // A chat no account can read: refuse up front (no Telegram call)
+        // and say why — the dashboard shows the reason + "Check again".
+        {
+            const acc = _accessForId(groupKey, loadConfig());
+            if (chatAccess.isBlockingState(acc.state)) {
+                return res.status(409).json({
+                    error: `This chat can't be reached (${acc.state}${acc.code ? `: ${acc.code}` : ''}) — no account can read it`,
+                    code: 'CHAT_UNREACHABLE',
+                    access: acc,
+                });
+            }
+        }
         // limit === 0 (or "0") means "no limit" → backfill the entire history.
         // Anything else is clamped into a sane positive range.
         const limRaw = parseInt(limit, 10);
@@ -2817,6 +2986,10 @@ app.post('/api/history', async (req, res) => {
                 if (_activeBackfillsByGroup.get(groupKey) === jobId) {
                     _activeBackfillsByGroup.delete(groupKey);
                 }
+                // Same grace-window eviction as the success path — failed
+                // jobs are persisted above, so keeping them in memory
+                // forever only grew the map (and GET /api/history).
+                setTimeout(() => _historyJobs.delete(jobId), HISTORY_JOB_TTL_MS);
             });
 
         log({
@@ -3364,10 +3537,41 @@ app.post('/api/queue/batch', async (req, res) => {
 
 // ====== Stories ============================================================
 
+// Stories of a chat the dashboard already knows no account can read:
+// answer from the access registry instead of spending the getEntity +
+// GetPeerStories calls. A @username is matched against the cached dialogs
+// list (no lookup); anything unknown goes to Telegram as before.
+function _storiesTargetAccess(ref) {
+    const r = String(ref || '').trim();
+    if (!r) return null;
+    let id = null;
+    if (/^-?\d+$/.test(r)) id = r;
+    else {
+        const u = r.replace(/^@/, '').toLowerCase();
+        const d = (_dialogsResponseCache.body?.dialogs || []).find(
+            (x) => String(x.username || '').toLowerCase() === u,
+        );
+        if (d) id = String(d.id);
+    }
+    if (!id) return null;
+    const access = _accessForId(id, loadConfig());
+    return chatAccess.isBlockingState(access.state) ? { id, access } : null;
+}
+
+function _storiesUnreachable(res, blocked) {
+    return res.status(409).json({
+        error: `This chat can't be reached (${blocked.access.state}) — no account can read it`,
+        code: 'CHAT_UNREACHABLE',
+        access: blocked.access,
+    });
+}
+
 app.post('/api/stories/user', async (req, res) => {
     try {
         const { username } = req.body || {};
         if (!username) return res.status(400).json({ error: 'username required' });
+        const blocked = _storiesTargetAccess(username);
+        if (blocked) return _storiesUnreachable(res, blocked);
         const am = await getAccountManager();
         if (am.count === 0) return res.status(409).json({ error: 'No Telegram accounts loaded' });
         const r = await listUserStories(am.getDefaultClient(), username);
@@ -3396,6 +3600,8 @@ app.post('/api/stories/download', async (req, res) => {
         if (!username || !Array.isArray(storyIds) || storyIds.length === 0) {
             return res.status(400).json({ error: 'username and storyIds required' });
         }
+        const blockedTarget = _storiesTargetAccess(username);
+        if (blockedTarget) return _storiesUnreachable(res, blockedTarget);
         const am = await getAccountManager();
         if (am.count === 0) return res.status(409).json({ error: 'No Telegram accounts loaded' });
         const client = am.getDefaultClient();
@@ -3567,6 +3773,20 @@ app.post('/api/download/url', async (req, res) => {
         for (const raw of list) {
             try {
                 const parsed = parseTelegramUrl(raw);
+                // A t.me/c/<id> link into a chat no account can read: say so
+                // without asking every account again.
+                if (/^-?\d+$/.test(String(parsed.chatRef))) {
+                    const acc = _accessForId(String(parsed.chatRef), config);
+                    if (chatAccess.isBlockingState(acc.state)) {
+                        results.push({
+                            url: raw,
+                            ok: false,
+                            error: `This chat can't be reached (${acc.state})`,
+                            code: 'CHAT_UNREACHABLE',
+                        });
+                        continue;
+                    }
+                }
                 // Try every account until one can read the chat
                 let resolved = null;
                 let workingClient = null;
@@ -3685,8 +3905,14 @@ async function _computeStatsPayload(role) {
     const config = loadConfig();
     let diskUsage = Number(dbStats.totalSize) || 0;
     if (diskUsage <= 0) {
-        diskUsage = await scanDirectorySize(DOWNLOADS_DIR);
-        writeDiskUsageCache(diskUsage);
+        const scanned = await scanDirectorySize(DOWNLOADS_DIR);
+        if (scanned !== null) {
+            diskUsage = scanned;
+            writeDiskUsageCache(diskUsage);
+        } else {
+            // tgdl-core can't answer right now: keep the last figure.
+            diskUsage = readDiskUsageCache();
+        }
     }
     let accountCount = 0;
     try {
@@ -3747,10 +3973,27 @@ function broadcastStatsSoon() {
     _statsBroadcastTimer = setTimeout(async () => {
         _statsBroadcastTimer = null;
         try {
-            // Admin payload — guests just refetch via HTTP on reconnect.
             const body = await _computeStatsPayload('admin');
             _statsCache = { role: 'admin', at: Date.now(), body };
-            broadcast({ type: 'stats_update', stats: body });
+            // Per role: guest sessions get the guest payload (no cluster
+            // peer stats), not the admin one everyone used to receive.
+            // Sent directly rather than through broadcast(): a stats push
+            // is superseded by the next one, so a backed-up client just
+            // skips it.
+            const adminText = JSON.stringify({ type: 'stats_update', stats: body });
+            let guestText = null;
+            for (const ws of Array.from(clients)) {
+                if (ws.readyState !== 1 || ws.bufferedAmount > 1 << 20) continue;
+                if (ws.role === 'guest') {
+                    guestText ??= JSON.stringify({
+                        type: 'stats_update',
+                        stats: await _computeStatsPayload('guest'),
+                    });
+                    ws.send(guestText);
+                } else {
+                    ws.send(adminText);
+                }
+            }
         } catch (e) {
             console.warn('[stats] broadcast failed:', e.message);
         }
@@ -3818,6 +4061,31 @@ app.get('/api/system/health', async (req, res) => {
             connections: {
                 wsClients: clients.size,
             },
+            goCore: (() => {
+                try {
+                    return getGoCoreStatus();
+                } catch {
+                    return null;
+                }
+            })(),
+            // The tgdl-core front server (who serves PORT, restarts,
+            // request counters): only when asked, so the default payload
+            // stays what it has always been.
+            ...(req.query.front === '1'
+                ? {
+                      goCoreFront: await (async () => {
+                          try {
+                              return {
+                                  ...getFrontStatus(),
+                                  servedByNode: _frontProblem,
+                                  stats: await frontStats(),
+                              };
+                          } catch {
+                              return null;
+                          }
+                      })(),
+                  }
+                : {}),
         });
     } catch (e) {
         res.status(500).json({ error: e.message });
@@ -3858,8 +4126,13 @@ async function _stats_legacy_block_removed(req, res) {
 
         let diskUsage = Number(dbStats.totalSize) || 0;
         if (diskUsage <= 0) {
-            diskUsage = await scanDirectorySize(DOWNLOADS_DIR);
-            writeDiskUsageCache(diskUsage);
+            const scanned = await scanDirectorySize(DOWNLOADS_DIR);
+            if (scanned !== null) {
+                diskUsage = scanned;
+                writeDiskUsageCache(diskUsage);
+            } else {
+                diskUsage = readDiskUsageCache();
+            }
         }
 
         // Account count: reflect the on-disk session files even when no
@@ -3959,7 +4232,7 @@ app.get('/api/dialogs', async (req, res) => {
             _dialogsResponseCache.body &&
             Math.max(0, now - _dialogsResponseCache.at) < DIALOG_CACHE_TTL_MS
         ) {
-            return res.json(_dialogsResponseCache.body);
+            return res.json(_dialogsWithAccess(_dialogsResponseCache.body, req.role));
         }
 
         // Collect every connected client + its account metadata. Manage
@@ -4024,12 +4297,17 @@ app.get('/api/dialogs', async (req, res) => {
             }),
         );
 
+        // Dialogs sync — free access information: a chat that's back in an
+        // account's list is reachable again; a configured chat that shows
+        // up forbidden / migrated is recorded without another call.
+        _syncAccessFromDialogs(perClient, configGroups);
+
         // Build maps keyed by dialog id:
         //   firstDialog[id] -> { d, archived } picked on first sighting (active wins over archived)
         //   accountIds[id]  -> Set of every accountId that sees this chat
         const firstDialog = new Map();
         const accountIds = new Map();
-        const nameById = new Map(_dialogsNameCache.byId);
+        const nameById = new Map(_dialogsNames.current() || []);
 
         for (const p of perClient) {
             for (const isArchived of [false, true]) {
@@ -4058,7 +4336,7 @@ app.get('/api/dialogs', async (req, res) => {
                 }
             }
         }
-        _dialogsNameCache = { at: now, byId: nameById };
+        if (nameById.size > 0) _dialogsNames.set(nameById);
 
         // Account directory for the response — lets the SPA render account
         // chips by id without a second round-trip to /api/accounts.
@@ -4126,10 +4404,507 @@ app.get('/api/dialogs', async (req, res) => {
 
         const body = { success: true, dialogs: results, allowDM, accounts };
         _dialogsResponseCache = { at: now, body };
-        res.json(body);
+        res.json(_dialogsWithAccess(body, req.role));
     } catch (error) {
         console.error('GET /api/dialogs:', error);
         res.status(500).json({ error: 'Internal error' });
+    }
+});
+
+// ---- Chat access state (src/core/chat-access.js) ---------------------------
+//
+// `access` on /api/groups, /api/dialogs and /api/chats/lookup rows:
+// `{ state: 'ok' }` for a chat nothing is known against, otherwise
+// `{ state, code, detail, migratedTo, firstSeenAt, checkedAt, nextCheckAt,
+// checks, accounts:[{id,state,code,at}] }`. Older installs' auto-disabled
+// entries (`suspended`, `_resolveFailedAt`) map to the same states with
+// `legacy: true`. Account ids are left out for guest sessions.
+
+function _accessForGroup(group, role) {
+    const a = chatAccess.effectiveAccess(group);
+    if (role === 'guest' && a.accounts) return { ...a, accounts: [] };
+    return a;
+}
+
+function _accessForId(id, config, role) {
+    const g = (config?.groups || []).find((x) => String(x.id) === String(id));
+    if (g) return _accessForGroup(g, role);
+    const a = chatAccess.accessOf(id);
+    if (role === 'guest' && a.accounts) return { ...a, accounts: [] };
+    return a;
+}
+
+// Computed per response (a Map lookup per row) so the 5-minute dialogs
+// cache never serves a stale badge.
+function _dialogsWithAccess(body, role) {
+    if (!body || !Array.isArray(body.dialogs)) return body;
+    let config = {};
+    try {
+        config = loadConfig();
+    } catch {
+        /* fall back to registry-only answers */
+    }
+    const byId = new Map((config.groups || []).map((g) => [String(g.id), g]));
+    return {
+        ...body,
+        dialogs: body.dialogs.map((d) => {
+            const g = byId.get(String(d.id));
+            let access = g ? _accessForGroup(g, role) : chatAccess.accessOf(d.id);
+            if (role === 'guest' && access.accounts) access = { ...access, accounts: [] };
+            return { ...d, access };
+        }),
+    };
+}
+
+/** perClient: [{ accountId, active, archived }] as fetched for dialogs. */
+function _syncAccessFromDialogs(perClient, configGroups) {
+    try {
+        const configIds = new Set((configGroups || []).map((g) => String(g.id)));
+        // Entries an older version switched off (no registry row): back in
+        // an account's list as a member → drop the old flags too.
+        const legacyIds = new Set(
+            (configGroups || [])
+                .filter(
+                    (g) =>
+                        g &&
+                        (g.suspended === true || g._resolveFailedAt) &&
+                        !String(g.id).startsWith('unknown:'),
+                )
+                .map((g) => String(g.id)),
+        );
+        const legacyBack = [];
+        for (const p of perClient || []) {
+            if (!p || p.accountId === 'legacy') continue;
+            const list = [...(p.active || []), ...(p.archived || [])];
+            chatAccess.syncFromDialogs(p.accountId, list, { configIds });
+            if (!legacyIds.size) continue;
+            for (const d of list) {
+                const id = String(d?.id);
+                if (legacyIds.has(id) && chatAccess.classifyEntity(d.entity)?.state === 'ok') {
+                    legacyBack.push(id);
+                    legacyIds.delete(id);
+                }
+            }
+        }
+        if (legacyBack.length) _clearLegacyAccessFlags(legacyBack);
+    } catch (e) {
+        console.warn('[chat-access] dialogs sync failed:', e?.message || e);
+    }
+}
+
+// Older versions switched a chat off with `suspended` / `_resolveFailedAt`
+// when no account could open it. Once it's reachable again those flags go
+// (so it can be switched back on); `enabled` is left as the operator set it.
+function _clearLegacyAccessFlags(ids) {
+    try {
+        const want = new Set((ids || []).map(String));
+        const cfg = loadConfig();
+        let dirty = false;
+        for (const g of cfg.groups || []) {
+            if (!g || !want.has(String(g.id)) || String(g.id).startsWith('unknown:')) continue;
+            if (chatAccess.isBlocked(g.id)) continue;
+            if (g.suspended || g._resolveFailedAt || g._resolveFailedReason) {
+                delete g.suspended;
+                delete g._resolveFailedAt;
+                delete g._resolveFailedReason;
+                dirty = true;
+            }
+        }
+        if (dirty) {
+            saveConfig(cfg);
+            _dialogsResponseCache = { at: 0, body: null };
+            broadcast({ type: 'config_updated' });
+        }
+    } catch (e) {
+        console.warn('[chat-access] legacy flag cleanup failed:', e?.message || e);
+    }
+}
+
+// Access changes (polling, a download, the re-checker, a dialogs sync…)
+// fan out as one coalesced `chat_access_changed` WS event so every open
+// dashboard repaints its badges.
+const _accessChangedIds = new Set();
+let _accessFlushTimer = null;
+chatAccess.accessEvents.on('change', (e) => {
+    _accessChangedIds.add(String(e.id));
+    if (_accessFlushTimer) return;
+    _accessFlushTimer = setTimeout(() => {
+        _accessFlushTimer = null;
+        const ids = [..._accessChangedIds];
+        _accessChangedIds.clear();
+        const back = ids.filter((id) => !id.startsWith('dest:') && !chatAccess.isBlocked(id));
+        if (back.length) _clearLegacyAccessFlags(back);
+        broadcast({ type: 'chat_access_changed', ids });
+    }, 500);
+    _accessFlushTimer.unref?.();
+});
+
+/**
+ * Re-check one chat now: every account (pinned first), one call each,
+ * stopping at the first that can read it. Through the running monitor when
+ * there is one (so it re-binds the working account right away).
+ */
+async function _recheckChat(id) {
+    const idStr = String(id);
+    const config = loadConfig();
+    const cfgGroup = (config.groups || []).find((g) => String(g.id) === idStr) || null;
+    const monitor = runtime.state === 'running' ? runtime._monitor : null;
+    let r;
+    if (monitor) {
+        const mg = (monitor.config?.groups || []).find((g) => String(g.id) === idStr) ||
+            cfgGroup || { id };
+        r = await monitor.recheckGroup(mg);
+    } else {
+        let pairs = [];
+        try {
+            const am = await getAccountManager();
+            const pinned = String(cfgGroup?.monitorAccount || '');
+            pairs = [...am.clients.entries()]
+                .sort(
+                    (a, b) => (String(b[0]) === pinned ? 1 : 0) - (String(a[0]) === pinned ? 1 : 0),
+                )
+                .map(([accountId, client]) => ({ accountId, client }));
+        } catch {
+            /* no accounts — nothing to ask */
+        }
+        r = await chatAccess.probeChatAccess(cfgGroup ? cfgGroup.id : idStr, pairs, {
+            isRecheck: true,
+        });
+    }
+    if (r.client) {
+        _clearLegacyAccessFlags([idStr]);
+        // Its avatar / name can load again.
+        entityCache.delete(idStr);
+        _photoMissUntil.delete(idStr);
+        downloadProfilePhoto(idStr, { ignoreAccess: true }).catch(() => {});
+    }
+    const access = cfgGroup
+        ? _accessForGroup(loadConfig().groups.find((g) => String(g.id) === idStr) || cfgGroup)
+        : chatAccess.accessOf(idStr);
+    return {
+        id: idStr,
+        state: r.client ? 'ok' : access.state,
+        access,
+        accountId: r.accountId ?? null,
+        // No account gave a definite answer (flood wait, timeout, no
+        // account connected) — nothing was learned; try again later.
+        inconclusive: !r.client && !r.results.some((x) => x.state !== 'unknown'),
+        results: r.results,
+    };
+}
+
+// Configured chats that can't be reached (Chats → Needs attention, the
+// Settings → Tools attention list). `?countOnly=1` → just the numbers.
+app.get('/api/chats/access', (req, res) => {
+    try {
+        const config = loadConfig();
+        const items = [];
+        const byState = {};
+        for (const g of config.groups || []) {
+            if (!g || String(g.id).startsWith('unknown:')) continue;
+            const access = _accessForGroup(g, req.role);
+            if (!chatAccess.isBlockingState(access.state)) continue;
+            byState[access.state] = (byState[access.state] || 0) + 1;
+            items.push({
+                id: String(g.id),
+                name: g.name || String(g.id),
+                type: g.type || dialogsTypeFor(g.id),
+                enabled: g.enabled !== false,
+                access,
+            });
+        }
+        if (req.query.countOnly === '1') {
+            return res.json({ success: true, total: items.length, byState });
+        }
+        res.json({ success: true, total: items.length, byState, items });
+    } catch (e) {
+        res.status(500).json({ error: e?.message || 'Internal error' });
+    }
+});
+
+// "Check again". `{id}` → checked now, answer in the response.
+// `{ids:[…]}` or `{all:true}` (every configured chat that can't be
+// reached) → a background job, one chat every 2 s so a long list is never
+// a burst; progress on `chat_access_recheck_progress` / `_done`.
+const RECHECK_BULK_GAP_MS = 2000;
+const RECHECK_BULK_MAX = 500;
+app.post('/api/chats/access/recheck', async (req, res) => {
+    const body = req.body || {};
+    if (body.id != null && body.id !== '' && !Array.isArray(body.ids) && !body.all) {
+        try {
+            const r = await _recheckChat(body.id);
+            return res.json({ success: true, ...r });
+        } catch (e) {
+            const { status, body: errBody } = tgAuthErrorBody(e);
+            return res
+                .status(status === 400 ? 500 : status)
+                .json(errBody.error ? errBody : { error: e?.message || 'Check failed' });
+        }
+    }
+    let ids = Array.isArray(body.ids) ? body.ids.map(String).filter(Boolean) : [];
+    if (body.all) {
+        const config = loadConfig();
+        ids = (config.groups || [])
+            .filter(
+                (g) =>
+                    g &&
+                    !String(g.id).startsWith('unknown:') &&
+                    chatAccess.isBlockingState(_accessForGroup(g).state),
+            )
+            .map((g) => String(g.id));
+    }
+    ids = [...new Set(ids)].slice(0, RECHECK_BULK_MAX);
+    if (!ids.length) return res.json({ success: true, started: false, total: 0 });
+    const tracker = _jobTrackers.chatAccessRecheck;
+    const r = tracker.tryStart(async ({ onProgress }) => {
+        const results = [];
+        let reachable = 0;
+        onProgress({ processed: 0, total: ids.length, reachable: 0 });
+        for (let i = 0; i < ids.length; i++) {
+            if (i > 0) await new Promise((r2) => setTimeout(r2, RECHECK_BULK_GAP_MS));
+            let one;
+            try {
+                one = await _recheckChat(ids[i]);
+            } catch (e) {
+                one = { id: ids[i], state: 'unknown', error: e?.message || String(e) };
+            }
+            if (one.state === 'ok') reachable += 1;
+            results.push({ id: one.id, state: one.state, inconclusive: !!one.inconclusive });
+            onProgress({ processed: i + 1, total: ids.length, reachable });
+        }
+        return { total: ids.length, reachable, results };
+    });
+    if (!r.started) {
+        return res
+            .status(409)
+            .json({ error: 'A check is already running', code: 'ALREADY_RUNNING' });
+    }
+    res.json({ success: true, started: true, total: ids.length });
+});
+
+app.get('/api/chats/access/recheck/status', (req, res) => {
+    res.json(_jobTrackers.chatAccessRecheck.getStatus());
+});
+
+// Stop monitoring (enabled:false) — config only.
+app.post('/api/chats/access/stop', async (req, res) => {
+    const ids = new Set(Array.isArray(req.body?.ids) ? req.body.ids.map(String) : []);
+    if (!ids.size) return res.status(400).json({ error: 'ids[] required' });
+    try {
+        const config = loadConfig();
+        let n = 0;
+        for (const g of config.groups || []) {
+            if (g && ids.has(String(g.id)) && g.enabled !== false) {
+                g.enabled = false;
+                n += 1;
+            }
+        }
+        if (n) {
+            await writeConfigAtomic(config);
+            _dialogsResponseCache = { at: 0, body: null };
+            broadcast({ type: 'config_updated' });
+        }
+        res.json({ success: true, stopped: n });
+    } catch (e) {
+        res.status(500).json({ error: e?.message || 'Internal error' });
+    }
+});
+
+// Remove from the list — the config entry only. Downloaded files and
+// their gallery rows stay; nothing is left or unsubscribed in Telegram.
+app.post('/api/chats/access/remove', async (req, res) => {
+    const ids = new Set(Array.isArray(req.body?.ids) ? req.body.ids.map(String) : []);
+    if (!ids.size) return res.status(400).json({ error: 'ids[] required' });
+    try {
+        const config = loadConfig();
+        const before = (config.groups || []).length;
+        config.groups = (config.groups || []).filter((g) => !g || !ids.has(String(g.id)));
+        const removed = before - config.groups.length;
+        if (removed) {
+            await writeConfigAtomic(config);
+            _dialogsResponseCache = { at: 0, body: null };
+            broadcast({ type: 'config_updated' });
+        }
+        for (const id of ids) chatAccess.clearAccess(id);
+        res.json({ success: true, removed });
+    } catch (e) {
+        res.status(500).json({ error: e?.message || 'Internal error' });
+    }
+});
+
+// A basic group upgraded to a supergroup: add the new group with the old
+// one's settings (media types, forwarding, topics, accounts, rescue) and
+// switch the old one off. Its files stay where they are.
+app.post('/api/chats/:id/follow-migration', async (req, res) => {
+    try {
+        const idStr = String(req.params.id);
+        const config = loadConfig();
+        const old = (config.groups || []).find((g) => String(g.id) === idStr);
+        if (!old) return res.status(404).json({ error: 'Chat not in the list' });
+        const access = _accessForGroup(old);
+        if (access.state !== 'migrated' || !access.migratedTo) {
+            return res
+                .status(409)
+                .json({ error: 'This chat was not moved to a new group', code: 'NOT_MIGRATED' });
+        }
+        const newId = String(access.migratedTo);
+        let target = (config.groups || []).find((g) => String(g.id) === newId);
+        const added = !target;
+        if (!target) {
+            const keep = [
+                'filters',
+                'autoForward',
+                'trackUsers',
+                'topics',
+                'rescueMode',
+                'rescueRetentionHours',
+                'monitorAccount',
+                'forwardAccount',
+                'ownerPeerId',
+                'backupPeerId',
+            ];
+            target = {
+                id: Number.isSafeInteger(Number(newId)) ? Number(newId) : newId,
+                name: old.name,
+                enabled: old.enabled !== false,
+            };
+            for (const k of keep) {
+                if (old[k] !== undefined) target[k] = JSON.parse(JSON.stringify(old[k]));
+            }
+            config.groups.push(target);
+        } else if (old.enabled !== false) {
+            target.enabled = true;
+        }
+        old.enabled = false;
+        await writeConfigAtomic(config);
+        _dialogsResponseCache = { at: 0, body: null };
+        broadcast({ type: 'config_updated' });
+        res.json({ success: true, added, group: target, previous: { id: old.id, enabled: false } });
+    } catch (e) {
+        res.status(500).json({ error: e?.message || 'Internal error' });
+    }
+});
+
+// "Add" sheet lookup: resolve a @username / t.me link / invite link /
+// message link to the chat behind it. The sheet searches the dialogs list
+// by name on its own; this covers what a name search can't — chats that
+// aren't in the dialogs list, invite previews, and the chat a message link
+// points at. Admin-only through the guest gate (not on the GET allowlist).
+// Username / id answers ride resolveEntityAcrossAccounts()'s cache, so a
+// repeated lookup doesn't spend another ResolveUsername call.
+function _chatDescriptor(entity, config) {
+    const id = String(tgUtils.getPeerId(entity));
+    const cls = entity?.className;
+    let type = 'group';
+    if (cls === 'Channel') type = entity.broadcast ? 'channel' : 'group';
+    else if (cls === 'User') type = entity.bot ? 'bot' : 'user';
+    const name =
+        entity.title ||
+        [entity.firstName, entity.lastName].filter(Boolean).join(' ') ||
+        entity.username ||
+        id;
+    const cfg = (config.groups || []).find((g) => String(g.id) === id);
+    const isUser = cls === 'User';
+    return {
+        id,
+        name,
+        type,
+        username: entity.username || null,
+        members: entity.participantsCount ?? null,
+        // Channels / groups carry `left` when this account isn't a member.
+        joined: isUser ? true : entity.left !== true,
+        inConfig: !!cfg,
+        enabled: cfg?.enabled === true,
+        suspended: cfg?.suspended === true,
+        dmDisabled: isUser && config.allowDmDownloads !== true,
+        access: _accessForId(id, config),
+    };
+}
+
+app.get('/api/chats/lookup', async (req, res) => {
+    const q = String(req.query.q || '')
+        .trim()
+        .slice(0, 300);
+    if (!q) return res.status(400).json({ error: 'q required' });
+    const parsed = parseChatQuery(q);
+    if (parsed.kind === 'name') return res.json({ kind: 'name', chat: null });
+    if (parsed.kind === 'unsupported') {
+        return res.status(422).json({ kind: 'unsupported', error: parsed.reason });
+    }
+    const message =
+        parsed.kind === 'message'
+            ? { messageId: parsed.messageId, topicId: parsed.topicId ?? null, url: q }
+            : null;
+
+    let clients = [];
+    try {
+        const am = await getAccountManager();
+        clients = [...am.clients.values()].filter((c) => c?.connected);
+    } catch {
+        /* no API credentials / no account yet */
+    }
+    if (!clients.length) {
+        return res.status(503).json({ kind: parsed.kind, error: 'no_account', message });
+    }
+    const config = loadConfig();
+
+    try {
+        if (parsed.kind === 'invite') {
+            let preview = null;
+            let lastErr = null;
+            for (const c of clients) {
+                try {
+                    const r = await c.invoke(
+                        new TgApi.messages.CheckChatInvite({ hash: parsed.hash }),
+                    );
+                    if (r instanceof TgApi.ChatInviteAlready) {
+                        return res.json({ kind: 'invite', chat: _chatDescriptor(r.chat, config) });
+                    }
+                    if (!preview) preview = r;
+                } catch (e) {
+                    lastErr = e;
+                }
+            }
+            if (!preview) {
+                const code = lastErr?.errorMessage || '';
+                if (/FLOOD/.test(code)) {
+                    return res.status(429).json({
+                        kind: 'invite',
+                        error: 'flood',
+                        seconds: Number(lastErr?.seconds) || null,
+                    });
+                }
+                return res.status(404).json({ kind: 'invite', error: 'invite_invalid' });
+            }
+            // Not a member on any account: a preview only (ChatInvitePeek
+            // carries the chat, ChatInvite just the title + member count).
+            const chat = preview.chat ? _chatDescriptor(preview.chat, config) : null;
+            if (chat) chat.joined = false;
+            return res.json({
+                kind: 'invite',
+                chat,
+                invite: {
+                    title: preview.title || chat?.name || '',
+                    members: preview.participantsCount ?? chat?.members ?? null,
+                    type: preview.broadcast ? 'channel' : 'group',
+                    url: `https://t.me/+${parsed.hash}`,
+                },
+            });
+        }
+
+        const ref = parsed.kind === 'username' ? `@${parsed.username}` : parsed.chatRef;
+        const found = await resolveEntityAcrossAccounts(ref);
+        if (!found?.entity) {
+            return res.status(404).json({ kind: parsed.kind, error: 'not_found', message });
+        }
+        return res.json({
+            kind: parsed.kind,
+            chat: _chatDescriptor(found.entity, config),
+            message,
+        });
+    } catch (e) {
+        console.error('GET /api/chats/lookup:', e);
+        return res.status(500).json({ kind: parsed.kind, error: e?.message || 'Lookup failed' });
     }
 });
 
@@ -4162,75 +4937,109 @@ function bestGroupName(id, configName, dbName, dialogsName) {
 }
 
 // Server-side cache of `id -> name` from every connected account's
-// dialog list. Refreshed on demand with a 5-minute TTL — Telegram
-// rate-limits getDialogs heavily, so we don't want to call it on
-// every /api/groups request.
-let _dialogsNameCache = { at: 0, byId: new Map() };
+// dialog list, 5-minute TTL — Telegram rate-limits getDialogs heavily.
+// Stale-while-revalidate: /api/groups + /api/downloads (the dashboard's
+// first paint) never wait on Telegram once any names are cached; an
+// expired map is served as-is while ONE shared background refresh runs.
+// Before, every request after expiry re-ran getDialogs for each account
+// serially, and gramJS' 60 s flood-sleep could park the request for a
+// minute. A failed / empty refresh keeps the previous names and is
+// retried at most every 30 s instead of on every request. With nothing
+// cached yet (first boot) a request waits at most this long, then renders
+// with config / DB names and picks the live ones up on the next load.
+const DIALOGS_COLD_WAIT_MS = 2000;
 // Parallel type cache so the sidebar's Downloaded Groups list can
 // distinguish channel / group / user / bot icons (matches what Manage
 // Groups already shows). Keyed by the same string id; values are one
 // of 'channel' | 'group' | 'user' | 'bot'.
 let _dialogsTypeCache = new Map();
-async function getDialogsNameCache() {
-    const now = Date.now();
-    if (
-        Math.max(0, now - _dialogsNameCache.at) < DIALOG_CACHE_TTL_MS &&
-        _dialogsNameCache.byId.size > 0
-    ) {
-        return _dialogsNameCache.byId;
-    }
-    const byId = new Map();
-    const typeById = new Map();
+const _dialogsNames = createSwrCache({
+    ttlMs: DIALOG_CACHE_TTL_MS,
+    retryAfterFailureMs: 30_000,
+    // Above gramJS' default floodSleepThreshold (60 s) so a flood-sleep
+    // finishes instead of being cut off mid-way.
+    loadTimeoutMs: 90_000,
+    isUsable: (byId) => byId instanceof Map && byId.size > 0,
+    load: loadDialogsNames,
+});
+async function loadDialogsNames() {
+    const clients = [];
+    const accountIdOf = new Map(); // client → accountId
     try {
         const am = await getAccountManager();
-        const clients = [];
-        for (const [, c] of am.clients) clients.push(c);
-        if (telegramClient?.connected && !clients.includes(telegramClient))
-            clients.push(telegramClient);
+        for (const [id, c] of am.clients) {
+            clients.push(c);
+            accountIdOf.set(c, id);
+        }
+    } catch {
+        /* no AM — fresh install */
+    }
+    if (telegramClient?.connected && !clients.includes(telegramClient))
+        clients.push(telegramClient);
 
-        for (const client of clients) {
-            if (!client?.connected) continue;
+    // Accounts in parallel; results keep account order so first-wins
+    // naming stays deterministic.
+    const live = clients.filter((c) => c?.connected);
+    const perClient = await Promise.all(
+        live.map(async (client) => {
             try {
                 const [active, archived] = await Promise.all([
                     client.getDialogs({ limit: 500 }).catch(() => []),
                     client.getDialogs({ limit: 200, archived: true }).catch(() => []),
                 ]);
-                for (const d of [...active, ...archived]) {
-                    const id = String(d.id);
-                    const name =
-                        d.title ||
-                        d.name ||
-                        (
-                            (d.entity?.firstName || '') +
-                            (d.entity?.lastName ? ' ' + d.entity.lastName : '')
-                        ).trim() ||
-                        d.entity?.username ||
-                        null;
-                    if (name && !nameLooksUnresolved(name, id) && !byId.has(id)) {
-                        byId.set(id, name);
-                    }
-                    if (!typeById.has(id)) {
-                        let t = 'group';
-                        if (d.isChannel) t = 'channel';
-                        else if (d.isUser && d.entity?.bot) t = 'bot';
-                        else if (d.isUser) t = 'user';
-                        typeById.set(id, t);
-                    }
-                    // Hard cap so a runaway upstream (multi-account user
-                    // with 50 k+ joined dialogs) can't blow the heap. See
-                    // CLAUDE.md → Big-data patterns rule 3.
-                    if (byId.size > 50000) break;
-                }
+                return [...active, ...archived];
             } catch {
-                /* one bad client doesn't kill the whole sweep */
+                return []; /* one bad client doesn't kill the whole sweep */
             }
-        }
+        }),
+    );
+    // The same free access sync /api/dialogs does (this refresh runs
+    // every few minutes while the dashboard is open).
+    try {
+        _syncAccessFromDialogs(
+            live
+                .map((c, i) => ({ accountId: accountIdOf.get(c), active: perClient[i] }))
+                .filter((p) => p.accountId),
+            loadConfig().groups,
+        );
     } catch {
-        /* no AM — fresh install */
+        /* names still load */
     }
-    _dialogsNameCache = { at: now, byId };
-    _dialogsTypeCache = typeById;
+    const byId = new Map();
+    const typeById = new Map();
+    for (const dialogs of perClient) {
+        for (const d of dialogs) {
+            const id = String(d.id);
+            const name =
+                d.title ||
+                d.name ||
+                (
+                    (d.entity?.firstName || '') +
+                    (d.entity?.lastName ? ' ' + d.entity.lastName : '')
+                ).trim() ||
+                d.entity?.username ||
+                null;
+            if (name && !nameLooksUnresolved(name, id) && !byId.has(id)) {
+                byId.set(id, name);
+            }
+            if (!typeById.has(id)) {
+                let t = 'group';
+                if (d.isChannel) t = 'channel';
+                else if (d.isUser && d.entity?.bot) t = 'bot';
+                else if (d.isUser) t = 'user';
+                typeById.set(id, t);
+            }
+            // Hard cap so a runaway upstream (multi-account user
+            // with 50 k+ joined dialogs) can't blow the heap. See
+            // CLAUDE.md → Big-data patterns rule 3.
+            if (byId.size > 50000) break;
+        }
+    }
+    if (typeById.size > 0) _dialogsTypeCache = typeById;
     return byId;
+}
+async function getDialogsNameCache() {
+    return (await _dialogsNames.get({ waitMs: DIALOGS_COLD_WAIT_MS })) || new Map();
 }
 
 // Lookup helper used by /api/groups and /api/downloads to enrich each
@@ -4242,34 +5051,61 @@ function dialogsTypeFor(id) {
     return _dialogsTypeCache.get(String(id)) || null;
 }
 
+// Per-group aggregate — best DB-side display name, file count, total
+// size — shared by /api/groups and /api/downloads. Even index-only
+// (idx_group_name_size) it's a pass over every row, and one sidebar paint
+// hits both routes, so the rows are cached briefly. Invalidated by the
+// same broadcasts that refresh the footer stats (_STATS_TRIGGER_TYPES in
+// broadcast()) plus _GROUP_AGG_INVALIDATE_TYPES; the TTL bounds staleness
+// from any writer that doesn't broadcast.
+//
+// Plain MAX(group_name) misbehaves on this schema because "Unknown"
+// sorts above most ASCII titles — a group with rows ["Unknown", "Cool
+// Channel"] would surface "Unknown". CASE-filter out the placeholders
+// before MAX, then fall back to MAX(any) only if every row was one.
+const GROUP_AGG_TTL_MS = 15_000;
+let _groupAggCache = { at: 0, rows: null };
+function getGroupAggregates() {
+    const now = Date.now();
+    if (_groupAggCache.rows && Math.max(0, now - _groupAggCache.at) < GROUP_AGG_TTL_MS) {
+        return _groupAggCache.rows;
+    }
+    const rows = getDb()
+        .prepare(`
+            SELECT group_id,
+                   MAX(CASE
+                         WHEN group_name IS NOT NULL
+                          AND group_name != ''
+                          AND group_name != 'Unknown'
+                          AND group_name != 'unknown'
+                          AND group_name NOT GLOB '-?[0-9]*'
+                          AND group_name NOT GLOB 'Group [0-9]*'
+                       THEN group_name END) AS best_name,
+                   MAX(group_name) AS any_name,
+                   COUNT(*) as count,
+                   SUM(file_size) as size
+              FROM downloads
+             GROUP BY group_id
+        `)
+        .all();
+    _groupAggCache = { at: now, rows };
+    return rows;
+}
+function invalidateGroupAggregates() {
+    _groupAggCache = { at: 0, rows: null };
+}
+
 app.get('/api/groups', async (req, res) => {
     try {
         const config = loadConfig();
         // Pull the best DB-side name per group_id so a config row with
         // "Unknown" doesn't shadow a real name we already saved at
-        // download time. Plain MAX(group_name) misbehaves on this
-        // schema because "Unknown" sorts above most ASCII titles —
-        // a group with rows ["Unknown", "Cool Channel"] would surface
-        // "Unknown". CASE-filter out the placeholders before MAX, then
-        // fall back to MAX(any) only if every row was a placeholder.
+        // download time.
         let dbNames = new Map();
         try {
-            const rows = getDb()
-                .prepare(`
-                SELECT group_id,
-                       MAX(CASE
-                             WHEN group_name IS NOT NULL
-                              AND group_name != ''
-                              AND group_name != 'Unknown'
-                              AND group_name != 'unknown'
-                              AND group_name NOT GLOB '-?[0-9]*'
-                              AND group_name NOT GLOB 'Group [0-9]*'
-                           THEN group_name END) AS best_name,
-                       MAX(group_name) AS any_name
-                  FROM downloads
-                 GROUP BY group_id`)
-                .all();
-            for (const r of rows) dbNames.set(String(r.group_id), r.best_name || r.any_name);
+            for (const r of getGroupAggregates()) {
+                dbNames.set(String(r.group_id), r.best_name || r.any_name);
+            }
         } catch {}
 
         // Live dialogs from every connected account — same source the
@@ -4300,6 +5136,16 @@ app.get('/api/groups', async (req, res) => {
                     // appended below.
                     peerId: null,
                     peerName: null,
+                    // Can we still use this chat? (see _accessForGroup)
+                    access: _accessForGroup(group, req.role),
+                    // Its auto-forward destination refused our posts
+                    // (forwarding is paused until its re-check).
+                    forwardAccess: (() => {
+                        const k = destinationKey(group.autoForward?.destination);
+                        if (!k || !chatAccess.isBlocked(k)) return undefined;
+                        const a = chatAccess.accessOf(k);
+                        return { state: a.state, code: a.code, nextCheckAt: a.nextCheckAt };
+                    })(),
                 };
             }),
         );
@@ -4386,30 +5232,9 @@ app.get('/api/downloads', async (req, res) => {
     try {
         const config = loadConfig();
         const configGroups = config.groups || [];
-        const db = getDb();
-
-        // CASE-filter "Unknown" / numeric-id placeholders BEFORE MAX so
-        // a group with mixed rows ["Cool Channel", "Unknown"] returns
-        // "Cool Channel" instead of the lexically-larger "Unknown".
-        const rows = db
-            .prepare(`
-            SELECT group_id,
-                   MAX(CASE
-                         WHEN group_name IS NOT NULL
-                          AND group_name != ''
-                          AND group_name != 'Unknown'
-                          AND group_name != 'unknown'
-                          AND group_name NOT GLOB '-?[0-9]*'
-                          AND group_name NOT GLOB 'Group [0-9]*'
-                       THEN group_name END) AS best_name,
-                   MAX(group_name) AS any_name,
-                   COUNT(*) as count,
-                   SUM(file_size) as size
-              FROM downloads
-             WHERE (user_deleted IS NULL OR user_deleted = 0)
-             GROUP BY group_id
-        `)
-            .all();
+        // Placeholder-filtered best name + count + size per group (cached;
+        // see getGroupAggregates).
+        const rows = getGroupAggregates();
 
         const dialogsNames = await getDialogsNameCache();
 
@@ -4458,10 +5283,9 @@ app.get('/api/downloads/all', async (req, res) => {
         const limit = Math.max(1, Math.min(500, parseInt(req.query.limit, 10) || 50));
         const type = req.query.type || 'all';
         const offset = (page - 1) * limit;
-        // Pinned filter chip (`?pinned=1` pinned-only, `?pinned=0`
-        // unpinned-only) and "surface pinned at top" setting
-        // (`?pinnedFirst=1`) — all opt-in, default off so existing
-        // callers behave identically. pinnedOnly wins if both set.
+        // Pinned filter chip (`?pinned=1`) and "surface pinned at top"
+        // setting (`?pinnedFirst=1`) — both opt-in, both default off so
+        // existing callers behave identically.
         const pinnedOnly = req.query.pinned === '1' || req.query.pinned === 'true';
         const unpinnedOnly =
             !pinnedOnly && (req.query.pinned === '0' || req.query.pinned === 'false');
@@ -4568,13 +5392,13 @@ app.get('/api/downloads/all', async (req, res) => {
     }
 });
 
-// 5b. Playlist IDs for player shuffle — full matching set (no page limit).
-// Must be registered before `/api/downloads/:groupId` so "ids" is not
-// treated as a group id.
+// 5b. Playlist IDs for gallery shuffle — full matching set (no page limit).
+// Must be registered before `/api/downloads/:groupId` so "ids" is not a group.
 app.get('/api/downloads/ids', async (req, res) => {
     try {
         const type = req.query.type || 'all';
         const groupId = req.query.groupId ? String(req.query.groupId) : null;
+        const q = String(req.query.q || '').trim();
         const pinnedOnly = req.query.pinned === '1' || req.query.pinned === 'true';
         const unpinnedOnly =
             !pinnedOnly && (req.query.pinned === '0' || req.query.pinned === 'false');
@@ -4591,33 +5415,45 @@ app.get('/api/downloads/ids', async (req, res) => {
             unpinnedOnly,
             pinnedFirst,
             include,
+            ...(groupId ? { groupId } : {}),
             ...(peerIdFilter ? { peerId: peerIdFilter } : {}),
         };
 
-        // Local fast path — one SELECT id query, no pagination.
-        if (include === 'local') {
+        if (include === 'local' && !q) {
             const result = groupId
                 ? listDownloadIdsForGroup(groupId, type, opts)
                 : listDownloadIds(type, opts);
             return res.json({ ids: result.ids, total: result.total });
         }
 
-        // Federated: page existing list helpers and emit {id, peer_id} keys
-        // so peer remote_ids stay distinguishable from local PKs.
+        // Search, or a federated scope: page the existing list helpers.
+        // Federated keys are {id, peer_id} so a peer remote_id cannot
+        // collide with a local primary key.
         const PAGE = 500;
         const keys = [];
         let total = 0;
         let offset = 0;
         for (;;) {
-            const pageResult = groupId
-                ? getDownloadsForGroupFederated(groupId, PAGE, offset, type, opts)
-                : getAllDownloadsFederated(PAGE, offset, type, opts);
+            const pageResult = q
+                ? searchDownloadsFederated(q, {
+                      ...opts,
+                      limit: PAGE,
+                      offset,
+                      type,
+                      order: 'newest',
+                  })
+                : groupId
+                  ? getDownloadsForGroupFederated(groupId, PAGE, offset, type, opts)
+                  : getAllDownloadsFederated(PAGE, offset, type, opts);
             total = Number(pageResult.total) || 0;
             for (const row of pageResult.files || []) {
-                keys.push({
-                    id: row.id,
-                    peer_id: row.peer_id && row.peer_id !== 'self' ? row.peer_id : 'self',
-                });
+                if (include === 'local') keys.push(row.id);
+                else {
+                    keys.push({
+                        id: row.id,
+                        peer_id: row.peer_id && row.peer_id !== 'self' ? row.peer_id : 'self',
+                    });
+                }
             }
             offset += PAGE;
             if (!pageResult.files?.length || keys.length >= total || offset > total + PAGE) break;
@@ -4652,8 +5488,6 @@ app.post('/api/downloads/by-ids', async (req, res) => {
                 if (Number.isFinite(id) && id > 0) localIds.push(id);
             }
         }
-
-        // Guests cannot hydrate peer catalog rows.
         if (req.role === 'guest') peerKeys.length = 0;
 
         const localRows = getDownloadsByIds(localIds).map((r) => ({ ...r, peer_id: 'self' }));
@@ -4677,13 +5511,18 @@ app.post('/api/downloads/by-ids', async (req, res) => {
 
         const byKey = new Map();
         for (const row of localRows) {
-            byKey.set(`self:${row.id}`, mapDownloadRowToGalleryFile(row, { configGroups, peerNameMap }));
+            byKey.set(
+                `self:${row.id}`,
+                mapDownloadRowToGalleryFile(row, { configGroups, peerNameMap }),
+            );
         }
         for (const row of peerRows) {
-            byKey.set(`${row.peer_id}:${row.id}`, mapDownloadRowToGalleryFile(row, { configGroups, peerNameMap }));
+            byKey.set(
+                `${row.peer_id}:${row.id}`,
+                mapDownloadRowToGalleryFile(row, { configGroups, peerNameMap }),
+            );
         }
 
-        // Preserve request order.
         const files = [];
         const seen = new Set();
         for (const entry of raw) {
@@ -4872,36 +5711,6 @@ async function safeResolveDownload(userPath) {
     return { ok: true, real };
 }
 
-/**
- * On-disk file is gone: tombstone every live download on that path and wipe
- * faces / thumbs / seekbar so missing crop tiles do not linger until the
- * next hourly integrity sweep.
- */
-function autoPruneMissingPath(filePath) {
-    if (!filePath) return;
-    queueMicrotask(() => {
-        try {
-            const ids = liveIdsSharingFilePath(filePath);
-            if (!ids.length) return;
-            const seekbarMap = collectSeekbarPaths(ids);
-            const changes = pruneDownloadsForMissingPath(filePath);
-            if (changes > 0) {
-                for (const id of ids) {
-                    purgeThumbsForDownload(id).catch(() => {});
-                    purgeSeekbarForDownload(id, seekbarMap.get(id)).catch(() => {});
-                }
-                broadcast({
-                    type: 'file_deleted',
-                    path: String(filePath).replace(/\\/g, '/'),
-                    autoPruned: true,
-                });
-            }
-        } catch {
-            /* never let a stray request crash the server */
-        }
-    });
-}
-
 // Search across all downloads (filename + group name). Federated when the
 // caller passes ?include=peers — UNIONs filename / group_name LIKE matches
 // from peer_downloads on top of the local rows. Default is local-only so
@@ -4919,17 +5728,32 @@ app.get('/api/downloads/search', async (req, res) => {
                 : 'local';
         // Guest sessions stay local-only — federation is admin-gated.
         const include = req.role === 'guest' ? 'local' : reqInclude;
+        // Same optional narrowing as the gallery feeds (type tab, pinned
+        // chip / pinned-first) so the gallery search box keeps the active
+        // filter. `order=newest` sorts like the gallery; the default stays
+        // FTS relevance for existing callers.
         const r = searchDownloadsFederated(q, {
             limit,
             offset: (page - 1) * limit,
             groupId,
             include,
+            type: typeof req.query.type === 'string' ? req.query.type : 'all',
+            pinnedOnly: req.query.pinned === '1' || req.query.pinned === 'true',
+            unpinnedOnly:
+                req.query.pinned !== '1' &&
+                req.query.pinned !== 'true' &&
+                (req.query.pinned === '0' || req.query.pinned === 'false'),
+            pinnedFirst: req.query.pinnedFirst === '1' || req.query.pinnedFirst === 'true',
+            order: req.query.order === 'newest' ? 'newest' : 'relevance',
         });
 
         const config = loadConfig();
         const groupFolderById = new Map();
-        for (const g of config.groups || [])
+        const groupNameById = new Map();
+        for (const g of config.groups || []) {
             groupFolderById.set(String(g.id), sanitizeName(g.name));
+            if (g.name) groupNameById.set(String(g.id), g.name);
+        }
 
         // Peer name lookup for federated rows.
         const peerNameMap = new Map();
@@ -4966,15 +5790,18 @@ app.get('/api/downloads/search', async (req, res) => {
             return {
                 id: row.id,
                 groupId: row.group_id,
-                groupName: row.group_name,
+                groupName: groupNameById.get(String(row.group_id)) || row.group_name,
                 name: row.file_name,
+                path: row.file_path,
                 fullPath,
                 size: row.file_size,
                 sizeFormatted: formatBytes(row.file_size),
                 type: typeFolder,
+                extension: path.extname(row.file_name || ''),
                 modified: row.created_at,
                 pendingUntil: row.pending_until || null,
                 rescuedAt: row.rescued_at || null,
+                pinned: !!row.pinned,
                 peer_id: row.peer_id || 'self',
                 peer_name: isPeerRow ? peerNameMap.get(String(row.peer_id)) || null : null,
                 duration: row.duration_sec ?? null,
@@ -5006,29 +5833,47 @@ app.post('/api/downloads/bulk-delete', async (req, res) => {
         // downloader writes file_path with the OS-native separator (which
         // on Windows is `\`), so `DELETE WHERE file_path = ?` against the
         // raw frontend string never matches the row. Resolve to ids up
-        // front via a slash-insensitive comparison, then merge into the
-        // id-keyed delete path that already works everywhere. Files still
-        // unlink off disk via the path because the OS treats `/` and `\`
-        // identically on Windows path resolution.
+        // front (both separator forms, indexed — the old per-path
+        // REPLACE(file_path, …) comparison was a full scan each, ~7 s of
+        // frozen event loop for 1000 paths at 150k rows), then merge into
+        // the id-keyed delete path that already works everywhere. Files
+        // still unlink off disk via the path because the OS treats `/` and
+        // `\` identically on Windows path resolution. The SPA sends ids for
+        // its own tiles; paths stay for older clients + peer tiles.
+        //
+        // A path names a file, and several rows can point at one file
+        // (download-time dedup), so take every row for the path — deleting
+        // the file must not leave another row pointing at nothing.
         const resolvedIdsFromPaths = [];
+        const idsByPath = new Map();
         if (pathList.length) {
-            const db = getDb();
-            const stmt = db.prepare(
-                "SELECT id FROM downloads WHERE REPLACE(file_path, '\\', '/') = ?",
-            );
+            const idsByNorm = new Map();
+            for (const row of findDownloadsByPaths(pathList.map((p) => String(p || '')))) {
+                const norm = String(row.file_path).replace(/\\/g, '/');
+                if (!idsByNorm.has(norm)) idsByNorm.set(norm, []);
+                idsByNorm.get(norm).push(row.id);
+            }
             for (const p of pathList) {
                 const norm = String(p || '').replace(/\\/g, '/');
                 if (!norm) continue;
-                const row = stmt.get(norm);
-                if (row?.id) resolvedIdsFromPaths.push(row.id);
+                const pathIds = idsByNorm.get(norm) || [];
+                idsByPath.set(p, pathIds);
+                resolvedIdsFromPaths.push(...pathIds);
             }
         }
+        const allIds = Array.from(new Set([...idList, ...resolvedIdsFromPaths]));
+        // Rows whose file another (not deleted) row still uses: drop the
+        // row, keep the file.
+        const fileInUse = idsWithFileInUse(allIds);
         const total = idList.length + pathList.length;
         let processed = 0;
         let unlinked = 0;
         onProgress({ processed: 0, total, stage: 'deleting_files' });
         for (const p of pathList) {
-            for (const extraId of liveIdsSharingFilePath(p)) resolvedIdsFromPaths.push(extraId);
+            if ((idsByPath.get(p) || []).some((id) => fileInUse.has(id))) {
+                processed += 1;
+                continue;
+            }
             const sr = await safeResolveDownload(p);
             if (sr.ok) {
                 try {
@@ -5049,7 +5894,6 @@ app.post('/api/downloads/bulk-delete', async (req, res) => {
                 onProgress({ processed, total, stage: 'deleting_files' });
             }
         }
-        const pendingIds = Array.from(new Set([...idList, ...resolvedIdsFromPaths]));
         if (idList.length) {
             const db = getDb();
             // SELECT `file_path` so we use the same on-disk path the
@@ -5060,16 +5904,26 @@ app.post('/api/downloads/bulk-delete', async (req, res) => {
             // any drift (group renamed in UI, special chars sanitised
             // differently, custom file_path from the downloader) made
             // safeResolveDownload return ENOENT and the file survived
-            // on disk while the DB row got dropped.
-            const rows = db
-                .prepare(
-                    `SELECT id, group_id, group_name, file_name, file_type, file_path FROM downloads WHERE id IN (${idList.map(() => '?').join(',')})`,
-                )
-                .all(...idList);
+            // on disk while the DB row got dropped. Chunked so a huge
+            // gallery selection can't overflow SQLite's bound-parameter cap.
+            const selectRows = (chunk) =>
+                db
+                    .prepare(
+                        `SELECT id, group_id, group_name, file_name, file_type, file_path FROM downloads WHERE id IN (${chunk.map(() => '?').join(',')})`,
+                    )
+                    .all(...chunk);
+            const rows = [];
+            for (let i = 0; i < idList.length; i += 500) {
+                rows.push(...selectRows(idList.slice(i, i + 500)));
+            }
             const config = loadConfig();
             const folderById = new Map();
             for (const g of config.groups || []) folderById.set(String(g.id), sanitizeName(g.name));
             for (const row of rows) {
+                if (fileInUse.has(row.id)) {
+                    processed += 1;
+                    continue;
+                }
                 // Prefer the stored file_path — it's the authoritative
                 // record of where the downloader wrote the file. Fall back
                 // to the reconstructed candidate ONLY when file_path is
@@ -5094,19 +5948,16 @@ app.post('/api/downloads/bulk-delete', async (req, res) => {
                 }
                 const sr = await safeResolveDownload(candidate);
                 if (sr.ok) {
-                    const keepers = liveIdsSharingFilePath(candidate, { exceptIds: pendingIds });
-                    if (keepers.length === 0) {
+                    try {
+                        const { deferDelete } = await import('../core/deferred-delete.js');
+                        deferDelete(sr.real);
+                        unlinked++;
+                    } catch {
                         try {
-                            const { deferDelete } = await import('../core/deferred-delete.js');
-                            deferDelete(sr.real);
+                            await fs.unlink(sr.real);
                             unlinked++;
-                        } catch {
-                            try {
-                                await fs.unlink(sr.real);
-                                unlinked++;
-                            } catch (e2) {
-                                if (e2.code !== 'ENOENT') throw e2;
-                            }
+                        } catch (e2) {
+                            if (e2.code !== 'ENOENT') throw e2;
                         }
                     }
                 }
@@ -5116,7 +5967,6 @@ app.post('/api/downloads/bulk-delete', async (req, res) => {
                 }
             }
         }
-        const allIds = Array.from(new Set([...idList, ...resolvedIdsFromPaths]));
         const seekbarMap = collectSeekbarPaths(allIds);
         const dbDeleted = deleteDownloadsBy({ ids: allIds });
         onProgress({ processed: total, total, stage: 'purging_cache' });
@@ -5141,6 +5991,35 @@ app.post('/api/downloads/bulk-delete', async (req, res) => {
             .json({ error: 'A bulk delete is already running', code: 'ALREADY_RUNNING' });
     }
     res.json({ success: true, started: true, queued: idList.length + pathList.length });
+});
+
+// Pin / unpin many rows at once (gallery bulk Pin). Body:
+// `{ ids: [1,2,3], pinned: true | false }`. The gallery used to send one
+// request per selected file. Registered before `/:id/pin`; admin-only via
+// the guest gate like every other mutation.
+const PIN_BATCH_MAX = 5000;
+app.post('/api/downloads/pin', async (req, res) => {
+    const { ids, pinned } = req.body || {};
+    if (typeof pinned !== 'boolean') {
+        return res.status(400).json({ error: 'Body must include `pinned` (boolean)' });
+    }
+    if (!Array.isArray(ids) || ids.length === 0) {
+        return res.status(400).json({ error: '`ids` must be a non-empty array' });
+    }
+    if (ids.length > PIN_BATCH_MAX) {
+        return res.status(413).json({
+            error: `Too many ids in one request (max ${PIN_BATCH_MAX})`,
+            max: PIN_BATCH_MAX,
+        });
+    }
+    try {
+        const updated = setDownloadsPinned(ids, pinned);
+        if (updated.length) broadcast({ type: 'downloads_pinned', ids: updated, pinned });
+        res.json({ success: true, pinned, ids: updated, updated: updated.length });
+    } catch (e) {
+        console.error('POST /api/downloads/pin:', e);
+        res.status(500).json({ error: 'Update failed' });
+    }
 });
 
 // Toggle the `pinned` flag on a single download row. Pinned rows survive
@@ -5319,35 +6198,66 @@ app.delete('/api/file', async (req, res) => {
                 .json({ error: r.reason === 'missing' ? 'File not found' : 'Access denied' });
         }
 
-        try {
-            const { deferDelete } = await import('../core/deferred-delete.js');
-            deferDelete(r.real);
-        } catch {
-            await fs.unlink(r.real);
-        }
-        console.log(`🗑️ Deleted: ${filePath}`);
-
-        // Mark as user-deleted rather than removing the DB row. Keeping the
-        // row means isDownloaded(groupId, messageId) still returns true, so
-        // backfill won't re-download this file from Telegram. Gallery queries
-        // filter out user_deleted rows so the file won't reappear in the UI.
-        // Capture matching ids first so we can wipe their cached thumbnails;
-        // a stale thumb pointing at a deleted file would otherwise serve
-        // bytes from cache until the next "Rebuild thumbnails".
+        // Resolve the DB row(s) for THIS file before it's moved away, so an
+        // SPA-supplied `?id=` can be checked against the real on-disk path.
+        // Capture ids first so we can wipe their cached thumbnails; a stale
+        // thumb pointing at a deleted file would otherwise serve bytes from
+        // cache until the next "Rebuild thumbnails". This used to match
+        // every row sharing the basename, so deleting `photo_123.jpg` in one
+        // group also dropped another group's row for its own file.
         const db = getDb();
         const fileName = path.basename(r.real);
-        const matchingRows = db
-            .prepare('SELECT id, file_size FROM downloads WHERE file_name = ?')
-            .all(fileName);
-        const matchingIds = Array.from(
-            new Set([...matchingRows.map((row) => row.id), ...liveIdsSharingFilePath(filePath)]),
-        );
-        const freedBytes = matchingRows.reduce((s, row) => s + (Number(row.file_size) || 0), 0);
+        let matchingIds = [];
+        const idParam = parseInt(req.query.id, 10);
+        if (Number.isInteger(idParam) && idParam > 0) {
+            const row = db
+                .prepare('SELECT id, file_name, file_path FROM downloads WHERE id = ?')
+                .get(idParam);
+            const hasDir = /[\\/]/.test(row?.file_path || '');
+            if (row && hasDir) {
+                const own = await safeResolveDownload(row.file_path);
+                if (own.ok && own.real === r.real) matchingIds = [row.id];
+            } else if (row && row.file_name === fileName) {
+                matchingIds = [row.id];
+            }
+        }
+        if (!matchingIds.length) {
+            matchingIds = findDownloadsByPaths([String(filePath)]).map((row) => row.id);
+        }
+        if (!matchingIds.length) {
+            // Legacy rows written before file_path carried the folder only
+            // know their basename — match those, but never a row that has a
+            // real stored path (that one belongs to some other folder).
+            matchingIds = db
+                .prepare(
+                    `SELECT id FROM downloads WHERE file_name = ?
+                        AND (file_path IS NULL OR (instr(file_path, '/') = 0 AND instr(file_path, '\\') = 0))`,
+                )
+                .all(fileName)
+                .map((row) => row.id);
+        }
+
+        // Download-time dedup points several rows (often in other groups)
+        // at one file. With `?id=` only that row goes, so the file stays
+        // while any other row still uses it. Without an id every row for
+        // the path is in `matchingIds`, so the file is free to go.
+        const fileStillUsed = idsWithFileInUse(matchingIds).size > 0;
+        if (!fileStillUsed) {
+            try {
+                const { deferDelete } = await import('../core/deferred-delete.js');
+                deferDelete(r.real);
+            } catch {
+                await fs.unlink(r.real);
+            }
+            console.log(`🗑️ Deleted: ${filePath}`);
+        }
+
         const seekbarMap = collectSeekbarPaths(matchingIds);
-        // Soft-delete via deleteDownloadsBy so faces / embeddings / pending
-        // backup jobs are wiped. Tombstone keeps isDownloaded() true.
-        if (matchingIds.length) deleteDownloadsBy({ ids: matchingIds });
-        runtime.decrementDiskUsage(freedBytes);
+        const delStmt = db.prepare('DELETE FROM downloads WHERE id = ?');
+        db.transaction((ids) => {
+            rememberDeletedDownloads(ids);
+            for (const id of ids) delStmt.run(id);
+        })(matchingIds);
         for (const id of matchingIds) {
             try {
                 await purgeThumbsForDownload(id);
@@ -5356,10 +6266,19 @@ app.delete('/api/file', async (req, res) => {
                 await purgeSeekbarForDownload(id, seekbarMap.get(id));
             } catch {}
         }
+        try {
+            purgeOrphanPeople();
+        } catch {}
         import('../core/deferred-delete.js').then((m) => m.startDrain()).catch(() => {});
 
+        if (fileStillUsed) {
+            // Name the removed row(s) by id: other tiles showing the same
+            // path are still valid and must not be dropped from open views.
+            for (const id of matchingIds) broadcast({ type: 'file_deleted', id });
+        } else {
+            broadcast({ type: 'file_deleted', path: filePath });
+        }
         res.json({ success: true });
-        broadcast({ type: 'file_deleted', path: filePath });
     } catch (error) {
         if (error.code === 'ENOENT') return res.status(404).json({ error: 'File not found' });
         console.error('DELETE /api/file:', error);
@@ -5370,8 +6289,8 @@ app.delete('/api/file', async (req, res) => {
 // Mint a short-lived bearer token for /files/ paths. The token lets a URL
 // work without the session cookie — useful when Cloudflare redirects the
 // request to a direct DDNS host where the cookie doesn't follow.
-app.get('/api/files/token', (_req, res) => {
-    const { token, exp } = mintFileToken();
+app.get('/api/files/token', (req, res) => {
+    const { token, exp } = mintFileToken(undefined, req.role);
     res.json({ token, exp });
 });
 
@@ -5623,7 +6542,8 @@ app.delete('/api/groups/:id/purge', async (req, res) => {
             };
             filesDeleted = countFiles(folderPath);
             onProgress({ stage: 'deleting_files', groupId, total: filesDeleted, processed: 0 });
-            await fs.rm(folderPath, { recursive: true, force: true });
+            // Files other groups still use (download-time dedup) stay.
+            filesDeleted -= await removeGroupFolder(groupId, folderPath);
             onProgress({
                 stage: 'deleting_files',
                 groupId,
@@ -5646,6 +6566,7 @@ app.delete('/api/groups/:id/purge', async (req, res) => {
 
         // 4. Remove from config
         config.groups = (config.groups || []).filter((g) => String(g.id) !== String(groupId));
+        chatAccess.clearAccess(groupId);
         await writeConfigAtomic(config);
 
         // 5. Delete profile photo
@@ -5763,7 +6684,8 @@ app.post('/api/groups/:id/delete-files', async (req, res) => {
             };
             filesDeleted = countFiles(folderPath);
             onProgress({ stage: 'deleting_files', groupId, total: filesDeleted, processed: 0 });
-            await fs.rm(folderPath, { recursive: true, force: true });
+            // Files other groups still use (download-time dedup) stay.
+            filesDeleted -= await removeGroupFolder(groupId, folderPath);
             onProgress({
                 stage: 'deleting_files',
                 groupId,
@@ -5830,7 +6752,19 @@ app.post('/api/groups/:id/delete-files', async (req, res) => {
 // Fire-and-forget — a full library wipe is the slowest, most destructive
 // admin action we have. Returns 200 immediately; final counts via
 // `purge_all_done`. Single-flight via the shared tracker.
+//
+// The body must carry `{ "confirm": "DELETE ALL" }` (the dashboard sends
+// it after its two confirmation sheets). A bare DELETE — a stray script, a
+// dashboard tab from before this guard — gets a 400 that says what to do,
+// and nothing is touched.
+const PURGE_ALL_CONFIRM = 'DELETE ALL';
 app.delete('/api/purge/all', async (req, res) => {
+    if (req.body?.confirm !== PURGE_ALL_CONFIRM) {
+        return res.status(400).json({
+            error: `Factory reset not confirmed: send {"confirm": "${PURGE_ALL_CONFIRM}"} in the request body. If you used the dashboard, reload the page and try again.`,
+            code: 'CONFIRM_REQUIRED',
+        });
+    }
     const tracker = _jobTrackers.purgeAll;
     const r = tracker.tryStart(async ({ onProgress }) => {
         let totalFiles = 0;
@@ -5937,7 +6871,9 @@ async function _requirePassword(req, res) {
         // Export-Session into a full account-takeover surface for anyone
         // who already holds a session cookie.
         const result = loginVerify(supplied, config.web);
-        if (!result?.ok) {
+        // loginVerify also accepts the guest password (role 'guest'); the
+        // re-auth guard must only take the admin one.
+        if (!result?.ok || result.role !== 'admin') {
             res.status(403).json({ error: 'Invalid password' });
             return false;
         }
@@ -5988,7 +6924,11 @@ app.post('/api/maintenance/resync-dialogs', async (req, res) => {
         const pendingDbUpdates = [];
         onProgress({ processed: 0, total, updated: 0, stage: 'resolving' });
         for (const id of ids) {
-            const resolved = await resolveEntityAcrossAccounts(id);
+            // Chats no account can read are skipped — no name or photo to
+            // fetch, only calls to spend.
+            const resolved = chatAccess.isBlocked(id)
+                ? null
+                : await resolveEntityAcrossAccounts(id);
             if (resolved) {
                 const e = resolved.entity;
                 const realName =
@@ -6032,7 +6972,7 @@ app.post('/api/maintenance/resync-dialogs', async (req, res) => {
         }
         if (mutated) await writeConfigAtomic(config);
         _dialogsResponseCache = { at: 0, body: null };
-        _dialogsNameCache = { at: 0, byId: new Map() };
+        _dialogsNames.invalidate();
         broadcast({ type: 'config_updated' });
         return { scanned: total, updated };
     });
@@ -6123,7 +7063,7 @@ app.get('/api/maintenance/db/integrity/status', async (req, res) => {
 // open for a while. POST returns 200 immediately; progress + result land
 // over WS as `files_verify_progress` / `files_verify_done`. Page hydrates
 // running state from `/files/verify/status` on mount.
-app.post('/api/maintenance/files/verify', async (req, res) => {
+app.post('/api/maintenance/files/verify', requireGoCore('stat'), async (req, res) => {
     const t = _jobTrackers.filesVerify;
     const r = t.tryStart(async ({ onProgress }) => {
         const result = await integrity.sweep(onProgress);
@@ -6176,7 +7116,7 @@ app.get('/api/maintenance/files/verify/stats', async (req, res) => {
 // which component owned the job. Now there's one tracker. Prefix
 // 'reindex' is preserved so the duplicates page's listeners need no
 // change.
-app.post('/api/maintenance/reindex', async (req, res) => {
+app.post('/api/maintenance/reindex', requireGoCore('walk'), async (req, res) => {
     const tracker = _jobTrackers.reindex;
     const r = tracker.tryStart(async ({ onProgress }) => {
         const cfg = await readConfigSafe();
@@ -6200,11 +7140,7 @@ app.post('/api/maintenance/reindex', async (req, res) => {
 });
 
 app.get('/api/maintenance/reindex/status', async (req, res) => {
-    const snap = _jobTrackers.reindex.getStatus();
-    // Authoritative snapshot fields must win over stale leftovers in
-    // `progress` from a finished run — see dedup/status for the bug this
-    // ordering prevents.
-    res.json({ ...(snap.progress || {}), ...snap });
+    res.json(flattenStatus(_jobTrackers.reindex.getStatus()));
 });
 
 app.get('/api/maintenance/reindex/stats', async (req, res) => {
@@ -6280,26 +7216,13 @@ app.get('/api/maintenance/db/vacuum/status', async (req, res) => {
 // duration tracking. WS event prefix stays 'dedup' — the duplicates
 // page's existing `dedup_progress` / `dedup_done` listeners are
 // unaffected.
-app.post('/api/maintenance/dedup/scan', async (req, res) => {
+app.post('/api/maintenance/dedup/scan', requireGoCore('hash'), async (req, res) => {
     const tracker = _jobTrackers.dedupScan;
     const r = tracker.tryStart(async ({ onProgress, signal }) => {
-        // Safety net: auto-abort if the scan runs longer than the configured
-        // ceiling. Prevents a permanently stuck scan (e.g. NFS hang during
-        // hash, worker deadlock) from keeping the UI in "Scanning…" forever.
-        // The hash-level timeout (DEDUP_HASH_TIMEOUT_MS) covers individual
-        // slow files; this covers the whole-scan worst case.
-        const MAX_SCAN_MS =
-            parseInt(process.env.DEDUP_MAX_SCAN_MS, 10) || 30 * 60 * 1000; // 30 min
-        const autoAbortTimer = setTimeout(() => tracker.cancel(), MAX_SCAN_MS);
-        let result;
-        try {
-            result = await dedupFindDuplicates({
-                onProgress,
-                signal,
-            });
-        } finally {
-            clearTimeout(autoAbortTimer);
-        }
+        const result = await dedupFindDuplicates({
+            onProgress: (p) => onProgress({ ...p, running: true }),
+            signal,
+        });
         // Persist a small summary so a server restart still surfaces
         // "Last scan: 2 h ago — N duplicates" on the duplicates page
         // without having to recompute. The full duplicate-sets payload
@@ -6377,57 +7300,33 @@ app.post('/api/maintenance/dedup/scan', async (req, res) => {
 // accumulated. Returns instantly; the caller doesn't need to wait for the
 // scan to wind down (it's typically one-file-latency, i.e. milliseconds).
 app.post('/api/maintenance/dedup/scan/stop', (req, res) => {
-    const tracker = _jobTrackers.dedupScan;
-    const wasRunning = tracker.cancel();
-    // If the scan was in flight, give the runFn 30 s to honour the abort
-    // signal before force-resetting the tracker. This unblocks the UI even
-    // when a per-file hash is hanging and hasn't hit its own timeout yet.
-    // The runFn continues running in the background (we can't kill async
-    // work mid-flight), but the tracker is free for new scans.
-    if (wasRunning) {
-        const FORCE_RESET_MS =
-            parseInt(process.env.DEDUP_STOP_FORCE_RESET_MS, 10) || 30_000;
-        setTimeout(() => tracker.forceReset(), FORCE_RESET_MS);
-    }
+    const wasRunning = _jobTrackers.dedupScan.cancel();
     res.json({ stopped: true, wasRunning });
 });
 
 app.get('/api/maintenance/dedup/status', async (req, res) => {
     const snap = _jobTrackers.dedupScan.getStatus();
-    // Flatten progress fields (processed/total/stage/etc.) onto the top
-    // level for legacy consumers, but authoritative snapshot fields
-    // (running, stage, error, ...) must always win over anything left
-    // behind in `progress` from a prior run — `progress` is only reset
-    // when a NEW run starts, so a stale `{running:true}` merged into it
-    // by a previous run's onProgress callback would otherwise leak
-    // "running" forever after the scan has actually finished.
-    const out = { ...(snap.progress || {}), ...snap };
-    // `duplicateSets` is stored as a non-enumerable property on snap.result so
-    // that JSON.stringify (used by WS broadcast) skips it and avoids multi-MB
-    // frames. But `res.json` also uses JSON.stringify, so we must explicitly
-    // re-attach it as an enumerable own property before serialising.
-    // The old guard `!out.result?.duplicateSets` was wrong: non-enumerable
-    // properties ARE reachable via direct access, so the guard always evaluated
-    // to false and the block never ran.
+    // Flat progress fields for older clients, but `running` must come from
+    // the tracker — the last progress event still says running:true after
+    // the scan has finished.
+    const out = { ...snap, ...(snap.progress || {}), running: snap.running };
+    // duplicateSets is non-enumerable on the stored result (so the WS done
+    // event doesn't carry multi-MB frames); copy it onto an enumerable
+    // result here or JSON serialisation drops it and the page shows nothing.
     if (snap.result?.duplicateSets) {
         out.result = { ...snap.result, duplicateSets: snap.result.duplicateSets };
     }
     res.json(out);
 });
 
-// Reconstruct the current duplicate sets from the DB without re-hashing.
-// All files hashed by a previous scan have their SHA-256 stored in
-// `downloads.file_hash`. This endpoint skips the expensive hash pass and
-// goes straight to the GROUP BY + file-detail build, returning in
-// milliseconds. Used by the frontend to restore the duplicate list after a
-// server restart (when the in-memory JobTracker result has been cleared but
-// the stats KV entry confirms a completed scan exists).
+// Duplicate sets rebuilt from the hashes already stored in the DB. The last
+// scan's result only lives in memory, so after a restart the Duplicates
+// page would stay empty until a full re-scan; this needs no hashing.
 app.get('/api/maintenance/dedup/sets', async (req, res) => {
     try {
-        const result = await dedupGetSets();
-        res.json(result);
+        res.json({ duplicateSets: await buildDuplicateSets() });
     } catch (e) {
-        res.status(500).json({ error: e?.message || String(e) });
+        res.status(500).json({ error: e.message });
     }
 });
 
@@ -6441,9 +7340,9 @@ app.get('/api/maintenance/dedup/sets', async (req, res) => {
 app.get('/api/maintenance/dedup/stats', async (req, res) => {
     try {
         const db = getDb();
-        const totalFiles = db.prepare('SELECT COUNT(*) AS n FROM downloads WHERE (user_deleted IS NULL OR user_deleted = 0)').get().n || 0;
+        const totalFiles = db.prepare('SELECT COUNT(*) AS n FROM downloads').get().n || 0;
         const hashed =
-            db.prepare('SELECT COUNT(*) AS n FROM downloads WHERE file_hash IS NOT NULL AND (user_deleted IS NULL OR user_deleted = 0)').get().n ||
+            db.prepare('SELECT COUNT(*) AS n FROM downloads WHERE file_hash IS NOT NULL').get().n ||
             0;
         // Same predicate the dedup scanner uses to decide what to hash —
         // mirrors src/core/dedup.js findDuplicates() so the "Awaiting hash"
@@ -6455,7 +7354,6 @@ app.get('/api/maintenance/dedup/stats', async (req, res) => {
                  WHERE file_hash IS NULL
                    AND file_path IS NOT NULL
                    AND COALESCE(file_size, 0) > 0
-                   AND (user_deleted IS NULL OR user_deleted = 0)
             `)
                 .get().n || 0;
         let lastScan = null;
@@ -6469,6 +7367,196 @@ app.get('/api/maintenance/dedup/stats', async (req, res) => {
             if (stored && typeof stored === 'object' && stored.partial) partialProgress = stored;
         } catch {}
         res.json({ totalFiles, hashed, missing, lastScan, partialProgress });
+    } catch (e) {
+        res.status(500).json({ error: e?.message || String(e) });
+    }
+});
+
+// ====== Similar clips (fingerprint Scan + Analyze) ========================
+// Scan uses the similar-only ffmpeg runner (not seekbar). A file is skipped
+// when file_hash matches and algo is pdq-scene-v1.
+
+app.post('/api/maintenance/similar/scan', async (req, res) => {
+    const tracker = _jobTrackers.similarScan;
+    const r = tracker.tryStart(async ({ onProgress, signal }) => {
+        try {
+            kvSet('pending_job_similarScan', { startedAt: Date.now() });
+        } catch {}
+        const result = await scanSimilarClips({ onProgress, signal });
+        try {
+            kvSet('pending_job_similarScan', null);
+        } catch {}
+        try {
+            kvSet('similar_last_scan', { finishedAt: Date.now(), ...result });
+        } catch {}
+        return result;
+    });
+    if (!r.started) return res.status(409).json(r);
+    res.json({ started: true });
+});
+
+app.post('/api/maintenance/similar/scan/stop', (req, res) => {
+    _jobTrackers.similarScan.cancel();
+    res.json({ success: true });
+});
+
+app.get('/api/maintenance/similar/status', (req, res) => {
+    res.json({
+        ..._jobTrackers.similarScan.getStatus(),
+        analyze: _jobTrackers.similarAnalyze.getStatus(),
+    });
+});
+
+app.get('/api/maintenance/similar/stats', (req, res) => {
+    try {
+        res.json({
+            success: true,
+            ...getSimilarScanStats(),
+            lastScan: kvGet('similar_last_scan') || null,
+            lastAnalyze: kvGet('similar_last_analyze') || null,
+        });
+    } catch (e) {
+        res.status(500).json({ error: e?.message || String(e) });
+    }
+});
+
+app.post('/api/maintenance/similar/analyze', async (req, res) => {
+    const checkPartialClips = Boolean((req.body || {}).checkPartialClips);
+    const tracker = _jobTrackers.similarAnalyze;
+    const r = tracker.tryStart(async ({ onProgress, signal }) => {
+        try {
+            kvSet('pending_job_similarAnalyze', { startedAt: Date.now() });
+        } catch {}
+        const result = await analyzeSimilarClips({ onProgress, signal, checkPartialClips });
+        try {
+            kvSet('pending_job_similarAnalyze', null);
+        } catch {}
+        try {
+            kvSet('similar_last_analyze', { finishedAt: Date.now(), ...result });
+        } catch {}
+        return result;
+    });
+    if (!r.started) return res.status(409).json(r);
+    res.json({ started: true });
+});
+
+app.post('/api/maintenance/similar/analyze/stop', (req, res) => {
+    _jobTrackers.similarAnalyze.cancel();
+    res.json({ success: true });
+});
+
+app.get('/api/maintenance/similar/groups', (req, res) => {
+    try {
+        const kind = req.query.kind ? String(req.query.kind) : undefined;
+        res.json({ success: true, groups: listSimilarGroups({ kind }) });
+    } catch (e) {
+        res.status(500).json({ error: e?.message || String(e) });
+    }
+});
+
+app.post('/api/maintenance/similar/delete', async (req, res) => {
+    try {
+        const { ids } = req.body || {};
+        if (!Array.isArray(ids) || !ids.length) {
+            return res.status(400).json({ error: 'ids array required' });
+        }
+        const cleanIds = ids.map(Number).filter((n) => Number.isInteger(n) && n > 0);
+        if (!cleanIds.length) {
+            return res.status(400).json({ error: 'No valid ids supplied' });
+        }
+        const seekbarMap = collectSeekbarPaths(cleanIds);
+        const r = dedupDeleteByIds(cleanIds);
+        for (const id of cleanIds) {
+            try {
+                await purgeThumbsForDownload(id);
+            } catch {}
+            try {
+                await purgeSeekbarForDownload(id, seekbarMap.get(id));
+            } catch {}
+        }
+        try {
+            purgeOrphanPeople();
+        } catch {}
+        import('../core/deferred-delete.js').then((m) => m.startDrain()).catch(() => {});
+        try {
+            broadcast({ type: 'bulk_delete', count: cleanIds.length });
+        } catch {}
+        res.json({ success: true, ...r });
+    } catch (e) {
+        res.status(500).json({ error: e?.message || String(e) });
+    }
+});
+
+app.post('/api/maintenance/similar/ignore', (req, res) => {
+    try {
+        const { aId, bId, kind, note } = req.body || {};
+        const k = kind == null ? 'similar' : String(kind);
+        const id = addSimilarIgnore({ aId, bId, kind: k, note });
+        res.json({ success: true, id });
+    } catch (e) {
+        res.status(400).json({ error: e?.message || String(e) });
+    }
+});
+
+app.get('/api/maintenance/similar/ignore', (req, res) => {
+    try {
+        const kind = req.query.kind ? String(req.query.kind) : undefined;
+        res.json({ success: true, ignores: listSimilarIgnores({ kind }) });
+    } catch (e) {
+        res.status(500).json({ error: e?.message || String(e) });
+    }
+});
+
+app.delete('/api/maintenance/similar/ignore/:id', (req, res) => {
+    try {
+        const id = Number(req.params.id);
+        const changes = deleteSimilarIgnore(id);
+        if (!changes) return res.status(404).json({ error: 'ignore not found' });
+        res.json({ success: true });
+    } catch (e) {
+        res.status(500).json({ error: e?.message || String(e) });
+    }
+});
+
+app.post('/api/maintenance/similar/purge', async (req, res) => {
+    try {
+        if (
+            _jobTrackers.similarScan.getStatus().running ||
+            _jobTrackers.similarAnalyze.getStatus().running
+        ) {
+            return res.status(409).json({
+                error: 'A similar Scan or Analyze is already running. Cancel it before purging records.',
+                code: 'ALREADY_RUNNING',
+            });
+        }
+        const counts = purgeSimilarClipsRecords();
+        let leftoverRaws = 0;
+        try {
+            leftoverRaws = await unlinkLeftoverFingerprintRaws();
+        } catch (e) {
+            console.warn('[similar] leftover fp.raw unlink failed:', e?.message || e);
+        }
+        broadcast({ type: 'similar_purged', ts: Date.now() });
+        res.json({ success: true, leftoverRaws, ...counts });
+    } catch (e) {
+        res.status(500).json({ error: e?.message || String(e) });
+    }
+});
+
+app.post('/api/maintenance/similar/analyze/purge', (req, res) => {
+    try {
+        if (
+            _jobTrackers.similarScan.getStatus().running ||
+            _jobTrackers.similarAnalyze.getStatus().running
+        ) {
+            return res.status(409).json({
+                error: 'A similar Scan or Analyze is already running. Cancel it before purging Analyze records.',
+                code: 'ALREADY_RUNNING',
+            });
+        }
+        const counts = purgeSimilarAnalyzeRecords();
+        broadcast({ type: 'similar_purged', ts: Date.now(), scope: 'analyze' });
+        res.json({ success: true, ...counts });
     } catch (e) {
         res.status(500).json({ error: e?.message || String(e) });
     }
@@ -6504,7 +7592,10 @@ app.post('/api/maintenance/dedup/delete', async (req, res) => {
         let processed = 0;
         onProgress({ processed: 0, total, stage: 'deleting' });
         for (let off = 0; off < cleanIds.length; off += BATCH) {
-            const slice = cleanIds.slice(off, off + BATCH);
+            // Each listed id is one physical copy; take every row that uses
+            // that file with it, or the file can't be freed.
+            const listed = cleanIds.slice(off, off + BATCH);
+            const slice = expandToSharedRefs(listed);
             const seekbarMap = collectSeekbarPaths(slice);
             const part = dedupDeleteByIds(slice);
             aggregate.removed += part.removed || 0;
@@ -6518,7 +7609,7 @@ app.post('/api/maintenance/dedup/delete', async (req, res) => {
                     await purgeSeekbarForDownload(id, seekbarMap.get(id));
                 } catch {}
             }
-            processed += slice.length;
+            processed += listed.length;
             onProgress({ processed, total, stage: 'deleting' });
             await new Promise((r) => setImmediate(r));
         }
@@ -6571,7 +7662,7 @@ const THUMB_MISS_WINDOW_MS = 15 * 60_000;
 const THUMB_MISS_FLOOR = 200;
 const THUMB_MISS_COOLDOWN_MS = 30 * 60_000;
 let _thumbMissBatch = { count: 0, resetAt: 0, lastWarnedAt: 0 };
-app.get('/api/thumbs/:id', async (req, res) => {
+app.get('/api/thumbs/:id', requireFront, async (req, res) => {
     try {
         const id = parseInt(req.params.id, 10);
         if (!Number.isInteger(id) || id <= 0) {
@@ -6621,13 +7712,9 @@ app.get('/api/thumbs/:id', async (req, res) => {
         }
 
         res.setHeader('Content-Type', 'image/webp');
-        // Browser cache for an hour + must-revalidate so stale entries
-        // (e.g. a 404 the client cached before this URL had a real thumb
-        // on disk) get rechecked against Last-Modified instead of being
-        // served forever from the local cache. `immutable` was the wrong
-        // hint for this URL: the same id+width can legitimately serve
-        // different bytes after a source replacement or a manual purge.
-        res.setHeader('Cache-Control', 'public, max-age=3600, must-revalidate');
+        // See THUMB_CACHE_CONTROL in core/thumbs.js. A 404 is sent with
+        // no-store (above), so a missing thumb is never cached.
+        res.setHeader('Cache-Control', THUMB_CACHE_CONTROL);
         // ETag derived from mtime + size so a regenerated thumb produces
         // a different validator and the browser can't reuse the old
         // body byte-for-byte under a 304.
@@ -6770,11 +7857,7 @@ app.post('/api/maintenance/thumbs/build/cancel', async (req, res) => {
 });
 
 app.get('/api/maintenance/thumbs/build/status', async (req, res) => {
-    const snap = _jobTrackers.thumbsBuild.getStatus();
-    // Authoritative snapshot fields must win over stale leftovers in
-    // `progress` from a finished run — see dedup/status for the bug this
-    // ordering prevents.
-    res.json({ ...(snap.progress || {}), ...snap });
+    res.json(flattenStatus(_jobTrackers.thumbsBuild.getStatus()));
 });
 
 app.get('/api/maintenance/thumbs/build/stats', async (req, res) => {
@@ -6810,7 +7893,7 @@ app.get('/api/maintenance/thumbs/list', async (req, res) => {
         // `file_path IS NOT NULL` matches what `buildAllThumbnails` walks —
         // hides rows whose files were deleted but whose DB entries linger,
         // so the gallery doesn't paint tiles that will only ever 404.
-        let where = `file_type IN (${placeholders}) AND file_path IS NOT NULL AND (user_deleted IS NULL OR user_deleted = 0)`;
+        let where = `file_type IN (${placeholders}) AND file_path IS NOT NULL`;
         if (cursor !== null) {
             where += ' AND id < ?';
             args.push(cursor);
@@ -6845,7 +7928,7 @@ app.get('/api/maintenance/thumbs/list', async (req, res) => {
                 db
                     .prepare(
                         `SELECT COUNT(*) AS c FROM downloads
-                     WHERE file_type IN (${placeholders}) AND file_path IS NOT NULL AND (user_deleted IS NULL OR user_deleted = 0)`,
+                     WHERE file_type IN (${placeholders}) AND file_path IS NOT NULL`,
                     )
                     .get(...types).c || 0;
         }
@@ -7024,7 +8107,6 @@ app.get('/api/maintenance/seekbar/list', async (req, res) => {
                         s.format, s.generated_at, d.file_name
                    FROM seekbar_sprites s
                    JOIN downloads d ON d.id = s.download_id
-                  WHERE (d.user_deleted IS NULL OR d.user_deleted = 0)
                   ORDER BY s.generated_at DESC
                   LIMIT ? OFFSET ?`,
             )
@@ -7102,200 +8184,42 @@ app.get('/api/maintenance/seekbar/hwaccel-probe', async (req, res) => {
     }
 });
 
+// Probe an external seekbar sidecar before saving it: reachable? version?
+// token accepted (via the token-gated /v1/stats)? upload mode available?
+app.post('/api/maintenance/seekbar/sidecar-test', async (req, res) => {
+    const probe = _sidecarHealthUrl(req.body?.url);
+    if (probe.error) return res.status(400).json({ ok: false, error: probe.error });
+    try {
+        const saved = resolveSeekbarRemote();
+        const token = _sidecarTestToken(req.body, saved.url, saved.token);
+        const r = await probeSidecar({
+            url: probe.base,
+            token,
+            authCheck: { method: 'GET', path: '/v1/stats' },
+        });
+        const h = r.health || {};
+        res.json({
+            ok: r.ok,
+            reachable: r.reachable,
+            error: r.error,
+            version: r.version,
+            features: r.features,
+            auth: r.auth,
+            authRequired: r.authRequired,
+            platform: h.platform ? `${h.platform}/${h.arch || ''}` : null,
+            hwaccel: h.hwaccel_resolved || null,
+            ffmpeg: h.ffmpeg_version || null,
+            tokenSent: !!token,
+        });
+    } catch (e) {
+        res.json({ ok: false, error: e?.message || String(e) });
+    }
+});
+
 app.post('/api/maintenance/seekbar/sidecar/restart', async (req, res) => {
     try {
         await refreshSeekbarSidecar();
         res.json({ success: true, sidecar: getSeekbarSidecarStatus() });
-    } catch (e) {
-        res.status(500).json({ error: e?.message || String(e) });
-    }
-});
-
-// ====== Similar clips (fingerprint Scan + Analyze) ========================
-// Similar-clips fingerprint Scan + Analyze.
-// Scan uses the similar-only ffmpeg runner (not seekbar). Skip when
-// file_hash matches and algo is pdq-scene-v1.
-
-app.post('/api/maintenance/similar/scan', async (req, res) => {
-    const tracker = _jobTrackers.similarScan;
-    const r = tracker.tryStart(async ({ onProgress, signal }) => {
-        try {
-            kvSet('pending_job_similarScan', { startedAt: Date.now() });
-        } catch {}
-        const result = await scanSimilarClips({ onProgress, signal });
-        try {
-            kvSet('pending_job_similarScan', null);
-        } catch {}
-        try {
-            kvSet('similar_last_scan', { finishedAt: Date.now(), ...result });
-        } catch {}
-        return result;
-    });
-    if (!r.started) return res.status(409).json(r);
-    res.json({ started: true });
-});
-
-app.post('/api/maintenance/similar/scan/stop', (req, res) => {
-    _jobTrackers.similarScan.cancel();
-    res.json({ success: true });
-});
-
-app.get('/api/maintenance/similar/status', (req, res) => {
-    res.json({
-        ..._jobTrackers.similarScan.getStatus(),
-        analyze: _jobTrackers.similarAnalyze.getStatus(),
-    });
-});
-
-app.get('/api/maintenance/similar/stats', (req, res) => {
-    try {
-        res.json({
-            success: true,
-            ...getSimilarScanStats(),
-            lastScan: kvGet('similar_last_scan') || null,
-            lastAnalyze: kvGet('similar_last_analyze') || null,
-        });
-    } catch (e) {
-        res.status(500).json({ error: e?.message || String(e) });
-    }
-});
-
-app.post('/api/maintenance/similar/analyze', async (req, res) => {
-    const checkPartialClips = Boolean((req.body || {}).checkPartialClips);
-    const tracker = _jobTrackers.similarAnalyze;
-    const r = tracker.tryStart(async ({ onProgress, signal }) => {
-        try {
-            kvSet('pending_job_similarAnalyze', { startedAt: Date.now() });
-        } catch {}
-        const result = await analyzeSimilarClips({ onProgress, signal, checkPartialClips });
-        try {
-            kvSet('pending_job_similarAnalyze', null);
-        } catch {}
-        try {
-            kvSet('similar_last_analyze', { finishedAt: Date.now(), ...result });
-        } catch {}
-        return result;
-    });
-    if (!r.started) return res.status(409).json(r);
-    res.json({ started: true });
-});
-
-app.post('/api/maintenance/similar/analyze/stop', (req, res) => {
-    _jobTrackers.similarAnalyze.cancel();
-    res.json({ success: true });
-});
-
-app.get('/api/maintenance/similar/groups', (req, res) => {
-    try {
-        const kind = req.query.kind ? String(req.query.kind) : undefined;
-        res.json({ success: true, groups: listSimilarGroups({ kind }) });
-    } catch (e) {
-        res.status(500).json({ error: e?.message || String(e) });
-    }
-});
-
-app.post('/api/maintenance/similar/delete', async (req, res) => {
-    try {
-        const { ids } = req.body || {};
-        if (!Array.isArray(ids) || !ids.length) {
-            return res.status(400).json({ error: 'ids array required' });
-        }
-        const cleanIds = ids.map(Number).filter((n) => Number.isInteger(n) && n > 0);
-        if (!cleanIds.length) {
-            return res.status(400).json({ error: 'No valid ids supplied' });
-        }
-        const seekbarMap = collectSeekbarPaths(cleanIds);
-        const r = dedupDeleteByIds(cleanIds);
-        for (const id of cleanIds) {
-            try {
-                await purgeThumbsForDownload(id);
-            } catch {}
-            try {
-                await purgeSeekbarForDownload(id, seekbarMap.get(id));
-            } catch {}
-        }
-        try {
-            import('../core/deferred-delete.js').then((m) => m.startDrain()).catch(() => {});
-        } catch {}
-        try {
-            broadcast({ type: 'bulk_delete', count: cleanIds.length });
-        } catch {}
-        res.json({ success: true, ...r });
-    } catch (e) {
-        res.status(500).json({ error: e?.message || String(e) });
-    }
-});
-
-app.post('/api/maintenance/similar/ignore', (req, res) => {
-    try {
-        const { aId, bId, kind, note } = req.body || {};
-        const k = kind == null ? 'similar' : String(kind);
-        const id = addSimilarIgnore({ aId, bId, kind: k, note });
-        res.json({ success: true, id });
-    } catch (e) {
-        res.status(400).json({ error: e?.message || String(e) });
-    }
-});
-
-app.get('/api/maintenance/similar/ignore', (req, res) => {
-    try {
-        const kind = req.query.kind ? String(req.query.kind) : undefined;
-        res.json({ success: true, ignores: listSimilarIgnores({ kind }) });
-    } catch (e) {
-        res.status(500).json({ error: e?.message || String(e) });
-    }
-});
-
-app.delete('/api/maintenance/similar/ignore/:id', (req, res) => {
-    try {
-        const id = Number(req.params.id);
-        const changes = deleteSimilarIgnore(id);
-        if (!changes) return res.status(404).json({ error: 'ignore not found' });
-        res.json({ success: true });
-    } catch (e) {
-        res.status(500).json({ error: e?.message || String(e) });
-    }
-});
-
-app.post('/api/maintenance/similar/purge', async (req, res) => {
-    try {
-        if (
-            _jobTrackers.similarScan.getStatus().running ||
-            _jobTrackers.similarAnalyze.getStatus().running
-        ) {
-            return res.status(409).json({
-                error: 'A similar Scan or Analyze is already running. Cancel it before purging records.',
-                code: 'ALREADY_RUNNING',
-            });
-        }
-        const counts = purgeSimilarClipsRecords();
-        let leftoverRaws = 0;
-        try {
-            leftoverRaws = await unlinkLeftoverFingerprintRaws();
-        } catch (e) {
-            console.warn('[similar] leftover fp.raw unlink failed:', e?.message || e);
-        }
-        broadcast({ type: 'similar_purged', ts: Date.now() });
-        res.json({ success: true, leftoverRaws, ...counts });
-    } catch (e) {
-        res.status(500).json({ error: e?.message || String(e) });
-    }
-});
-
-app.post('/api/maintenance/similar/analyze/purge', (req, res) => {
-    try {
-        if (
-            _jobTrackers.similarScan.getStatus().running ||
-            _jobTrackers.similarAnalyze.getStatus().running
-        ) {
-            return res.status(409).json({
-                error: 'A similar Scan or Analyze is already running. Cancel it before purging Analyze records.',
-                code: 'ALREADY_RUNNING',
-            });
-        }
-        const counts = purgeSimilarAnalyzeRecords();
-        broadcast({ type: 'similar_purged', ts: Date.now(), scope: 'analyze' });
-        res.json({ success: true, ...counts });
     } catch (e) {
         res.status(500).json({ error: e?.message || String(e) });
     }
@@ -7396,11 +8320,7 @@ app.post('/api/maintenance/faststart/scan', async (req, res) => {
 });
 
 app.get('/api/maintenance/faststart/status', async (req, res) => {
-    const snap = _jobTrackers.faststart.getStatus();
-    // Authoritative snapshot fields must win over stale leftovers in
-    // `progress` from a finished run — see dedup/status for the bug this
-    // ordering prevents.
-    res.json({ ...(snap.progress || {}), ...snap });
+    res.json(flattenStatus(_jobTrackers.faststart.getStatus()));
 });
 
 app.get('/api/maintenance/faststart/stats', async (req, res) => {
@@ -7453,6 +8373,7 @@ function _nsfwCfg() {
             preload: cfg.preload === true,
             blocklistEnabled: cfg.blocklistEnabled === true,
             model: cfg.model || NSFW_DEFAULTS.model,
+            dtype: cfg.dtype || NSFW_DEFAULTS.dtype,
             threshold: Number.isFinite(cfg.threshold) ? cfg.threshold : NSFW_DEFAULTS.threshold,
             concurrency: Number.isFinite(cfg.concurrency)
                 ? cfg.concurrency
@@ -7618,32 +8539,86 @@ app.post('/api/maintenance/nsfw/preload', async (req, res) => {
     }
 });
 
-// Server-side health probe for an arbitrary NSFW sidecar URL (CORS proxy).
-app.post('/api/maintenance/nsfw/sidecar-test', async (req, res) => {
-    const url = typeof req.body?.url === 'string' ? req.body.url.trim().replace(/\/+$/, '') : '';
-    if (!url) return res.status(400).json({ ok: false, error: 'url_required' });
-    if (!/^https?:\/\//i.test(url))
-        return res.status(400).json({ ok: false, error: 'invalid_scheme' });
+// Admin-typed sidecar base URL (not yet saved) → its `/health` URL.
+// Returns { error } for input the probe endpoints should reject. There's
+// deliberately no host allowlist — sidecars live on LAN / tunnel hosts —
+// so the guard is: admin-only route (guestGate), http(s) only, no embedded
+// credentials, and only a few whitelisted JSON fields echoed back.
+// Trailing slashes are trimmed with a scan, not /\/+$/ — that regex is
+// quadratic on long runs of '/' in attacker-sized input.
+function _sidecarHealthUrl(raw) {
+    const s = typeof raw === 'string' ? raw.trim() : '';
+    if (!s) return { error: 'url_required' };
+    if (s.length > 2048) return { error: 'invalid_url' };
+    let u;
     try {
-        const ctrl = new AbortController();
-        const timer = setTimeout(() => ctrl.abort(), 5000);
-        let r;
-        try {
-            r = await fetch(`${url}/health`, { method: 'GET', signal: ctrl.signal });
-        } finally {
-            clearTimeout(timer);
-        }
-        if (!r.ok) return res.json({ ok: false, error: `http_${r.status}` });
-        const body = await r.json();
+        u = new URL(s);
+    } catch {
+        return { error: 'invalid_url' };
+    }
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return { error: 'invalid_scheme' };
+    if (u.username || u.password) return { error: 'invalid_url' };
+    let end = u.pathname.length;
+    while (end > 0 && u.pathname[end - 1] === '/') end--;
+    u.pathname = u.pathname.slice(0, end);
+    u.search = '';
+    u.hash = '';
+    // `base` is the validated URL the probe talks to — never the raw input.
+    const base = u.href.endsWith('/') ? u.href.slice(0, -1) : u.href;
+    return { url: `${base}/health`, base };
+}
+
+// Token for a sidecar Test button: the one typed in the form, else the saved
+// one when the URL under test is the saved URL (so the operator doesn't
+// have to re-enter a write-only secret just to re-test).
+function _sidecarTestToken(body, savedUrl, savedToken) {
+    if (typeof body?.token === 'string' && body.token.trim()) return body.token.trim();
+    if (body?.useSavedToken === false) return '';
+    const same =
+        savedUrl && normalizeSidecarUrl(body?.url) === normalizeSidecarUrl(String(savedUrl));
+    return same ? savedToken || '' : '';
+}
+
+// Server-side probe for an NSFW sidecar URL (CORS proxy): reachable?
+// version? token accepted? path mode or upload mode?
+app.post('/api/maintenance/nsfw/sidecar-test', async (req, res) => {
+    const probe = _sidecarHealthUrl(req.body?.url);
+    if (probe.error) return res.status(400).json({ ok: false, error: probe.error });
+    try {
+        const saved = loadConfig().advanced?.nsfw || {};
+        const token = _sidecarTestToken(
+            req.body,
+            process.env.TGDL_NSFW_SIDECAR_URL || saved.sidecarUrl,
+            process.env.TGDL_NSFW_API_TOKEN || saved.apiToken,
+        );
+        // An empty /classify is a cheap token check: 401 = rejected,
+        // 400 missing_input = accepted (or no token required).
+        const r = await probeSidecar({
+            url: probe.base,
+            token,
+            authCheck: { method: 'POST', path: '/classify', body: {} },
+        });
+        const h = r.health || {};
+        const features = r.features;
         res.json({
-            ok: body?.ok === true,
-            version: body?.version ?? null,
-            model: body?.model ?? null,
-            ready: body?.ready === true,
+            ok: r.ok,
+            reachable: r.reachable,
+            error: r.error,
+            version: r.version,
+            model: h.model ?? null,
+            ready: h.ready === true,
+            device: h.device ?? null,
+            features,
+            auth: r.auth,
+            authRequired: r.authRequired,
+            // Path mode needs TGDL_NSFW_ALLOW_ROOTS on the sidecar (older
+            // sidecars don't say); otherwise images travel as bytes.
+            pathMode: typeof h.path_mode === 'boolean' ? h.path_mode : null,
+            transfer: features.includes('upload') ? 'upload' : 'base64',
+            tokenSent: !!token,
         });
     } catch (e) {
-        const msg = e?.name === 'AbortError' ? 'timeout' : e?.message || String(e);
-        res.json({ ok: false, error: msg });
+        res.json({ ok: false, error: e?.message || String(e) });
     }
 });
 
@@ -7651,7 +8626,11 @@ app.post('/api/maintenance/nsfw/sidecar-test', async (req, res) => {
 // /maintenance/nsfw page so the model-status pill reflects reality
 // even between WS messages.
 app.get('/api/maintenance/nsfw/model-status', async (req, res) => {
-    res.json({ success: true, ...nsfwClassifierReady() });
+    res.json({
+        success: true,
+        ...nsfwClassifierReady(),
+        sidecar: { ...getNsfwSidecarInfo(), sources: getNsfwSidecarSources() },
+    });
 });
 
 // Wipe the cached weights on disk. Confirm-gated in the UI; safe-by-
@@ -8112,19 +9091,6 @@ function _aiCfg() {
     }
 }
 
-/** Resolve DBSCAN ε + labelMatchEps the same way Phase B does. */
-function _aiFacesEps() {
-    const cfg = _aiCfg();
-    const faces = cfg.faces && typeof cfg.faces === 'object' ? cfg.faces : {};
-    const epsRaw = faces.epsilon ?? cfg.facesEpsilon;
-    const eps = Number.isFinite(epsRaw) && epsRaw > 0 ? Number(epsRaw) : 1.05;
-    const matchRaw = faces.labelMatchEps ?? cfg.facesLabelMatchEps;
-    const matchEps = Number.isFinite(matchRaw) && matchRaw > 0
-        ? Number(matchRaw)
-        : Math.max(0.2, Math.min(0.6, eps * 0.9));
-    return { eps, matchEps, faces };
-}
-
 // ---- AI status -----------------------------------------------------------
 //
 // Faces-only build — the prior `/api/ai/status` payload exposed embed +
@@ -8151,6 +9117,7 @@ async function _fetchSidecarInfo(url) {
     try {
         const res = await fetch(`${url.replace(/\/+$/, '')}/info`, {
             signal: controller.signal,
+            headers: aiSidecarAuthHeaders(),
         });
         if (!res.ok) return null;
         const data = await res.json();
@@ -8165,6 +9132,27 @@ async function _fetchSidecarInfo(url) {
     }
 }
 
+// `faces.quality_score IS NULL` has no index, so the count reads every
+// face row including its 2 KB embedding (~0.2 s at 50 k faces, all on the
+// event loop) — and the AI page refetches status on every WS nudge. The
+// number only moves during a quality backfill, so cache it: 30 s normally,
+// 5 s while the backfill runs so its progress still shows.
+const _QUALITY_PENDING_CACHE = { ts: 0, value: 0 };
+function _qualityBackfillPending() {
+    const ttl = _jobTrackers.qualityBackfill.isRunning() ? 5000 : 30_000;
+    const now = Date.now();
+    if (now - _QUALITY_PENDING_CACHE.ts < ttl) return _QUALITY_PENDING_CACHE.value;
+    try {
+        _QUALITY_PENDING_CACHE.value = aiGetDb()
+            .prepare('SELECT COUNT(*) AS n FROM faces WHERE quality_score IS NULL')
+            .get().n;
+    } catch {
+        _QUALITY_PENDING_CACHE.value = 0;
+    }
+    _QUALITY_PENDING_CACHE.ts = now;
+    return _QUALITY_PENDING_CACHE.value;
+}
+
 app.get('/api/ai/status', async (_req, res) => {
     try {
         const cfg = _aiCfg();
@@ -8176,14 +9164,7 @@ app.get('/api/ai/status', async (_req, res) => {
                     facesBlock.scanVideos === true && !baseTypes.includes('video')
                         ? [...baseTypes, 'video']
                         : baseTypes;
-                return getAiCounts({
-                    fileTypes,
-                    facesEpsilon: Number.isFinite(facesBlock.epsilon)
-                        ? facesBlock.epsilon
-                        : Number.isFinite(cfg.facesEpsilon)
-                          ? cfg.facesEpsilon
-                          : 1.05,
-                });
+                return getAiCounts({ fileTypes });
             } catch {
                 return { totalEligible: 0, indexed: 0, withFaces: 0 };
             }
@@ -8207,14 +9188,17 @@ app.get('/api/ai/status', async (_req, res) => {
                         facesBlock.detectorModel || cfg.facesDetectorModel || 'buffalo_l',
                     ),
                     scanVideos: facesBlock.scanVideos === true,
-                    videoScanLimit: Number.isFinite(facesBlock.videoScanLimit)
-                        ? Math.max(0, facesBlock.videoScanLimit | 0)
-                        : 0,
-                    videoNice: Number.isFinite(facesBlock.videoNice)
-                        ? Math.max(0, Math.min(19, facesBlock.videoNice | 0))
-                        : 0,
                     sidecarUrl:
                         typeof facesBlock.sidecarUrl === 'string' ? facesBlock.sidecarUrl : '',
+                    // External sidecar extras. The token itself is never
+                    // returned; env vars that override a field are named.
+                    sidecarTokenSet: !!facesBlock.sidecarToken,
+                    pathMap: typeof facesBlock.pathMap === 'string' ? facesBlock.pathMap : '',
+                    sources: {
+                        url: process.env.TGDL_FACES_SIDECAR_URL?.trim() ? 'env' : 'config',
+                        token: process.env.TGDL_FACES_SIDECAR_TOKEN?.trim() ? 'env' : 'config',
+                        pathMap: process.env.TGDL_FACES_PATH_MAP?.trim() ? 'env' : 'config',
+                    },
                 },
             },
             counts,
@@ -8255,11 +9239,13 @@ app.get('/api/ai/status', async (_req, res) => {
                         /* sidecar offline / fetch failed — fall through */
                     }
                     let sidecarMode = null;
+                    let sidecarModeLabel = null;
                     try {
                         const facesSpawnStatus = (
                             await import('../core/ai/faces-spawn.js')
                         ).getSidecarStatus();
                         sidecarMode = facesSpawnStatus?.mode || null;
+                        sidecarModeLabel = facesSpawnStatus?.modeLabel || null;
                     } catch {}
                     return {
                         id,
@@ -8274,6 +9260,7 @@ app.get('/api/ai/status', async (_req, res) => {
                         providersRequested: String(facesBlock.providers || 'auto'),
                         version: sidecarVersion,
                         mode: sidecarMode,
+                        modeLabel: sidecarModeLabel,
                     };
                 })(),
             },
@@ -8284,15 +9271,7 @@ app.get('/api/ai/status', async (_req, res) => {
                     return { realtime: 0, backfill: 0 };
                 }
             })(),
-            qualityBackfillPending: (() => {
-                try {
-                    return aiGetDb()
-                        .prepare('SELECT COUNT(*) AS n FROM faces WHERE quality_score IS NULL')
-                        .get().n;
-                } catch {
-                    return 0;
-                }
-            })(),
+            qualityBackfillPending: _qualityBackfillPending(),
             trackers: {
                 aiPeople: _jobTrackers.aiPeople.getStatus(),
                 qualityBackfill: _jobTrackers.qualityBackfill.getStatus(),
@@ -8310,6 +9289,20 @@ app.get('/api/ai/status', async (_req, res) => {
 // field so older clients fail with a clear `unknown feature` error
 // rather than a silent no-op.
 const AI_SCAN_FEATURES = new Set(['faces']);
+
+// A scan needs a sidecar. If none was started (AI was off at boot) or the
+// last spawn attempt failed, try again with the current config; the scan
+// itself waits for it to become ready. Also re-checks the stock compose
+// URL: the `faces` profile may have been started or stopped since boot.
+// A custom URL that is merely unreachable is left alone.
+async function _ensureFacesSidecar() {
+    try {
+        const spawnMod = await import('../core/ai/faces-spawn.js');
+        await spawnMod.ensureSidecarForScan();
+    } catch {
+        /* the scan reports the missing sidecar itself */
+    }
+}
 
 function _aiTrackerFor(feature) {
     if (feature === 'faces') return _jobTrackers.aiPeople;
@@ -8353,6 +9346,7 @@ app.post('/api/ai/scan/start', async (req, res) => {
         if (aiIsScanRunning(feature)) {
             return res.status(409).json({ error: 'Scan already running', code: 'ALREADY_RUNNING' });
         }
+        await _ensureFacesSidecar();
         const tracker = _aiTrackerFor(feature);
         const starter = _aiStarterFor(feature);
         const claim = tracker.tryStart(({ onProgress, signal }) => {
@@ -8422,31 +9416,41 @@ app.get('/api/ai/scan/status', async (req, res) => {
 // The browser can't hit a Cloudflare-tunnelled endpoint directly (CORS),
 // so we proxy the health check. Accepts { url } in the POST body.
 app.post('/api/ai/faces/health-test', async (req, res) => {
-    const url = typeof req.body?.url === 'string' ? req.body.url.trim().replace(/\/+$/, '') : '';
-    if (!url) return res.status(400).json({ ok: false, error: 'url_required' });
-    if (!/^https?:\/\//i.test(url))
-        return res.status(400).json({ ok: false, error: 'invalid_scheme' });
+    const probe = _sidecarHealthUrl(req.body?.url);
+    if (probe.error) return res.status(400).json({ ok: false, error: probe.error });
     try {
-        const ctrl = new AbortController();
-        const timer = setTimeout(() => ctrl.abort(), 5000);
-        let r;
-        try {
-            r = await fetch(`${url}/health`, { method: 'GET', signal: ctrl.signal });
-        } finally {
-            clearTimeout(timer);
-        }
-        if (!r.ok) return res.json({ ok: false, error: `http_${r.status}` });
-        const body = await r.json();
+        const { resolveFacesValue } = await import('../core/ai/faces-config.js');
+        const saved = _aiCfg().faces || {};
+        const token = _sidecarTestToken(
+            req.body,
+            resolveFacesValue('sidecarUrl', saved),
+            resolveFacesValue('sidecarToken', saved),
+        );
+        // An empty /detect is a cheap token check: 401 = rejected, 400
+        // (validation) = accepted or no token required.
+        const r = await probeSidecar({
+            url: probe.base,
+            token,
+            authCheck: { method: 'POST', path: '/detect', body: {} },
+        });
+        const h = r.health || {};
         res.json({
-            ok: body?.ok === true,
-            version: body?.version ?? null,
-            model: body?.model ?? null,
-            ready: body?.ready === true,
-            providers: body?.providers_resolved ?? null,
+            ok: r.ok,
+            reachable: r.reachable,
+            error: r.error,
+            version: r.version,
+            model: h.model ?? null,
+            ready: h.ready === true,
+            providers: h.providers_resolved ?? h.providers ?? null,
+            features: r.features,
+            auth: r.auth,
+            authRequired: r.authRequired,
+            // 0.5.1+ takes raw uploads; older sidecars get base64.
+            transfer: r.features.includes('upload') ? 'upload' : 'base64',
+            tokenSent: !!token,
         });
     } catch (e) {
-        const msg = e?.name === 'AbortError' ? 'timeout' : e?.message || String(e);
-        res.json({ ok: false, error: msg });
+        res.json({ ok: false, error: e?.message || String(e) });
     }
 });
 
@@ -8466,7 +9470,10 @@ app.get('/api/ai/faces/provider-probe', async (_req, res) => {
         const t = setTimeout(() => ctrl.abort(), 10_000);
         let r;
         try {
-            r = await globalThis.fetch(`${url}/providers`, { signal: ctrl.signal });
+            r = await globalThis.fetch(`${url}/providers`, {
+                signal: ctrl.signal,
+                headers: aiSidecarAuthHeaders(),
+            });
         } finally {
             clearTimeout(t);
         }
@@ -8547,11 +9554,11 @@ app.post('/api/ai/faces/install-deps', async (req, res) => {
 // re-detecting. Lets the operator tweak ε / minPoints and see the new
 // People grid in seconds (vs minutes for a full re-scan). Implemented
 // by triggering the standard faces scan-runner; Phase A is a no-op when
-// Incremental Phase B only (skipPhaseA). Does not detect faces on
-// unscanned media — use "Scan now" for that. For fully-indexed libraries
-// this is equivalent to the old recluster; for partial libraries it will
-// not pick up where a cancelled scan left off.
-app.post('/api/ai/faces/recluster', async (_req, res) => {
+// every photo carries `ai_indexed_at IS NOT NULL`, so for fully-indexed
+// libraries this lands in Phase B immediately. For partially-indexed
+// libraries (a scan was cancelled mid-way), Phase A picks up where it
+// left off — same as clicking "Scan now".
+app.post('/api/ai/faces/recluster', requireGoCore('dbscan'), async (_req, res) => {
     try {
         const cfg = _aiCfg();
         if (aiIsScanRunning('faces')) {
@@ -8560,8 +9567,7 @@ app.post('/api/ai/faces/recluster', async (_req, res) => {
                 message: 'A face scan is already in progress.',
             });
         }
-        // Incremental Phase B only — no detection of unscanned media.
-        const runCfg = { ...cfg, facesClusterMode: 'incremental', skipPhaseA: true };
+        await _ensureFacesSidecar();
         const tracker = _aiTrackerFor('faces');
         const claim = tracker.tryStart(({ onProgress, signal }) => {
             return new Promise((resolve, reject) => {
@@ -8573,7 +9579,7 @@ app.post('/api/ai/faces/recluster', async (_req, res) => {
                     });
                 }
                 aiStartFacesScan(
-                    runCfg,
+                    cfg,
                     (p) => {
                         try {
                             onProgress(p);
@@ -8590,55 +9596,7 @@ app.post('/api/ai/faces/recluster', async (_req, res) => {
         if (!claim.started) {
             return res.status(409).json({ error: 'Tracker busy', code: claim.code });
         }
-        res.json({ success: true, started: true, mode: 'incremental' });
-    } catch (e) {
-        res.status(500).json({ error: e?.message || String(e) });
-    }
-});
-
-// Full rebuild — clearAllPeople + clear exclusions + DBSCAN over every
-// face (old recluster behavior). Use after changing ε when a global
-// reshuffle is wanted. Merges and exclusions are NOT preserved.
-// Labels / covers still carry over via centroid match.
-app.post('/api/ai/faces/rebuild', async (_req, res) => {
-    try {
-        const cfg = _aiCfg();
-        if (aiIsScanRunning('faces')) {
-            return res.status(409).json({
-                error: 'scan_running',
-                message: 'A face scan is already in progress.',
-            });
-        }
-        const runCfg = { ...cfg, facesClusterMode: 'full' };
-        const tracker = _aiTrackerFor('faces');
-        const claim = tracker.tryStart(({ onProgress, signal }) => {
-            return new Promise((resolve, reject) => {
-                if (signal?.addEventListener) {
-                    signal.addEventListener('abort', () => {
-                        try {
-                            aiCancelScan('faces');
-                        } catch {}
-                    });
-                }
-                aiStartFacesScan(
-                    runCfg,
-                    (p) => {
-                        try {
-                            onProgress(p);
-                        } catch {}
-                    },
-                    (p) => {
-                        if (p?.error) reject(new Error(p.error));
-                        else resolve(p || {});
-                    },
-                    (entry) => log(entry),
-                );
-            });
-        });
-        if (!claim.started) {
-            return res.status(409).json({ error: 'Tracker busy', code: claim.code });
-        }
-        res.json({ success: true, started: true, mode: 'full' });
+        res.json({ success: true, started: true });
     } catch (e) {
         res.status(500).json({ error: e?.message || String(e) });
     }
@@ -8664,12 +9622,12 @@ app.post('/api/ai/faces/reindex', async (_req, res) => {
         const tx = db.transaction(() => {
             db.prepare(`DELETE FROM faces`).run();
             db.prepare(`DELETE FROM people`).run();
-            db.prepare(`DELETE FROM excluded_people`).run();
             db.prepare(
                 `UPDATE downloads SET ai_indexed_at = NULL WHERE file_type IN (${placeholders})`,
             ).run(...types);
         });
         tx();
+        _purgeFaceCropCache();
         broadcast({ type: 'ai_faces_reindexed', ts: Date.now() });
         res.json({ success: true });
     } catch (e) {
@@ -8772,6 +9730,7 @@ app.post('/api/ai/preload-model/:name', async (_req, res) => {
         const r = await fetch(`${url}/preload/${encodeURIComponent(name)}`, {
             method: 'POST',
             signal: AbortSignal.timeout(5000),
+            headers: aiSidecarAuthHeaders(),
         });
         res.json(await r.json());
     } catch (e) {
@@ -8787,6 +9746,7 @@ app.get('/api/ai/preload-model/:name/status', async (_req, res) => {
         if (!url) return res.status(503).json({ error: 'sidecar not running' });
         const r = await fetch(`${url}/preload/${encodeURIComponent(name)}/status`, {
             signal: AbortSignal.timeout(3000),
+            headers: aiSidecarAuthHeaders(),
         });
         res.json(await r.json());
     } catch (e) {
@@ -8796,28 +9756,42 @@ app.get('/api/ai/preload-model/:name/status', async (_req, res) => {
 
 // ---- People (face clusters) ---------------------------------------------
 
+// Same order as db.js listPeople() for rows merged from several peers.
+function _peopleComparator(sort, dir) {
+    const sign = dir === 'asc' ? 1 : -1;
+    const tie = (a, b) =>
+        (Number(b.face_count) || 0) - (Number(a.face_count) || 0) ||
+        (Number(a.id) || 0) - (Number(b.id) || 0);
+    if (sort === 'name') {
+        return (a, b) => {
+            const an = a.label ? 0 : 1;
+            const bn = b.label ? 0 : 1;
+            // Unlabelled first ascending, last descending.
+            if (an !== bn) return (bn - an) * sign;
+            const c = String(a.label || '').localeCompare(String(b.label || ''), undefined, {
+                sensitivity: 'base',
+            });
+            return c * sign || tie(a, b);
+        };
+    }
+    const key = sort === 'avg_quality' ? 'avg_quality' : 'face_count';
+    return (a, b) => ((Number(a[key]) || 0) - (Number(b[key]) || 0)) * sign || tie(a, b);
+}
+
 app.get('/api/ai/people', async (req, res) => {
     try {
         const limit = Math.max(1, Math.min(2000, Number(req.query?.limit) || 100));
         const offset = Math.max(0, Number(req.query?.offset) || 0);
         const scope = String(req.query?.scope || 'local').toLowerCase();
-        // Accept `sort`/`sortBy` and `dir`/`sortDir` (aliases). Whitelist
-        // enforced inside listPeople — unknown values fall back to defaults.
-        const sortByRaw = String(req.query?.sortBy || req.query?.sort || 'face_count');
-        const sortDirRaw = String(req.query?.sortDir || req.query?.dir || 'desc');
-        const sortBy = ['face_count', 'avg_quality', 'name'].includes(sortByRaw)
-            ? sortByRaw
-            : 'face_count';
-        const sortDir = sortDirRaw.toLowerCase() === 'asc' ? 'asc' : 'desc';
-        const local = listPeople({ limit, offset, sortBy, sortDir });
+        // Sorted server-side so "top N by quality / name" really is the top N
+        // of the whole library, not of the first N by face count.
+        const { sort, dir } = resolvePeopleSort(
+            String(req.query?.sort || ''),
+            String(req.query?.dir || '').toLowerCase(),
+        );
+        const local = listPeople({ limit, offset, sort, dir });
         if (scope !== 'federated') {
-            return res.json({
-                success: true,
-                scope: 'local',
-                sortBy,
-                sortDir,
-                ...local,
-            });
+            return res.json({ success: true, scope: 'local', sort, dir, ...local });
         }
         // Federated — list local clusters first, then peer summaries
         // tagged with the owning peer id. The UI's cover thumbnail is
@@ -8827,14 +9801,13 @@ app.get('/api/ai/people', async (req, res) => {
             const { listPeers } = await import('../core/cluster/peers.js');
             const { relayTo } = await import('../core/cluster/relay.js');
             const peers = listPeers();
-            const peerQs = `limit=${limit}&sortBy=${encodeURIComponent(sortBy)}&sortDir=${encodeURIComponent(sortDir)}`;
             const peerLists = await Promise.all(
                 peers.map(async (p) => {
                     try {
                         const r = await relayTo({
                             targetPeerId: p.peerId,
                             method: 'GET',
-                            path: `/api/ai/people?${peerQs}`,
+                            path: `/api/ai/people?limit=${limit}&sort=${sort}&dir=${dir}`,
                         });
                         if (!r.ok) return [];
                         const json = await r.json();
@@ -8853,12 +9826,12 @@ app.get('/api/ai/people', async (req, res) => {
             const merged = [
                 ...(local.people || []).map((row) => ({ ...row, _peerId: 'local' })),
                 ...peerLists.flat(),
-            ];
+            ].sort(_peopleComparator(sort, dir));
             return res.json({
                 success: true,
                 scope: 'federated',
-                sortBy,
-                sortDir,
+                sort,
+                dir,
                 people: merged,
                 total: merged.length,
                 peerErrors,
@@ -8901,26 +9874,10 @@ app.get('/api/ai/group-by-person', async (req, res) => {
         const limit = Math.max(1, Math.min(200, Number(req.query?.limit) || 50));
         const rows = aiGetDb()
             .prepare(`
-                SELECT p.id, p.label,
-                       COALESCE((
-                           SELECT COUNT(*) FROM faces fl
-                            JOIN downloads dl ON dl.id = fl.download_id
-                           WHERE fl.person_id = p.id
-                             AND (dl.user_deleted IS NULL OR dl.user_deleted = 0)
-                       ), 0) AS face_count,
-                       (SELECT f.download_id FROM faces f
-                          JOIN downloads d ON d.id = f.download_id
-                         WHERE f.person_id = p.id
-                           AND (d.user_deleted IS NULL OR d.user_deleted = 0)
-                         LIMIT 1) AS cover_download_id
+                SELECT p.id, p.label, p.face_count,
+                       (SELECT f.download_id FROM faces f WHERE f.person_id = p.id LIMIT 1) AS cover_download_id
                   FROM people p
-                 WHERE (
-                       SELECT COUNT(*) FROM faces fex
-                        JOIN downloads dex ON dex.id = fex.download_id
-                       WHERE fex.person_id = p.id
-                         AND (dex.user_deleted IS NULL OR dex.user_deleted = 0)
-                 ) > 0
-                 ORDER BY face_count DESC, p.id ASC
+                 ORDER BY p.face_count DESC, p.id ASC
                  LIMIT ?
             `)
             .all(limit);
@@ -8930,225 +9887,26 @@ app.get('/api/ai/group-by-person', async (req, res) => {
     }
 });
 
-// Extract a single frame from a video file as a raw image buffer using ffmpeg.
-// Used by the face crop endpoints when the source is a video file.
-async function _extractVideoFrame(videoPath, timeSec = 0) {
-    const { execFile } = await import('child_process');
-    const { resolveFfmpegBin } = await import('../core/thumbs.js');
-    const ffmpeg = resolveFfmpegBin();
-    const ss = Math.max(0, Number(timeSec) || 0);
-    const args =
-        ss > 0
-            ? [
-                  '-ss',
-                  String(ss),
-                  '-i',
-                  videoPath,
-                  '-vframes',
-                  '1',
-                  '-f',
-                  'image2',
-                  '-vcodec',
-                  'png',
-                  'pipe:1',
-              ]
-            : ['-i', videoPath, '-vframes', '1', '-f', 'image2', '-vcodec', 'png', 'pipe:1'];
-    return new Promise((resolve, reject) => {
-        execFile(
-            ffmpeg,
-            args,
-            { encoding: 'buffer', maxBuffer: 20 * 1024 * 1024, timeout: 15000 },
-            (err, stdout) => {
-                if (err) return reject(err);
-                resolve(stdout);
-            },
-        );
-    });
+// ---- Face crops ------------------------------------------------------------
+//
+// Cached on disk, concurrency-capped, video-frame-aware — see
+// src/core/ai/face-crops.js for the why. `TGDL_FACE_CROP_CONCURRENCY`
+// (default 4) bounds how many crops render at once.
+const _faceCropper = createFaceCropper({
+    cacheDir: path.join(DATA_DIR, 'thumbs', 'face-crops'),
+    concurrency: Number(process.env.TGDL_FACE_CROP_CONCURRENCY) || 4,
+    resolveFfmpeg: resolveFfmpegBin,
+    // Legacy video rows: find the frame whose face matches the stored
+    // embedding. Null (sidecar away) makes the cropper fall back uncached.
+    detectInImage: (jpeg) => aiDetectFacesInImage(jpeg, _aiCfg()),
+});
+
+/** Drop every cached crop (after a reindex the boxes are all new anyway). */
+function _purgeFaceCropCache() {
+    _faceCropper.purge();
 }
 
-async function _probeVideoDurationSec(videoPath) {
-    const { execFile } = await import('child_process');
-    const { resolveFfprobeBin } = await import('../core/thumbs.js');
-    const ffprobe = resolveFfprobeBin();
-    try {
-        const { stdout } = await new Promise((resolve, reject) => {
-            execFile(
-                ffprobe,
-                [
-                    '-v',
-                    'error',
-                    '-show_entries',
-                    'format=duration',
-                    '-of',
-                    'default=noprint_wrappers=1:nokey=1',
-                    videoPath,
-                ],
-                { encoding: 'utf8', timeout: 10000 },
-                (err, out) => (err ? reject(err) : resolve({ stdout: out })),
-            );
-        });
-        const d = Number(String(stdout || '').trim());
-        return Number.isFinite(d) && d > 0 ? d : 0;
-    } catch {
-        return 0;
-    }
-}
-
-/** Cheap sharpness proxy for a face bbox on a decoded frame (higher = better). */
-async function _faceCropSharpness(sourceBuf, row) {
-    const pad = 0.4;
-    const meta = await sharp(sourceBuf, { failOn: 'none' }).metadata();
-    const imgW = meta.width || 9999;
-    const imgH = meta.height || 9999;
-    const left = Math.max(0, Math.round(row.x - row.w * pad));
-    const top = Math.max(0, Math.round(row.y - row.h * pad));
-    const right = Math.min(imgW, Math.round(row.x + row.w + row.w * pad));
-    const bottom = Math.min(imgH, Math.round(row.y + row.h + row.h * pad));
-    const width = Math.max(1, right - left);
-    const height = Math.max(1, bottom - top);
-    const raw = await sharp(sourceBuf, { failOn: 'none' })
-        .extract({ left, top, width, height })
-        .greyscale()
-        .raw()
-        .toBuffer();
-    if (!raw.length) return 0;
-    let sum = 0;
-    for (let i = 0; i < raw.length; i++) sum += raw[i];
-    const mean = sum / raw.length;
-    let varSum = 0;
-    for (let i = 0; i < raw.length; i++) {
-        const d = raw[i] - mean;
-        varSum += d * d;
-    }
-    return varSum / raw.length;
-}
-
-// Pick the best frame for a legacy video face (no stored timestamp) by
-// trying several seek points and keeping the crop with highest variance.
-async function _extractBestVideoFrameForCrop(videoPath, row) {
-    const stored = Number(row.frame_time_sec);
-    if (Number.isFinite(stored) && stored >= 0) {
-        return _extractVideoFrame(videoPath, stored);
-    }
-    const duration = await _probeVideoDurationSec(videoPath);
-    const times =
-        duration > 0
-            ? [0, duration * 0.25, duration * 0.5, duration * 0.75, Math.max(0, duration - 0.05)]
-            : [0];
-    let bestBuf = null;
-    let bestScore = -1;
-    for (const t of times) {
-        try {
-            const frameBuf = await _extractVideoFrame(videoPath, t);
-            const score = await _faceCropSharpness(frameBuf, row);
-            if (score > bestScore) {
-                bestScore = score;
-                bestBuf = frameBuf;
-            }
-        } catch {
-            /* try next candidate */
-        }
-    }
-    if (!bestBuf) throw new Error('no video frame extracted');
-    return bestBuf;
-}
-
-// Crop a face from an image buffer (or file path) with padding.
-// `.rotate()` honours EXIF orientation so coordinates from the sidecar
-// (which already applies EXIF before detection) match the pixel space.
-async function _cropFace(source, row, size) {
-    const pad = 0.4;
-    const meta = await sharp(source, { failOn: 'none' }).rotate().metadata();
-    const imgW = meta.width || 9999;
-    const imgH = meta.height || 9999;
-    const left = Math.max(0, Math.round(row.x - row.w * pad));
-    const top = Math.max(0, Math.round(row.y - row.h * pad));
-    const right = Math.min(imgW, Math.round(row.x + row.w + row.w * pad));
-    const bottom = Math.min(imgH, Math.round(row.y + row.h + row.h * pad));
-    const width = Math.max(1, right - left);
-    const height = Math.max(1, bottom - top);
-    return sharp(source, { failOn: 'none' })
-        .rotate()
-        .extract({ left, top, width, height })
-        .resize(size, size, { fit: 'cover', position: 'centre' })
-        .jpeg({ quality: 82, progressive: true })
-        .toBuffer();
-}
-
-// Unclassified / face-review grids used to request every crop at once.
-// Each miss decodes a full photo or ffmpeg-extracts a video frame, so a
-// burst of 50–100 hangs the event loop until nginx/Cloudflare time out.
-// Cap in-flight generation; extra requests wait for a slot.
-const FACE_CROP_CONCURRENCY = Math.max(
-    1,
-    Math.min(8, Number(process.env.TGDL_FACE_CROP_CONCURRENCY) || 4),
-);
-
-function _makeFaceCropSemaphore(max) {
-    let active = 0;
-    const queue = [];
-    return {
-        acquire() {
-            return new Promise((resolve) => {
-                if (active < max) {
-                    active++;
-                    resolve();
-                    return;
-                }
-                queue.push(resolve);
-            });
-        },
-        release() {
-            active--;
-            const next = queue.shift();
-            if (next) {
-                active++;
-                next();
-            }
-        },
-    };
-}
-const _faceCropSem = _makeFaceCropSemaphore(FACE_CROP_CONCURRENCY);
-const _faceCropInflight = new Map();
-
-async function _generateFaceCrop(sourcePathOrBuf, row, size) {
-    if (row.file_type === 'video') {
-        const frameBuf = await _extractBestVideoFrameForCrop(sourcePathOrBuf, row);
-        try {
-            return await _cropFace(frameBuf, row, size);
-        } catch {
-            return await sharp(frameBuf, { failOn: 'none' })
-                .rotate()
-                .resize(size, size, { fit: 'cover', position: 'attention' })
-                .jpeg({ quality: 82, progressive: true })
-                .toBuffer();
-        }
-    }
-    return _cropFace(sourcePathOrBuf, row, size);
-}
-
-async function _generateFaceCropLimited(sourcePathOrBuf, row, size) {
-    const key = `${sourcePathOrBuf}|${row.x}|${row.y}|${row.w}|${row.h}|${row.frame_time_sec}|${size}|${row.file_type}`;
-    const hit = _faceCropInflight.get(key);
-    if (hit) return hit;
-    const job = (async () => {
-        await _faceCropSem.acquire();
-        try {
-            return await _generateFaceCrop(sourcePathOrBuf, row, size);
-        } finally {
-            _faceCropSem.release();
-        }
-    })();
-    _faceCropInflight.set(key, job);
-    try {
-        return await job;
-    } finally {
-        _faceCropInflight.delete(key);
-    }
-}
-
-// Face crop for person avatar — pinned cover_face_id when set and still
-// belonging to this person; otherwise best (highest-quality/largest) face.
+// Face crop for person avatar — best (highest-quality/largest) face for this person.
 // Used by the People grid as the circle avatar. Sharp-crops with 40% padding so the
 // face is framed, not cut tight. For video-sourced faces, extracts a frame via ffmpeg.
 app.get('/api/ai/person/:id/face', async (req, res) => {
@@ -9160,16 +9918,13 @@ app.get('/api/ai/person/:id/face', async (req, res) => {
 
         const row = aiGetDb()
             .prepare(
-                `SELECT f.x, f.y, f.w, f.h, f.frame_time_sec, d.file_path, d.file_type
+                `SELECT f.x, f.y, f.w, f.h, f.exif_oriented, f.frame_time_sec, f.embedding,
+                        d.file_path, d.file_type
                    FROM faces f
                    JOIN downloads d ON d.id = f.download_id
-                   JOIN people p ON p.id = f.person_id
                   WHERE f.person_id = ?
-                    AND (d.user_deleted IS NULL OR d.user_deleted = 0)
-                  ORDER BY
-                    CASE WHEN p.cover_face_id IS NOT NULL AND f.id = p.cover_face_id THEN 0 ELSE 1 END,
-                    CASE WHEN d.file_type = 'photo' THEN 0 ELSE 1 END,
-                    COALESCE(f.quality_score, 0) DESC, f.w * f.h DESC
+                  ORDER BY CASE WHEN d.file_type = 'photo' THEN 0 ELSE 1 END,
+                           COALESCE(f.quality_score, 0) DESC, f.w * f.h DESC
                   LIMIT 1`,
             )
             .get(personId);
@@ -9177,14 +9932,13 @@ app.get('/api/ai/person/:id/face', async (req, res) => {
 
         const resolved = await safeResolveDownload(row.file_path);
         if (!resolved.ok) {
-            if (resolved.reason === 'missing') autoPruneMissingPath(row.file_path);
+            if (resolved.reason === 'missing') await pruneMissingDownload(row.file_path);
             return res
                 .status(resolved.reason === 'missing' ? 404 : 403)
                 .json({ error: resolved.reason });
         }
 
-        const buf = await _generateFaceCropLimited(resolved.real, row, size);
-
+        const buf = await _faceCropper.crop(row, resolved.real, size);
         res.set('content-type', 'image/jpeg');
         res.set('cache-control', 'public, max-age=604800, immutable');
         res.send(buf);
@@ -9198,74 +9952,9 @@ app.get('/api/ai/person/:id/face', async (req, res) => {
     }
 });
 
-// Face crop for an individual face (used in the per-person photo gallery
-// and the "Review faces" panel). Crops the face bbox from the source image
-// with the same 40% padding as the person-avatar endpoint above — reuses
-// the same `_cropFace()` helper instead of duplicating the crop math, and
-// the same `_extractVideoFrame()` fallback for video-sourced faces (sharp
-// can't decode a video container directly; without this, any face whose
-// download is a video 404s with "Input file contains unsupported image
-// format").
-
-// Unclassified faces review — static path MUST be registered before
-// `/api/ai/faces/:id/*` so Express does not treat "unclassified" as an id.
-app.get('/api/ai/faces/unclassified', async (req, res) => {
-    try {
-        const { eps } = _aiFacesEps();
-        const limit = Math.max(1, Math.min(200, Number(req.query?.limit) || 50));
-        const offset = Math.max(0, Number(req.query?.offset) || 0);
-        const result = listUnclassifiedFaces({
-            limit,
-            offset,
-            facesEpsilon: eps,
-        });
-        res.json({ success: true, ...result });
-    } catch (e) {
-        res.status(500).json({ error: e.message });
-    }
-});
-
-app.get('/api/ai/faces/:id/suggestions', async (req, res) => {
-    try {
-        const faceId = Number(req.params.id);
-        if (!Number.isFinite(faceId) || faceId <= 0) {
-            return res.status(400).json({ error: 'invalid face id' });
-        }
-        const { matchEps } = _aiFacesEps();
-        const limit = Math.max(1, Math.min(20, Number(req.query?.limit) || 5));
-        const r = suggestPeopleForFace(faceId, { matchEps, limit });
-        if (!r.ok) {
-            const status = r.reason === 'not_found' ? 404 : 400;
-            return res.status(status).json({ error: r.reason || 'suggest failed' });
-        }
-        res.json({ success: true, faceId, matchEps, suggestions: r.suggestions });
-    } catch (e) {
-        res.status(500).json({ error: e.message });
-    }
-});
-
-app.post('/api/ai/faces/:id/new-person', async (req, res) => {
-    try {
-        const faceId = Number(req.params.id);
-        if (!Number.isFinite(faceId) || faceId <= 0) {
-            return res.status(400).json({ error: 'invalid face id' });
-        }
-        const label = req.body?.label == null ? null : String(req.body.label).trim().slice(0, 100) || null;
-        const r = splitFacePerson([faceId], label);
-        if (!r.personId || !r.moved) {
-            return res.status(404).json({ error: 'face not found or already moved' });
-        }
-        log({
-            source: 'ai',
-            level: 'info',
-            msg: `faces/new-person: face=${faceId} → person=${r.personId} label=${label || '(unlabelled)'}`,
-        });
-        res.json({ success: true, ...r, label });
-    } catch (e) {
-        res.status(500).json({ error: e.message });
-    }
-});
-
+// Face crop for an individual face (used in the per-person photo gallery).
+// Crops the face bbox from the source image with the same 40% padding;
+// video faces go through the same frame-aware path as the avatar.
 app.get('/api/ai/faces/:id/crop', async (req, res) => {
     try {
         const faceId = Number(req.params.id);
@@ -9275,25 +9964,24 @@ app.get('/api/ai/faces/:id/crop', async (req, res) => {
 
         const row = aiGetDb()
             .prepare(
-                `SELECT f.x, f.y, f.w, f.h, f.frame_time_sec, d.file_path, d.file_type
+                `SELECT f.x, f.y, f.w, f.h, f.exif_oriented, f.frame_time_sec, f.embedding,
+                        d.file_path, d.file_type
                    FROM faces f
                    JOIN downloads d ON d.id = f.download_id
-                  WHERE f.id = ?
-                    AND (d.user_deleted IS NULL OR d.user_deleted = 0)`,
+                  WHERE f.id = ?`,
             )
             .get(faceId);
         if (!row) return res.status(404).json({ error: 'face not found' });
 
         const resolved = await safeResolveDownload(row.file_path);
         if (!resolved.ok) {
-            if (resolved.reason === 'missing') autoPruneMissingPath(row.file_path);
+            if (resolved.reason === 'missing') await pruneMissingDownload(row.file_path);
             return res
                 .status(resolved.reason === 'missing' ? 404 : 403)
                 .json({ error: resolved.reason });
         }
 
-        const buf = await _generateFaceCropLimited(resolved.real, row, size);
-
+        const buf = await _faceCropper.crop(row, resolved.real, size);
         res.set('content-type', 'image/jpeg');
         res.set('cache-control', 'public, max-age=604800, immutable');
         res.send(buf);
@@ -9322,25 +10010,6 @@ app.get('/api/ai/people/:id/photos', async (req, res) => {
     }
 });
 
-// Additive companion to /photos — one row PER FACE (no ROW_NUMBER collapse
-// per download), so the "review faces" grid can show every face the model
-// attributed to this cluster, including several from the same group photo.
-// Does not change /photos or its callers.
-app.get('/api/ai/people/:id/faces', async (req, res) => {
-    try {
-        const id = Number(req.params.id);
-        if (!Number.isFinite(id) || id <= 0) {
-            return res.status(400).json({ error: 'invalid person id' });
-        }
-        const limit = Math.max(1, Math.min(200, Number(req.query?.limit) || 50));
-        const offset = Math.max(0, Number(req.query?.offset) || 0);
-        const result = listFacesForPerson(id, { limit, offset });
-        res.json({ success: true, personId: id, ...result });
-    } catch (e) {
-        res.status(500).json({ error: e.message });
-    }
-});
-
 app.patch('/api/ai/people/:id', async (req, res) => {
     try {
         const id = Number(req.params.id);
@@ -9353,53 +10022,6 @@ app.patch('/api/ai/people/:id', async (req, res) => {
         const changes = renamePerson(id, label || null);
         if (!changes) return res.status(404).json({ error: 'person not found' });
         res.json({ success: true, id, label });
-    } catch (e) {
-        res.status(500).json({ error: e.message });
-    }
-});
-
-// Pin a face as this person's People avatar thumbnail.
-app.post('/api/ai/people/:id/cover', async (req, res) => {
-    try {
-        const id = Number(req.params.id);
-        const faceId = Number(req.body?.faceId);
-        if (!Number.isFinite(id) || id <= 0) {
-            return res.status(400).json({ error: 'invalid person id' });
-        }
-        if (!Number.isFinite(faceId) || faceId <= 0) {
-            return res.status(400).json({ error: 'invalid faceId' });
-        }
-        const r = setPersonCoverFace(id, faceId);
-        if (!r.ok) {
-            const status =
-                r.reason === 'person_not_found' || r.reason === 'face_not_found'
-                    ? 404
-                    : r.reason === 'mismatch'
-                      ? 400
-                      : 400;
-            return res.status(status).json({ error: r.reason || 'cover failed' });
-        }
-        res.json({ success: true, id, coverFaceId: r.coverFaceId });
-    } catch (e) {
-        res.status(500).json({ error: e.message });
-    }
-});
-
-// Nearest other People by centroid distance — merge suggestion chips / picker.
-app.get('/api/ai/people/:id/suggestions', async (req, res) => {
-    try {
-        const personId = Number(req.params.id);
-        if (!Number.isFinite(personId) || personId <= 0) {
-            return res.status(400).json({ error: 'invalid person id' });
-        }
-        const { matchEps } = _aiFacesEps();
-        const limit = Math.max(1, Math.min(20, Number(req.query?.limit) || 5));
-        const r = suggestPeopleForPerson(personId, { matchEps, limit });
-        if (!r.ok) {
-            const status = r.reason === 'not_found' ? 404 : 400;
-            return res.status(status).json({ error: r.reason || 'suggest failed' });
-        }
-        res.json({ success: true, personId, matchEps, suggestions: r.suggestions });
     } catch (e) {
         res.status(500).json({ error: e.message });
     }
@@ -9433,33 +10055,18 @@ app.post('/api/ai/people/:id/merge', async (req, res) => {
 // fresh cluster from them. Used when DBSCAN over-merged two similar
 // people — operator picks the faces that look wrong, calls split,
 // gets a new cluster they can rename.
-//
-// Body: `{ faceIds?, downloadIds?, label?|newLabel? }`. When
-// `downloadIds` is supplied (photo-grid split) and `faceIds` is empty,
-// expand to every face of this person on those downloads so sibling
-// detections on the same photo are not left behind.
 app.post('/api/ai/people/:id/split', async (req, res) => {
     try {
-        const personId = Number(req.params.id);
-        if (!Number.isFinite(personId) || personId <= 0) {
-            return res.status(400).json({ error: 'invalid person id' });
-        }
-        let faceIds = Array.isArray(req.body?.faceIds) ? req.body.faceIds : [];
-        const downloadIds = Array.isArray(req.body?.downloadIds) ? req.body.downloadIds : [];
-        const labelRaw = req.body?.label ?? req.body?.newLabel ?? '';
+        const faceIds = Array.isArray(req.body?.faceIds) ? req.body.faceIds : [];
+        // The AI page sends `newLabel`; older clients / scripts send `label`.
         const label =
-            String(labelRaw || '')
+            String(req.body?.newLabel ?? req.body?.label ?? '')
                 .trim()
                 .slice(0, 100) || null;
-        const { splitFacePerson, listFaceIdsForPersonDownloads } = await import('../core/db.js');
-        if (!faceIds.length && downloadIds.length) {
-            faceIds = listFaceIdsForPersonDownloads(personId, downloadIds);
-        }
         if (!faceIds.length) {
-            return res.status(400).json({
-                error: 'faceIds or downloadIds required (non-empty array)',
-            });
+            return res.status(400).json({ error: 'faceIds required (non-empty array)' });
         }
+        const { splitFacePerson } = await import('../core/db.js');
         const r = splitFacePerson(faceIds, label);
         if (!r.personId) {
             return res.status(404).json({ error: 'no faces matched the supplied ids' });
@@ -9504,30 +10111,6 @@ app.post('/api/ai/faces/:id/reassign', async (req, res) => {
     }
 });
 
-// Permanently delete one face detection (used by Unclassified review
-// "remove face" — drops a bad detection so it cannot re-cluster).
-app.delete('/api/ai/faces/:id', async (req, res) => {
-    try {
-        const faceId = Number(req.params.id);
-        if (!Number.isFinite(faceId) || faceId <= 0) {
-            return res.status(400).json({ error: 'invalid face id' });
-        }
-        const r = deleteFace(faceId);
-        if (!r.ok) {
-            const status = r.reason === 'not_found' ? 404 : 400;
-            return res.status(status).json({ error: r.reason || 'delete failed' });
-        }
-        log({
-            source: 'ai',
-            level: 'info',
-            msg: `faces/delete: face=${faceId} oldPerson=${r.oldPersonId ?? 'null'} personDeleted=${r.personDeleted}`,
-        });
-        res.json({ success: true, ...r });
-    } catch (e) {
-        res.status(500).json({ error: e.message });
-    }
-});
-
 app.delete('/api/ai/people/:id', async (req, res) => {
     try {
         const id = Number(req.params.id);
@@ -9536,56 +10119,6 @@ app.delete('/api/ai/people/:id', async (req, res) => {
         }
         const changes = deletePerson(id);
         if (!changes) return res.status(404).json({ error: 'person not found' });
-        res.json({ success: true, id });
-    } catch (e) {
-        res.status(500).json({ error: e.message });
-    }
-});
-
-// Durable exclude — identity stays out of People across Phase B reclusters.
-// Distinct from DELETE above (temporary unassign). Must be registered with
-// the static `/excluded` paths before any ambiguous :id-only catch-alls.
-app.post('/api/ai/people/:id/exclude', async (req, res) => {
-    try {
-        const id = Number(req.params.id);
-        if (!Number.isFinite(id) || id <= 0) {
-            return res.status(400).json({ error: 'invalid person id' });
-        }
-        const r = excludePerson(id);
-        if (!r.ok) {
-            const status = r.reason === 'not_found' ? 404 : 400;
-            return res.status(status).json({ error: r.reason || 'exclude failed' });
-        }
-        log({
-            source: 'ai',
-            level: 'info',
-            msg: `faces/exclude: person=${r.personId} → excluded=${r.excludedId} label=${r.label || ''}`,
-        });
-        res.json({ success: true, ...r });
-    } catch (e) {
-        res.status(500).json({ error: e.message });
-    }
-});
-
-app.get('/api/ai/people/excluded', async (req, res) => {
-    try {
-        const limit = Math.max(1, Math.min(2000, Number(req.query?.limit) || 500));
-        const offset = Math.max(0, Number(req.query?.offset) || 0);
-        const r = listExcludedPeople({ limit, offset });
-        res.json({ success: true, ...r });
-    } catch (e) {
-        res.status(500).json({ error: e.message });
-    }
-});
-
-app.delete('/api/ai/people/excluded/:id', async (req, res) => {
-    try {
-        const id = Number(req.params.id);
-        if (!Number.isFinite(id) || id <= 0) {
-            return res.status(400).json({ error: 'invalid excluded id' });
-        }
-        const changes = deleteExcludedPerson(id);
-        if (!changes) return res.status(404).json({ error: 'excluded person not found' });
         res.json({ success: true, id });
     } catch (e) {
         res.status(500).json({ error: e.message });
@@ -9707,6 +10240,7 @@ app.post('/api/ai/reindex', async (req, res) => {
         // Settle one tick so the scan loops see the abort signal.
         if (cancelled) await new Promise((r) => setTimeout(r, 100));
         const r = resetAllAiData();
+        _purgeFaceCropCache();
         log({
             source: 'ai',
             level: 'info',
@@ -9926,7 +10460,7 @@ app.get(['/api/ai/doctor', '/api/ai/health'], async (_req, res) => {
                 id: 'sidecar',
                 label: 'Python face sidecar',
                 status: 'ok',
-                detail: `v${facesVer} · running at ${st.url}`,
+                detail: `v${facesVer} · ${st.modeLabel || 'running'} at ${st.url}`,
             });
         } else if (st.state === 'downloading') {
             checks.push({
@@ -9954,7 +10488,9 @@ app.get(['/api/ai/doctor', '/api/ai/health'], async (_req, res) => {
                 id: 'sidecar',
                 label: 'Python face sidecar',
                 status: 'info',
-                detail: 'disabled',
+                detail: st.composeFallback
+                    ? 'compose `faces` profile not running — one is auto-spawned in this container once AI + face clustering are on'
+                    : 'disabled',
             });
         }
     } catch (e) {
@@ -10189,7 +10725,10 @@ app.get(['/api/ai/doctor', '/api/ai/health'], async (_req, res) => {
 function _classifyRecoveryGroup(g, dbStats) {
     const id = String(g.id);
     const isSynthetic = id.startsWith('unknown:');
-    const failed = !!g._resolveFailedAt;
+    // Chats the access registry has paused (no account can read them) are
+    // listed here too, with the same reason the Chats page shows.
+    const blocked = !isSynthetic && chatAccess.isBlocked(id) ? chatAccess.accessOf(id) : null;
+    const failed = !!g._resolveFailedAt || !!blocked;
     if (!isSynthetic && !failed) return null;
     const stats = dbStats.get(id) || { files: 0, lastSeen: null };
     return {
@@ -10197,8 +10736,11 @@ function _classifyRecoveryGroup(g, dbStats) {
         name: g.name || id,
         enabled: !!g.enabled,
         isSynthetic,
-        resolveFailedAt: g._resolveFailedAt || null,
-        resolveFailedReason: g._resolveFailedReason || (isSynthetic ? 'index_miss' : null),
+        resolveFailedAt: blocked?.firstSeenAt || g._resolveFailedAt || null,
+        resolveFailedReason: blocked
+            ? `access:${blocked.state}:${blocked.code || ''}`
+            : g._resolveFailedReason || (isSynthetic ? 'index_miss' : null),
+        access: blocked || null,
         monitorAccount: g.monitorAccount || null,
         fileCount: stats.files || 0,
         lastSeenAt: stats.lastSeen || null,
@@ -10218,7 +10760,6 @@ app.get('/api/maintenance/recovery/list', async (req, res) => {
                 .prepare(`
                     SELECT group_id, COUNT(*) AS files, MAX(created_at) AS lastSeen
                       FROM downloads
-                     WHERE (user_deleted IS NULL OR user_deleted = 0)
                      GROUP BY group_id
                 `)
                 .all();
@@ -10355,6 +10896,7 @@ app.post('/api/maintenance/recovery/delete', async (req, res) => {
         cfg.groups = (cfg.groups || []).filter((g) => !ids.includes(String(g.id)));
         const removed = before - (cfg.groups || []).length;
         if (removed) saveConfig(cfg);
+        for (const id of ids) chatAccess.clearAccess(id);
         let purged = { totalRows: 0, totalFiles: 0 };
         if (purgeDownloads) {
             // Synchronous per-id wipe — the Recovery cleanup page already
@@ -10614,6 +11156,18 @@ app.get('/api/backup/destinations/:id/status', async (req, res) => {
     }
 });
 
+// Non-secret provider fields for the Edit form. Secrets never leave the
+// server — the form leaves them blank and PUT keeps the stored values.
+app.get('/api/backup/destinations/:id/config', async (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'bad id' });
+    try {
+        res.json({ success: true, config: backup.getDestinationConfig(id) });
+    } catch (e) {
+        res.status(404).json({ error: e.message });
+    }
+});
+
 app.get('/api/backup/destinations/:id/jobs', async (req, res) => {
     const id = Number(req.params.id);
     if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'bad id' });
@@ -10667,8 +11221,82 @@ app.post('/api/backup/jobs/:id/retry', async (req, res) => {
 // route needs both an entry in PUBLIC_API_PATHS *and* a verifyPeerHmac
 // call in the handler — never one without the other.
 
-function _peerHmacGate(req, res) {
-    const v = verifyPeerHmac(req);
+// ---- Cluster engines: sync poll, /ws/cluster channel, LAN discovery,
+// failover watcher ------------------------------------------------------
+//
+// They run while the cluster is in use — at least one paired, non-revoked
+// peer — so an install that never paired anything opens no socket and
+// sends no LAN beacon. Started (each idempotent):
+//   - at boot when a peer is paired (server.listen callback), so a
+//     restarted node syncs again without anyone opening the dashboard;
+//   - by any /api/cluster request once a peer is paired (the middleware
+//     below, registered ahead of every cluster route);
+//   - right after a handshake pairs a peer (either direction);
+//   - when a paired peer opens /ws/cluster to us (the upgrade handler), so
+//     its events reach the dashboard.
+// The middleware used to be registered after the cluster routes, so only
+// POST /api/cluster/failover/run or an unknown /api/cluster path reached
+// it and the engines normally never ran.
+let _clusterSyncStarted = false;
+function _ensureSyncEngineStarted() {
+    if (_clusterSyncStarted) return;
+    _clusterSyncStarted = true;
+    try {
+        startSyncEngine({ intervalMs: 30_000 });
+    } catch (e) {
+        console.warn('[cluster] sync engine start failed:', e?.message || e);
+    }
+}
+let _clusterDiscoveryStarted = false;
+function _ensureClusterDiscoveryStarted() {
+    if (_clusterDiscoveryStarted) return;
+    _clusterDiscoveryStarted = true;
+    try {
+        const port = Number(process.env.PORT) || 3000;
+        const proto = process.env.PUBLIC_PROTO || 'http';
+        const host = process.env.PUBLIC_HOST || `localhost:${port}`;
+        const selfUrl = process.env.PUBLIC_URL || `${proto}://${host}`;
+        clusterDiscovery.startDiscovery({ selfUrl });
+    } catch (e) {
+        console.warn('[cluster] discovery start failed:', e?.message || e);
+    }
+}
+let _clusterFailoverStarted = false;
+function _ensureClusterFailoverStarted() {
+    if (_clusterFailoverStarted) return;
+    _clusterFailoverStarted = true;
+    try {
+        startFailoverWatcher();
+    } catch (e) {
+        console.warn('[cluster] failover watcher start failed:', e?.message || e);
+    }
+}
+let _clusterEnginesStarted = false;
+function _clusterHasPairedPeer() {
+    try {
+        return listPeers().some((p) => p && p.status !== 'revoked');
+    } catch {
+        return false;
+    }
+}
+function _ensureClusterEngines({ ifPaired = true } = {}) {
+    if (_clusterEnginesStarted) return true;
+    if (ifPaired && !_clusterHasPairedPeer()) return false;
+    _clusterEnginesStarted = true;
+    _ensureSyncEngineStarted();
+    _ensureClusterWsInit();
+    _ensureClusterDiscoveryStarted();
+    _ensureClusterFailoverStarted();
+    return true;
+}
+
+app.use('/api/cluster', (_req, _res, next) => {
+    _ensureClusterEngines();
+    next();
+});
+
+function _peerHmacGate(req, res, opts) {
+    const v = verifyPeerHmac(req, { pairedOnly: true, ...opts });
     if (!v.ok) {
         recordClusterAudit({
             kind: 'request',
@@ -10687,7 +11315,17 @@ function _peerHmacGate(req, res) {
 app.post('/api/cluster/handshake', async (req, res) => {
     // The very first signed call from a new remote peer — no peer row
     // exists yet, so we verify against our local cluster token directly.
-    const v = _peerHmacGate(req, res);
+    // A handshake that carries one of our unexpired pairing codes may
+    // instead be signed with a key derived from that code (the initiator
+    // doesn't hold our token) — see identity.pairingKeysFor. It used to be
+    // checked against the token only, so every pairing-code handshake got
+    // 401 bad_signature.
+    const pairingCode = typeof req.body?.pairing_code === 'string' ? req.body.pairing_code : null;
+    const v = _peerHmacGate(req, res, {
+        expectedToken: pairingCode
+            ? [...pairingKeysFor(pairingCode), getClusterToken()]
+            : getClusterToken(),
+    });
     if (!v) return;
     try {
         const body = req.body || {};
@@ -10709,6 +11347,7 @@ app.post('/api/cluster/handshake', async (req, res) => {
         // just stored about them). The response carries OUR identity for
         // the caller to record symmetrically.
         res.json(peer);
+        _ensureClusterEngines();
     } catch (e) {
         const status = e?.status || 500;
         res.status(status).json({ error: e?.message || String(e), code: e?.code || 'error' });
@@ -10817,6 +11456,7 @@ app.post('/api/cluster/peers', async (req, res) => {
             return res.status(400).json({ error: r.message, code: r.code });
         }
         res.json({ peer: r.peer });
+        _ensureClusterEngines();
     } catch (e) {
         res.status(500).json({ error: e?.message || String(e) });
     }
@@ -10956,7 +11596,6 @@ app.get('/api/cluster/downloads', (req, res) => {
                     `SELECT id, group_id, group_name, message_id, file_name, file_size,
                             file_type, file_path, file_hash, status, created_at, nsfw_score
                        FROM downloads
-                      WHERE (user_deleted IS NULL OR user_deleted = 0)
                       ORDER BY id DESC LIMIT ? OFFSET ?`,
                 )
                 .all(limit, offset);
@@ -11051,11 +11690,14 @@ app.get('/api/cluster/peer-thumbs/:remoteId', async (req, res) => {
             res.setHeader('Cache-Control', 'no-store');
             return res.status(404).type('text/plain').send('No thumb');
         }
+        // getOrCreateThumb() resolves to `{ path, width, mtime }` — the
+        // WebP file in the thumbnail cache. This route used to res.send()
+        // that object: a JSON body (with our absolute cache path) labelled
+        // image/webp. Send the file's bytes.
+        const bytes = await fs.readFile(thumb.path);
         res.setHeader('Content-Type', 'image/webp');
         res.setHeader('Cache-Control', 'private, no-store');
-        if (Buffer.isBuffer(thumb)) return res.send(thumb);
-        if (typeof thumb === 'string') return res.sendFile(thumb);
-        return res.send(thumb);
+        return res.end(bytes);
     } catch (e) {
         recordClusterAudit({
             kind: 'thumb',
@@ -11075,6 +11717,18 @@ const _PEER_THUMB_PLACEHOLDER = Buffer.from(
     'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=',
     'base64',
 );
+
+// The image type of a thumbnail body by its magic bytes (WebP — what the
+// thumbnail cache holds — plus PNG / JPEG), or null.
+function _imageKindOf(buf) {
+    if (!Buffer.isBuffer(buf) || buf.length < 12) return null;
+    if (buf.toString('latin1', 0, 4) === 'RIFF' && buf.toString('latin1', 8, 12) === 'WEBP') {
+        return 'image/webp';
+    }
+    if (buf[0] === 0x89 && buf.toString('latin1', 1, 4) === 'PNG') return 'image/png';
+    if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'image/jpeg';
+    return null;
+}
 
 function _sendPeerThumbPlaceholder(res) {
     res.setHeader('Content-Type', 'image/png');
@@ -11107,12 +11761,16 @@ app.get('/api/cluster/thumbs/:peerId/:remoteId', async (req, res) => {
         if (!upstream.ok) {
             return _sendPeerThumbPlaceholder(res);
         }
-        const ct = upstream.headers.get('content-type') || 'image/webp';
-        res.setHeader('Content-Type', ct);
+        const buf = Buffer.from(await upstream.arrayBuffer());
+        // Peers before the peer-thumbs fix answer 200 with a JSON object
+        // labelled image/webp. Only pass real image bytes on (and never
+        // cache anything else for a day).
+        const kind = _imageKindOf(buf);
+        if (!kind) return _sendPeerThumbPlaceholder(res);
+        res.setHeader('Content-Type', kind);
         // Browser HTTP cache only — content-addressed by (peer, remoteId, w),
         // so a stale cache hit is impossible during the URL's lifetime.
         res.setHeader('Cache-Control', 'public, max-age=86400, immutable');
-        const buf = Buffer.from(await upstream.arrayBuffer());
         res.send(buf);
     } catch (e) {
         recordClusterAudit({
@@ -11141,13 +11799,20 @@ app.post('/api/cluster/sign-url', async (req, res, next) => {
         // requesting peer's browser will fetch this directly. Reuse the
         // existing share infra so revocation + access counters stay one
         // unified source of truth.
-        const expiresAt = Date.now() + Math.max(10, Math.min(3600, Number(ttlSec) || 60)) * 1000;
+        // share_links.expires_at is epoch SECONDS (what /share verifies the
+        // signature against and compares with "now" in seconds). This used
+        // to store milliseconds while signing seconds, so no minted URL
+        // ever verified (401 bad_sig). The response keeps `expiresAt` in
+        // ms (its wire format) and adds `exp` (epoch seconds), which also tells the
+        // requesting peer that the URL works (see requestSignedShareUrl).
+        const ttl = Math.max(10, Math.min(3600, Number(ttlSec) || 60));
+        const expSec = Math.floor(Date.now() / 1000) + ttl;
+        const expiresAt = expSec * 1000;
         const linkRow = createShareLink({
             downloadId: Number(row.id),
-            expiresAt,
+            expiresAt: expSec,
             label: `cluster:${v.peerId.slice(0, 8)}`,
         });
-        const expSec = Math.floor(expiresAt / 1000);
         const baseUrl = (() => {
             const proto =
                 req.headers['x-forwarded-proto'] || (req.socket?.encrypted ? 'https' : 'http');
@@ -11157,6 +11822,7 @@ app.post('/api/cluster/sign-url', async (req, res, next) => {
         res.set('Cache-Control', 'no-store').json({
             url: baseUrl + buildShareUrlPath(linkRow.id, expSec),
             expiresAt,
+            exp: expSec,
         });
     } catch (e) {
         res.status(500).json({ error: e?.message || String(e) });
@@ -11259,8 +11925,8 @@ app.post('/api/cluster/files/delete', async (req, res) => {
         }
         const r = await safeResolveDownload(row.file_path);
         let freedBytes = 0;
-        const keepers = liveIdsSharingFilePath(row.file_path, { exceptIds: [Number(row.id)] });
-        if (r.ok && keepers.length === 0) {
+        // Another local row (download-time dedup) may still use the file.
+        if (r.ok && !idsWithFileInUse([Number(row.id)]).has(Number(row.id))) {
             try {
                 const { deferDelete } = await import('../core/deferred-delete.js');
                 deferDelete(r.real);
@@ -11275,12 +11941,13 @@ app.post('/api/cluster/files/delete', async (req, res) => {
         const seekbarRow = getDb()
             .prepare('SELECT sprite_path, meta_path FROM seekbar_sprites WHERE download_id = ?')
             .get(Number(row.id));
-        // Soft-delete via deleteDownloadsBy so faces / embeddings / pending
-        // backup jobs are wiped. Tombstone keeps isDownloaded() true.
-        deleteDownloadsBy({ ids: [Number(row.id)] });
-        if (freedBytes > 0) runtime.decrementDiskUsage(freedBytes);
+        rememberDeletedDownloads([Number(row.id)]);
+        getDb().prepare('DELETE FROM downloads WHERE id = ?').run(Number(row.id));
         purgeThumbsForDownload(row.id).catch(() => {});
         purgeSeekbarForDownload(row.id, seekbarRow || undefined).catch(() => {});
+        try {
+            purgeOrphanPeople();
+        } catch {}
         import('../core/deferred-delete.js').then((m) => m.startDrain()).catch(() => {});
         recordClusterAudit({
             kind: 'cross_delete',
@@ -11310,14 +11977,13 @@ app.get('/api/cluster/search/peer', (req, res) => {
     const limit = Math.max(1, Math.min(200, Number(req.query.limit) || 50));
     if (!q) return res.json({ rows: [] });
     try {
-        const like = `%${q.replace(/[%_]/g, '\\$&')}%`;
+        const like = `%${q.replace(/[\\%_]/g, '\\$&')}%`;
         const rows = getDb()
             .prepare(
                 `SELECT id, group_id, group_name, message_id, file_name, file_size, file_type,
                         file_path, file_hash, status, created_at, nsfw_score
                    FROM downloads
-                  WHERE (file_name LIKE ? ESCAPE '\\' OR group_name LIKE ? ESCAPE '\\')
-                    AND (user_deleted IS NULL OR user_deleted = 0)
+                  WHERE file_name LIKE ? ESCAPE '\\' OR group_name LIKE ? ESCAPE '\\'
                   ORDER BY created_at DESC
                   LIMIT ?`,
             )
@@ -11334,15 +12000,14 @@ app.get('/api/cluster/search', async (req, res) => {
     const limit = Math.max(1, Math.min(200, Number(req.query.limit) || 50));
     if (!q) return res.json({ rows: [] });
     try {
-        const like = `%${q.replace(/[%_]/g, '\\$&')}%`;
+        const like = `%${q.replace(/[\\%_]/g, '\\$&')}%`;
         const ownPid = getSelfPeerId();
         const local = getDb()
             .prepare(
                 `SELECT id, group_id, group_name, message_id, file_name, file_size, file_type,
                         file_path, file_hash, status, created_at, nsfw_score
                    FROM downloads
-                  WHERE (file_name LIKE ? ESCAPE '\\' OR group_name LIKE ? ESCAPE '\\')
-                    AND (user_deleted IS NULL OR user_deleted = 0)
+                  WHERE file_name LIKE ? ESCAPE '\\' OR group_name LIKE ? ESCAPE '\\'
                   ORDER BY created_at DESC LIMIT ?`,
             )
             .all(like, like, limit);
@@ -11423,7 +12088,7 @@ app.get('/api/cluster/stats', async (_req, res) => {
         const localBytes = (() => {
             try {
                 return getDb()
-                    .prepare('SELECT COALESCE(SUM(file_size),0) AS n FROM downloads WHERE (user_deleted IS NULL OR user_deleted = 0)')
+                    .prepare('SELECT COALESCE(SUM(file_size),0) AS n FROM downloads')
                     .get().n;
             } catch {
                 return 0;
@@ -11450,52 +12115,6 @@ app.get('/api/cluster/stats', async (_req, res) => {
     } catch (e) {
         res.status(500).json({ error: e?.message || String(e) });
     }
-});
-
-// Start the sync engine on first cluster route hit. It will poll every
-// 30s; idempotent if already running.
-let _clusterSyncStarted = false;
-function _ensureSyncEngineStarted() {
-    if (_clusterSyncStarted) return;
-    _clusterSyncStarted = true;
-    try {
-        startSyncEngine({ intervalMs: 30_000 });
-    } catch (e) {
-        console.warn('[cluster] sync engine start failed:', e?.message || e);
-    }
-}
-let _clusterDiscoveryStarted = false;
-function _ensureClusterDiscoveryStarted() {
-    if (_clusterDiscoveryStarted) return;
-    _clusterDiscoveryStarted = true;
-    try {
-        const port = Number(process.env.PORT) || 3000;
-        const proto = process.env.PUBLIC_PROTO || 'http';
-        const host = process.env.PUBLIC_HOST || `localhost:${port}`;
-        const selfUrl = process.env.PUBLIC_URL || `${proto}://${host}`;
-        clusterDiscovery.startDiscovery({ selfUrl });
-    } catch (e) {
-        console.warn('[cluster] discovery start failed:', e?.message || e);
-    }
-}
-
-let _clusterFailoverStarted = false;
-function _ensureClusterFailoverStarted() {
-    if (_clusterFailoverStarted) return;
-    _clusterFailoverStarted = true;
-    try {
-        startFailoverWatcher();
-    } catch (e) {
-        console.warn('[cluster] failover watcher start failed:', e?.message || e);
-    }
-}
-
-app.use('/api/cluster', (_req, _res, next) => {
-    _ensureSyncEngineStarted();
-    _ensureClusterWsInit();
-    _ensureClusterDiscoveryStarted();
-    _ensureClusterFailoverStarted();
-    next();
 });
 
 // Manual failover sweep (admin) — useful when an operator wants to
@@ -11575,11 +12194,9 @@ app.post('/api/share/links', async (req, res) => {
         if (!Number.isInteger(did) || did <= 0) {
             return res.status(400).json({ error: 'downloadId required' });
         }
-        // Confirm the download row exists and is not soft-deleted — otherwise
-        // the link would perpetually 404, and we'd be storing useless rows.
-        const exists = getDb()
-            .prepare('SELECT id FROM downloads WHERE id = ? AND (user_deleted IS NULL OR user_deleted = 0)')
-            .get(did);
+        // Confirm the download row exists — otherwise the link would
+        // perpetually 404, and we'd be storing useless rows.
+        const exists = getDb().prepare('SELECT id FROM downloads WHERE id = ?').get(did);
         if (!exists) return res.status(404).json({ error: 'Download not found' });
 
         // Pass through whatever the caller sent (including null/undefined).
@@ -11794,7 +12411,14 @@ app.get('/api/maintenance/config/raw', async (req, res) => {
         if (config.telegram?.apiHash) config.telegram.apiHash = '••••••• (redacted)';
         if (config.web?.passwordHash) config.web.passwordHash = '••••••• (redacted)';
         if (config.web?.password) config.web.password = '••••••• (redacted)';
+        if (config.web?.guestPasswordHash) config.web.guestPasswordHash = '••••••• (redacted)';
+        if (config.web?.shareSecret) config.web.shareSecret = '••••••• (redacted)';
         if (config.proxy?.password) config.proxy.password = '••••••• (redacted)';
+        for (const block of [config.advanced?.nsfw, config.advanced?.seekbar]) {
+            if (block?.apiToken) block.apiToken = '••••••• (redacted)';
+        }
+        const rawFaces = config.advanced?.ai?.faces;
+        if (rawFaces?.sidecarToken) rawFaces.sidecarToken = '••••••• (redacted)';
         if (Array.isArray(config.accounts)) {
             // Phone numbers are stored alongside the metadata; keep but show
             // the user what they're about to download.
@@ -11821,6 +12445,30 @@ app.get('/api/config', async (req, res) => {
         if (safe.web) {
             delete safe.web.password;
             delete safe.web.passwordHash;
+            // Write-only secrets, same shape as the sidecar tokens below: a
+            // `<name>Set` presence flag instead of the value. The share
+            // secret signs share links / file tokens and keys the backup
+            // credential blobs; the guest hash is managed by
+            // /api/auth/guest-password. POST keeps both when they're left out.
+            safe.web.shareSecretSet = !!safe.web.shareSecret;
+            delete safe.web.shareSecret;
+            safe.web.guestPasswordHashSet = !!safe.web.guestPasswordHash;
+            delete safe.web.guestPasswordHash;
+        }
+        if (safe.proxy && typeof safe.proxy === 'object') {
+            safe.proxy.passwordSet = !!safe.proxy.password;
+            delete safe.proxy.password;
+        }
+        // Sidecar tokens are write-only from the dashboard's point of view.
+        for (const block of [safe.advanced?.nsfw, safe.advanced?.seekbar]) {
+            if (!block || typeof block !== 'object') continue;
+            block.apiTokenSet = !!block.apiToken;
+            delete block.apiToken;
+        }
+        const safeFaces = safe.advanced?.ai?.faces;
+        if (safeFaces && typeof safeFaces === 'object') {
+            safeFaces.sidecarTokenSet = !!safeFaces.sidecarToken;
+            delete safeFaces.sidecarToken;
         }
         if (Array.isArray(safe.accounts)) {
             safe.accounts = safe.accounts.map((a) => ({
@@ -11860,6 +12508,15 @@ app.get('/api/rescue/stats', async (req, res) => {
         console.error('GET /api/rescue/stats:', e);
         res.status(500).json({ error: 'Internal error' });
     }
+});
+
+// CSP editor support: shipped defaults (for "Reset") + whether TGDL_CSP=off
+// is overriding the saved setting. Admin-only (not in the guest allow-list).
+app.get('/api/csp', (req, res) => {
+    res.json({
+        defaults: getDefaultCsp(),
+        envOff: String(process.env.TGDL_CSP || '').toLowerCase() === 'off',
+    });
 });
 
 // 7b. Config Update
@@ -11915,6 +12572,8 @@ app.post('/api/config', async (req, res) => {
             // field to remove it.
             const merged = { ...(currentConfig.proxy || {}), ...req.body.proxy };
             for (const k of Object.keys(merged)) if (merged[k] === null) delete merged[k];
+            // Read-only flag from GET /api/config, never stored.
+            delete merged.passwordSet;
             newConfig.proxy = merged;
         }
         if (req.body.web) {
@@ -11924,6 +12583,17 @@ app.post('/api/config', async (req, res) => {
             delete safeWeb.password;
             if (!currentConfig.web?.passwordHash) delete safeWeb.passwordHash;
             else safeWeb.passwordHash = currentConfig.web.passwordHash;
+            // Read-only flags from GET /api/config, never stored. The values
+            // they stand for stay as saved unless the body names them.
+            delete safeWeb.shareSecretSet;
+            delete safeWeb.guestPasswordHashSet;
+            if (req.body.web.csp === null) {
+                delete safeWeb.csp; // reset to defaults
+            } else if (req.body.web.csp !== undefined) {
+                const v = validateCsp(req.body.web.csp);
+                if (!v.ok) return res.status(400).json({ error: v.error });
+                safeWeb.csp = v.value;
+            }
             newConfig.web = safeWeb;
         }
 
@@ -12007,6 +12677,8 @@ app.post('/api/config', async (req, res) => {
                             ...((cur.ai || {}).faces || {}),
                             ...inc.ai.faces,
                         };
+                        // Read-only flag from GET /api/config, never stored.
+                        delete merged.faces.sidecarTokenSet;
                     }
                     return merged;
                 })(),
@@ -12057,7 +12729,6 @@ app.post('/api/config', async (req, res) => {
             if (d.maxConcurrency < d.minConcurrency) d.maxConcurrency = d.minConcurrency;
             d.scalerIntervalSec = clampInt(d.scalerIntervalSec, 1, 600, 5);
             d.idleSleepMs = clampInt(d.idleSleepMs, 50, 10000, 200);
-            d.spilloverThreshold = clampInt(d.spilloverThreshold, 100, 100000, 2000);
 
             const h = merged.history;
             h.backpressureCap = clampInt(h.backpressureCap, 10, 100000, BACKPRESSURE_CAP_DEFAULT);
@@ -12123,6 +12794,12 @@ app.post('/api/config', async (req, res) => {
                 .map((s) => String(s).toLowerCase())
                 .filter((s) => ALLOWED_TYPES.includes(s));
             if (!ns.fileTypes.length) ns.fileTypes = NSFW_DEFAULTS.fileTypes.slice();
+            // External sidecar: URL, shared token, app→sidecar path map.
+            // GET /api/config never returns the token (apiTokenSet instead).
+            ns.sidecarUrl = typeof ns.sidecarUrl === 'string' ? ns.sidecarUrl.trim() : '';
+            ns.apiToken = typeof ns.apiToken === 'string' ? ns.apiToken.trim().slice(0, 256) : '';
+            ns.pathMap = typeof ns.pathMap === 'string' ? ns.pathMap.slice(0, 4096) : '';
+            delete ns.apiTokenSet;
 
             // AI subsystem (semantic search + auto-tag + face clustering).
             // All values are config-driven — same posture as NSFW. Master
@@ -12130,6 +12807,19 @@ app.post('/api/config', async (req, res) => {
             // an operator flips master to true they get all three out of
             // the box.
             const ai = merged.ai;
+            if (ai.faces && typeof ai.faces === 'object') {
+                // External sidecar: token + app→sidecar path map, strings only.
+                if ('pathMap' in ai.faces) {
+                    ai.faces.pathMap =
+                        typeof ai.faces.pathMap === 'string' ? ai.faces.pathMap.slice(0, 4096) : '';
+                }
+                if ('sidecarToken' in ai.faces) {
+                    ai.faces.sidecarToken =
+                        typeof ai.faces.sidecarToken === 'string'
+                            ? ai.faces.sidecarToken.trim().slice(0, 256)
+                            : '';
+                }
+            }
             ai.enabled = ai.enabled === true;
             ai.semanticSearch = ai.semanticSearch !== false;
             ai.autoTags = ai.autoTags !== false;
@@ -12292,6 +12982,8 @@ app.post('/api/config', async (req, res) => {
             // it alongside the dashboard passwordHash).
             sk.sidecarUrl = typeof sk.sidecarUrl === 'string' ? sk.sidecarUrl.trim() : '';
             sk.apiToken = typeof sk.apiToken === 'string' ? sk.apiToken.trim().slice(0, 256) : '';
+            sk.pathMap = typeof sk.pathMap === 'string' ? sk.pathMap.slice(0, 4096) : '';
+            delete sk.apiTokenSet;
 
             const sc = merged.similarClips;
             const scDef = SIMILAR_CLIPS_DEFAULTS;
@@ -12350,6 +13042,10 @@ app.post('/api/config', async (req, res) => {
             sc.floorIntervalSec = clampFloat(sc.floorIntervalSec, 0.5, 30, scDef.floorIntervalSec);
             delete sc.fingerprintFps;
 
+            // `advanced.goCore` (the old tgdl-core mode switches) is no
+            // longer read; like any key not listed above it is dropped on
+            // the next save.
+
             newConfig.advanced = merged;
         }
 
@@ -12376,7 +13072,7 @@ app.post('/api/config', async (req, res) => {
         // so a save takes effect immediately without a process restart.
         try {
             applyShareLimits(newConfig.advanced?.share || {});
-            _invalidateShareConfigCache();
+            _applyShareRateLimit(newConfig.advanced?.share || {});
         } catch {}
 
         // Reset the lazy AccountManager singleton if Telegram credentials
@@ -12390,7 +13086,10 @@ app.post('/api/config', async (req, res) => {
 
         // Refresh the cached rate-limit config so the toggle / RPM change
         // takes effect immediately instead of waiting for the 30s sweep.
-        if (req.body.web?.rateLimit) refreshRateLimitConfig();
+        if (req.body.web?.rateLimit) await refreshRateLimitConfig();
+        // And the tgdl-core front server has the new auth / Force HTTPS /
+        // rate-limit / CSP state before the caller sees the save succeed.
+        if (req.body.web) await pushFrontState().catch(() => {});
 
         // Restart the disk rotator if the user changed any diskManagement
         // field — picks up the new cap / enabled / interval on the very next
@@ -12485,10 +13184,15 @@ app.post('/api/config', async (req, res) => {
                 // rather than the merged config so a no-op save doesn't restart.
                 const bodyAi = req.body.advanced.ai || {};
                 const bodyFaces = bodyAi.faces || {};
+                // `enabled` too: the auto-spawned sidecar only starts once AI
+                // is switched on, so flipping it has to (re)run the spawn path.
                 const needsRestart =
                     bodyFaces.detectorModel !== undefined ||
                     bodyFaces.providers !== undefined ||
                     bodyFaces.backend !== undefined ||
+                    bodyFaces.sidecarUrl !== undefined ||
+                    bodyFaces.sidecarToken !== undefined ||
+                    bodyAi.enabled !== undefined ||
                     bodyAi.faceClustering !== undefined;
                 if (needsRestart && facesSpawnMod) {
                     facesSpawnMod.stopSidecar();
@@ -12507,8 +13211,13 @@ app.post('/api/config', async (req, res) => {
             }
         }
 
-        // Re-init NSFW sidecar when the URL changes.
-        if (req.body.advanced?.nsfw?.sidecarUrl !== undefined) {
+        // Re-init the NSFW sidecar client when its URL / token / path map change.
+        const nsIn = req.body.advanced?.nsfw || {};
+        if (
+            nsIn.sidecarUrl !== undefined ||
+            nsIn.apiToken !== undefined ||
+            nsIn.pathMap !== undefined
+        ) {
             try {
                 initNsfwSidecar(loadConfig());
             } catch {}
@@ -12545,7 +13254,7 @@ app.put('/api/groups/:id', async (req, res) => {
                 groupName === groupId ||
                 groupName.startsWith('Group ')
             ) {
-                const r = await resolveEntityAcrossAccounts(groupId);
+                const r = await resolveEntityAcrossAccounts(groupId, { force: true });
                 if (r?.entity) {
                     const e = r.entity;
                     groupName =
@@ -12650,7 +13359,10 @@ app.put('/api/groups/:id', async (req, res) => {
         // "Monitored Only" tab keeps the group hidden for up to
         // DIALOG_CACHE_TTL_MS even though it's now in config.
         _dialogsResponseCache = { at: 0, body: null };
-        broadcast({ type: 'config_updated', config });
+        // Payload-less like every other config_updated: the dashboard
+        // refetches /api/config, and the event also reaches guest sockets,
+        // which must never see password hashes or the share secret.
+        broadcast({ type: 'config_updated' });
 
         // Auto-backfill on first add (v2.3.34) — when a group transitions
         // from "never seen / disabled" → "enabled" AND has zero rows in
@@ -12718,6 +13430,9 @@ async function _spawnInternalBackfill({
     const config = loadConfig();
     const group = (config.groups || []).find((g) => String(g.id) === groupKey);
     if (!group) throw new Error('Group not configured');
+    // Auto-first / catch-up backfills never start on a chat no account
+    // can read — that would only spend calls to fail.
+    if (chatAccess.isBlockingState(chatAccess.effectiveAccess(group).state)) return null;
 
     const { HistoryDownloader } = await import('../core/history.js');
     const { DownloadManager } = await import('../core/downloader.js');
@@ -12821,6 +13536,10 @@ async function _spawnInternalBackfill({
             saveHistoryJobsToStore();
             if (_activeBackfillsByGroup.get(groupKey) === jobId)
                 _activeBackfillsByGroup.delete(groupKey);
+            // Evict like the success path; a group that fails its catch-up
+            // on every boot / gap check otherwise accumulated one entry per
+            // attempt for the life of the process.
+            setTimeout(() => _historyJobs.delete(jobId), HISTORY_JOB_TTL_MS);
         });
     return jobId;
 }
@@ -12908,6 +13627,10 @@ app.get('/api/groups/:id/photo', async (req, res) => {
     const url = await downloadProfilePhoto(id);
     if (url && existsSync(photoPath)) return send();
 
+    // The 404 itself stays uncached (the /api/* no-store default): a
+    // browser-cached miss would keep hiding a photo that "Refresh photos"
+    // fetched a minute later. Repeat misses are cheap anyway — answered
+    // from the server-side miss caches above without touching Telegram.
     res.status(404).send('Not found');
 });
 
@@ -12926,10 +13649,20 @@ app.post('/api/groups/refresh-info', async (req, res) => {
         const config = loadConfig();
         const ids = new Set((config.groups || []).map((g) => String(g.id)));
         try {
-            const rows = getDb()
-                .prepare('SELECT DISTINCT group_id, group_name FROM downloads LIMIT 10000')
-                .all();
-            for (const rr of rows) ids.add(String(rr.group_id));
+            // One row per group from the (usually still cached) sidebar
+            // aggregate instead of another DISTINCT pass over every row.
+            for (const rr of getGroupAggregates()) {
+                if (ids.size >= 10000) break;
+                ids.add(String(rr.group_id));
+            }
+        } catch {}
+        let renameStmt = null;
+        try {
+            // Seeks idx_group_name_size (group_id = ?) — one prepare for the
+            // whole sweep instead of one per group.
+            renameStmt = getDb().prepare(
+                `UPDATE downloads SET group_name = ? WHERE group_id = ? AND (group_name IS NULL OR group_name = '' OR group_name = 'Unknown' OR group_name = ?)`,
+            );
         } catch {}
 
         let updated = 0;
@@ -12939,7 +13672,12 @@ app.post('/api/groups/refresh-info', async (req, res) => {
         let processed = 0;
         onProgress({ processed: 0, total, updated: 0, stage: 'resolving' });
         for (const id of ids) {
-            const resolved = await resolveEntityAcrossAccounts(id);
+            // Chats no account can read are skipped (the sidebar asks for
+            // this sweep whenever a name looks unresolved — a dead chat
+            // never resolves, so it used to be re-asked on every render).
+            const resolved = chatAccess.isBlocked(id)
+                ? null
+                : await resolveEntityAcrossAccounts(id, { force: true });
             if (resolved) {
                 const { entity } = resolved;
                 const realName =
@@ -12961,10 +13699,7 @@ app.post('/api/groups/refresh-info', async (req, res) => {
                         mutatedConfig = true;
                     }
                     try {
-                        const stmt = getDb().prepare(
-                            `UPDATE downloads SET group_name = ? WHERE group_id = ? AND (group_name IS NULL OR group_name = '' OR group_name = 'Unknown' OR group_name = ?)`,
-                        );
-                        stmt.run(realName, id, id);
+                        renameStmt?.run(realName, id, id);
                     } catch {}
                     updates.push({ id, name: realName });
                     updated++;
@@ -13008,7 +13743,7 @@ app.post('/api/groups/refresh-photos', async (req, res) => {
         const results = [];
         onProgress({ processed: 0, total, stage: 'downloading' });
         for (const group of groups) {
-            const url = await downloadProfilePhoto(group.id).catch(() => null);
+            const url = await downloadProfilePhoto(group.id, { force: true }).catch(() => null);
             results.push({ id: group.id, url });
             processed += 1;
             onProgress({ processed, total, stage: 'downloading' });
@@ -13028,10 +13763,62 @@ app.get('/api/groups/refresh-photos/status', async (req, res) => {
 });
 
 // ============ FILE SERVING ============
-// Serve files from data/downloads. Uses safeResolveDownload to reject path
-// traversal, NUL bytes, and symlink escapes. Adds Content-Disposition so a
-// rogue HTML file can't be rendered inline (the browser still inlines images
-// and videos via the explicit ?inline=1 query parameter the SPA passes).
+// Local files (/files/<path> under data/downloads) are served by tgdl-core's
+// front server (core-service/internal/front): tokens, sessions, Range,
+// conditional requests, Content-Disposition, and the 400 / 403 / 404
+// answers. What stays here needs Node: the cluster bridge, federated
+// `?peer=` fetches, and the inline HEIC transcode (sharp). Everything
+// checkAuth refuses never gets this far.
+
+// Media has nothing to be served from without tgdl-core on PORT: answer
+// the way the tgdl-core-backed routes do while it can't run.
+function mediaUnavailable(res) {
+    res.status(503).json({
+        error: 'tgdl-core is not serving this port, so media is unavailable. Reinstall tgdl-core or run "npm run build:core", then restart the app.',
+        code: 'TGDL_CORE_UNAVAILABLE',
+    });
+}
+function requireFront(req, res, next) {
+    if (req[VIA_FRONT] !== undefined) return next();
+    mediaUnavailable(res);
+}
+
+// A file the front server found missing (its 404 already went out): drop
+// the rows that point at it and tell the dashboard. STRICT match on
+// file_path only — matching by file_name was unsafe because two groups can
+// hold files with the same timestamp-based basename, and a 404 on one would
+// mass-delete the other's rows. Not done when the file's folder is missing
+// too: the disk is more likely unmounted (or the group folder renamed) than
+// the file deleted, so the rows stay.
+async function pruneMissingDownload(reqPath) {
+    const r = await safeResolveDownload(reqPath);
+    if (r.ok || r.reason !== 'missing') return;
+    // ('missing' already implies the path passed the containment checks;
+    // re-check so nothing outside DOWNLOADS_DIR is probed.)
+    const downloadsRoot = path.resolve(DOWNLOADS_DIR);
+    const parentDir = path.dirname(path.resolve(downloadsRoot, reqPath));
+    if (!parentDir.startsWith(downloadsRoot + path.sep) || !existsSync(parentDir)) return;
+    const fwd = reqPath.replace(/\\/g, '/');
+    const bwd = fwd.replace(/\//g, '\\');
+    const db = getDb();
+    const matchIds = db
+        .prepare('SELECT id FROM downloads WHERE file_path = ? OR file_path = ?')
+        .all(fwd, bwd)
+        .map((row) => row.id);
+    if (!matchIds.length) return;
+    const seekbarMap = collectSeekbarPaths(matchIds);
+    const result = db
+        .prepare(`DELETE FROM downloads WHERE file_path = ? OR file_path = ?`)
+        .run(fwd, bwd);
+    if (result.changes > 0) {
+        for (const id of matchIds) {
+            purgeThumbsForDownload(id).catch(() => {});
+            purgeSeekbarForDownload(id, seekbarMap.get(id)).catch(() => {});
+        }
+        broadcast({ type: 'file_deleted', path: fwd, autoPruned: true });
+    }
+}
+
 app.use('/files', async (req, res, next) => {
     try {
         let reqPath;
@@ -13062,9 +13849,12 @@ app.use('/files', async (req, res, next) => {
                     const url = await requestSignedShareUrl(ref.peerId, ownerRow.file_path);
                     return res.redirect(302, url);
                 } catch (e) {
-                    return res
-                        .status(502)
-                        .json({ error: 'storage_offline', message: e?.message || String(e) });
+                    // An older peer's URL wouldn't verify: proxy instead.
+                    if (e?.code !== 'LEGACY_SIGN_URL') {
+                        return res
+                            .status(502)
+                            .json({ error: 'storage_offline', message: e?.message || String(e) });
+                    }
                 }
             }
             return streamFromPeer(req, res, ref.peerId, ownerRow.file_path);
@@ -13091,53 +13881,32 @@ app.use('/files', async (req, res, next) => {
                     const url = await requestSignedShareUrl(peerIdParam, peerSidePath);
                     return res.redirect(302, url);
                 } catch (e) {
-                    return res
-                        .status(502)
-                        .json({ error: 'storage_offline', message: e?.message || String(e) });
+                    // An older peer's URL wouldn't verify: proxy instead.
+                    if (e?.code !== 'LEGACY_SIGN_URL') {
+                        return res
+                            .status(502)
+                            .json({ error: 'storage_offline', message: e?.message || String(e) });
+                    }
                 }
             }
             return streamFromPeer(req, res, peerIdParam, peerSidePath);
         }
 
+        // Local file: tgdl-core answers it. Only the HEIC / HEIF inline view
+        // is Node's — browsers don't render the format natively (Safari
+        // excepted, and even there only on iOS / macOS), so it is transcoded
+        // to JPEG via sharp's built-in libheif and cached; the second open is
+        // a plain stream. A download (`?inline=1` absent) keeps the original
+        // bytes and is tgdl-core's.
         const r = await safeResolveDownload(reqPath);
-        if (!r.ok) {
-            // Distinguish "genuinely missing" from "blocked for safety" so
-            // users see "File not found" instead of a misleading "Forbidden"
-            // when a file was rotated/deleted but the DB row lingered.
-            const status = r.reason === 'missing' ? 404 : 403;
-            // Auto-prune the DB row for genuinely-missing files so the
-            // gallery stops listing them on next refresh. STRICT match on
-            // file_path only — matching by file_name was unsafe because
-            // two groups can hold files with the same timestamp-based
-            // basename, and a 404 on one would mass-delete the other's
-            // rows. Done in the background so the HTTP response isn't
-            // blocked by the DB write.
-            if (r.reason === 'missing') {
-                autoPruneMissingPath(reqPath);
-            }
-            return res.status(status).send(r.reason === 'missing' ? 'File not found' : 'Forbidden');
-        }
-
-        const inline = req.query.inline === '1';
-        const baseName = path.basename(r.real);
-        // RFC 5987 — `filename*` for UTF-8, plus an ASCII fallback for legacy
-        // clients. Some browsers / proxies still parse the basic `filename=`
-        // first, so omitting it leaves the file with a generic name.
-        const dispKind = inline ? 'inline' : 'attachment';
-        const asciiName = baseName.replace(/[^\x20-\x7e]/g, '_');
-        res.setHeader(
-            'Content-Disposition',
-            `${dispKind}; filename="${asciiName}"; filename*=UTF-8''${encodeURIComponent(baseName)}`,
-        );
-
-        // HEIC / HEIF inline view — browsers don't render the format
-        // natively (Safari excepted, and even there only on iOS / macOS).
-        // For inline requests we transcode on the fly to JPEG via sharp's
-        // built-in libheif (compiled into the prebuilt sharp binary), and
-        // cache the result so the second open is a static stream. Disk
-        // download (`?inline=1` absent) keeps the original .heic bytes.
-        const heicExt = path.extname(r.real).toLowerCase();
-        if (inline && (heicExt === '.heic' || heicExt === '.heif')) {
+        const heicExt = r.ok ? path.extname(r.real).toLowerCase() : '';
+        if (req.query.inline === '1' && (heicExt === '.heic' || heicExt === '.heif')) {
+            if (req[VIA_FRONT] === undefined) return mediaUnavailable(res);
+            const baseName = path.basename(r.real);
+            res.setHeader(
+                'Content-Disposition',
+                `inline; filename="${baseName.replace(/[^\x20-\x7e]/g, '_')}"; filename*=UTF-8''${encodeURIComponent(baseName)}`,
+            );
             try {
                 const cachePath = await _heicInlineCache(r.real);
                 res.setHeader('Content-Type', 'image/jpeg');
@@ -13145,10 +13914,11 @@ app.use('/files', async (req, res, next) => {
                 return res.sendFile(cachePath);
             } catch (e) {
                 console.warn('[heic] inline transcode failed:', baseName, e?.message || e);
-                // Fall through to raw .heic — Safari users still get the file.
+                // Fall through to the raw .heic — Safari users still get the file.
+                return res.sendFile(r.real);
             }
         }
-        res.sendFile(r.real);
+        return mediaUnavailable(res);
     } catch (e) {
         next();
     }
@@ -13191,8 +13961,25 @@ async function loadSession() {
     return '';
 }
 
-async function connectTelegram() {
-    if (telegramClient && isConnected) return telegramClient;
+// A failed attempt (e.g. a revoked legacy session) is retried at most
+// every 5 min — this runs on every entity-cache miss, and each attempt
+// opens a new MTProto connection.
+const LEGACY_RETRY_MS = 5 * 60 * 1000;
+let _legacyRetryAt = 0;
+let _legacyConnecting = null;
+
+function connectTelegram() {
+    if (telegramClient && isConnected) return Promise.resolve(telegramClient);
+    if (Date.now() < _legacyRetryAt) return Promise.resolve(null);
+    if (!_legacyConnecting) {
+        _legacyConnecting = _connectLegacy().finally(() => {
+            _legacyConnecting = null;
+        });
+    }
+    return _legacyConnecting;
+}
+
+async function _connectLegacy() {
     // Quiet, configuration-aware: no creds → no work, no scary warning.
     let config;
     try {
@@ -13202,30 +13989,59 @@ async function connectTelegram() {
         return null;
     }
     if (!config.telegram?.apiId || !config.telegram?.apiHash) return null;
+    // AccountManager owns every account in data/sessions/ — including the
+    // migrated copy of data/session.enc. Connecting the legacy file as well
+    // would put the same auth key on two connections (AUTH_KEY_DUPLICATED).
+    if (hasAccountSessions()) {
+        _legacyRetryAt = Date.now() + LEGACY_RETRY_MS;
+        return null;
+    }
 
+    let client = null;
     try {
         const sessionString = await loadSession();
         if (!sessionString) return null;
-        const stringSession = new StringSession(sessionString);
-        telegramClient = new TelegramClient(
-            stringSession,
+        client = new TelegramClient(
+            new DedupStringSession(sessionString),
             parseInt(config.telegram.apiId),
             config.telegram.apiHash,
             { connectionRetries: 3, useWSS: false },
         );
-        telegramClient.setLogLevel('none');
-        await telegramClient.connect();
-        if (await telegramClient.isUserAuthorized()) {
+        client.setLogLevel('none');
+        await client.connect();
+        // Re-check: AccountManager may have migrated this session while we
+        // were connecting (first boot after upgrading from a single-session
+        // install).
+        if (hasAccountSessions()) {
+            await client.destroy().catch(() => {});
+            _legacyRetryAt = Date.now() + LEGACY_RETRY_MS;
+            return null;
+        }
+        if (await client.isUserAuthorized()) {
+            telegramClient = client;
             isConnected = true;
             console.log(
                 '✅ Telegram connected (legacy single-session client; AccountManager is the canonical source)',
             );
-            return telegramClient;
+            return client;
         }
     } catch (error) {
         console.log('⚠️ Telegram connect attempt failed:', error.message);
     }
+    // destroy(), not disconnect(): only destroy() stops gramJS's update
+    // loop, which otherwise keeps the client (and its socket) alive forever.
+    if (client) await client.destroy().catch(() => {});
+    _legacyRetryAt = Date.now() + LEGACY_RETRY_MS;
     return null;
+}
+
+async function dropLegacyClientIfOwned() {
+    if (!telegramClient || !hasAccountSessions()) return;
+    const c = telegramClient;
+    telegramClient = null;
+    isConnected = false;
+    _legacyRetryAt = Date.now() + LEGACY_RETRY_MS;
+    await c.destroy().catch(() => {});
 }
 
 // Entity & Photo Helpers — stores `{ entity, client, at }` (NOT bare entity).
@@ -13235,13 +14051,27 @@ async function connectTelegram() {
 // hard cap so a long-running process doesn't grow this Map without bound.
 const entityCache = new Map();
 const ENTITY_CACHE_TTL_MS = 30 * 60 * 1000;
+// Definite misses (every connected account answered "no such chat" —
+// left it, deleted, never joined; see lib/entity-lookup.js) are cached as
+// `{ entity: null }` for a shorter window, so avatar renders don't re-ask
+// each account for the same unknown id. Transient failures (FLOOD_WAIT,
+// timeouts, connection errors) are never cached.
+const ENTITY_MISS_TTL_MS = 10 * 60 * 1000;
 const ENTITY_CACHE_MAX = 5000;
 
-/** Walk every loaded account looking for one that can resolve `idStr`. */
-async function resolveEntityAcrossAccounts(idStr) {
+/**
+ * Walk every loaded account looking for one that can resolve `idStr`.
+ * `force` skips the failed-lookup cache — refresh-info, PUT
+ * /api/groups/:id and Refresh photos always ask Telegram again.
+ */
+async function resolveEntityAcrossAccounts(idStr, { force = false } = {}) {
     const cached = entityCache.get(idStr);
-    if (cached && Date.now() - cached.at < ENTITY_CACHE_TTL_MS) {
-        return { entity: cached.entity, client: cached.client };
+    if (cached) {
+        const age = Math.max(0, Date.now() - cached.at);
+        if (cached.entity && age < ENTITY_CACHE_TTL_MS) {
+            return { entity: cached.entity, client: cached.client };
+        }
+        if (!cached.entity && !force && age < ENTITY_MISS_TTL_MS) return null;
     }
 
     let am;
@@ -13256,7 +14086,7 @@ async function resolveEntityAcrossAccounts(idStr) {
     const legacy = await connectTelegram();
     if (legacy && !candidates.includes(legacy)) candidates.push(legacy);
 
-    const cacheHit = (e, c) => {
+    const remember = (e, c) => {
         // Hard-cap the cache by evicting the oldest entry on overflow.
         if (entityCache.size >= ENTITY_CACHE_MAX) {
             const firstKey = entityCache.keys().next().value;
@@ -13266,25 +14096,46 @@ async function resolveEntityAcrossAccounts(idStr) {
         return { entity: e, client: c };
     };
 
-    for (const c of candidates) {
-        try {
-            const e = await c.getEntity(idStr);
-            if (e) return cacheHit(e, c);
-        } catch {}
-        try {
-            const e = await c.getEntity(BigInt(idStr));
-            if (e) return cacheHit(e, c);
-        } catch {}
-    }
+    const found = await lookupEntityAcrossClients(idStr, candidates);
+    if (found.entity) return remember(found.entity, found.client);
+    // Remember the miss only when every connected account said "no such
+    // chat". A FLOOD_WAIT / timeout / connection error, or every client
+    // still (re)connecting, stays retryable on the next call.
+    if (found.definite) remember(null, null);
     return null;
 }
 
-async function downloadProfilePhoto(groupId) {
+// Chats known to have no profile photo → expiry (ms). The sidebar
+// re-renders every avatar on each list refresh, and each miss used to
+// resolve the entity across all accounts again. Bounded + TTL'd.
+const _photoMissUntil = new Map();
+const PHOTO_MISS_TTL_MS = 60 * 60 * 1000;
+const PHOTO_MISS_MAX = 5000;
+
+/** Remaining ms of a cached "no photo" answer for `idStr` (0 = none). */
+function photoMissRemainingMs(idStr) {
+    const until = _photoMissUntil.get(idStr);
+    if (!until) return 0;
+    const left = until - Date.now();
+    if (left <= 0) _photoMissUntil.delete(idStr);
+    return Math.max(0, left);
+}
+
+/**
+ * Fetch + cache a chat's small profile photo. `force` (explicit operator
+ * refresh) ignores the cached "no photo" / failed-lookup answers.
+ */
+async function downloadProfilePhoto(groupId, { force = false, ignoreAccess = false } = {}) {
     const idStr = String(groupId);
     const photoPath = path.join(PHOTOS_DIR, `${idStr}.jpg`);
     if (existsSync(photoPath)) return `/photos/${idStr}.jpg`;
+    // A chat no account can read has no photo to fetch — every avatar
+    // render used to re-resolve it across all accounts. Only an explicit
+    // "Check again" (ignoreAccess) asks.
+    if (!ignoreAccess && chatAccess.isBlocked(idStr)) return null;
+    if (!force && photoMissRemainingMs(idStr) > 0) return null;
 
-    const resolved = await resolveEntityAcrossAccounts(idStr);
+    const resolved = await resolveEntityAcrossAccounts(idStr, { force });
     if (!resolved) return null;
     const { entity, client } = resolved;
     try {
@@ -13292,21 +14143,21 @@ async function downloadProfilePhoto(groupId) {
             const buffer = await client.downloadProfilePhoto(entity, { isBig: false });
             if (buffer) {
                 await fs.writeFile(photoPath, buffer);
+                _photoMissUntil.delete(idStr);
                 return `/photos/${idStr}.jpg`;
             }
         }
+        // Resolved, but the chat has no photo set.
+        _photoMissUntil.set(idStr, Date.now() + PHOTO_MISS_TTL_MS);
+        lruCap(_photoMissUntil, PHOTO_MISS_MAX);
     } catch (e) {
-        console.log(`Error processing ${idStr}:`, e.message);
+        console.log('Error processing %s:', idStr, e.message);
     }
     return null;
 }
 
 // ============ SERVER START ============
 
-/**
- * Map a downloads / peer_downloads row to the gallery tile + viewer file
- * shape used by `/api/downloads/all` and `/api/downloads/by-ids`.
- */
 function mapDownloadRowToGalleryFile(row, { configGroups, peerNameMap } = {}) {
     const typeFolder =
         row.file_type === 'photo'
@@ -13370,23 +14221,32 @@ const _STATS_TRIGGER_TYPES = new Set([
     'download_complete',
 ]);
 
+// Other events that change group names / row counts without being stats
+// triggers — drop the cached sidebar aggregate for them too.
+const _GROUP_AGG_INVALIDATE_TYPES = new Set([
+    'groups_refreshed',
+    'integrity_swept',
+    'reindex_done',
+    'dedup_delete_done',
+]);
+
 function broadcast(data) {
-    const message = JSON.stringify(data);
-    for (const client of Array.from(clients)) {
-        if (client.readyState === 1) client.send(message);
-    }
+    // Per-chunk download progress, per-message scan progress and
+    // per-enqueue queue events are coalesced (≤ 2/s per key, same message
+    // shapes); everything else is sent right away.
+    _wsBroadcaster.broadcast(data);
     // Side-channel: if the event meaningfully changed stats, schedule a
     // single recompute + push. Debounce inside broadcastStatsSoon() makes
     // a 50-row bulk delete still cost one stats broadcast, not fifty.
     try {
-        if (
-            data &&
-            typeof data === 'object' &&
-            typeof data.type === 'string' &&
-            _STATS_TRIGGER_TYPES.has(data.type) &&
-            typeof broadcastStatsSoon === 'function'
-        ) {
-            broadcastStatsSoon();
+        if (data && typeof data === 'object' && typeof data.type === 'string') {
+            if (_STATS_TRIGGER_TYPES.has(data.type)) {
+                // Same events move the sidebar's per-group counts / names.
+                invalidateGroupAggregates();
+                if (typeof broadcastStatsSoon === 'function') broadcastStatsSoon();
+            } else if (_GROUP_AGG_INVALIDATE_TYPES.has(data.type)) {
+                invalidateGroupAggregates();
+            }
         }
     } catch {}
 }
@@ -13530,6 +14390,13 @@ const _jobTrackers = {
         log,
         eventPrefix: 'recovery_bulk',
     }),
+    // Chats → Needs attention: "Check all again".
+    chatAccessRecheck: createJobTracker({
+        kind: 'chatAccessRecheck',
+        broadcast,
+        log,
+        eventPrefix: 'chat_access_recheck',
+    }),
     // AI subsystem — three independent scans owned by the same page.
     // Event prefixes match the WS contract used by maintenance-ai.js:
     // ai_index_progress / ai_index_done, ai_tags_*, ai_people_*.
@@ -13598,7 +14465,14 @@ app.get('/api/maintenance/logs/recent', async (req, res) => {
 
 wss.on('connection', (ws) => {
     clients.add(ws);
+    // Ping/pong liveness for the heartbeat — a half-open phone socket is
+    // terminated after one missed pong instead of buffering for minutes.
+    _wsBroadcaster.attach(ws);
     ws.on('close', () => clients.delete(ws));
+    // Protocol errors (bad frame, oversized payload) are emitted as
+    // 'error'; without a listener EventEmitter re-throws them as an
+    // uncaught exception, which crashes the process.
+    ws.on('error', () => clients.delete(ws));
 });
 
 // Last-resort handler — converts any throw or rejected promise that
@@ -13607,6 +14481,16 @@ wss.on('connection', (ws) => {
 // Must be registered after all routes/middleware and before listen().
 app.use((err, req, res, _next) => {
     if (res.headersSent) return;
+    // send() (behind res.sendFile: /files, /share, the cluster file bridge,
+    // thumbnails) reports a Range the file can't satisfy as a 416 error —
+    // a client error, answered as RFC 9110 asks, not a 500.
+    const unsatisfiable = rangeNotSatisfiableOf(err);
+    if (unsatisfiable) return sendRangeNotSatisfiable(res, unsatisfiable);
+    // express.json() (mounted for every route) fails a malformed JSON body,
+    // a JSON `null` (strict mode) or one over the 2 MB limit before any
+    // route runs: 400 / 413, not a server error.
+    const bodyError = bodyParserErrorResponse(err);
+    if (bodyError) return res.status(bodyError.status).json(bodyError.body);
     log({
         source: 'http',
         level: 'error',
@@ -13615,12 +14499,72 @@ app.use((err, req, res, _next) => {
     res.status(500).json({ error: err?.message || 'Internal Server Error' });
 });
 
+// Deferred index builds — see the call site in the listen callback.
+const DEFERRED_INDEX_START_DELAY_MS = 90_000;
+const DEFERRED_INDEX_GAP_MS = 45_000;
+function scheduleDeferredIndexBuilds() {
+    let pending;
+    try {
+        const plan = planDeferredIndexBuilds();
+        pending = plan.build;
+        for (const idx of plan.interrupted) {
+            // A previous start was killed while building this index — most
+            // likely a restart loop on a very large library / slow disk.
+            // Don't walk into it again; everything works without it.
+            log({
+                source: 'db',
+                level: 'warn',
+                msg:
+                    `index ${idx.name}: the previous build attempt never finished (the process was stopped mid-build), so it is not retried automatically. ` +
+                    'The dashboard works without it (bulk deletes / sidebar are just slower). To build it, stop the dashboard and run ' +
+                    '`npm run build-indexes` (Docker: `docker compose stop telegram-downloader && docker compose run --rm telegram-downloader node scripts/build-indexes.js && docker compose start telegram-downloader`).',
+            });
+        }
+    } catch {
+        return;
+    }
+    if (!pending.length) return;
+    log({
+        source: 'db',
+        level: 'info',
+        msg: `building ${pending.length} new index(es) in the background: ${pending.map((i) => i.name).join(', ')}`,
+    });
+    let busyRetries = 0;
+    const buildNext = () => {
+        const idx = pending.shift();
+        if (!idx) return;
+        try {
+            const ms = buildDeferredIndex(idx.name);
+            log({ source: 'db', level: 'info', msg: `index ${idx.name} built in ${ms} ms` });
+            // The sidebar aggregate cache may hold rows computed without it —
+            // harmless, but let the next paint use the faster plan.
+            invalidateGroupAggregates();
+        } catch (e) {
+            const msg = String(e?.message || e);
+            if (/busy|locked/i.test(msg) && busyRetries < 20) {
+                // A maintenance sweep holds the connection — try again later.
+                busyRetries += 1;
+                pending.unshift(idx);
+            } else {
+                // Retried on the next boot (IF NOT EXISTS); queries still work.
+                log({
+                    source: 'db',
+                    level: 'warn',
+                    msg: `index ${idx.name} build failed (will retry next start): ${msg}`,
+                });
+            }
+        }
+        if (pending.length) setTimeout(buildNext, DEFERRED_INDEX_GAP_MS).unref();
+    };
+    setTimeout(buildNext, DEFERRED_INDEX_START_DELAY_MS).unref();
+}
+
 const PORT = process.env.PORT || 3000;
 // Without this, EADDRINUSE made the container exit silently with no clue
 // where to look. Print a clear message + exit non-zero so docker-compose
 // surfaces the failure instead of looping a hidden restart.
-server.on('error', (e) => {
-    if (e.code === 'EADDRINUSE') {
+function _fatalListen(e) {
+    if (e?.code === 'EADDRINUSE') {
         console.error(
             `\n[fatal] Port ${PORT} is already in use. Stop the other process or set PORT=<free> in the environment.\n`,
         );
@@ -13628,8 +14572,154 @@ server.on('error', (e) => {
         console.error('[fatal] HTTP server error:', e?.message || e);
     }
     process.exit(1);
-});
-server.listen(PORT, async () => {
+}
+server.on('error', _fatalListen);
+
+// ---- tgdl-core front server ----------------------------------------------
+//
+// tgdl-core (`tgdl-core front`, core-service/internal/front) owns PORT: it
+// serves /files, /photos and thumbnail cache hits itself — so video keeps
+// playing while this event loop is busy — and proxies everything else to
+// `server`, which listens on 127.0.0.1 only. Responses are the ones this
+// process would give (tests/front-parity.e2e.test.js); requests keep their
+// client address (lib/front-bridge.js).
+//
+// When tgdl-core can't run — binary missing, fails to start, or keeps
+// exiting — this process binds PORT itself (`_publicServer`) for the
+// dashboard and /api/auth_check, logs why and shows a banner in the
+// dashboard. Media routes answer 503 TGDL_CORE_UNAVAILABLE: there is no
+// Node file serving.
+let _publicServer = null;
+let _frontProblem = null;
+
+function _listenOn(srv, ...args) {
+    return new Promise((resolve) => srv.listen(...args, resolve));
+}
+
+async function _serveOnPortDirectly(reason) {
+    _frontProblem = String(reason || 'unknown error');
+    // CI / tests: fail loudly instead of quietly serving PORT from Node.
+    if (process.env.TGDL_FRONT_REQUIRED === '1') {
+        console.error(`[fatal] tgdl-core front server required but not running: ${_frontProblem}`);
+        process.exit(1);
+    }
+    if (_publicServer) return;
+    const srv = createServer(app);
+    srv.keepAliveTimeout = server.keepAliveTimeout;
+    srv.headersTimeout = server.headersTimeout;
+    srv.requestTimeout = server.requestTimeout;
+    srv.on('upgrade', _onUpgrade);
+    srv.on('error', _fatalListen);
+    _publicServer = srv;
+    await _listenOn(srv, PORT);
+    console.warn(
+        `[go-front] tgdl-core is not serving port ${PORT} (${_frontProblem}); Node serves it directly. Reinstall tgdl-core or run \`npm run build:core\`, then restart.`,
+    );
+}
+
+// The dashboard banner (monitor status `core`) while this process serves
+// PORT itself although tgdl-core as such is fine. No local paths: the
+// status also reaches guests.
+function _frontBanner() {
+    // A missing / outdated binary is tgdl-core's own banner (getCoreBanner);
+    // once it runs, the next restart brings the front server up too.
+    if (!_frontProblem || getFrontStatus().state === 'binary_missing') return null;
+    return {
+        state: 'front_down',
+        fix: "tgdl-core's web server keeps stopping. Check the [go-front] lines in the log, then restart the app.",
+    };
+}
+
+// What tgdl-core must agree with to answer media requests itself.
+async function _frontState() {
+    const config = await readConfigSafe();
+    const web = config.web || {};
+    const forceHttps = Boolean(web.forceHttps);
+    // tgdl-core answers a request that is secure, or any request when
+    // forceHttps is off: one header set per route. With forceHttps on, a
+    // plain-HTTP request from the machine itself gets through too (no HSTS
+    // on it): a second set per route, keyed "<route>.local".
+    const routes = {
+        files: ['/files/x'],
+        photos: ['/photos/x'],
+        // + what GET /api/thumbs/:id sets before its per-file validators
+        thumbs: ['/api/thumbs/1', (res) => res.setHeader('Cache-Control', THUMB_CACHE_CONTROL)],
+    };
+    const headers = {};
+    for (const [name, [p, route]] of Object.entries(routes)) {
+        headers[name] = await captureHeaders(
+            _frontHeaderChain,
+            { path: p, secure: forceHttps },
+            route,
+        );
+        if (forceHttps) {
+            headers[`${name}.local`] = await captureHeaders(
+                _frontHeaderChain,
+                { path: p, secure: false, ip: '127.0.0.1' },
+                route,
+            );
+        }
+    }
+    return {
+        authReady: web.enabled !== false && isAuthConfigured(web),
+        forceHttps,
+        rateLimit: _rateLimitConfig.enabled === true,
+        shareSecret: getShareSecretForFront() || '',
+        headers,
+    };
+}
+
+async function _startHttp() {
+    const port = /^\d+$/.test(String(PORT)) ? Number(PORT) : Number.NaN;
+    if (!(port >= 0 && port <= 65535)) {
+        // PORT names a pipe / socket path: listen on it directly, as before.
+        await _listenOn(server, PORT);
+        return;
+    }
+    // Room for the two headers tgdl-core adds to a request that was
+    // already at Node's 16 KiB limit (tgdl-core enforces that limit).
+    server.maxHeaderSize = 16 * 1024 + 1024;
+    await _listenOn(server, 0, '127.0.0.1');
+    // Where the OS hands out ephemeral ports from low numbers (Windows can
+    // start at 1024), don't let this listener sit on PORT itself.
+    if (server.address().port === port) {
+        await new Promise((r) => server.close(r));
+        await _listenOn(server, 0, '127.0.0.1');
+    }
+    const thumbsDir = path.join(DATA_DIR, 'thumbs');
+    const r = await startFront({
+        port,
+        upstreamPort: server.address().port,
+        trustProxy: _trustProxyRaw === undefined ? 'loopback' : _trustProxyRaw,
+        dbPath: path.join(DATA_DIR, 'db.sqlite'),
+        downloadsDir: path.resolve(DOWNLOADS_DIR),
+        photosDir: path.resolve(PHOTOS_DIR),
+        thumbsDir,
+        allowRoots: [path.resolve(DOWNLOADS_DIR), path.resolve(PHOTOS_DIR), thumbsDir],
+        getState: _frontState,
+        onGiveUp: (reason) => {
+            _serveOnPortDirectly(reason).catch(_fatalListen);
+        },
+    });
+    if (r.ok) {
+        // Config changes reach tgdl-core at once (it also re-checks every 2 s).
+        // setImmediate: writeConfigAtomic drops the config cache right after
+        // saveConfig emits.
+        watchConfig(() => setImmediate(() => pushFrontState()));
+        return;
+    }
+    if (r.code === 'EADDRINUSE' || r.code === 'EACCES' || r.code === 'EADDRNOTAVAIL') {
+        _fatalListen({ code: r.code, message: r.error });
+        return;
+    }
+    await _serveOnPortDirectly(r.error);
+}
+
+_startHttp()
+    .then(_afterListen)
+    .catch((e) => _fatalListen(e));
+
+async function _afterListen() {
     // Backfill group names for existing records
     try {
         const config = loadConfig();
@@ -13689,6 +14779,21 @@ ${tip}
         console.warn('[seekbar-sidecar] wiring failed:', e?.message || e);
     }
 
+    // tgdl-core (the Go file engine) — find / download / spawn in the
+    // background. Never awaited, so boot time and /api/auth_check don't
+    // depend on it; features that need it wait briefly for it or answer
+    // 503 with the fix.
+    import('../config/manager.js')
+        .then(({ watchConfig }) =>
+            startGoCore({
+                readConfig: () => loadConfig(),
+                watchConfig,
+            }),
+        )
+        .catch((e) => {
+            console.warn('[go-core] start failed:', e?.message || e);
+        });
+
     // One-shot v2.x cache migration — collapse the thumb cache from five
     // widths (120 / 200 / 240 / 320 / 480 px) down to a single canonical
     // 320-px width. Pre-upgrade caches still hold the legacy WebPs as
@@ -13717,6 +14822,17 @@ ${tip}
             console.warn('[thumbs] one-shot purge guard threw:', e.message);
         }
     });
+
+    // New indexes on an existing big library (see DEFERRED_INDEXES in
+    // core/db.js) are built here instead of in initSchema, so an upgrade
+    // never delays the first healthcheck. Each CREATE INDEX still blocks
+    // the loop while it runs (~1 s per index per 1M rows on SSD), so start
+    // well after boot (past the compose start_period + autoheal grace) and
+    // leave more than one healthcheck interval between builds: a single
+    // slow build can fail at most one check, never the three in a row that
+    // mark the container unhealthy. Queries work (slower) until done; a
+    // restart mid-way just resumes on the next boot.
+    scheduleDeferredIndexBuilds();
 
     // Boot the disk rotator. No-op when diskManagement.enabled is false —
     // safe to call at every startup. Restarts via POST /api/config (above).
@@ -13908,6 +15024,10 @@ ${tip}
         }
     } catch {}
 
+    // Cluster engines resume on their own when a peer is paired (see
+    // _ensureClusterEngines); an install without peers starts nothing.
+    if (_ensureClusterEngines()) console.log('[cluster] engines started (paired peers)');
+
     // Resume the realtime monitor if it was running before the last
     // shutdown. The start/stop endpoints persist monitor.autoStart to
     // config so the flag reflects the operator's last intent — graceful
@@ -13999,6 +15119,7 @@ ${tip}
                 const aiCfg = _aiCfg();
                 if (aiCfg.enabled) {
                     console.log('[auto-resume] resuming AI faces scan');
+                    await _ensureFacesSidecar();
                     const tracker = _aiTrackerFor('faces');
                     tracker.tryStart(({ onProgress, signal }) => {
                         try {
@@ -14037,7 +15158,7 @@ ${tip}
             console.warn('[auto-resume] error:', e.message);
         }
     }, 5000);
-});
+}
 
 // Graceful shutdown — Docker / systemd / Ctrl-C send SIGTERM/SIGINT and
 // expect the process to exit fast. Without this we just relied on
@@ -14050,6 +15171,21 @@ async function gracefulShutdown(signal) {
     if (_shuttingDown) return;
     _shuttingDown = true;
     console.log(`\n[shutdown] ${signal} received — cleaning up…`);
+
+    // tgdl-core first: it holds no state, and closing its stdin lets it
+    // exit on its own even if this process is killed mid-shutdown. The
+    // front server stops accepting connections and drains the ones in
+    // flight (up to 3 s) while this process keeps answering them.
+    try {
+        stopFront();
+    } catch (e) {
+        console.warn('[shutdown] go-front.stop:', e.message);
+    }
+    try {
+        stopGoCore();
+    } catch (e) {
+        console.warn('[shutdown] go-core.stop:', e.message);
+    }
 
     // Stop background sweepers first so their setInterval callbacks
     // don't try to write to a closing DB / broadcast to dead clients.
@@ -14067,11 +15203,6 @@ async function gracefulShutdown(signal) {
         getDiskRotator()?.stop();
     } catch (e) {
         console.warn('[shutdown] rotator.stop:', e.message);
-    }
-    try {
-        await shutdownAlignPool();
-    } catch (e) {
-        console.warn('[shutdown] align worker:', e.message);
     }
 
     // Stop the monitor + its keep-alive ping.
@@ -14098,6 +15229,7 @@ async function gracefulShutdown(signal) {
 
     // Stop accepting new HTTP connections; let the in-flight ones drain.
     try {
+        _publicServer?.close();
         server.close(() => process.exit(0));
     } catch {
         process.exit(0);

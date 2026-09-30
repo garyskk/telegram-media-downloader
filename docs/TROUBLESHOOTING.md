@@ -1,4 +1,12 @@
+---
+title: "Troubleshooting"
+description: "Common Telegram Media Downloader errors and how to fix them, starting with npm run doctor."
+nav_order: 3
+---
+
 # Troubleshooting
+
+Fixes for the problems people hit most often when installing, running and updating Telegram Media Downloader.
 
 ## First stop: `npm run doctor`
 
@@ -110,7 +118,7 @@ The model classifier is an optional feature. Run `npm install @huggingface/trans
 
 ## "Install update" button is greyed out
 
-Two reasons: either the dashboard isn't running inside Docker (`/.dockerenv` heuristic), or the watchtower sidecar isn't reachable. Set `WATCHTOWER_HTTP_API_TOKEN` in `.env` and start with `docker compose --profile auto-update up -d`. The button hover-tip explains which check failed.
+Two reasons: either the dashboard isn't running inside Docker (`/.dockerenv` heuristic), or the watchtower sidecar isn't reachable. Make sure the compose file includes the `watchtower` service (re-download it if it is old) and run `docker compose up -d`; the token is generated automatically. If you set `WATCHTOWER_HTTP_API_TOKEN` in `.env`, it must match on both services. The button hover-tip explains which check failed.
 
 ## Share link returns "Share link is not valid"
 
@@ -172,14 +180,6 @@ If the sidecar itself won't come up, check **Maintenance → Seekbar previews �
 ## "database is locked" during a seekbar / dedup scan
 
 Pre-v2.17 builds streamed the seekbar backfill via better-sqlite3's `.iterate()` cursor, which holds an exclusive connection lock across `await` boundaries — so a long-running scan could block the realtime downloader's `kv['queue_history']` writer for minutes and surface as `TypeError: This database connection is busy executing a query`. v2.17 rewrote the scan-runner to keyset pagination (`.all()` per batch); upgrade to fix.
-
-## Backup Run now: "This database connection is busy executing a query"
-
-Mirror catch-up used to walk `downloads` with better-sqlite3 `.iterate()` while enqueueing jobs on the same connection — that throws the busy-connection error and aborts the run. Current builds use keyset-paginated `.all()` batches. Upgrade, then click **Run now** again.
-
-## Backup crash-loop: `ENOENT` opening a path under `data/downloads/`
-
-Mirror upload opened missing files via `createReadStream` without a pre-check; on S3/etc. that became an uncaughtException and Docker restarted the container. Usually the DB still has soft-deleted (`user_deleted=1`) or externally deleted paths that were queued for upload. Current builds fail those jobs permanently instead of crashing. Soft-delete also clears faces for the tombstone; mirror **Run now** later prunes matching remote orphans. Upgrade and rebuild; if the container is still looping on an old image, pause/disable the mirror destination until then.
 
 ## NSFW classifier won't load: "sharp not loadable"
 

@@ -3,9 +3,10 @@
 # Multi-stage build for the tgdl-faces sidecar.
 #
 # Stage 1 ("builder") installs all Python deps + pre-downloads the
-# buffalo_l weights into the insightface model cache.
-# Stage 2 ("runtime") copies the resolved .venv + model cache from the
-# builder, drops the C/C++ toolchain, and ships only the runtime libraries.
+# buffalo_l weights into the per-user pip + insightface caches.
+# Stage 2 ("runtime") copies the resolved /root/.local + model cache
+# from the builder, drops the C/C++ toolchain, and ships only the
+# runtime libraries.
 #
 # Target final image size: <=350 MB compressed (CPU variant).
 #
@@ -15,10 +16,11 @@
 #   "openvino" → onnxruntime-openvino (Intel iGPU/dGPU; ~400 MB; linux/amd64)
 #
 # The DirectML variant is not built into a Linux image (DirectML is a
-# Windows-only EP — operators on Windows use `uv sync --extra directml`
-# in a Python venv on the host). The CUDA variant requires the NVIDIA
-# container runtime AND a host with nvidia-smi for GPU passthrough;
-# without those it falls back to CPU at runtime with a warning.
+# Windows-only EP — operators on Windows use `pip install -e
+# faces-service/[directml]` in a Python venv on the host). The CUDA
+# variant requires the NVIDIA container runtime AND a host with
+# nvidia-smi for GPU passthrough; without those it falls back to CPU
+# at runtime with a warning.
 
 ARG FACES_EP_VARIANT=cpu
 
@@ -41,35 +43,33 @@ RUN apt-get update \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/
-
 WORKDIR /build
 
 # Install Python deps first (separate from the source copy) so layer
 # caching kicks in when only tgdl_faces/*.py changes. README.md must
 # come along because pyproject.toml's `readme = "README.md"` is
 # validated by hatchling at metadata-prep time.
-COPY pyproject.toml uv.lock README.md ./
-
-# The variant arg picks which onnxruntime wheel uv resolves; the extras
-# auto-uninstall the conflicting base `onnxruntime` package.
-RUN --mount=type=cache,target=/root/.cache/uv \
-    if [ "$FACES_EP_VARIANT" = "gpu" ]; then \
-        uv sync --frozen --no-dev --no-install-project --extra gpu; \
-    elif [ "$FACES_EP_VARIANT" = "openvino" ]; then \
-        uv sync --frozen --no-dev --no-install-project --extra openvino; \
-    else \
-        uv sync --frozen --no-dev --no-install-project; \
-    fi
-
+COPY pyproject.toml README.md ./
 COPY tgdl_faces ./tgdl_faces
+
+# `--user` lays everything under /root/.local — the runtime stage just
+# copies that directory verbatim instead of recreating a virtualenv.
+# The variant arg picks which onnxruntime wheel pip resolves; the extras
+# auto-uninstall the conflicting base `onnxruntime` package.
+RUN if [ "$FACES_EP_VARIANT" = "gpu" ]; then \
+        pip install --user --no-cache-dir ".[gpu]"; \
+    elif [ "$FACES_EP_VARIANT" = "openvino" ]; then \
+        pip install --user --no-cache-dir ".[openvino]"; \
+    else \
+        pip install --user --no-cache-dir .; \
+    fi
 
 # Pre-download buffalo_l (10MB-ish ONNX bundle, ~280 MB on disk after
 # extraction) so the runtime image boots offline. Models land under
 # /root/.cache/tgdl-faces/models/<model-name>/...; insightface auto-
 # extracts the bundled .zip when `prepare()` runs.
 ENV TGDL_FACES_MODELS_DIR=/root/.cache/tgdl-faces/models
-RUN .venv/bin/python -c "from insightface.app import FaceAnalysis; a = FaceAnalysis(name='buffalo_l', root='/root/.cache/tgdl-faces/models'); a.prepare(ctx_id=-1)"
+RUN python -c "from insightface.app import FaceAnalysis; a = FaceAnalysis(name='buffalo_l', root='/root/.cache/tgdl-faces/models'); a.prepare(ctx_id=-1)"
 
 # ---------------------------------------------------------------------------
 # Stage 2 — runtime
@@ -87,14 +87,14 @@ RUN apt-get update \
         wget \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy the resolved venv + model cache from the builder.
-COPY --from=builder /build/.venv /app/.venv
+# Copy the resolved Python user-site + model cache from the builder.
+COPY --from=builder /root/.local /root/.local
 COPY --from=builder /root/.cache/tgdl-faces/models /root/.cache/tgdl-faces/models
 
 WORKDIR /app
 COPY tgdl_faces /app/tgdl_faces
 
-ENV PATH="/app/.venv/bin:${PATH}" \
+ENV PATH="/root/.local/bin:${PATH}" \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     TGDL_FACES_HOST=0.0.0.0 \
@@ -111,7 +111,7 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
 
 LABEL org.opencontainers.image.title="tgdl-faces" \
       org.opencontainers.image.description="Face detection + 512-dim embedding sidecar for telegram-media-downloader" \
-      org.opencontainers.image.version="0.2.0" \
+      org.opencontainers.image.version="0.5.0" \
       org.opencontainers.image.source="https://github.com/botnick/telegram-media-downloader" \
       org.opencontainers.image.licenses="MIT" \
       com.centurylinklabs.watchtower.enable="true"

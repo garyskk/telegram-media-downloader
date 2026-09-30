@@ -1,18 +1,15 @@
 # Compose file for Telegram Media Downloader.
 #
-# Defaults to the prebuilt multi-arch image from GitHub Container Registry.
-# `pull_policy: always` ensures `docker compose up -d` grabs the newest
-# release each time — without this, an older locally-cached image wins and
-# manifests as `Cannot find module '/app/src/web/server.js'` after upgrades.
-#
-# To build from source instead (for local dev), comment out `image:` +
-# `pull_policy:` and uncomment `build:`.
+# The app image is built from this tree (`build: .`). Faces stays on the
+# published `ghcr.io/botnick/tgdl-faces` image. `docker compose up -d --build`
+# picks up local Dockerfile and source changes. Watchtower still updates
+# the faces image; it does not replace this locally built app image.
 
 services:
   telegram-downloader:
+    build: .
     # image: ghcr.io/botnick/telegram-media-downloader:latest
     # pull_policy: always
-    build: .
     container_name: telegram-downloader
     restart: unless-stopped
     ports:
@@ -26,7 +23,6 @@ services:
       # - /mnt/ssd/tgdl/data:/app/data
       # - /mnt/hdd/tgdl/downloads:/mnt/hdd/downloads
     environment:
-      # - NODE_ENV=production
       - NODE_ENV=development
       - TZ=${TZ:-UTC}
       - TGDL_DEBUG=${TGDL_DEBUG:-}
@@ -46,8 +42,7 @@ services:
       # list) or empty string to disable when running directly on the
       # host without a proxy.
       - TRUST_PROXY=${TRUST_PROXY:-1}
-      # Auto-update wiring — only consulted when the `auto-update` profile
-      # is enabled. With these set, Settings → Maintenance shows an
+      # Auto-update wiring — used by the `watchtower` service below. With these set, Settings → Maintenance shows an
       # **Install update** button that hands the swap off to the watchtower
       # sidecar below. Tokens read from .env (see .env.example).
       - WATCHTOWER_URL=${WATCHTOWER_URL:-http://watchtower:8080}
@@ -78,20 +73,19 @@ services:
       # stays empty and Node falls back to the bundled PyInstaller
       # binary downloaded on first use.
       - FACES_SERVICE_URL=${FACES_SERVICE_URL:-http://tgdl-faces:8011}
-      # Do NOT inject TGDL_FACES_VIDEO_SCAN_LIMIT / TGDL_FACES_VIDEO_NICE
-      # with `:-0` defaults here. Env beats dashboard kv config
-      # (resolveFacesValue), so a compose default of 0 would silently
-      # ignore Maintenance → Video scan limit / nice. Pin at deploy time
-      # only when you mean it — see .env.example / docs/AI.md.
-      # - TGDL_FACES_VIDEO_SCAN_LIMIT=${TGDL_FACES_VIDEO_SCAN_LIMIT}
-      # - TGDL_FACES_VIDEO_NICE=${TGDL_FACES_VIDEO_NICE}
-      # Seekbar preview sidecar URL. Leave unset to auto-spawn the Go
-      # binary compiled into this image (`SEEKBAR_BIN`, from the
-      # Dockerfile `seekbar` stage) on a random localhost port. Set
-      # only when running `seekbar-service/` as a separate compose
+      # Sent to the faces sidecar when it requires a token (TGDL_FACES_API_TOKEN).
+      - TGDL_FACES_SIDECAR_TOKEN=${TGDL_FACES_API_TOKEN:-}
+      # Seekbar preview sidecar URL. Leave unset to let the dashboard
+      # auto-spawn the bundled Go binary on a random localhost port;
+      # set when running `seekbar-service/` as a separate compose
       # service. See seekbar-service/README.md for the standalone setup.
       - SEEKBAR_SIDECAR_URL=${SEEKBAR_SIDECAR_URL:-}
       - SEEKBAR_API_TOKEN=${SEEKBAR_API_TOKEN:-}
+      # Go companion (tgdl-core, bundled in the image). Empty = default
+      # (shadow: Node does the work, Go double-checks a sample). See
+      # docs/GO-CORE.md; `off` turns it off completely.
+      - TGDL_GO_CORE=${TGDL_GO_CORE:-}
+      - TGDL_GO_FEATURES=${TGDL_GO_FEATURES:-}
       # Split-disk setup: store downloads on a separate volume (e.g. HDD)
       # while keeping db.sqlite, sessions, and backups on a faster disk (SSD).
       # Set TGDL_DATA_DIR to the SSD path and TGDL_DOWNLOADS_DIR to the HDD
@@ -159,7 +153,7 @@ services:
         max-file: "5"
         compress: "true"
 
-  # Face clustering sidecar. THREE variants are available — pick the one
+  # Face clustering sidecar. TWO variants are available — pick the one
   # that matches your host's hardware:
   #
   #   CPU only (default; works everywhere):
@@ -168,10 +162,7 @@ services:
   #   NVIDIA CUDA (linux/amd64 host with nvidia-container-toolkit):
   #     docker compose --profile faces-cuda up -d
   #
-  #   Intel OpenVINO (Intel iGPU / dGPU / NPU on linux/amd64):
-  #     docker compose --profile faces-openvino up -d
-  #
-  # All three expose port 8011 inside the compose network so the main
+  # Both expose port 8011 inside the compose network so the main
   # app's `FACES_SERVICE_URL=http://tgdl-faces:8011` env var resolves
   # the same way regardless of which variant is running. Pick exactly
   # one — they'd race for the same DNS name and port. Outside compose
@@ -181,12 +172,11 @@ services:
   # host filesystem.
   #
   # The images are built by .github/workflows/release-faces-service.yml
-  # and tagged `:latest` (CPU), `:cuda-latest`, `:openvino-latest`.
+  # and tagged `:latest` (CPU), `:cuda-latest`.
   # Watchtower picks them up via the label below.
   tgdl-faces:
-    # image: ghcr.io/botnick/tgdl-faces:latest
-    build: ./faces-service
-    # pull_policy: always
+    image: ghcr.io/botnick/tgdl-faces:latest
+    pull_policy: always
     container_name: tgdl-faces
     restart: unless-stopped
     profiles: ["faces"]
@@ -215,23 +205,14 @@ services:
       # falls back to base64.
       - TGDL_FACES_ALLOW_ROOTS=/app/data/downloads
       - TGDL_FACES_MODELS_DIR=/root/.cache/tgdl-faces/models
-      # Detector pack — buffalo_m keeps the same ResNet50 recognition head
-      # as buffalo_l with a lighter SCRFD detector (faster CPU scans).
-      # Override via .env: TGDL_FACES_DETECTOR_MODEL=buffalo_l|buffalo_s|…
-      - TGDL_FACES_DETECTOR_MODEL=${TGDL_FACES_DETECTOR_MODEL:-buffalo_m}
       # Inter-image sleep on CPU-only hosts. Set to 50–200 (ms) to cap
       # sustained CPU load between images in a batch so other processes
       # (downloader, OS) get breathing room. Leave at 0 (default) when a
       # GPU provider is active — GPU inference already leaves the CPU idle.
       - TGDL_FACES_THROTTLE_MS=${TGDL_FACES_THROTTLE_MS:-0}
-      # Confirmed-track floors for video face keep (seen in ≥2 sampled frames).
-      # Lowered from 0.45/0.60 to keep harder poses in group clips.
-      - TGDL_FACES_VIDEO_CONFIRMED_MIN_QUALITY=${TGDL_FACES_VIDEO_CONFIRMED_MIN_QUALITY:-0.35}
-      - TGDL_FACES_VIDEO_CONFIRMED_MIN_SCORE=${TGDL_FACES_VIDEO_CONFIRMED_MIN_SCORE:-0.50}
-      - TGDL_FACES_VIDEO_MIN_LANDMARK_REGULARITY=${TGDL_FACES_VIDEO_MIN_LANDMARK_REGULARITY:-0.15}
-      # Video nice: prefer Maintenance UI (Node forwards `nice` on each
-      # /detect/video). Do not pin with `:-10` — that ignores UI=0.
-      # - TGDL_FACES_VIDEO_NICE=${TGDL_FACES_VIDEO_NICE}
+      # Optional shared secret: set TGDL_FACES_API_TOKEN in .env to require it
+      # on every call except /health (the main app sends the same value).
+      - TGDL_FACES_API_TOKEN=${TGDL_FACES_API_TOKEN:-}
       - TZ=${TZ:-UTC}
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:8011/health || exit 1"]
@@ -252,12 +233,9 @@ services:
         # resident on amd64 amid a scan burst; 2g default leaves
         # headroom. Override via TGDL_FACES_MEM_LIMIT for boxes with
         # tighter envelopes (Pi 4 4GB, small Synology).
-        #
-        # Optional: lower cgroup CPU weight vs the main app (default 1024).
-        # Uncomment when video scans starve downloads/UI even with nice:
-        #   cpu_shares: 256
         limits:
           memory: ${TGDL_FACES_MEM_LIMIT:-2g}
+          # Keep a photo scan from taking every core. Override in .env.
           cpus: ${TGDL_FACES_CPU_LIMIT:-6}
         reservations:
           memory: 512m
@@ -275,7 +253,7 @@ services:
   # configure --runtime=docker && systemctl restart docker`). The image
   # is `ghcr.io/botnick/tgdl-faces:cuda-latest` — linux/amd64 only.
   #
-  # Mutually exclusive with the `faces` and `faces-openvino` profiles —
+  # Mutually exclusive with the `faces` profile —
   # they all bind container_name=tgdl-faces and port 8011 so Node's
   # FACES_SERVICE_URL=http://tgdl-faces:8011 resolves to whichever
   # variant is running. Compose refuses to bring up more than one.
@@ -303,19 +281,14 @@ services:
       # Default to auto-pick: sidecar will probe CUDA first, fall back
       # to CPU if the driver/runtime isn't usable inside the container.
       - TGDL_FACES_PROVIDERS=${TGDL_FACES_PROVIDERS:-auto}
-      - TGDL_FACES_DETECTOR_MODEL=${TGDL_FACES_DETECTOR_MODEL:-buffalo_m}
       - NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES:-all}
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       # Throttle: 0 (default) is correct for GPU — CPU is idle between
       # kernel dispatches. Only raise this if falling back to CPU.
       - TGDL_FACES_THROTTLE_MS=${TGDL_FACES_THROTTLE_MS:-0}
-      # Confirmed-track floors for video face keep (seen in ≥2 sampled frames).
-      - TGDL_FACES_VIDEO_CONFIRMED_MIN_QUALITY=${TGDL_FACES_VIDEO_CONFIRMED_MIN_QUALITY:-0.35}
-      - TGDL_FACES_VIDEO_CONFIRMED_MIN_SCORE=${TGDL_FACES_VIDEO_CONFIRMED_MIN_SCORE:-0.50}
-      - TGDL_FACES_VIDEO_MIN_LANDMARK_REGULARITY=${TGDL_FACES_VIDEO_MIN_LANDMARK_REGULARITY:-0.15}
-      # Video nice: prefer Maintenance UI (Node forwards `nice` on each
-      # /detect/video). Do not pin with `:-10` — that ignores UI=0.
-      # - TGDL_FACES_VIDEO_NICE=${TGDL_FACES_VIDEO_NICE}
+      # Optional shared secret: set TGDL_FACES_API_TOKEN in .env to require it
+      # on every call except /health (the main app sends the same value).
+      - TGDL_FACES_API_TOKEN=${TGDL_FACES_API_TOKEN:-}
       - TZ=${TZ:-UTC}
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:8011/health || exit 1"]
@@ -342,148 +315,99 @@ services:
         max-size: "10m"
         max-file: "5"
 
-  # OpenVINO variant of the faces sidecar. ENABLE WITH:
-  #   docker compose --profile faces-openvino up -d
+  # Auto-restart on hangs. Docker's `restart: unless-stopped` policy only
+  # fires when the process *exits*; a wedged event loop, deadlocked DB
+  # handle, or AI worker that hangs but doesn't crash leaves the container
+  # running with healthcheck stuck on "unhealthy" indefinitely.
   #
-  # Requires the host's Intel iGPU/dGPU/NPU exposed via /dev/dri (same
-  # passthrough that ffmpeg vaapi uses) AND the operator's user inside
-  # the container holding the render group GID. The default permission
-  # set works on Synology DSM 7, recent Debian/Ubuntu, and Intel NUC
-  # hosts. The image is `ghcr.io/botnick/tgdl-faces:openvino-latest`
-  # — linux/amd64 only (OpenVINO doesn't ship arm64 wheels).
-  tgdl-faces-openvino:
-    image: ghcr.io/botnick/tgdl-faces:openvino-latest
-    pull_policy: always
-    container_name: tgdl-faces
+  # `willfarrell/autoheal` polls the docker socket every AUTOHEAL_INTERVAL
+  # seconds, finds containers whose health is "unhealthy" AND that carry
+  # the AUTOHEAL_CONTAINER_LABEL ("autoheal=true"), and `docker restart`s
+  # them. The label scoping means the sidecar can NEVER touch an unrelated
+  # container on the same host even if it wanted to.
+  #
+  # Disabled-by-default: comment out this service if you'd rather rely on
+  # an external supervisor (systemd, k8s, NAS health monitors, etc.).
+  autoheal:
+    image: willfarrell/autoheal:1.2.0
+    container_name: telegram-downloader-autoheal
     restart: unless-stopped
-    profiles: ["faces-openvino"]
-    devices:
-      - /dev/dri:/dev/dri
-    group_add:
-      - "video"
-      - "render"
-    volumes:
-      # Mount the downloads tree at the SAME path the main app sees
-      # (`/app/data/downloads`) so absolute paths produced by Node's
-      # scan-runner work as-is in the sidecar — no Docker-specific path
-      # remapping. Without this, every /detect call falls back to base64
-      # transfer (CPU-bound on the Node side) because the sidecar's
-      # ALLOW_ROOTS doesn't include the Node-side path prefix.
-      - ./data/downloads:/app/data/downloads:ro
-      - ./data/faces-service/models:/root/.cache/tgdl-faces/models
+    profiles:
+      - autoheal
+    # autoheal only needs the docker socket — no inbound network. `none`
+    # makes a hypothetical RCE in autoheal unable to phone home.
+    network_mode: none
     environment:
-      - TGDL_FACES_HOST=0.0.0.0
-      - TGDL_FACES_PORT=8011
-      - TGDL_FACES_ALLOW_ROOTS=/app/data/downloads
-      - TGDL_FACES_MODELS_DIR=/root/.cache/tgdl-faces/models
-      - TGDL_FACES_PROVIDERS=${TGDL_FACES_PROVIDERS:-auto}
-      - TGDL_FACES_DETECTOR_MODEL=${TGDL_FACES_DETECTOR_MODEL:-buffalo_m}
-      - TGDL_FACES_THROTTLE_MS=${TGDL_FACES_THROTTLE_MS:-0}
-      # Confirmed-track floors for video face keep (seen in ≥2 sampled frames).
-      - TGDL_FACES_VIDEO_CONFIRMED_MIN_QUALITY=${TGDL_FACES_VIDEO_CONFIRMED_MIN_QUALITY:-0.35}
-      - TGDL_FACES_VIDEO_CONFIRMED_MIN_SCORE=${TGDL_FACES_VIDEO_CONFIRMED_MIN_SCORE:-0.50}
-      - TGDL_FACES_VIDEO_MIN_LANDMARK_REGULARITY=${TGDL_FACES_VIDEO_MIN_LANDMARK_REGULARITY:-0.15}
-      # Video nice: prefer Maintenance UI (Node forwards `nice` on each
-      # /detect/video). Do not pin with `:-10` — that ignores UI=0.
-      # - TGDL_FACES_VIDEO_NICE=${TGDL_FACES_VIDEO_NICE}
+      # Only restart containers explicitly opted-in via label. The main
+      # service above carries `autoheal=true`.
+      - AUTOHEAL_CONTAINER_LABEL=autoheal
+      # Poll cadence — matches the dashboard healthcheck interval.
+      - AUTOHEAL_INTERVAL=30
+      # Don't act during the container's own start_period — gives boot
+      # time without the sidecar racing the first healthcheck. Compose
+      # already passes `start_period: 30s`; this is the upper bound.
+      - AUTOHEAL_START_PERIOD=60
+      # Graceful stop timeout before SIGKILL during a restart attempt.
+      - AUTOHEAL_DEFAULT_STOP_TIMEOUT=10
       - TZ=${TZ:-UTC}
-    healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:8011/health || exit 1"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 90s
-    labels:
-      - "com.centurylinklabs.watchtower.enable=true"
-    deploy:
-      resources:
-        limits:
-          memory: ${TGDL_FACES_MEM_LIMIT:-2g}
-        reservations:
-          memory: 512m
+    volumes:
+      # Read+write because autoheal calls `POST /containers/<id>/restart`.
+      # If you need defence-in-depth against a compromised sidecar, swap
+      # this for a docker-socket-proxy (tecnativa/docker-socket-proxy)
+      # configured with CONTAINERS=1 + POST=1 and nothing else.
+      - /var/run/docker.sock:/var/run/docker.sock
     logging:
       driver: "json-file"
       options:
-        max-size: "10m"
-        max-file: "5"
+        max-size: "1m"
+        max-file: "3"
 
-  # # Auto-restart on hangs. Docker's `restart: unless-stopped` policy only
-  # # fires when the process *exits*; a wedged event loop, deadlocked DB
-  # # handle, or AI worker that hangs but doesn't crash leaves the container
-  # # running with healthcheck stuck on "unhealthy" indefinitely.
-  # #
-  # # `willfarrell/autoheal` polls the docker socket every AUTOHEAL_INTERVAL
-  # # seconds, finds containers whose health is "unhealthy" AND that carry
-  # # the AUTOHEAL_CONTAINER_LABEL ("autoheal=true"), and `docker restart`s
-  # # them. The label scoping means the sidecar can NEVER touch an unrelated
-  # # container on the same host even if it wanted to.
-  # #
-  # # Disabled-by-default: comment out this service if you'd rather rely on
-  # # an external supervisor (systemd, k8s, NAS health monitors, etc.).
-  # autoheal:
-  #   image: willfarrell/autoheal:1.2.0
-  #   container_name: telegram-downloader-autoheal
-  #   restart: unless-stopped
-  #   # autoheal only needs the docker socket — no inbound network. `none`
-  #   # makes a hypothetical RCE in autoheal unable to phone home.
-  #   network_mode: none
-  #   environment:
-  #     # Only restart containers explicitly opted-in via label. The main
-  #     # service above carries `autoheal=true`.
-  #     - AUTOHEAL_CONTAINER_LABEL=autoheal
-  #     # Poll cadence — matches the dashboard healthcheck interval.
-  #     - AUTOHEAL_INTERVAL=30
-  #     # Don't act during the container's own start_period — gives boot
-  #     # time without the sidecar racing the first healthcheck. Compose
-  #     # already passes `start_period: 30s`; this is the upper bound.
-  #     - AUTOHEAL_START_PERIOD=60
-  #     # Graceful stop timeout before SIGKILL during a restart attempt.
-  #     - AUTOHEAL_DEFAULT_STOP_TIMEOUT=10
-  #     - TZ=${TZ:-UTC}
-  #   volumes:
-  #     # Read+write because autoheal calls `POST /containers/<id>/restart`.
-  #     # If you need defence-in-depth against a compromised sidecar, swap
-  #     # this for a docker-socket-proxy (tecnativa/docker-socket-proxy)
-  #     # configured with CONTAINERS=1 + POST=1 and nothing else.
-  #     - /var/run/docker.sock:/var/run/docker.sock
-  #   logging:
-  #     driver: "json-file"
-  #     options:
-  #       max-size: "1m"
-  #       max-file: "3"
-
-  # # Optional one-click updater. ENABLE WITH:
-  # #   docker compose --profile auto-update up -d
-  # # Without the `--profile` flag the sidecar isn't started and the dashboard
-  # # falls back to "click the GitHub link and run docker compose up -d".
-  # #
-  # # Security model:
-  # #   - watchtower is the ONLY container that touches /var/run/docker.sock.
-  # #     The main app calls watchtower over the internal docker network via
-  # #     an HTTP token; it never sees the socket itself, so a hypothetical
-  # #     RCE in the dashboard cannot escalate to host root.
-  # #   - WATCHTOWER_LABEL_ENABLE=true scopes operations to ONLY the labeled
-  # #     telegram-downloader container — watchtower can't sweep up
-  # #     unrelated apps even if it wanted to.
-  # #   - HTTP API requires WATCHTOWER_HTTP_API_TOKEN (random hex). Set this
-  # #     in .env BEFORE first boot of the profile; absence disables the
-  # #     dashboard button entirely.
-  # watchtower:
-  #   image: containrrr/watchtower:1.7.1
-  #   profiles: ["auto-update"]
-  #   container_name: telegram-downloader-updater
-  #   restart: unless-stopped
-  #   volumes:
-  #     - /var/run/docker.sock:/var/run/docker.sock:ro
-  #   environment:
-  #     - WATCHTOWER_HTTP_API_UPDATE=true
-  #     - WATCHTOWER_HTTP_API_TOKEN=${WATCHTOWER_HTTP_API_TOKEN:-}
-  #     - WATCHTOWER_HTTP_API_PERIODIC_POLLS=false
-  #     - WATCHTOWER_LABEL_ENABLE=true
-  #     - WATCHTOWER_CLEANUP=true
-  #     - WATCHTOWER_INCLUDE_RESTARTING=true
-  #     - WATCHTOWER_NO_STARTUP_MESSAGE=true
-  #     - TZ=${TZ:-UTC}
+  # One-click updater behind the dashboard's **Install update** button.
+  # Runs by default but idle: HTTP-API-only mode, no periodic polling, no
+  # published ports. It updates only when the button (or a `curl -X POST`
+  # with the token) asks. No setup: the app generates a random token in
+  # ./data/watchtower/ and this service reads it from that file (starts after
+  # the app is healthy). A WATCHTOWER_HTTP_API_TOKEN in .env overrides it.
+  #
+  # Opt in to scheduled updates: put WATCHTOWER_HTTP_API_PERIODIC_POLLS=true
+  # and WATCHTOWER_SCHEDULE="0 0 4 * * *" in .env and add the second to the
+  # environment list below.
+  #
+  # Security model:
+  #   - watchtower is the ONLY container that touches /var/run/docker.sock.
+  #     The main app calls it over the internal docker network with a
+  #     bearer token; it never sees the socket, so an RCE in the dashboard
+  #     cannot escalate to host root.
+  #   - WATCHTOWER_LABEL_ENABLE=true scopes operations to ONLY containers
+  #     carrying the `com.centurylinklabs.watchtower.enable=true` label.
+  #
+  # Image: maintained fork of the archived containrrr/watchtower. The
+  # original pins Docker API 1.25 and fails on Docker Engine 29+ with
+  # "client version 1.25 is too old"; the fork negotiates the API version.
+  watchtower:
+    image: nickfedor/watchtower:1.22
+    container_name: telegram-downloader-updater
+    restart: unless-stopped
+    profiles:
+      - autoupdate
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # Only the generated token folder, never the DB/sessions.
+      - ./data/watchtower:/run/tgdl:ro
+    depends_on:
+      telegram-downloader:
+        condition: service_healthy
+    environment:
+      - WATCHTOWER_HTTP_API_ENDPOINTS=update
+      # Default = path of the token file the app generates; watchtower reads
+      # the file's contents. A token set in .env is used as-is instead.
+      - WATCHTOWER_HTTP_API_TOKEN=${WATCHTOWER_HTTP_API_TOKEN:-/run/tgdl/api-token}
+      - WATCHTOWER_HTTP_API_PERIODIC_POLLS=${WATCHTOWER_HTTP_API_PERIODIC_POLLS:-false}
+      - WATCHTOWER_LABEL_ENABLE=true
+      - WATCHTOWER_CLEANUP=true
+      - WATCHTOWER_INCLUDE_RESTARTING=true
+      - WATCHTOWER_NO_STARTUP_MESSAGE=true
+      - TZ=${TZ:-UTC}
 
 # First-time setup:
 #   docker compose up -d
@@ -491,17 +415,14 @@ services:
 #   from localhost on first run), then go to Settings → Telegram Accounts
 #   → Add account.
 #
-# Upgrade (manual):
-#   docker compose up -d        # `pull_policy: always` re-pulls latest
+# Upgrade the app image from this tree:
+#   docker compose up -d --build
 #
-# Upgrade (one-click in dashboard) — opt-in:
-#   1. Generate a token:
-#        openssl rand -hex 32   # or: node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
-#   2. Add to .env (next to docker-compose.yml):
-#        WATCHTOWER_HTTP_API_TOKEN=<the random token>
-#   3. Boot with the auto-update profile:
-#        docker compose --profile auto-update up -d
-#   4. Settings → Maintenance → "Install update" — does the rest.
+# Faces (and watchtower) still come from the registry:
+#   docker compose pull tgdl-faces tgdl-faces-cuda watchtower && docker compose up -d
+#
+# Upgrade (one-click): Settings → Maintenance → "Install update". Needs
+#   no setup (token is generated; WATCHTOWER_HTTP_API_TOKEN in .env overrides).
 #
 # Headless monitor (instead of web dashboard):
 #   docker compose run --rm \

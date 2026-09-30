@@ -45,6 +45,21 @@ describe('config manager (kv-backed)', () => {
         expect(dbApi.kvGet('config')).toBeTruthy();
     });
 
+    it('an old config with advanced.goCore (v2.28–2.29) loads and saves', () => {
+        // The tgdl-core mode switches are no longer read; a stored block must
+        // not break loading or saving.
+        dbApi.kvSet('config', {
+            download: { concurrent: 3 },
+            advanced: { goCore: { mode: 'shadow', features: { hash: 'on', stat: 'bogus' } } },
+        });
+        const cfg = manager.loadConfig();
+        expect(cfg.download.concurrent).toBe(3);
+        expect(() =>
+            manager.saveConfig({ ...cfg, download: { ...cfg.download, concurrent: 4 } }),
+        ).not.toThrow();
+        expect(manager.loadConfig().download.concurrent).toBe(4);
+    });
+
     it('saveConfig + loadConfig round-trips a full tree', () => {
         const cfg = manager.loadConfig();
         cfg.telegram.apiId = '99999';
@@ -164,7 +179,7 @@ describe('config manager (kv-backed)', () => {
         expect(f).toBeTruthy();
         expect(f.backend).toBe('sidecar');
         expect(f.autoDownload).toBe(true);
-        expect(f.detSize).toBe(480);
+        expect(f.detSize).toBe(640);
         expect(f.providers).toBe('auto');
         expect(f.epsilon).toBeCloseTo(1.05, 5);
         expect(f.minPoints).toBe(2);

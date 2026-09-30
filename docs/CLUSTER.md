@@ -1,3 +1,9 @@
+---
+title: "Cluster"
+description: "Pair several Telegram Media Downloader instances into one federated library with failover and cluster-wide search."
+nav_order: 6
+---
+
 # Cluster mode
 
 > **v2.10** — per-peer tokens, real-time WS push, LAN auto-discovery,
@@ -75,9 +81,9 @@ cluster catalog + bridge.
 If `Owner peer` is left blank, every peer that has the group enabled
 will download it (with cross-peer dedup catching duplicates by hash).
 
-The Group Settings modal → **Accounts** tab exposes both
-`ownerPeerId` and `backupPeerId` as dropdowns whenever at least one
-peer is paired. Pick a backup peer to enable automatic failover —
+A chat's details page (Chats → the chat, or the ⚙ in its gallery) →
+**Accounts** exposes both `ownerPeerId` and `backupPeerId` as
+dropdowns whenever at least one peer is paired. Pick a backup peer to enable automatic failover —
 the backup takes over downloading if the owner stays silent past
 `cluster.failover_grace_minutes` (default 5).
 
@@ -234,7 +240,7 @@ that matches the local cluster token.
 | `GET  /api/cluster/groups/snapshot` | HMAC | groups blob |
 | `GET  /api/cluster/accounts/snapshot` | HMAC | accounts (session redacted) |
 | `GET  /api/cluster/files/<path>` | HMAC | proxy stream of own files |
-| `POST /api/cluster/sign-url` | HMAC | mint short-lived share URL for direct mode |
+| `POST /api/cluster/sign-url` | HMAC | mint short-lived share URL for direct mode: `{url, expiresAt (ms), exp (s)}`. A peer answering without `exp` (older versions, whose URLs never verified) is streamed through the proxy instead. |
 
 ## v2.10 features (resolved limitations)
 
@@ -243,7 +249,14 @@ that matches the local cluster token.
   the migration guide.
 - **Pairing codes** — the receiving peer issues an 8-character code
   valid for 5 minutes; the initiator pastes URL + code; both sides
-  exchange secrets in the handshake.
+  exchange secrets in the handshake. The two peers don't need the same
+  cluster token. Versions up to v2.29.1 refused every pairing-code
+  handshake, so both peers need a later version; pairing with the
+  cluster token works with any version.
+- **Background engines** — the catalog sync poll, the `/ws/cluster`
+  link, LAN discovery and the failover watcher run whenever at least one
+  peer is paired: from boot, and right after a pairing. An install with
+  no paired peer runs none of them (no socket, no LAN beacon).
 - **Real-time WS push** — every paired peer maintains a persistent
   `/ws/cluster` link with HMAC handshake; catalog deltas propagate in
   <1 s. Polling drops to a 5-min safety net.

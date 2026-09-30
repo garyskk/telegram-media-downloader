@@ -1,4 +1,6 @@
-// Playlist ID helpers for player shuffle — full-library listing + ordered hydrate.
+// Playlist ID helpers for gallery shuffle — full-library listing + ordered hydrate.
+// v2.32.1 hard-deletes, so a deleted id is absent from the table rather than
+// flagged user_deleted.
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import fs from 'fs';
@@ -38,7 +40,6 @@ beforeAll(async () => {
             api.setDownloadPinned(id, true);
         }
     }
-    // Soft-delete one photo — must never appear in playlist ids.
     const delId = db.prepare('SELECT id FROM downloads WHERE message_id = 5').get().id;
     api.deleteDownloadsBy({ ids: [delId] });
 });
@@ -52,7 +53,7 @@ afterAll(() => {
 });
 
 describe('listDownloadIds', () => {
-    it('returns every non-deleted id (no page limit)', () => {
+    it('returns every remaining id (no page limit)', () => {
         const { ids, total } = api.listDownloadIds('all');
         expect(total).toBe(4);
         expect(ids).toHaveLength(4);
@@ -61,7 +62,7 @@ describe('listDownloadIds', () => {
 
     it('filters by type', () => {
         const { ids } = api.listDownloadIds('images');
-        expect(ids).toHaveLength(2); // a.jpg + c.jpg (e.jpg soft-deleted)
+        expect(ids).toHaveLength(2);
         const rows = api.getDownloadsByIds(ids);
         expect(rows.every((r) => r.file_type === 'photo')).toBe(true);
     });
@@ -77,17 +78,16 @@ describe('listDownloadIds', () => {
 describe('listDownloadIdsForGroup', () => {
     it('scopes to one group', () => {
         const { ids, total } = api.listDownloadIdsForGroup('-100a', 'all');
-        expect(total).toBe(2); // a.jpg + b.mp4 (e soft-deleted)
+        expect(total).toBe(2);
         expect(ids).toHaveLength(2);
     });
 });
 
 describe('getDownloadsByIds', () => {
-    it('preserves request order and skips missing/soft-deleted', () => {
+    it('preserves request order and skips missing ids', () => {
         const all = api.listDownloadIds('all').ids;
         const reversed = all.slice().reverse();
-        const deleted = db.prepare('SELECT id FROM downloads WHERE message_id = 5').get().id;
-        const rows = api.getDownloadsByIds([...reversed, deleted, 999999]);
+        const rows = api.getDownloadsByIds([...reversed, 999999]);
         expect(rows.map((r) => r.id)).toEqual(reversed);
     });
 });

@@ -2,11 +2,13 @@ import { state } from './store.js';
 import { formatDate, showToast } from './utils.js';
 import { attachSwipe, attachDragDismiss } from './gestures.js';
 import { tf as i18nTf, t as i18nT } from './i18n.js';
-import { getMediaUrl, getDownloadUrl } from './media-url.js';
+import { getMediaUrl, getDownloadUrl, isPeerRow } from './media-url.js';
+import { api } from './api.js';
+import { pinnedQs } from './gallery-toolbar.js';
+import { pushOverlay, popOverlay } from './overlay-history.js';
 import { ws } from './ws.js';
 import { renderTextInto, renderCodeInto, renderMarkdownInto, langFromExt } from './viewer-text.js';
 import { renderArchiveInto } from './viewer-archive.js';
-import { api } from './api.js';
 
 // ---- Seekbar feature flag — lazy, module-scoped --------------------------
 //
@@ -137,7 +139,7 @@ async function _fetchFaces(downloadId) {
     }
 }
 
-function _renderFaceOverlay(faces, highlightFaceId) {
+function _renderFaceOverlay(faces) {
     const layer = document.getElementById('face-overlay-layer');
     const toolbar = document.getElementById('face-toolbar');
     const countEl = document.getElementById('face-count');
@@ -157,7 +159,6 @@ function _renderFaceOverlay(faces, highlightFaceId) {
     _positionFaceLayerToImage(layer, img);
     const naturalW = img.naturalWidth;
     const naturalH = img.naturalHeight;
-    const highlightId = Number(highlightFaceId) || null;
     let html = '';
     for (const f of faces) {
         const x = (Number(f.x) / naturalW) * 100;
@@ -170,15 +171,8 @@ function _renderFaceOverlay(faces, highlightFaceId) {
             : f.person_id
               ? `#${f.person_id}`
               : i18nT('viewer.faces.unlabeled', 'Unlabeled');
-        const isHighlighted = highlightId != null && Number(f.id) === highlightId;
-        const cls = [
-            'face-label',
-            f.person_label || f.person_id ? '' : 'unlabeled',
-        ]
-            .filter(Boolean)
-            .join(' ');
-        const boxCls = isHighlighted ? 'face-box face-box-highlighted' : 'face-box';
-        html += `<div class="${boxCls}" data-face-id="${Number(f.id) || ''}" style="left:${x.toFixed(3)}%;top:${y.toFixed(3)}%;width:${w.toFixed(3)}%;height:${h.toFixed(3)}%" title="${label}" tabindex="0">`;
+        const cls = f.person_label || f.person_id ? 'face-label' : 'face-label unlabeled';
+        html += `<div class="face-box" style="left:${x.toFixed(3)}%;top:${y.toFixed(3)}%;width:${w.toFixed(3)}%;height:${h.toFixed(3)}%" title="${label}" tabindex="0">`;
         html += `<span class="${cls}">${label}</span></div>`;
     }
     layer.innerHTML = html;
@@ -192,17 +186,7 @@ function _renderFaceOverlay(faces, highlightFaceId) {
             : i18nT('viewer.faces.hide', 'Hide');
         toggleBtn.setAttribute('aria-pressed', hidden ? 'false' : 'true');
     }
-    // Opening from a face-review tile is an explicit "show me this face"
-    // action — force the overlay visible for this image even if the
-    // operator had previously toggled it off, so the highlight isn't
-    // silently hidden. Subsequent navigation without a highlight target
-    // reverts to the persisted preference as normal.
-    layer.classList.toggle('hidden', _facesOverlayHidden && highlightId == null);
-
-    if (highlightId != null) {
-        const box = layer.querySelector(`.face-box[data-face-id="${highlightId}"]`);
-        box?.focus?.({ preventScroll: true });
-    }
+    layer.classList.toggle('hidden', _facesOverlayHidden);
 }
 
 function _positionFaceLayerToImage(layer, img) {
@@ -247,7 +231,7 @@ async function _refreshFacesForCurrent() {
         return;
     }
     const faces = await _fetchFaces(Number(file.id));
-    _renderFaceOverlay(faces, file.highlightFaceId);
+    _renderFaceOverlay(faces);
 }
 
 function _wireFacesToolbarOnce() {
@@ -302,6 +286,8 @@ function _wireFacesToolbarOnce() {
 // ============================================================================
 
 let zoomState = { scale: 1, panning: false, pointX: 0, pointY: 0, startX: 0, startY: 0 };
+// overlay-history token while the modal is open (Back closes it).
+let _viewerOverlay = null;
 /** @type {VideoPlayer|null} */
 let videoPlayer = null;
 
@@ -311,12 +297,12 @@ let videoPlayer = null;
 // returns `'advance'` the viewer auto-navigates forward (so e.g. `w`
 // whitelist + advance keeps the operator moving without extra clicks).
 let _reviewActions = null;
+// Blocks shuffle for one-file and review sessions (not the gallery).
+let _shuffleBlocked = false;
 // Optional per-row metadata renderer for review mode (e.g. NSFW score
 // badge). Receives the current file and returns an HTML string painted
 // into #viewer-review-meta on every openMediaViewer call.
 let _reviewMetaRender = null;
-// Blocks shuffle for openMediaViewerSingle / review sessions (not the gallery).
-let _shuffleBlocked = false;
 
 /**
  * One-shot open: hand a `{ fullPath, type, name, … }` record straight to
@@ -414,19 +400,14 @@ async function _runReviewAction(action) {
         return;
     }
     if (outcome === 'remove-and-advance') {
-        // Remove by identity rather than by stale index: if a WS 'file_deleted'
-        // event arrived while the handler was awaited, state.files may have
-        // already been re-filtered and idx no longer points to `file`.
-        const prevLen = state.files.length;
-        state.files = state.files.filter((f) => f !== file);
-        const removed = prevLen > state.files.length ? [file] : [];
+        const removed = state.files.splice(idx, 1);
         if (!state.files.length) {
             closeMediaViewer();
             return;
         }
         const nextIdx = Math.min(idx, state.files.length - 1);
         openMediaViewer(nextIdx);
-        if (typeof action.afterRemove === 'function' && removed.length) {
+        if (typeof action.afterRemove === 'function') {
             try {
                 action.afterRemove(removed[0]);
             } catch {}
@@ -621,8 +602,8 @@ function _setTypeChip(file) {
 }
 
 export function openMediaViewer(index) {
-    state.currentFileIndex = index;
     if (_shuffle.active) _shuffle.cursor = index;
+    state.currentFileIndex = index;
     const file = state.files[index];
     if (!file) return;
 
@@ -808,18 +789,24 @@ export function openMediaViewer(index) {
         ? `${index + 1} / ${_shuffle.keys.length}`
         : `${index + 1} / ${state.files.length}`;
     document.getElementById('modal-download').href = downloadUrl;
-    _updatePinButton(file);
     _setTypeChip(file);
 
+    _syncPinButton(file);
+
+    const wasHidden = modal.classList.contains('hidden');
     modal.classList.remove('hidden');
     document.body.style.overflow = 'hidden';
+    // Back (Android / browser / PWA edge swipe) closes the viewer instead
+    // of leaving the page. Only the first open pushes; prev/next reuse it.
+    if (wasHidden && _viewerOverlay == null) {
+        _viewerOverlay = pushOverlay(() => closeMediaViewer());
+    }
 
     // Continuous player: start slideshow for photos, videos handle it via onended.
     _stopSlideshow();
     if (file.type === 'images' || file.type === 'documents') _startSlideshow();
     const autoBadge = document.getElementById('modal-continuous-badge');
     if (autoBadge) autoBadge.classList.toggle('hidden', !_isAutoAdvance());
-    _syncShuffleChrome();
 
     prefetchNeighbor(index + 1);
 
@@ -872,93 +859,6 @@ function _escape(text) {
         .replace(/'/g, '&#039;');
 }
 
-// ---- Viewer pin button ---------------------------------------------------
-
-let _pinBtnWired = false;
-
-/** Reflect `file.pinned` state onto the #modal-pin button. Hidden when the
- *  file has no DB id (peer tiles that can't be locally pinned). */
-function _updatePinButton(file) {
-    const btn = document.getElementById('modal-pin');
-    if (!btn) return;
-    if (!file?.id) {
-        btn.classList.add('hidden');
-        return;
-    }
-    btn.classList.remove('hidden');
-    const pinned = !!file.pinned;
-    const ico = btn.querySelector('i');
-    const lbl = btn.querySelector('span');
-    if (ico) {
-        ico.className = pinned ? 'ri-pushpin-2-fill sm:mr-1.5' : 'ri-pushpin-2-line sm:mr-1.5';
-    }
-    if (lbl) lbl.textContent = pinned ? i18nT('favorites.unpin', 'Unpin') : i18nT('favorites.pin', 'Pin');
-    btn.title = pinned ? i18nT('favorites.unpin', 'Unpin') : i18nT('favorites.pin', 'Pin');
-    // Yellow tint when pinned — matches the selection-bar Pin button style.
-    btn.classList.toggle('text-yellow-300', pinned);
-    btn.classList.toggle('bg-yellow-500/20', pinned);
-    btn.classList.toggle('hover:bg-yellow-500/30', pinned);
-    btn.classList.toggle('text-tg-text', !pinned);
-    btn.classList.toggle('bg-tg-panel', !pinned);
-    btn.classList.toggle('hover:bg-tg-hover', !pinned);
-
-    if (_pinBtnWired) return;
-    _pinBtnWired = true;
-    btn.addEventListener('click', async () => {
-        const f = state.files?.[state.currentFileIndex];
-        if (!f?.id) return;
-        const next = !f.pinned;
-        try {
-            await api.post(`/api/downloads/${encodeURIComponent(f.id)}/pin`, { pinned: next });
-            f.pinned = next;
-            // Mirror state onto the matching gallery tile (if rendered).
-            const tile = document.querySelector(`.media-item[data-id="${f.id}"]`);
-            if (tile) {
-                tile.classList.toggle('is-pinned', next);
-                const chip = tile.querySelector('[data-tile-pin] i');
-                if (chip) {
-                    chip.classList.toggle('ri-pushpin-2-fill', next);
-                    chip.classList.toggle('ri-pushpin-2-line', !next);
-                }
-            }
-            _updatePinButton(f);
-        } catch (e) {
-            showToast(
-                i18nTf('viewer.pin.failed', { msg: e.message }, `Pin failed: ${e.message}`),
-                'error',
-            );
-        }
-    });
-}
-
-// Keep the pin button in sync when another tab/device toggles the pin.
-try {
-    ws.on('download_pinned', ({ id, pinned }) => {
-        const f = state.files?.find((x) => x.id === id);
-        if (f) {
-            f.pinned = pinned;
-            // If the viewer is open on this file, refresh the button.
-            if (state.files?.[state.currentFileIndex]?.id === id) {
-                _updatePinButton(f);
-            }
-            // Mirror onto gallery tile.
-            const tile = document.querySelector(`.media-item[data-id="${id}"]`);
-            if (tile) {
-                tile.classList.toggle('is-pinned', pinned);
-                const chip = tile.querySelector('[data-tile-pin] i');
-                if (chip) {
-                    chip.classList.toggle('ri-pushpin-2-fill', pinned);
-                    chip.classList.toggle('ri-pushpin-2-line', !pinned);
-                }
-            }
-        }
-    });
-} catch {
-    /* ws not available in tests */
-}
-
-// -------------------------------------------------------------------------
-
 let _prefetchLink = null;
 function prefetchNeighbor(nextIndex) {
     const next = state.files[nextIndex];
@@ -985,16 +885,185 @@ function prefetchNeighbor(nextIndex) {
 function resetZoom() {
     zoomState = { scale: 1, panning: false, pointX: 0, pointY: 0 };
     const img = document.getElementById('modal-image');
-    if (img) img.style.transform = `translate(0px, 0px) scale(1)`;
+    if (img) {
+        img.style.transform = `translate(0px, 0px) scale(1)`;
+        img.classList.remove('is-zoomed');
+    }
+    document.getElementById('image-container')?.classList.remove('is-zoomed');
+}
+
+// Zoom geometry: translate(pointX, pointY) scale(scale) around the image
+// centre. Panning is clamped so the zoomed image can't be dragged off
+// screen. Swipe-to-navigate and drag-to-close are disabled while zoomed
+// (see _viewerGestureBlocked).
+const ZOOM_MAX = 5;
+const DOUBLE_TAP_SCALE = 2.5;
+
+function _applyZoom(animate) {
+    const img = document.getElementById('modal-image');
+    const container = document.getElementById('image-container');
+    if (!img) return;
+    const s = zoomState.scale;
+    if (s <= 1.001) {
+        zoomState.scale = 1;
+        zoomState.pointX = 0;
+        zoomState.pointY = 0;
+    } else if (container) {
+        const maxX = ((s - 1) * container.clientWidth) / 2;
+        const maxY = ((s - 1) * container.clientHeight) / 2;
+        zoomState.pointX = Math.max(-maxX, Math.min(maxX, zoomState.pointX));
+        zoomState.pointY = Math.max(-maxY, Math.min(maxY, zoomState.pointY));
+    }
+    img.style.transition = animate ? 'transform 180ms ease-out' : 'none';
+    img.style.transform = `translate(${zoomState.pointX}px, ${zoomState.pointY}px) scale(${zoomState.scale})`;
+    const zoomed = zoomState.scale > 1;
+    img.classList.toggle('is-zoomed', zoomed);
+    container?.classList.toggle('is-zoomed', zoomed);
+}
+
+// Zoom to `next` keeping the image point under (cx, cy) — viewport
+// coordinates — fixed on screen.
+function _zoomAt(next, cx, cy, animate) {
+    const container = document.getElementById('image-container');
+    if (!container) return;
+    const r = container.getBoundingClientRect();
+    const mx = cx - (r.left + r.width / 2);
+    const my = cy - (r.top + r.height / 2);
+    const s0 = zoomState.scale;
+    const s1 = Math.min(Math.max(1, next), ZOOM_MAX);
+    zoomState.pointX = mx - (s1 / s0) * (mx - zoomState.pointX);
+    zoomState.pointY = my - (s1 / s0) * (my - zoomState.pointY);
+    zoomState.scale = s1;
+    _applyZoom(animate);
+}
+
+// Pointer bookkeeping for the image pane (touch + pen + mouse).
+const _imgPointers = new Map(); // pointerId → {x, y}
+let _pinch = null; // { dist, scale, midX, midY, px, py }
+let _multiTouch = false; // a 2nd finger touched down during this gesture
+let _lastTap = { t: 0, x: 0, y: 0 };
+
+/** True while the image is zoomed or a pinch is in progress. */
+function _viewerGestureBlocked() {
+    return zoomState.scale > 1 || _multiTouch || _imgPointers.size > 1;
+}
+
+let _imageGesturesWired = false;
+function _wireImageGesturesOnce() {
+    if (_imageGesturesWired) return;
+    const container = document.getElementById('image-container');
+    if (!container) return;
+    _imageGesturesWired = true;
+
+    const mid = () => {
+        const [a, b] = [..._imgPointers.values()];
+        return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2, d: Math.hypot(a.x - b.x, a.y - b.y) };
+    };
+
+    container.addEventListener('pointerdown', (e) => {
+        if (e.pointerType === 'mouse' && e.button !== 0) return;
+        _imgPointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+        if (_imgPointers.size === 2) {
+            _multiTouch = true;
+            const m = mid();
+            _pinch = {
+                dist: m.d || 1,
+                scale: zoomState.scale,
+                midX: m.x,
+                midY: m.y,
+                px: zoomState.pointX,
+                py: zoomState.pointY,
+            };
+            _lastTap.t = 0;
+            return;
+        }
+        if (_imgPointers.size !== 1) return;
+        // Double tap (touch / pen) toggles 2.5× at the tapped point.
+        if (e.pointerType !== 'mouse') {
+            const now = Date.now();
+            if (
+                now - _lastTap.t < 300 &&
+                Math.hypot(e.clientX - _lastTap.x, e.clientY - _lastTap.y) < 30
+            ) {
+                _lastTap.t = 0;
+                if (zoomState.scale > 1) {
+                    zoomState.scale = 1;
+                    _applyZoom(true);
+                } else {
+                    _zoomAt(DOUBLE_TAP_SCALE, e.clientX, e.clientY, true);
+                }
+                return;
+            }
+            _lastTap = { t: now, x: e.clientX, y: e.clientY };
+        }
+        if (zoomState.scale > 1) {
+            zoomState.panning = true;
+            zoomState.startX = e.clientX - zoomState.pointX;
+            zoomState.startY = e.clientY - zoomState.pointY;
+            try {
+                container.setPointerCapture(e.pointerId);
+            } catch {}
+        }
+    });
+    container.addEventListener('pointermove', (e) => {
+        const p = _imgPointers.get(e.pointerId);
+        if (!p) return;
+        p.x = e.clientX;
+        p.y = e.clientY;
+        if (_pinch && _imgPointers.size >= 2) {
+            const m = mid();
+            const s1 = Math.min(Math.max(1, _pinch.scale * (m.d / _pinch.dist)), ZOOM_MAX);
+            // Keep the image point that was under the starting midpoint
+            // under the current midpoint (pinch + two-finger pan).
+            const r = container.getBoundingClientRect();
+            const cx = r.left + r.width / 2;
+            const cy = r.top + r.height / 2;
+            const k = s1 / _pinch.scale;
+            zoomState.scale = s1;
+            zoomState.pointX = m.x - cx - k * (_pinch.midX - cx - _pinch.px);
+            zoomState.pointY = m.y - cy - k * (_pinch.midY - cy - _pinch.py);
+            _applyZoom(false);
+            return;
+        }
+        if (zoomState.panning && zoomState.scale > 1) {
+            zoomState.pointX = e.clientX - zoomState.startX;
+            zoomState.pointY = e.clientY - zoomState.startY;
+            _applyZoom(false);
+        }
+    });
+    const end = (e) => {
+        if (!_imgPointers.delete(e.pointerId)) return;
+        if (_imgPointers.size < 2) _pinch = null;
+        if (_imgPointers.size === 1 && zoomState.scale > 1) {
+            // One finger left after a pinch: continue as a pan from here.
+            const [rest] = [..._imgPointers.values()];
+            zoomState.panning = true;
+            zoomState.startX = rest.x - zoomState.pointX;
+            zoomState.startY = rest.y - zoomState.pointY;
+        }
+        if (_imgPointers.size === 0) {
+            zoomState.panning = false;
+            // Keep blocking swipe/close until the next gesture starts.
+            setTimeout(() => {
+                if (_imgPointers.size === 0) _multiTouch = false;
+            }, 0);
+            if (zoomState.scale < 1.05) {
+                zoomState.scale = 1;
+                _applyZoom(true);
+            }
+        }
+    };
+    container.addEventListener('pointerup', end);
+    container.addEventListener('pointercancel', end);
 }
 
 function setupImageZoom() {
     const img = document.getElementById('modal-image');
+    _wireImageGesturesOnce();
     img.onwheel = (e) => {
         e.preventDefault();
         const delta = e.deltaY > 0 ? 0.9 : 1.1;
-        zoomState.scale = Math.min(Math.max(1, zoomState.scale * delta), 5);
-        img.style.transform = `scale(${zoomState.scale})`;
+        _zoomAt(zoomState.scale * delta, e.clientX, e.clientY, false);
     };
 }
 
@@ -1019,38 +1088,6 @@ function formatTime(seconds) {
     const s = total % 60;
     const pad = (n) => String(n).padStart(2, '0');
     return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${pad(m)}:${pad(s)}`;
-}
-
-/**
- * Whether the buffering spinner should be visible.
- *
- * Cold start is readyState-driven. Mid-playback stalls are NOT: Chrome
- * (and others) leave `readyState` at HAVE_ENOUGH_DATA while firing the
- * `waiting` event, and HTMLMediaElement has no `waiting` property to
- * read later. The caller must pass a sticky flag set on `waiting` and
- * cleared on `playing` / advancing `timeupdate`.
- *
- * Never key off the network `stalled` event — progressive HTTP streaming
- * fires it whenever the byte-range fetch pauses after filling the buffer,
- * while playback can still be perfectly smooth.
- *
- * @param {{ readyState: number, paused: boolean, seeking: boolean, waiting?: boolean }} media
- */
-function shouldShowVideoSpinner({ readyState, paused, seeking, waiting }) {
-    // HAVE_NOTHING / HAVE_METADATA — no picture yet (initial src / load()).
-    if (readyState < 2) return true;
-    // Don't cover the centre-play button while the user has paused.
-    if (paused) return false;
-    // Spec event for "playback stopped for lack of data" — independent
-    // of readyState, because browsers often leave that at 4.
-    if (waiting) return true;
-    // Seek while playing: readyState also stays at 4 until the new
-    // position decodes. A short delay in `_syncSpinner` swallows
-    // buffered seeks that finish instantly.
-    if (seeking) return true;
-    // Spec-faithful fallback when readyState actually dropped.
-    if (readyState < 3) return true;
-    return false;
 }
 
 class VideoPlayer {
@@ -1126,10 +1163,6 @@ class VideoPlayer {
         this._dragging = false;
         this._wasPlayingBeforeDrag = false;
         this._resumePlayed = false;
-        this._playbackWaiting = false;
-        this._spinnerDelay = null;
-        this._suppressSpinnerSync = false;
-        this._lastPlayhead = null;
         this._hideTimer = null;
         this._lastDoubleTapAt = 0;
         this._lastTapAt = 0;
@@ -1171,6 +1204,9 @@ class VideoPlayer {
                 this.seekRelative(isLeft ? -step : step);
                 this._flashSeekOverlay(isLeft, step);
                 this._lastTapAt = 0;
+                // The second tap's click would toggle play/pause right after
+                // the seek — swallow clicks for the next ~350 ms.
+                this._suppressClickUntil = now + 350;
             } else {
                 this._lastTapAt = now;
                 this._lastTapX = e.clientX;
@@ -1181,6 +1217,10 @@ class VideoPlayer {
         // them without toggling play — so tapping the video to "wake"
         // the controls doesn't accidentally pause.
         this.tapLayer.onclick = (e) => {
+            if (Date.now() < (this._suppressClickUntil || 0)) {
+                e.stopPropagation();
+                return;
+            }
             if (this._controlsWereHidden) {
                 this._controlsWereHidden = false;
                 this._showControls(true);
@@ -1190,6 +1230,12 @@ class VideoPlayer {
             e.stopPropagation();
         };
         this.tapLayer.ondblclick = (e) => {
+            // Touch: a double tap is the ±N s seek gesture handled in
+            // onpointerdown — it must not also toggle fullscreen.
+            if (!SUPPORTS_HOVER) {
+                e.stopPropagation();
+                return;
+            }
             if (localStorage.getItem('viewer-dbl-tap-fs') === '0') {
                 e.stopPropagation();
                 return;
@@ -1298,12 +1344,13 @@ class VideoPlayer {
         this.video.onplay = () => {
             this._refreshPlayIcons();
             if (this.video.paused === false) this._scheduleHide();
-            this._syncSpinner();
         };
         this.video.onpause = () => {
             this._refreshPlayIcons();
             this._showControls(true);
-            this._syncSpinner();
+            // Never spin over a paused clip; a resume that has to wait
+            // fires `waiting` again.
+            if (this.video.readyState >= 2) this._clearWaiting();
         };
         this.video.onended = () => {
             this._refreshPlayIcons();
@@ -1330,37 +1377,42 @@ class VideoPlayer {
                 localStorage.setItem(MUTED_LS_KEY, this.video.muted ? '1' : '0');
             } catch {}
         };
-        this.video.ontimeupdate = () => this._onTimeUpdate();
+        this.video.ontimeupdate = () => {
+            // Playback is demonstrably moving again → not buffering.
+            const t = this.video.currentTime;
+            if (this._waiting && t !== this._lastWaitTime && !this.video.paused) {
+                this._clearWaiting();
+            }
+            this._lastWaitTime = t;
+            this._onTimeUpdate();
+        };
         this.video.onprogress = () => this._renderBuffered();
         this.video.ondurationchange = () => {
             this.durTime.textContent = formatTime(this.video.duration || 0);
             this._renderBuffered();
         };
-        // Buffering spinner: `waiting` is the real "playback starved"
-        // signal (sticky flag — there is no element.waiting property).
-        // Never blindly trust `stalled` — that event means the *download*
-        // paused, which is normal once the progressive buffer is full.
-        this.video.onwaiting = () => {
-            this._playbackWaiting = true;
-            this._syncSpinner();
+        // Buffering spinner. `stalled` is deliberately ignored — it fires
+        // during perfectly smooth progressive playback whenever the
+        // network pauses for a moment, and nothing but canplay/playing
+        // hid the spinner again, so it sat over a playing video.
+        // `waiting` sets a flag; `playing` or currentTime advancing
+        // clears it. Cold start (no frame yet) shows the spinner at once,
+        // mid-playback waits/seeks only after 200 ms (most resolve
+        // sooner), and it never shows while paused.
+        this.video.onwaiting = () => this._markWaiting();
+        this.video.onseeking = () => {
+            if (!this.video.paused) this._markWaiting();
         };
-        this.video.onplaying = () => {
-            this._playbackWaiting = false;
-            this._syncSpinner();
+        this.video.onseeked = () => {
+            if (this.video.readyState >= 3) this._clearWaiting();
         };
-        this.video.onseeking = () => this._syncSpinner();
-        this.video.onseeked = () => this._syncSpinner();
-        this.video.oncanplay = () => this._syncSpinner();
-        this.video.oncanplaythrough = () => this._syncSpinner();
-        this.video.onloadeddata = () => this._syncSpinner();
-        this.video.onloadstart = () => {
-            // New source: lift the load()-time suppress so cold-start
-            // readyState (HAVE_NOTHING) can show the spinner, and so a
-            // stale timeupdate from the previous clip can't hide it.
-            this._suppressSpinnerSync = false;
-            this._syncSpinner();
+        this.video.oncanplay = () => {
+            if (this.video.paused) this._clearWaiting();
         };
-        this.video.onstalled = () => this._syncSpinner();
+        this.video.onplaying = () => this._clearWaiting();
+        this.video.onloadeddata = () => {
+            if (this.video.paused) this._clearWaiting();
+        };
         this.video.onerror = () => this._showError();
         this.video.onratechange = () => this._refreshSpeedUi();
 
@@ -1443,16 +1495,11 @@ class VideoPlayer {
         this.playBtn.setAttribute('aria-label', i18nT('viewer.video.play', 'Play'));
         this.centerPlay.classList.remove('hidden');
         this._hideError();
-        // Freeze spinner sync until loadstart so a delayed timeupdate /
-        // seeked from the previous clip can't hide the cold-start spinner
-        // while readyState is still the old file's HAVE_ENOUGH_DATA.
-        this._playbackWaiting = false;
-        this._lastPlayhead = null;
-        if (this._spinnerDelay) {
-            clearTimeout(this._spinnerDelay);
-            this._spinnerDelay = null;
-        }
-        this._suppressSpinnerSync = true;
+        // Cold start: no frame yet → spinner right away (cleared by
+        // playing / loadeddata-while-paused / timeupdate).
+        this._waiting = true;
+        this._lastWaitTime = 0;
+        clearTimeout(this._spinnerTimer);
         this._showSpinner(true);
 
         // Restore persisted volume + mute + speed.
@@ -1510,8 +1557,9 @@ class VideoPlayer {
         // interaction, so if we ever can't start with audio we fall back
         // to a muted start — the user can unmute with one click. The
         // mute state we already restored above wins when present.
-        const shouldAutoplay = localStorage.getItem(AUTOPLAY_LS_KEY) === '1'
-            || localStorage.getItem('viewer-auto-advance') === '1';
+        const shouldAutoplay =
+            localStorage.getItem(AUTOPLAY_LS_KEY) === '1' ||
+            localStorage.getItem('viewer-auto-advance') === '1';
         if (shouldAutoplay) {
             const tryPlay = () => {
                 this.video.play().catch(() => {
@@ -1570,13 +1618,6 @@ class VideoPlayer {
         this._currentUrl = null;
         this._storageKey = null;
         this._resumePlayed = false;
-        this._playbackWaiting = false;
-        this._lastPlayhead = null;
-        this._suppressSpinnerSync = false;
-        if (this._spinnerDelay) {
-            clearTimeout(this._spinnerDelay);
-            this._spinnerDelay = null;
-        }
         if (this._hideTimer) {
             clearTimeout(this._hideTimer);
             this._hideTimer = null;
@@ -1608,6 +1649,8 @@ class VideoPlayer {
         this._filmstripLastIdx = -1;
         this.speedMenu.classList.add('hidden');
         this._hideError();
+        this._waiting = false;
+        clearTimeout(this._spinnerTimer);
         this._showSpinner(false);
     }
 
@@ -2093,26 +2136,6 @@ class VideoPlayer {
     _onTimeUpdate() {
         const v = this.video;
         this.curTime.textContent = formatTime(v.currentTime);
-        // Safety net: if frames are advancing, the `waiting` flag (and
-        // a visible spinner) is stale — browsers sometimes never fire
-        // `playing` after a brief stall.
-        const t = v.currentTime;
-        if (
-            this._playbackWaiting &&
-            !v.seeking &&
-            Number.isFinite(t) &&
-            this._lastPlayhead != null &&
-            t !== this._lastPlayhead
-        ) {
-            this._playbackWaiting = false;
-        }
-        this._lastPlayhead = t;
-        if (
-            this.spinner &&
-            (!this.spinner.classList.contains('hidden') || this._spinnerDelay || this._playbackWaiting)
-        ) {
-            this._syncSpinner();
-        }
         if (Number.isFinite(v.duration) && v.duration > 0) {
             const pct = Math.max(0, Math.min(100, (v.currentTime / v.duration) * 100));
             this.progressFill.style.width = `${pct}%`;
@@ -2255,8 +2278,8 @@ class VideoPlayer {
     }
 
     _showControls(force = false) {
-        this.controls.style.opacity = '1';
         this.controls.classList.remove('controls-collapsed');
+        this.controls.style.opacity = '1';
         this.container.style.cursor = '';
         if (!force && SUPPORTS_HOVER && !this.video.paused) {
             this._scheduleHide();
@@ -2283,9 +2306,6 @@ class VideoPlayer {
             // Don't hide while the speed menu is open.
             if (!this.speedMenu.classList.contains('hidden')) return;
             this.controls.style.opacity = '0';
-            // Collapse the docked band so the picture expands into the
-            // freed space (overlay-free chrome when visible; immersive
-            // when hidden).
             this.controls.classList.add('controls-collapsed');
             this.container.style.cursor = 'none';
         }, delay);
@@ -2300,44 +2320,33 @@ class VideoPlayer {
         label.textContent = `${step}s`;
         show.style.opacity = '1';
         clearTimeout(this._seekOverlayTimer);
-        this._seekOverlayTimer = setTimeout(() => { show.style.opacity = '0'; }, 600);
+        this._seekOverlayTimer = setTimeout(() => {
+            show.style.opacity = '0';
+        }, 600);
     }
 
     _showSpinner(on) {
-        if (this._spinnerDelay) {
-            clearTimeout(this._spinnerDelay);
-            this._spinnerDelay = null;
-        }
         this.spinner.classList.toggle('hidden', !on);
     }
 
-    /**
-     * Recompute spinner from media state (see shouldShowVideoSpinner).
-     * Cold start (no frame yet) shows immediately; mid-playback waits
-     * and seeks are delayed so a buffered skip doesn't flash the icon.
-     */
-    _syncSpinner() {
-        if (this._suppressSpinnerSync) return;
-        if (!this.spinner || !this.video) return;
-        const show = shouldShowVideoSpinner({
-            readyState: this.video.readyState,
-            paused: this.video.paused,
-            seeking: this.video.seeking,
-            waiting: !!this._playbackWaiting,
-        });
-        if (!show) {
-            this._showSpinner(false);
-            return;
-        }
+    _markWaiting() {
+        this._waiting = true;
+        clearTimeout(this._spinnerTimer);
+        if (this.video.paused && this.video.readyState >= 2) return;
         if (this.video.readyState < 2) {
+            // Nothing to show yet (cold start / seek far outside the buffer).
             this._showSpinner(true);
             return;
         }
-        if (!this.spinner.classList.contains('hidden') || this._spinnerDelay) return;
-        this._spinnerDelay = setTimeout(() => {
-            this._spinnerDelay = null;
-            this.spinner.classList.remove('hidden');
+        this._spinnerTimer = setTimeout(() => {
+            if (this._waiting && !this.video.paused) this._showSpinner(true);
         }, 200);
+    }
+
+    _clearWaiting() {
+        this._waiting = false;
+        clearTimeout(this._spinnerTimer);
+        this._showSpinner(false);
     }
 
     _showError() {
@@ -2375,6 +2384,8 @@ class VideoPlayer {
         this.errorMsg.textContent = msg;
         this.errorOverlay.classList.remove('hidden');
         this.errorOverlay.classList.add('flex');
+        this._waiting = false;
+        clearTimeout(this._spinnerTimer);
         this._showSpinner(false);
     }
 
@@ -2613,6 +2624,12 @@ export function closeMediaViewer() {
     _stopSlideshow();
     modal.classList.add('hidden');
     document.body.style.overflow = '';
+    if (_viewerOverlay != null) {
+        const token = _viewerOverlay;
+        _viewerOverlay = null;
+        popOverlay(token);
+    }
+    resetZoom();
     if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
     if (videoPlayer) videoPlayer.unload();
     const image = document.getElementById('modal-image');
@@ -2625,21 +2642,80 @@ export function closeMediaViewer() {
     _reviewActions = null;
     _reviewMetaRender = null;
     _shuffleBlocked = false;
+    // Shuffle is a gallery mode — closing the player keeps the shuffled order.
+    if (_shuffle.active) _notifyShuffleChange();
     document.getElementById('viewer-review-bar')?.classList.add('hidden');
     document.getElementById('viewer-review-actions')?.classList.add('hidden');
     document.getElementById('viewer-review-meta')?.classList.add('hidden');
-    // Keep shuffle as a gallery mode — do not restore chronological order.
-    _syncShuffleChrome();
-    if (_shuffle.active) _notifyShuffleChange();
+}
+
+// Pin / unpin from the viewer's action bar — same endpoint + tile update
+// as the gallery tile's pin chip. Hidden for rows without a local id
+// (federated peer rows, synthetic queue files) and, via data-admin-only,
+// for guests.
+function _syncPinButton(file) {
+    const btn = document.getElementById('modal-pin');
+    if (!btn) return;
+    const canPin = file && file.id != null && !isPeerRow(file) && state.role === 'admin';
+    btn.classList.toggle('hidden', !canPin);
+    btn.classList.toggle('flex', !!canPin);
+    if (!canPin) return;
+    const pinned = !!file.pinned;
+    const label = pinned ? i18nT('favorites.unpin', 'Unpin') : i18nT('favorites.pin', 'Pin');
+    btn.setAttribute('aria-pressed', pinned ? 'true' : 'false');
+    btn.title = label;
+    btn.classList.toggle('text-yellow-300', pinned);
+    const icon = btn.querySelector('i');
+    if (icon) {
+        icon.classList.toggle('ri-pushpin-2-fill', pinned);
+        icon.classList.toggle('ri-pushpin-2-line', !pinned);
+    }
+    const text = btn.querySelector('span');
+    if (text) text.textContent = label;
+}
+
+async function _togglePinCurrent() {
+    const file = state.files[state.currentFileIndex];
+    if (!file || file.id == null || isPeerRow(file)) return;
+    const btn = document.getElementById('modal-pin');
+    if (btn?.dataset.busy === '1') return;
+    if (btn) btn.dataset.busy = '1';
+    const next = !file.pinned;
+    try {
+        await api.post(`/api/downloads/${encodeURIComponent(file.id)}/pin`, { pinned: next });
+        file.pinned = next;
+        _syncPinButton(file);
+        // Keep the gallery tile (if rendered) in step.
+        const tile = document.querySelector(
+            `#media-grid .media-item[data-id="${CSS.escape(String(file.id))}"]`,
+        );
+        if (tile) {
+            tile.classList.toggle('is-pinned', next);
+            const ico = tile.querySelector('[data-tile-pin] i');
+            if (ico) {
+                ico.classList.toggle('ri-pushpin-2-fill', next);
+                ico.classList.toggle('ri-pushpin-2-line', !next);
+            }
+        }
+        showToast(
+            next ? i18nT('favorites.pinned', 'Pinned') : i18nT('favorites.unpinned', 'Unpinned'),
+            'success',
+        );
+    } catch (e) {
+        showToast(e?.message || 'Pin failed', 'error');
+    } finally {
+        if (btn) delete btn.dataset.busy;
+    }
 }
 
 export function setupViewerEvents() {
     document.getElementById('modal-close')?.addEventListener('click', closeMediaViewer);
-    document.getElementById('modal-prev')?.addEventListener('click', () => navigateMedia(-1));
-    document.getElementById('modal-next')?.addEventListener('click', () => navigateMedia(1));
     document.getElementById('modal-shuffle-btn')?.addEventListener('click', () => {
         void toggleShuffle({ openPlayer: true });
     });
+    document.getElementById('modal-pin')?.addEventListener('click', _togglePinCurrent);
+    document.getElementById('modal-prev')?.addEventListener('click', () => navigateMedia(-1));
+    document.getElementById('modal-next')?.addEventListener('click', () => navigateMedia(1));
 
     // Share button — opens the share-link sheet for the current file.
     // Lazy-import keeps the module out of the cold-load path; it only
@@ -2827,6 +2903,7 @@ export function setupViewerEvents() {
     const swipeArea = document.getElementById('modal-swipe');
     if (swipeArea) {
         attachSwipe(swipeArea, {
+            shouldIgnore: _viewerGestureBlocked,
             onSwipe: (dir) => {
                 // Swiping while dragging the seek bar would jump clips. The
                 // controls' pointerdown already stops bubbling, so this is
@@ -2837,6 +2914,7 @@ export function setupViewerEvents() {
             threshold: 60,
         });
         attachDragDismiss(swipeArea, {
+            shouldIgnore: _viewerGestureBlocked,
             onDismiss: closeMediaViewer,
             threshold: 100,
         });
@@ -2896,10 +2974,9 @@ function _crossfadeTransition(callback) {
 }
 
 // ---- Shuffle playlist (full library) ----------------------------------
-// Builds a no-repeat order from GET /api/downloads/ids (full filtered set),
-// hydrates slots via POST /api/downloads/by-ids, and walks that order in
-// navigateMedia. Shuffle is a gallery mode: closing the player keeps the
-// shuffled list; grid + player buttons share one session.
+// One session shared by the gallery chip and the player button. The order
+// is the full filtered id set, not the loaded page. Closing the player
+// keeps that order.
 
 const SHUFFLE_HYDRATE_WINDOW = 40;
 
@@ -2917,7 +2994,6 @@ let _shuffle = {
 /** @type {null | (() => void)} */
 let _onShuffleChange = null;
 
-/** Normalize a playlist id / {id, peer_id} to a stable string key. */
 function _playlistKey(entry) {
     if (entry == null) return '';
     if (typeof entry === 'object') {
@@ -2947,7 +3023,6 @@ function _keyToPayload(key) {
     return { id, peer_id };
 }
 
-/** Fisher–Yates in place. */
 function _fisherYates(arr) {
     for (let i = arr.length - 1; i > 0; i--) {
         const j = Math.floor(Math.random() * (i + 1));
@@ -2958,10 +3033,6 @@ function _fisherYates(arr) {
     return arr;
 }
 
-/**
- * Put `currentKey` first (if present), shuffle the rest.
- * Pure — does not mutate the input array.
- */
 function _buildShuffleOrder(keys, currentKey) {
     const list = keys.slice();
     if (!currentKey || !list.length) return _fisherYates(list);
@@ -2973,16 +3044,10 @@ function _buildShuffleOrder(keys, currentKey) {
     return list;
 }
 
-/** Drop `dropKey` from an order array (pure). */
 function _dropKeyFromOrder(keys, dropKey) {
     if (!dropKey) return keys.slice();
     return keys.filter((k) => k !== dropKey);
 }
-
-export const _buildShuffleOrderForTests = _buildShuffleOrder;
-export const _fisherYatesForTests = _fisherYates;
-export const _playlistKeyForTests = _playlistKey;
-export const _dropKeyFromOrderForTests = _dropKeyFromOrder;
 
 function _notifyShuffleChange() {
     try {
@@ -3007,24 +3072,21 @@ function _syncShuffleChrome() {
     }
 }
 
+function _shuffleScopeQs() {
+    const viewerScope = state.viewerPeerScope;
+    if (viewerScope) return `&include=peers&peerId=${encodeURIComponent(viewerScope)}`;
+    const s = state.galleryScope;
+    if (!s || s === 'local') return '';
+    if (s === 'all') return '&include=peers';
+    return `&include=peers&peerId=${encodeURIComponent(s)}`;
+}
+
 function _shuffleQs() {
     const type =
         state.currentFilter && state.currentFilter !== 'all' ? state.currentFilter : 'all';
-    let qs = `type=${encodeURIComponent(type)}`;
-    if (state.pinnedFilter === 'pinned') qs += '&pinned=1';
-    else if (state.pinnedFilter === 'unpinned') qs += '&pinned=0';
-    if (state.currentGroup) qs += `&groupId=${encodeURIComponent(state.currentGroup)}`;
-    // Mirror app.js _galleryScopeQs
-    const viewerScope = state.viewerPeerScope;
-    if (viewerScope) {
-        qs += `&include=peers&peerId=${encodeURIComponent(viewerScope)}`;
-    } else {
-        const s = state.galleryScope;
-        if (s && s !== 'local') {
-            if (s === 'all') qs += '&include=peers';
-            else qs += `&include=peers&peerId=${encodeURIComponent(s)}`;
-        }
-    }
+    let qs = `type=${encodeURIComponent(type)}${pinnedQs()}${_shuffleScopeQs()}`;
+    if (state.currentGroupId) qs += `&groupId=${encodeURIComponent(state.currentGroupId)}`;
+    if (state.searchQuery) qs += `&q=${encodeURIComponent(state.searchQuery)}`;
     return qs;
 }
 
@@ -3056,7 +3118,6 @@ async function _hydrateShuffleKeys(keys) {
     }
 }
 
-/** Rebuild state.files as a dense prefix of hydrated shuffle keys (index-aligned). */
 function _materializeShuffleFiles(uptoExclusive) {
     const end = Math.min(
         _shuffle.keys.length,
@@ -3065,7 +3126,7 @@ function _materializeShuffleFiles(uptoExclusive) {
     const files = [];
     for (let i = 0; i < end; i++) {
         const f = _shuffle.cache.get(_shuffle.keys[i]);
-        if (!f) break; // stop at first hole so indices stay contiguous
+        if (!f) break;
         files.push(f);
     }
     state.files = files;
@@ -3099,8 +3160,13 @@ function _findShuffleKeyForFile(file) {
 
 function _fileMatchesDeleted(file, dropped) {
     if (!file || !dropped) return false;
+    if (dropped.id != null) {
+        const peer = file.peer_id || file.peerId || 'self';
+        const dPeer = dropped.peer_id || dropped.peerId || 'self';
+        if (file.id === dropped.id && String(peer) === String(dPeer)) return true;
+        if (!dropped.path && !dropped.fullPath) return false;
+    }
     if (dropped.path && (file.fullPath === dropped.path || file.path === dropped.path)) return true;
-    if (dropped.id != null && file.id === dropped.id) return true;
     if (dropped.fullPath && (file.fullPath === dropped.fullPath || file.path === dropped.fullPath))
         return true;
     return false;
@@ -3143,7 +3209,6 @@ async function _enableShuffle({ openPlayer = true } = {}) {
         _shuffle.cursor = 0;
         _shuffle.active = true;
 
-        // Hydrate a larger first window so the grid looks populated.
         const firstEnd = Math.min(
             _shuffle.keys.length,
             Math.max(SHUFFLE_HYDRATE_WINDOW, openPlayer ? SHUFFLE_HYDRATE_WINDOW : 100),
@@ -3204,7 +3269,7 @@ function _disableShuffle({ silent = false } = {}) {
             0,
             Math.min(backupIndex || 0, Math.max(0, state.files.length - 1)),
         );
-        state.hasMore = true; // chronological load will recompute on next scroll/refresh
+        state.hasMore = true;
     }
     _syncShuffleChrome();
     _notifyShuffleChange();
@@ -3222,10 +3287,6 @@ function _disableShuffle({ silent = false } = {}) {
     }
 }
 
-/**
- * Toggle shuffle. `{ openPlayer: true }` (player button) opens/keeps the
- * lightbox; `{ openPlayer: false }` (grid button) only reshuffles the gallery.
- */
 export async function toggleShuffle({ openPlayer = true } = {}) {
     if (_shuffle.active) {
         _disableShuffle();
@@ -3242,7 +3303,6 @@ export function onShuffleChange(cb) {
     _onShuffleChange = typeof cb === 'function' ? cb : null;
 }
 
-/** Clear shuffle before a chronological gallery reload (filter/group change). */
 export function clearShuffleSilent() {
     if (!_shuffle.active && _shuffle.backupFiles == null) return;
     _shuffle = {
@@ -3258,10 +3318,6 @@ export function clearShuffleSilent() {
     _syncShuffleChrome();
 }
 
-/**
- * Drop a deleted file from the shuffle playlist (keys, cache, backup).
- * Rematerializes state.files. Returns whether the playlist changed.
- */
 export function removeShuffleFile(fileOrMeta) {
     if (!_shuffle.active) return false;
     const file =
@@ -3281,7 +3337,6 @@ export function removeShuffleFile(fileOrMeta) {
         _shuffle.keys = _dropKeyFromOrder(_shuffle.keys, key);
         _shuffle.cache.delete(key);
     }
-    // Also strip by path/id from cache + backup even if key lookup failed.
     for (const [k, f] of [..._shuffle.cache.entries()]) {
         if (_fileMatchesDeleted(f, file)) {
             _shuffle.cache.delete(k);
@@ -3293,7 +3348,6 @@ export function removeShuffleFile(fileOrMeta) {
     }
 
     if (_shuffle.keys.length === beforeLen && !key) {
-        // Still try filtering state.files identity for path-only drops.
         const prev = state.files.length;
         state.files = state.files.filter((f) => !_fileMatchesDeleted(f, file));
         if (state.files.length === prev) return false;
@@ -3307,10 +3361,7 @@ export function removeShuffleFile(fileOrMeta) {
     if (_shuffle.cursor >= state.files.length) {
         _shuffle.cursor = Math.max(0, state.files.length - 1);
     }
-    state.currentFileIndex = Math.min(
-        state.currentFileIndex,
-        Math.max(0, state.files.length - 1),
-    );
+    state.currentFileIndex = Math.min(state.currentFileIndex, Math.max(0, state.files.length - 1));
     _syncShuffleChrome();
     _notifyShuffleChange();
 
@@ -3321,7 +3372,6 @@ export function removeShuffleFile(fileOrMeta) {
     return true;
 }
 
-/** Hydrate the next shuffle window for infinite scroll on the grid. */
 export async function loadMoreShuffle() {
     if (!_shuffle.active || _shuffle.busy) return false;
     if (state.files.length >= _shuffle.keys.length) {
@@ -3330,10 +3380,7 @@ export async function loadMoreShuffle() {
     }
     _shuffle.busy = true;
     try {
-        const nextEnd = Math.min(
-            _shuffle.keys.length,
-            state.files.length + SHUFFLE_HYDRATE_WINDOW,
-        );
+        const nextEnd = Math.min(_shuffle.keys.length, state.files.length + SHUFFLE_HYDRATE_WINDOW);
         await _hydrateShuffleKeys(_shuffle.keys.slice(0, nextEnd));
         const prevLen = state.files.length;
         _materializeShuffleFiles(nextEnd);
@@ -3382,7 +3429,6 @@ async function navigateShuffle(dir) {
                 next = state.files.length > 1 ? 1 : 0;
             } else return;
         }
-        // Skip holes if the slot vanished (delete race).
         if (!state.files[next]) {
             next = Math.min(next, state.files.length - 1);
             if (next < 0) return;
@@ -3403,7 +3449,6 @@ function navigateMedia(dir) {
         void navigateShuffle(dir);
         return;
     }
-
     const currentFilter = state.currentFilter || 'all';
     const visible =
         currentFilter === 'all' ? state.files : state.files.filter((f) => f.type === currentFilter);

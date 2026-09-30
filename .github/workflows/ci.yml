@@ -19,15 +19,90 @@ jobs:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@v7
+      # tgdl-core (core-service/) is a required part of the app: the test
+      # run builds it from this tree (tests/setup/gocore.global.js), so the
+      # suites always exercise the Go code in the same commit.
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.25'
+          cache: false
+      - uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node }}
           cache: 'npm'
       - run: npm ci
       - run: npm run lint
+      # Big-data regression guard (unbounded .all() / Math.max(...spread)).
+      - run: npm run check:oom
+        if: runner.os == 'Linux'
       - run: npm test
         env:
           # better-sqlite3 sometimes spews a single noise line on Windows;
           # treat the run as failed only on real errors.
           FORCE_COLOR: '1'
+          # Every server a suite spawns serves PORT through the tgdl-core
+          # front server; exit instead of quietly falling back to Node on
+          # PORT (gocore-boot, which tests exactly that, unsets it).
+          TGDL_FRONT_REQUIRED: '1'
+
+  # Black-box API contract suite (tests/contract): every HTTP route and WS
+  # event recorded from the Node server, compared against the committed
+  # goldens. Its own job — `npm test` stays fast. The app it starts serves
+  # PORT through the tgdl-core front server (built here), so this is also
+  # the front server's parity gate. Each later Go domain switches over only
+  # once this passes with CONTRACT_TARGET=go (docs/GO-MIGRATION.md).
+  contract:
+    name: API contract (Node target) on ${{ matrix.os }}
+    needs: go
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.25'
+          cache: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run build:core
+      - run: npm run test:contract
+        env:
+          CONTRACT_TARGET: node
+          TGDL_FRONT_REQUIRED: '1'
+          FORCE_COLOR: '1'
+
+  # tgdl-core (core-service/, Go): format, vet, tests, and a build for
+  # every release target (CGO off, so cross-builds need no toolchain).
+  go:
+    name: go (core-service)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: core-service
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.25'
+          cache: false
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then echo "gofmt needed:"; echo "$unformatted"; exit 1; fi
+      - run: go vet ./...
+      - run: go test -race ./...
+      - name: Cross-build every release target
+        run: |
+          set -e
+          for t in windows/amd64 windows/arm64 linux/amd64 linux/arm64 linux/arm linux/386 darwin/arm64 darwin/amd64; do
+            GOOS=${t%/*} GOARCH=${t#*/} GOARM=7 go vet ./...
+            CGO_ENABLED=0 GOOS=${t%/*} GOARCH=${t#*/} GOARM=7 go build -trimpath -o /dev/null ./cmd/tgdl-core
+            echo "ok $t"
+          done

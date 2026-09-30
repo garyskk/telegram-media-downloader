@@ -81,6 +81,16 @@ function getCachedSecret() {
     return _cachedSecret;
 }
 
+/**
+ * The secret verifyFileToken() uses right now, or null before the boot
+ * bootstrap ran. Only for the tgdl-core front server, which receives it
+ * over its token-gated loopback control channel (never argv / env) to
+ * check /files bearer tokens itself.
+ */
+export function getShareSecretForFront() {
+    return _cachedSecret;
+}
+
 /** Public-safe handle for log lines / metrics. Never logs the full secret. */
 export function getShareSecretFingerprint() {
     return _cachedSecretFingerprint || '(uninit)';
@@ -190,37 +200,56 @@ export function buildShareUrlPath(linkId, expEpochSeconds, fileName = null) {
 // ---- file-access token (bearer auth for /files/) --------------------------
 
 const FILE_TOKEN_TTL_DEFAULT = 3600;
+const FILE_TOKEN_ROLES = ['admin', 'guest'];
 
-export function mintFileToken(ttlSec) {
-    const ttl = Number.isFinite(ttlSec) && ttlSec > 0 ? Math.floor(ttlSec) : FILE_TOKEN_TTL_DEFAULT;
-    const exp = Math.floor(Date.now() / 1000) + ttl;
+// The minting session's role is part of the HMAC input, so a token handed
+// to a guest can't be replayed as an admin credential on /files/ (where the
+// admin-only `?peer=` federated fetch lives).
+function fileTokenSig(exp, role) {
     const secret = getCachedSecret();
-    const mac = crypto
-        .createHmac('sha256', Buffer.from(secret, 'hex'))
-        .update(`filetoken|${exp}`)
-        .digest();
-    return { token: `${exp}.${toBase64Url(mac)}`, exp };
+    return toBase64Url(
+        crypto
+            .createHmac('sha256', Buffer.from(secret, 'hex'))
+            .update(`filetoken:${role}|${exp}`)
+            .digest(),
+    );
 }
 
+export function mintFileToken(ttlSec, role = 'guest') {
+    const ttl = Number.isFinite(ttlSec) && ttlSec > 0 ? Math.floor(ttlSec) : FILE_TOKEN_TTL_DEFAULT;
+    const exp = Math.floor(Date.now() / 1000) + ttl;
+    const tokenRole = role === 'admin' ? 'admin' : 'guest';
+    return { token: `${exp}.${fileTokenSig(exp, tokenRole)}`, exp };
+}
+
+/**
+ * @returns {'admin'|'guest'|null} the role the token was minted for, or
+ *   null when it is malformed, expired or forged.
+ */
 export function verifyFileToken(token) {
-    if (typeof token !== 'string') return false;
+    if (typeof token !== 'string') return null;
     const dot = token.indexOf('.');
-    if (dot < 1) return false;
+    if (dot < 1) return null;
     const exp = Number(token.slice(0, dot));
-    if (!Number.isFinite(exp) || Date.now() / 1000 > exp) return false;
-    const sig = token.slice(dot + 1);
-    const secret = getCachedSecret();
-    const expected = toBase64Url(
-        crypto.createHmac('sha256', Buffer.from(secret, 'hex')).update(`filetoken|${exp}`).digest(),
-    );
-    const expectedBuf = Buffer.from(expected, 'utf8');
-    const gotBuf = Buffer.from(sig, 'utf8');
-    if (expectedBuf.length !== gotBuf.length) return false;
-    try {
-        return crypto.timingSafeEqual(expectedBuf, gotBuf);
-    } catch {
-        return false;
+    if (!Number.isFinite(exp) || Date.now() / 1000 > exp) return null;
+    const gotBuf = Buffer.from(token.slice(dot + 1), 'utf8');
+    const matches = (sig) => {
+        const expectedBuf = Buffer.from(sig, 'utf8');
+        return expectedBuf.length === gotBuf.length && crypto.timingSafeEqual(expectedBuf, gotBuf);
+    };
+    for (const role of FILE_TOKEN_ROLES) {
+        if (matches(fileTokenSig(exp, role))) return role;
     }
+    // Tokens minted before role binding (v2.24.5 and older) carry no role.
+    // Honour them as guest until they expire (1 h) so tabs left open across
+    // an upgrade keep loading media instead of breaking until a reload.
+    const legacy = toBase64Url(
+        crypto
+            .createHmac('sha256', Buffer.from(getCachedSecret(), 'hex'))
+            .update(`filetoken|${exp}`)
+            .digest(),
+    );
+    return matches(legacy) ? 'guest' : null;
 }
 
 // ---- TTL clamp -------------------------------------------------------------

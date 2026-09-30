@@ -1,3 +1,9 @@
+---
+title: "API"
+description: "HTTP and WebSocket API reference for the Telegram Media Downloader dashboard."
+nav_order: 7
+---
+
 # REST API
 
 Base URL: `http://localhost:3000` (or whatever you bound the dashboard to).
@@ -32,18 +38,20 @@ A few `/api/auth/*` routes are explicitly registered before the global auth midd
 |---|---|---|
 | `GET`    | `/api/accounts`                          | Saved sessions. |
 | `POST`   | `/api/accounts/auth/begin`               | `{label?}` → `{sessionId, state:'phone'}`. |
-| `POST`   | `/api/accounts/auth/phone`               | `{sessionId, phone}` → `{state:'code'\|'error'}`. |
-| `POST`   | `/api/accounts/auth/code`                | `{sessionId, code}` → `{state:'password'\|'done'\|'error', accountId?}`. |
-| `POST`   | `/api/accounts/auth/2fa`                 | `{sessionId, password}` → `{state:'done'\|'error', accountId?}`. |
+| `POST`   | `/api/accounts/auth/phone`               | `{sessionId, phone}` → `{state:'code'\|'phone'\|'error', error?, code?, seconds?}`. |
+| `POST`   | `/api/accounts/auth/code`                | `{sessionId, code}` → `{state:'password'\|'done'\|'code'\|'error', accountId?, hint?}`. |
+| `POST`   | `/api/accounts/auth/2fa`                 | `{sessionId, password}` → `{state:'done'\|'password'\|'error', accountId?}`. |
 | `POST`   | `/api/accounts/auth/cancel`              | `{sessionId}`. |
-| `GET`    | `/api/accounts/auth/:sessionId`          | Status polling. |
+| `GET`    | `/api/accounts/auth/:sessionId`          | Status polling. The first poll that sees `done` loads the new account into the running engine. |
+
+A wrong phone number / code / password keeps the step's state and sets `error` plus `code` — the Telegram error name (`PHONE_NUMBER_INVALID`, `PHONE_CODE_INVALID`, `PHONE_CODE_EXPIRED`, `PASSWORD_HASH_INVALID`, …) or `FLOOD_WAIT` with `seconds`; submitting that step again retries. `hint` is the 2FA password hint. `begin` answers `503 {code:'NO_API_CREDS'}` until `telegram.apiId` / `apiHash` are set.
 | `DELETE` | `/api/accounts/:id`                      | Removes the saved session. |
 
 ## Monitor / engine
 
 | Method | Path | Notes |
 |---|---|---|
-| `GET`  | `/api/monitor/status` | `{state, queue, active, workers, accounts, stats, uptimeMs}`. Also broadcast over WS as `monitor_status_push` every 3 s when at least one client is connected. |
+| `GET`  | `/api/monitor/status` | `{state, queue, active, workers, accounts, stats, uptimeMs, hint}`, plus `core: {state, fix}` only while tgdl-core (the app's Go engine) can't run — the dashboard shows it as a banner. Also broadcast over WS as `monitor_status_push` every 3 s when at least one client is connected. |
 | `POST` | `/api/monitor/start`  | Loads `AccountManager`, starts realtime monitor in-process. |
 | `POST` | `/api/monitor/stop`   | Cleans up watchers + the worker pool. |
 
@@ -52,13 +60,42 @@ A few `/api/auth/*` routes are explicitly registered before the global auth midd
 | Method | Path | Notes |
 |---|---|---|
 | `GET`  | `/api/stats`                  | `{totalFiles, totalSize, diskUsage, telegramConnected, peerStats:[{peerId, peerName, online, totalFiles, totalSize, totalSizeFormatted}], …}`. Also broadcast over WS as `stats_push` every 30 s. `peerStats` is `[]` for non-cluster installs and for guest sessions. |
-| `GET`  | `/api/dialogs`                | Active + archived chats; DMs gated by `config.allowDmDownloads`. |
-| `GET`  | `/api/groups`                 | Configured groups with photo URLs. |
+| `GET`  | `/api/dialogs`                | Active + archived chats; DMs gated by `config.allowDmDownloads`. Each row has `access` (see *Chat access* below). Fetching the lists also syncs access for free: a chat back in an account's list flips to `ok`; a configured chat listed as forbidden / migrated is recorded. |
+| `GET`  | `/api/chats/lookup?q=`        | Resolve what the dashboard's Add box can't find by name: `@username`, `t.me/<name>`, `t.me/c/<id>`, invite links (`t.me/+…`, `joinchat/…`) and message links. → `{kind, chat?, invite?, message?}`; `chat` has `id, name, type, username, members, joined, inConfig, enabled, suspended, dmDisabled, access`. An invite this account isn't in returns an `invite` preview (`title, members, url`). 404 `not_found` / `invite_invalid`, 422 for t.me links that aren't chats, 503 `no_account`. |
+| `GET`  | `/api/groups`                 | Configured groups with photo URLs. Each own row has `access` (see *Chat access* below) and, when its auto-forward destination refused our posts, `forwardAccess: {state, code, nextCheckAt}`. |
 | `PUT`  | `/api/groups/:id`             | Update group config (filters, autoForward, topics, accounts, **cluster routing** — `ownerPeerId` / `backupPeerId`). Auto-spawns a first-add backfill when the group is newly enabled and has no rows yet. |
 | `DELETE` | `/api/groups/:id/purge`     | Drop files + DB rows + config + photo. |
 | `GET`  | `/api/groups/:id/photo`       | Cached profile photo. |
 | `POST` | `/api/groups/refresh-photos`  | Re-fetch profile photos for every configured group. |
-| `POST` | `/api/groups/refresh-info`    | Re-resolve every monitored chat name from Telegram. |
+| `POST` | `/api/groups/refresh-info`    | Re-resolve every monitored chat name from Telegram. Chats that can't be reached are skipped (same for `refresh-photos`, `resync-dialogs` and `/api/groups/:id/photo`). |
+
+### Chat access
+
+Whether a chat can still be used, one standard answer everywhere. A chat that no loaded account can read is **paused** — polling, the update handler, the downloader (queued files are dropped, no retries), backfill, avatar / name lookups, Stories and auto-forwarding skip it with a local check, no Telegram call — until a re-check or a dialogs sync sees it readable again. Its config entry is left as it is (`enabled` stays the operator's choice); downloaded files are never touched and nothing is left or unsubscribed in Telegram.
+
+`access` object (on `/api/groups`, `/api/dialogs` and `/api/chats/lookup` rows):
+
+```json
+{ "state": "private", "code": "CHANNEL_PRIVATE", "detail": null, "migratedTo": null,
+  "firstSeenAt": 1790535647415, "checkedAt": 1790622047415, "nextCheckAt": 1790644432703,
+  "checks": 1, "accounts": [{ "id": "123", "state": "private", "code": "CHANNEL_PRIVATE", "at": 1790622047415 }] }
+```
+
+- `state`: `ok` · `left` (no account is a member) · `banned` (kicked / banned) · `private` (private channel, access lost) · `deleted` (deactivated / doesn't exist) · `restricted` (restricted by Telegram — `detail` has Telegram's text) · `migrated` (a basic group upgraded to a supergroup — `migratedTo` is the new id) · `unknown` (couldn't tell: flood wait, timeout, no account connected — never pauses anything). A chat with nothing against it is just `{ "state": "ok" }`.
+- `code` is Telegram's error (`CHANNEL_PRIVATE`, `CHANNEL_INVALID`, `USER_BANNED_IN_CHANNEL`, `CHANNEL_PUBLIC_GROUP_NA`, …) or the entity shape (`CHANNEL_FORBIDDEN`, `CHAT_MIGRATED`, …).
+- `accounts`: each account's own answer. The chat is only paused when **no** account can read it; if one still can, it takes over (and is pinned) and the chat stays `ok` with the other account's failure listed. Empty for guest sessions.
+- Re-checks: one chat per minute at most, after 1 h, 6 h, then daily (`nextCheckAt`), for monitored chats only; `migrated` is permanent and isn't re-checked. Adding an account makes every paused chat due.
+- `legacy: true` marks an entry an older version switched off (`suspended` / `_resolveFailedAt` in the config); those flags are cleared once the chat is reachable again.
+
+| Method | Path | Notes |
+|---|---|---|
+| `GET`  | `/api/chats/access`                  | Configured chats that can't be reached → `{total, byState, items:[{id, name, type, enabled, access}]}`. `?countOnly=1` → `{total, byState}`. |
+| `POST` | `/api/chats/access/recheck`          | "Check again". `{id}` → checked now (each account once, pinned first, stopping at the first that can read) → `{id, state, access, accountId, inconclusive, results}`; `inconclusive: true` means no account gave a definite answer (flood wait, timeout, none connected) and nothing changed. `{ids:[…]}` or `{all:true}` (every configured chat that can't be reached) → `{started, total}`, run in the background one chat every 2 s; progress on WS `chat_access_recheck_progress` / `chat_access_recheck_done`, status at `GET /api/chats/access/recheck/status`. 409 `ALREADY_RUNNING`. |
+| `POST` | `/api/chats/access/stop`             | `{ids}` → `enabled:false` for each → `{stopped}`. |
+| `POST` | `/api/chats/access/remove`           | `{ids}` → removes the config entries only → `{removed}`. Downloaded files and their gallery rows stay. |
+| `POST` | `/api/chats/:id/follow-migration`    | A `migrated` chat: adds the new supergroup with the old entry's settings (media types, forwarding, topics, accounts, rescue, cluster routing) and switches the old one off → `{added, group, previous}`. 409 `NOT_MIGRATED` otherwise. |
+
+All five are admin-only. `POST /api/history` for a chat that can't be reached answers `409 {code:'CHAT_UNREACHABLE', access}` before any Telegram call (auto-first and catch-up backfills are skipped); `POST /api/stories/*` does the same for a known chat, and `POST /api/download/url` reports `code: 'CHAT_UNREACHABLE'` per link. `GET /api/maintenance/recovery/list` includes paused chats with `resolveFailedReason: "access:<state>:<code>"` and `access`.
 
 ## Downloads
 
@@ -66,13 +103,13 @@ A few `/api/auth/*` routes are explicitly registered before the global auth midd
 |---|---|---|
 | `GET`    | `/api/downloads`                    | Aggregate per group. |
 | `GET`    | `/api/downloads/all`                | Cross-group All-Media list, paginated. `?page=&limit=&type=`. **`?include=local\|peers\|all`** (admin-only) UNIONs `peer_downloads` into the result; **`?peerId=<id>`** narrows to one peer. Each row carries `peer_id` (`'self'` or peer's id) + `peer_name`. Default `local` is backward-compatible. |
-| `GET`    | `/api/downloads/ids`                | Full matching ID set for gallery/player shuffle (no page limit). Same `?type=` / `?pinned=` / `?groupId=` / `?include=` / `?peerId=` filters as `/all`. Local → `{ ids: number[], total }`; federated → `{ ids: [{ id, peer_id }], total }`. Guests forced to `local`. |
-| `POST`   | `/api/downloads/by-ids`             | Hydrate shuffle playlist slots (gallery infinite-scroll windows + player advance). Body `{ ids: number[] \| { id, peer_id }[] }` (max 100). Returns gallery tile-shaped `{ files: […] }` in request order. Guest-allowed; peer keys ignored for guests. |
 | `GET`    | `/api/downloads/:groupId`           | Paginated rows for one group. `?type=images\|videos\|documents\|audio`. Same `?include=` / `?peerId=` federation params as `/all`. |
-| `GET`    | `/api/downloads/search`             | `?q=…&page=&limit=&groupId=`. Same `?include=` federation param. |
+| `GET`    | `/api/downloads/search`             | `?q=…&page=&limit=&groupId=`. Optional `type=` (`images` / `videos` / `documents` / `audio`), `pinned=1`, `pinnedFirst=1` (same as the gallery feeds) and `order=newest` (default: FTS relevance). File name / chat name prefix match, falling back to a substring match when that finds nothing. Same `?include=` federation param. |
 | `POST`   | `/api/downloads/bulk-delete`        | `{ids?, paths?}`. Also purges thumbnail cache for every removed id. |
+| `POST`   | `/api/downloads/pin`                | `{ids:[…], pinned}` — pin / unpin many rows in one request (max 5000 ids, else 413). Returns the ids that exist. |
+| `POST`   | `/api/downloads/:id/pin`            | `{pinned}` — one row. |
 | `DELETE` | `/api/file?path=…`                  | Single file. |
-| `DELETE` | `/api/purge/all`                    | Factory reset. |
+| `DELETE` | `/api/purge/all`                    | Factory reset. Body `{"confirm": "DELETE ALL"}` (exactly); without it `400 {code: "CONFIRM_REQUIRED"}` and nothing is touched. Starts a job: `{started: true}`, progress on `purge_all_progress` / `purge_all_done`. |
 
 ## Direct downloads
 
@@ -94,8 +131,8 @@ A few `/api/auth/*` routes are explicitly registered before the global auth midd
 | Method | Path | Notes |
 |---|---|---|
 | `GET` | `/api/thumbs/:id`           | `?w=120\|200\|240\|320\|480` — server-generated WebP. Image source → sharp; video source → ffmpeg first-frame. `Cache-Control: public, max-age=86400, immutable`. Allowed for guest sessions. |
-| `GET` | `/api/cluster/peer-thumbs/:remoteId`        | HMAC-only peer-to-peer thumb handler. Sibling of `/api/thumbs/:id` for federation. |
-| `GET` | `/api/cluster/thumbs/:peerId/:remoteId`     | Cookie-authed browser proxy that signs a request to peer's `peer-thumbs` and streams the response. Returns a 1×1 placeholder PNG with `Cache-Control: public, max-age=60` when the peer is offline. |
+| `GET` | `/api/cluster/peer-thumbs/:remoteId`        | HMAC-only peer-to-peer thumb handler: the WebP bytes (`image/webp`, `?w=` like `/api/thumbs/:id`). Sibling of `/api/thumbs/:id` for federation. |
+| `GET` | `/api/cluster/thumbs/:peerId/:remoteId`     | Cookie-authed browser proxy that signs a request to peer's `peer-thumbs` and streams the response. Returns a 1×1 placeholder PNG with `Cache-Control: public, max-age=60` when the peer is offline or answers something that isn't an image (older versions sent a JSON object here). |
 
 ## Share links
 
@@ -110,17 +147,17 @@ A few `/api/auth/*` routes are explicitly registered before the global auth midd
 
 | Method | Path | Notes |
 |---|---|---|
-| `POST` | `/api/maintenance/files/verify`  | Re-stat every cataloged download; prune rows whose file is missing on disk. |
+| `POST` | `/api/maintenance/files/verify`  | Re-stat every cataloged download; prune rows whose file is missing on disk. `503 TGDL_CORE_UNAVAILABLE` (with the fix) while tgdl-core can't run. |
 | `GET`  | `/api/maintenance/files/verify/status` | JobTracker snapshot — `{running, stage, progress, result}`. |
 | `GET`  | `/api/maintenance/files/verify/stats`  | `{lastRun: {finishedAt, removed, scanned}}` — survives restart. |
-| `POST` | `/api/maintenance/reindex`       | Walk `data/downloads/` and `INSERT OR IGNORE` rows for files the catalog doesn't have yet. |
+| `POST` | `/api/maintenance/reindex`       | Walk `data/downloads/` and `INSERT OR IGNORE` rows for files the catalog doesn't have yet. `503 TGDL_CORE_UNAVAILABLE` while tgdl-core can't run. |
 | `GET`  | `/api/maintenance/reindex/status`| JobTracker snapshot. |
 | `GET`  | `/api/maintenance/reindex/stats` | `{lastRun: {finishedAt, added, scanned}}`. |
 | `POST` | `/api/maintenance/resync-dialogs`| Re-resolve every group's name + profile photo. |
 | `POST` | `/api/maintenance/restart-monitor`| Stop + start the in-process monitor. |
 | `POST` | `/api/maintenance/db/integrity`  | `PRAGMA integrity_check`. |
 | `POST` | `/api/maintenance/db/vacuum`     | `VACUUM`. |
-| `POST` | `/api/maintenance/dedup/scan`    | SHA-256 catch-up + groups duplicate sets. Single in-flight guard; broadcasts `dedup_progress` over WS. |
+| `POST` | `/api/maintenance/dedup/scan`    | SHA-256 catch-up + groups duplicate sets. Single in-flight guard; broadcasts `dedup_progress` over WS. `503 TGDL_CORE_UNAVAILABLE` while tgdl-core can't run. |
 | `GET`  | `/api/maintenance/dedup/status`  | JobTracker snapshot — `{running, stage, processed, total, result}`. |
 | `GET`  | `/api/maintenance/dedup/stats`   | `{totalFiles, hashed, missing, lastScan: {finishedAt, scanned, hashed, duplicateSets, extraCopies, reclaimableBytes}}`. Survives restart. |
 | `POST` | `/api/maintenance/dedup/delete`  | `{ids:[…]}` — delete from disk + DB + thumbs cache. |
@@ -167,28 +204,6 @@ Opt-in feature — generates WebP sprite-sheet timeline thumbnails for video hov
 | `POST` | `/api/maintenance/seekbar/sidecar-test` | CORS proxy — test connection to an arbitrary seekbar sidecar URL. Body: `{url, token?}`. Returns `{ok, version}`. |
 | `POST` | `/api/maintenance/seekbar/sidecar/restart` | Tear down + respawn the Go sidecar. Use after changing hwaccel / concurrency / port range. Broadcasts `seekbar_sidecar_status`. |
 
-## Similar clips
-
-Near-duplicate videos and partial clips (a shorter video inside a longer one). Exact byte-identical files stay on Maintenance → Duplicates (SHA-256). See [docs/SIMILAR-CLIPS.md](SIMILAR-CLIPS.md).
-
-| Method | Path | Notes |
-|---|---|---|
-| `POST` | `/api/maintenance/similar/scan` | Similar-only ffmpeg: scene-or-floor `select`, 64×64 PDQ-256 + real pts. Skip when fingerprint `file_hash` matches and `algo` is `pdq-scene-v1`. Broadcasts `similar_progress`. |
-| `POST` | `/api/maintenance/similar/scan/stop` | Cancel the in-flight scan. |
-| `GET`  | `/api/maintenance/similar/status` | Scan JobTracker snapshot plus nested `analyze` snapshot. Hub running pill is Scan **or** Analyze. |
-| `GET`  | `/api/maintenance/similar/stats` | `{totalVideos, fingerprinted, missing, lastScan, lastAnalyze}`. Survives restart via `kv['similar_last_scan']` / `kv['similar_last_analyze']`. |
-| `POST` | `/api/maintenance/similar/analyze` | Rebuild `kind='similar'` groups (Smith-Waterman), then optional partial. Body: `{checkPartialClips?:bool}`. Broadcasts `similar_analyze_progress`. |
-| `POST` | `/api/maintenance/similar/analyze/stop` | Cancel the in-flight analyze. |
-| `GET`  | `/api/maintenance/similar/groups` | Persisted groups with keep/remove members. `?kind=similar\|partial\|partial_review`. |
-| `POST` | `/api/maintenance/similar/delete` | `{ids:[…]}` — same delete path as exact-dedup. |
-| `POST` | `/api/maintenance/similar/ignore` | `{aId, bId, kind?}` — false-positive pair (`kind` defaults to `similar`). |
-| `GET`  | `/api/maintenance/similar/ignore` | List ignored pairs. `?kind=`. |
-| `DELETE` | `/api/maintenance/similar/ignore/:id` | Un-ignore. |
-| `POST` | `/api/maintenance/similar/analyze/purge` | Wipe similar/partial groups and Analyze resume cursors. Keeps fingerprints, `similar_ignores`, and hover sprites. `409` `{code:'ALREADY_RUNNING'}` if Scan or Analyze is running. Broadcasts `similar_purged` `{scope:'analyze'}`. Does not start Analyze. |
-| `POST` | `/api/maintenance/similar/purge` | Wipe fingerprints, groups, and partial-resume cursors. Keeps `similar_ignores` and hover sprites. `409` `{code:'ALREADY_RUNNING'}` if Scan or Analyze is running. Broadcasts `similar_purged`. Does not start Scan. |
-
-Scan + Analyze (similar and optional partial) and the Maintenance hub card (`#/maintenance/similar`) are live. Schema is in `data/db.sqlite` already.
-
 ## AI / Face clustering (v2.16+)
 
 Opt-in face detection + clustering, backed by the Python sidecar in `faces-service/`. Off by default; flip `config.advanced.ai.enabled` + `config.advanced.ai.faceClustering`. All endpoints are admin-only. See [docs/AI.md](AI.md) for the deep dive.
@@ -203,24 +218,14 @@ Opt-in face detection + clustering, backed by the Python sidecar in `faces-servi
 | `POST`   | `/api/ai/faces/health-test`         | CORS proxy — test connection to an arbitrary faces sidecar URL. Body: `{url}`. Returns `{ok, version, model, ready, providers}`. |
 | `POST`   | `/api/ai/faces/restart`             | Restart the faces sidecar (after switching detector model / providers / det_size). Broadcasts `ai_faces_status`. |
 | `POST`   | `/api/ai/faces/install-deps`        | Stream `python -m tgdl_faces.install` over `ai_faces_install_progress` / `ai_faces_install_done`. Accepts `{force?:'cpu'\|'gpu'\|'directml'\|'openvino', dryRun?:bool, noUninstall?:bool}`. |
-| `POST`   | `/api/ai/faces/recluster`           | Incremental Phase B only (skip detection) — attach unassigned faces to existing People. Keeps merges/labels. |
-| `POST`   | `/api/ai/faces/rebuild`             | Destructive full DBSCAN — wipe People + exclusion denylist and reshape all clusters (ε reshuffle). Merges/exclusions lost; labels/covers carry over when centroids match. |
-| `POST`   | `/api/ai/faces/reindex`             | Confirm-sheet gated — wipes every detection + cluster + exclusion denylist and re-scans every photo. Use after switching detector model. Broadcasts `ai_faces_reindexed`. |
-| `GET`    | `/api/ai/faces/unclassified`        | Paginated unclassified face crops (`person_id` null, excluding denylisted). `{faces, total}`. `?limit=&offset=`. |
-| `GET`    | `/api/ai/faces/:id/suggestions`     | Nearest People within `labelMatchEps`, plus same-download (“clip”) co-occurrence — `{suggestions:[{id,label,faceCount,distance,sameClip?}]}`. |
-| `POST`   | `/api/ai/faces/:id/new-person`      | `{label?}` — create a new Person from this face (promote unclassified / split-of-one). |
-| `DELETE` | `/api/ai/faces/:id`                 | Permanently delete one face detection (Unclassified review remove). |
+| `POST`   | `/api/ai/faces/recluster`           | Re-run DBSCAN over the existing `faces` table without re-detecting (cheap; preserves labels via centroid match). `503 TGDL_CORE_UNAVAILABLE` while tgdl-core can't run. |
+| `POST`   | `/api/ai/faces/reindex`             | Confirm-sheet gated — wipes every detection + cluster and re-scans every photo. Use after switching detector model. Broadcasts `ai_faces_reindexed`. |
 | `POST`   | `/api/ai/preload-model/:name`       | Trigger background download of a face detection model. Proxies to sidecar `POST /preload/:name`. Returns `{model, status}`. `status` ∈ `not_downloaded`, `downloading`, `ready`, `error:…`. |
 | `GET`    | `/api/ai/preload-model/:name/status`| Check model download status. Returns `{model, status}`. |
-| `GET`    | `/api/ai/people`                    | Cluster list with cover-face + face count + `video_face_count` per person. `?limit=&offset=&sortBy=face_count\|avg_quality\|name&sortDir=asc\|desc` (aliases: `sort`, `dir`). Default `face_count` + `desc`. |
-| `GET`    | `/api/ai/people/excluded`           | Durable exclusion denylist (`{excluded:[{id,label,created_at,cover_face_id}], total}`). Cover crop via `/api/ai/faces/:cover_face_id/crop`. Survives recluster; cleared on Rebuild all clusters and full faces reindex. |
-| `GET`    | `/api/ai/people/:id/suggestions`    | Nearest other People within `labelMatchEps` (centroid↔centroid), plus same-download (“clip”) co-occurrence — `{suggestions:[{id,label,faceCount,distance,sameClip?}]}`. Used by People merge chips / **Merge into…** picker. |
+| `GET`    | `/api/ai/people`                    | Cluster list with cover-face + face count + `video_face_count` per person. `?page=&limit=`. |
 | `GET`    | `/api/ai/people/:id/photos`         | Paginated photos in this cluster. |
 | `PATCH`  | `/api/ai/people/:id`                | `{label}` — rename. |
-| `POST`   | `/api/ai/people/:id/cover`          | `{faceId}` — pin this face as the People avatar (must belong to the person). Survives recluster. |
-| `DELETE` | `/api/ai/people/:id`                | Drop cluster temporarily; faces become unassigned (may reappear on recluster). |
-| `POST`   | `/api/ai/people/:id/exclude`        | Durable exclude — snapshot centroid denylist + drop cluster (will not reappear on recluster). |
-| `DELETE` | `/api/ai/people/excluded/:id`       | Un-exclude; next recluster may recreate the person. |
+| `DELETE` | `/api/ai/people/:id`                | Drop cluster; faces become unassigned. |
 | `POST`   | `/api/ai/people/:id/merge`          | `{otherId}` — fold one cluster into another. |
 | `POST`   | `/api/ai/people/:id/split`          | `{faceIds, newLabel?}` — create a new cluster from selected faces. |
 | `POST`   | `/api/ai/faces/:id/reassign`        | `{personId}` — move a single face to another cluster. |
@@ -240,17 +245,17 @@ The dashboard proxies these via `/api/ai/preload-model/…` above, but the sidec
 
 | Method | Path | Notes |
 |---|---|---|
-| `GET`  | `/api/update/status`             | Capability probe — `{available, inDocker, watchtowerConfigured, watchtowerUrl}`. |
+| `GET`  | `/api/update/status`             | Any signed-in session (guests too — the status bar's update sheet reads it); 401 without one. Capability probe — `{available, inDocker, watchtowerConfigured, watchtowerUrl, overlayStallMs}`. |
 | `POST` | `/api/update`                    | Admin only. Runs a 5-step pipeline: ping watchtower (5 s HEAD) → live-DB `PRAGMA quick_check` → snapshot to `data/backups/db-pre-update-<UTC>.sqlite` → verify the snapshot is openable + clean (bad files are deleted) → POST watchtower's `/v1/update`. Returns 200 `{started:true}` on success or 4xx/5xx with a structured `code`: `AUTO_UPDATE_UNAVAILABLE`, `WATCHTOWER_UNREACHABLE`, `DB_CORRUPT`, `BACKUP_FAILED`, `BACKUP_VERIFY_FAILED`, `TRIGGER_FAILED`, or `ALREADY_RUNNING`. |
 | `GET`  | `/api/update/history`            | Admin only. Last N (default 25, max 200) update attempts from the `update_history` table — `{from_version, to_version, started_at, finished_at, status, error_code, error_msg, backup_path, backup_bytes}`. `status` is `triggered` (in-flight, not yet finalised), `success` (new container booted on a different version), `failed` (pre-flight or trigger threw), or `stalled` (watchtower acked but the swap never landed within 10 min). |
-| `GET`  | `/api/auto-update/status`        | Live `JobTracker` snapshot for the in-flight `/api/update` run (running flag, stage, durations, last error). |
+| `GET`  | `/api/auto-update/status`        | Admin only. Live `JobTracker` snapshot for the in-flight `/api/update` run (running flag, stage, durations, last error). |
 
 ## Config & proxy
 
 | Method | Path | Notes |
 |---|---|---|
-| `GET`  | `/api/config`     | `apiHash` + `password` redacted; `apiHashSet` boolean replaces hash. |
-| `POST` | `/api/config`     | Deep-merge updates; `advanced.*` namespaces are clamped per-field on save and re-applied at runtime via `config_updated`. |
+| `GET`  | `/api/config`     | Admin only. Secrets are write-only: `web.password` / `web.passwordHash` are left out, and `telegram.apiHash`, `web.shareSecret`, `web.guestPasswordHash`, `proxy.password`, `advanced.nsfw.apiToken`, `advanced.seekbar.apiToken` and `advanced.ai.faces.sidecarToken` are replaced by a `<name>Set` boolean (`apiHashSet`, `shareSecretSet`, `guestPasswordHashSet`, `passwordSet`, `apiTokenSet`, `sidecarTokenSet`). |
+| `POST` | `/api/config`     | Deep-merge updates; `advanced.*` namespaces are clamped per-field on save and re-applied at runtime via `config_updated`. A secret left out of the body keeps its saved value (send `proxy.password: null` to clear it); the `<name>Set` flags are ignored. |
 | `POST` | `/api/proxy/test` | `{host, port}` → 5-s TCP probe. |
 
 ## File serving
@@ -269,25 +274,22 @@ The dashboard proxies these via `/api/ai/preload-model/…` above, but the sidec
 |---|---|
 | `monitor_state`        | `{state, error?}` |
 | `monitor_status_push`  | Full `/api/monitor/status` snapshot every 3 s. |
-| `monitor_event`        | `{type, payload}` for download_start/_complete/_error, scale, queue_length, etc. |
-| `download_progress`    | `{key, groupId, fileName, progress, received, total, bps}` |
-| `download_complete`    | `{key, groupId, fileName, fileSize, deduped?}` |
+| `download_progress`    | `{payload: {key, groupId, fileName, progress, received, total, bps}}` |
+| `download_complete`    | `{payload: {key, groupId, fileName, fileSize, deduped?}}` |
+| `download_start` / `download_error` / `queue_length` / `queue_changed` / `scale` / `rate_wait` / `flood_wait` / `forward_error` / `rescued` / `monitor_download` / `monitor_urls` / `monitor_error` / `monitor_started` | Engine events, like the two above: each goes out under its own type with the event's data in `payload` (`queue_length`: `{length}`, `download_error`: `{job, error}`, `rate_wait` / `flood_wait`: `{seconds}`). There is no `monitor_event` envelope (older docs listed one; it was never sent). |
 | `stats_push`           | Full `/api/stats` snapshot every 30 s. |
 | `file_deleted`         | `{path, id?}` |
 | `bulk_delete`          | `{unlinked, dbDeleted, ids?}` |
 | `group_purged`         | `{groupId}` |
 | `purge_all`            | `{}` |
 | `groups_refreshed`     | `{updates}` |
+| `chat_access_changed`  | `{ids}` — chats whose access state changed (coalesced over 0.5 s); reload `/api/groups`. Forward-destination entries carry a `dest:` prefix. |
+| `chat_access_recheck_progress` / `chat_access_recheck_done` | Job-tracker snapshots of a bulk "Check again" (`progress: {processed, total, reachable}`, `result: {total, reachable, results}`). |
 | `history_progress`     | `{jobId, processed, downloaded, group, mode}` |
 | `history_done` / `history_cancelled` / `history_error` | as above |
 | `history_deleted` / `history_cleared`   | Cross-tab Recent-backfills sync. |
 | `history_stalled`      | `{pending, cap, stallSeconds}` |
 | `dedup_progress`       | `{stage, processed, total, hashed, errored}` |
-| `similar_progress`     | `{stage, processed, total, generated, skipped, errored}` |
-| `similar_done`         | `{processed, generated, skipped, errored, durationMs, cancelled}` |
-| `similar_analyze_progress` | `{stage, processed, total, comparedPairs, groups}` |
-| `similar_analyze_done` | `{similarGroups, comparedPairs, cancelled, durationMs, checkPartialClips, partialSkipped, partialGroups, partialReviewGroups, partialClipsScanned}` |
-| `similar_purged`       | `{ts}` — fingerprints/groups/resume wiped; ignores kept |
 | `thumbs_progress`      | `{stage, processed, total, built, skipped, errored}` |
 | `nsfw_progress`        | `{scanned, total, candidates, keep, running}` |
 | `nsfw_done`            | `{scanned, candidates, keep, durationMs}` |

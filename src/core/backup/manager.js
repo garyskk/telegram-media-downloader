@@ -46,6 +46,9 @@ const DEFAULT_WORKERS_PER_DEST =
         ? Math.min(20, Math.floor(Number(process.env.BACKUP_WORKERS_PER_DEST)))
         : 3;
 
+// Rows per keyset page in the mirror catch-up walk.
+const MIRROR_BATCH = 500;
+
 // ---- Public API surface ----------------------------------------------------
 
 const events = new EventEmitter();
@@ -98,10 +101,11 @@ export function init(deps = {}) {
                 });
             }
             _scheduleSnapshot(dest);
-            // Catch up remote prune + UI counters without waiting for the
-            // next snapshot upload (lifetime total_files used to only grow).
+            // Clears a retain_count backlog (e.g. lowered after already having
+            // more archives than that on the remote) without waiting for the
+            // next snapshot upload to trigger retention.
             if (dest.mode === 'snapshot' || dest.mode === 'manual') {
-                _applyRetention(dest.id).catch((e) => {
+                _reconcileRetentionBacklog(dest).catch((e) => {
                     _log({
                         source: 'backup',
                         level: 'warn',
@@ -186,9 +190,11 @@ export function addDestination(input) {
 }
 
 /**
- * Partial update of a destination. The `config` field, if present,
- * is fully replaced (not merged) and re-encrypted. Boots / kills the
- * worker as the `enabled` flag flips.
+ * Partial update of a destination. The `config` field, if present, is
+ * merged over the stored config and re-encrypted — the edit form leaves
+ * secret fields blank ("leave blank to keep"), so a blank or absent
+ * secret keeps its stored value. Boots / kills the worker as the
+ * `enabled` flag flips.
  */
 export function updateDestination(id, patch = {}) {
     const dest = _loadDestRowOrThrow(id);
@@ -201,8 +207,9 @@ export function updateDestination(id, patch = {}) {
         next.mode = patch.mode;
     }
     if (patch.cron !== undefined) next.cron = patch.cron || null;
-    // Mirror / manual never schedule — drop any leftover cron so the
-    // destination card doesn't show a misleading schedule.
+    // Cron only applies to snapshot mode — saving a mirror/manual
+    // destination always clears a leftover cron instead of keeping
+    // whatever the (hidden) form field happened to submit.
     if (next.mode !== 'snapshot') next.cron = null;
     if (patch.retainCount != null)
         next.retain_count = Math.max(1, Math.min(365, Number(patch.retainCount) || 7));
@@ -214,7 +221,17 @@ export function updateDestination(id, patch = {}) {
     if (patch.config) {
         const shareSecret = _getShareSecret();
         if (!shareSecret) throw new Error('share secret not initialised');
-        const merged = _mergeConfigPatch(dest, patch.config);
+        let merged = {};
+        try {
+            merged = _decryptCfgOrThrow(dest);
+        } catch {
+            /* undecryptable (shareSecret rotated) — the operator re-enters everything */
+        }
+        const secrets = _secretFields(dest.provider);
+        for (const [key, value] of Object.entries(patch.config)) {
+            if (secrets.has(key) && (value == null || value === '')) continue;
+            merged[key] = value;
+        }
         const blob = encryptConfig(merged, shareSecret);
         updates.push('config_blob = ?');
         params.push(blob);
@@ -291,6 +308,26 @@ export function getDestinationStatus(id, now = Date.now()) {
 }
 
 /**
+ * Non-secret config fields of a destination, for pre-filling the edit
+ * form. Secret fields (per the provider's configSchema) are never
+ * returned. Empty when the stored blob can't be decrypted.
+ */
+export function getDestinationConfig(id) {
+    const dest = _loadDestRowOrThrow(id);
+    let cfg;
+    try {
+        cfg = _decryptCfgOrThrow(dest);
+    } catch {
+        return {};
+    }
+    const out = {};
+    for (const field of PROVIDER_CLASSES[dest.provider]?.configSchema || []) {
+        if (!field.secret && cfg[field.name] != null) out[field.name] = cfg[field.name];
+    }
+    return out;
+}
+
+/**
  * Run a one-shot backup. For `manual` and `snapshot` modes this enqueues
  * a fresh archive job; for `mirror` mode it sweeps every download row
  * that doesn't have a job yet.
@@ -304,67 +341,129 @@ export async function runBackup(id) {
         return { started: true, mode: dest.mode };
     }
     // Mirror catch-up: enqueue every DB download whose backup hasn't
-    // been done yet. Keyset-paginated `.all()` — never `.iterate()`. A
-    // live `.iterate()` cursor holds the better-sqlite3 connection open
-    // for its entire lifetime; `hasJobForDownload` / `enqueue` then collide
-    // on the busy connection and throw
-    // "This database connection is busy executing a query". Each `.all()`
-    // opens and closes the statement before those writes run. Also keeps
-    // the JS heap bounded on million-row libraries (Synology / small VMs)
-    // that would otherwise OOM inside `Statement::JS_all`.
-    let enqueued = 0;
-    const PAGE_SIZE = 500;
-    let afterId = 0;
-    const pageStmt = getDb().prepare(`
-        SELECT id, file_name, file_path, file_size FROM downloads
-         WHERE file_path IS NOT NULL
-           AND (user_deleted IS NULL OR user_deleted = 0)
-           AND id > ?
+    // been done yet. Keyset-paginated `.all()` batches — one unbounded
+    // `.all()` would blow the heap on a million-row library, and an open
+    // `.iterate()` cursor keeps the connection busy so the enqueue INSERTs
+    // threw "This database connection is busy executing a query". One
+    // transaction per batch + a yield between batches keeps the walk from
+    // stalling the event loop.
+    const db = getDb();
+    const pageStmt = db.prepare(`
+        SELECT id, file_path FROM downloads
+         WHERE file_path IS NOT NULL AND id > ?
          ORDER BY id ASC
          LIMIT ?
     `);
-    while (true) {
-        const page = pageStmt.all(afterId, PAGE_SIZE);
-        if (!page.length) break;
-        for (const row of page) {
+    const enqueueBatch = db.transaction((rows) => {
+        let n = 0;
+        for (const row of rows) {
             if (queue.hasJobForDownload(id, row.id)) continue;
             queue.enqueue({
                 destinationId: id,
                 downloadId: row.id,
                 remotePath: _mirrorRemotePath(row),
             });
-            enqueued += 1;
+            n += 1;
         }
-        afterId = page[page.length - 1].id;
-        if (page.length < PAGE_SIZE) break;
+        return n;
+    });
+    let enqueued = 0;
+    let afterId = 0;
+    while (true) {
+        const rows = pageStmt.all(afterId, MIRROR_BATCH);
+        if (!rows.length) break;
+        enqueued += enqueueBatch(rows);
+        afterId = rows[rows.length - 1].id;
+        if (rows.length < MIRROR_BATCH) break;
+        await new Promise((r) => setImmediate(r));
     }
+    // The catch-up succeeded, so an old error badge is stale. Jobs that
+    // still fail from here set it again. The dashboard re-reads it on the
+    // worker's `backup_queue_drained` broadcast.
+    db.prepare('UPDATE backup_destinations SET last_error = NULL WHERE id = ?').run(Number(id));
     _wakeWorker(id);
-    // True mirror: list the remote and delete anything that isn't in the
-    // live local library (soft-deleted / missing rows). Snapshots/ is
-    // left alone so a shared bucket with a snapshot destination stays safe.
-    let pruned = 0;
-    let reconcileOk = true;
+    _log({
+        source: 'backup',
+        level: 'info',
+        msg: `mirror catch-up enqueued ${enqueued} jobs for #${id}`,
+    });
+    // Reconcile the remote: delete anything that's no longer a live
+    // download row. Best-effort — a listing/delete failure never fails
+    // the catch-up walk above, which already queued the uploads.
+    let reconciled = { listed: 0, deleted: 0 };
     try {
-        const r = await _reconcileMirror(dest);
-        pruned = r.deleted;
+        reconciled = await _reconcileMirrorRemote(_loadDestRowOrThrow(id));
     } catch (e) {
-        reconcileOk = false;
-        _markFailureOnDest(id, `mirror reconcile failed: ${e.message}`);
         _log({
             source: 'backup',
             level: 'warn',
             msg: `mirror reconcile failed for #${id}: ${e.message}`,
         });
     }
-    // A successful Run now (even with 0 new uploads) clears a sticky
-    // Error pill left by an earlier per-file failure.
-    if (reconcileOk) _markSuccessOnDest(id);
+    return { started: true, mode: 'mirror', enqueued, reconciled };
+}
+
+/**
+ * Mirror mode's own reconciliation step: list the remote (skipping
+ * `snapshots/`, which a snapshot-mode destination may share the same
+ * bucket/root with) and delete anything that no longer matches a
+ * `downloads` row. This build has no soft-delete column — every row
+ * still in `downloads` is "live" — so a file only disappears from the
+ * remote once its download row is actually deleted.
+ */
+async function _reconcileMirrorRemote(dest) {
+    const ProviderClass = PROVIDER_CLASSES[dest.provider];
+    if (!ProviderClass) return { listed: 0, deleted: 0 };
+    let cfg;
+    try {
+        cfg = _decryptCfgOrThrow(dest);
+    } catch (e) {
+        _log({
+            source: 'backup',
+            level: 'warn',
+            msg: `mirror reconcile skipped for #${dest.id}: ${e.message}`,
+        });
+        return { listed: 0, deleted: 0 };
+    }
+    const live = new Set(
+        getDb()
+            .prepare('SELECT file_path FROM downloads WHERE file_path IS NOT NULL')
+            .all()
+            .map((row) => _mirrorRemotePath(row)),
+    );
+    const provider = new ProviderClass();
+    const ctx = { destinationId: dest.id, log: _log, signal: new AbortController().signal };
+    let listed = 0;
+    let deleted = 0;
+    try {
+        await provider.init(cfg, ctx);
+        for await (const item of provider.list('', ctx)) {
+            const name = String(item.name || '')
+                .replace(/\\/g, '/')
+                .replace(/^\/+/, '');
+            if (!name || name.startsWith('snapshots/')) continue;
+            listed += 1;
+            if (live.has(name)) continue;
+            try {
+                await provider.delete(name, ctx);
+                deleted += 1;
+            } catch (e) {
+                _log({
+                    source: 'backup',
+                    level: 'warn',
+                    msg: `mirror reconcile could not delete ${name} on #${dest.id}: ${e.message}`,
+                });
+            }
+        }
+    } finally {
+        await provider.close().catch(() => {});
+    }
     _log({
         source: 'backup',
         level: 'info',
-        msg: `mirror catch-up enqueued ${enqueued} jobs for #${id}; pruned ${pruned} remote orphans`,
+        msg: `mirror reconcile on #${dest.id}: listed ${listed}, deleted ${deleted}`,
     });
-    return { started: true, mode: 'mirror', enqueued, pruned };
+    return { listed, deleted };
 }
 
 /** Pause / resume the worker. Existing pending jobs sit in the DB
@@ -508,110 +607,6 @@ function _mirrorRemotePath(row) {
     return String(row.file_path || '').replace(/\\/g, '/');
 }
 
-/**
- * Build the set of remote paths that should exist for a live library.
- * Soft-deleted / null-path rows are excluded.
- */
-function _liveMirrorPathSet() {
-    const set = new Set();
-    const PAGE = 1000;
-    let afterId = 0;
-    const stmt = getDb().prepare(`
-        SELECT id, file_path FROM downloads
-         WHERE file_path IS NOT NULL
-           AND (user_deleted IS NULL OR user_deleted = 0)
-           AND id > ?
-         ORDER BY id ASC
-         LIMIT ?
-    `);
-    while (true) {
-        const page = stmt.all(afterId, PAGE);
-        if (!page.length) break;
-        for (const row of page) {
-            const p = String(row.file_path || '').replace(/\\/g, '/').replace(/^\/+/, '');
-            if (p) set.add(p);
-        }
-        afterId = page[page.length - 1].id;
-        if (page.length < PAGE) break;
-    }
-    return set;
-}
-
-function _shouldSkipRemoteMirrorName(name) {
-    const n = String(name || '').replace(/\\/g, '/').replace(/^\/+/, '');
-    if (!n) return true;
-    if (n === 'snapshots' || n.startsWith('snapshots/')) return true;
-    if (n.endsWith('.part')) return true;
-    if (n.includes('.tgdl-write-probe') || n.includes('.tgdl-test-probe')) return true;
-    return false;
-}
-
-/**
- * List the remote destination and delete objects that aren't in the live
- * local library. This is what makes mirror mode actually mirror — Run now
- * both catches up uploads and prunes remote orphans.
- *
- * @returns {Promise<{ listed:number, deleted:number, kept:number }>}
- */
-async function _reconcileMirror(dest) {
-    const live = _liveMirrorPathSet();
-    let cfg;
-    try {
-        cfg = _decryptCfgOrThrow(dest);
-    } catch (e) {
-        throw new Error(`credentials: ${e.message}`);
-    }
-    const ProviderClass = PROVIDER_CLASSES[dest.provider];
-    if (!ProviderClass) throw new Error(`unknown provider "${dest.provider}"`);
-    const provider = new ProviderClass();
-    const ctx = { destinationId: dest.id, log: _log, signal: new AbortController().signal };
-    let listed = 0;
-    let deleted = 0;
-    let kept = 0;
-    try {
-        await provider.init(cfg, ctx);
-        // List from the destination root. Provider.list already scopes to
-        // the configured prefix / remoteRoot / rootPath.
-        for await (const item of provider.list('', ctx)) {
-            const name = String(item?.name || '').replace(/\\/g, '/').replace(/^\/+/, '');
-            listed += 1;
-            if (_shouldSkipRemoteMirrorName(name)) {
-                kept += 1;
-                continue;
-            }
-            if (live.has(name)) {
-                kept += 1;
-                continue;
-            }
-            try {
-                await provider.delete(name, ctx);
-                deleted += 1;
-                _log({
-                    source: 'backup',
-                    level: 'info',
-                    msg: `mirror pruned orphan ${name} on #${dest.id}`,
-                });
-            } catch (e) {
-                _log({
-                    source: 'backup',
-                    level: 'warn',
-                    msg: `mirror prune failed for ${name} on #${dest.id}: ${e.message}`,
-                });
-            }
-        }
-    } finally {
-        await provider.close().catch(() => {});
-    }
-    _broadcast({
-        type: 'backup_reconcile',
-        destinationId: dest.id,
-        listed,
-        deleted,
-        kept,
-    });
-    return { listed, deleted, kept };
-}
-
 // ---- Workers --------------------------------------------------------------
 
 class Worker {
@@ -739,21 +734,12 @@ class Worker {
             return;
         }
 
-        // Stale downloads rows (file deleted from disk, DB row still
-        // present) used to crash the process: S3/Dropbox/etc. open the
-        // path with createReadStream().pipe(...) before any await, so
-        // ENOENT fires as an uncaughtException and the watchdog
-        // restart-loops. Fail the job permanently instead — retrying
-        // won't bring the bytes back. Do NOT paint the destination
-        // Error pill: one missing path is a per-file data issue, and a
-        // later successful Run now / upload must be able to clear state.
+        // A missing / unreadable source can't be fixed by retrying: fail
+        // this job only, without flagging the whole destination as errored.
         try {
             await fsp.access(localPath, fs.constants.R_OK);
         } catch (e) {
-            const msg =
-                e?.code === 'ENOENT'
-                    ? `local file missing: ${downloadRow?.file_path || localPath}`
-                    : `local file unreadable (${e?.code || e?.message}): ${downloadRow?.file_path || localPath}`;
+            const msg = `local file ${e.code === 'ENOENT' ? 'missing' : 'unreadable'}: ${localPath}`;
             queue.markFailed(job.id, msg);
             _broadcast({
                 type: 'backup_error',
@@ -765,7 +751,7 @@ class Worker {
             _log({
                 source: 'backup',
                 level: 'warn',
-                msg: `job #${job.id} skipped — ${msg}`,
+                msg: `job #${job.id} on dest #${this.destinationId} failed: ${msg}`,
             });
             return;
         }
@@ -786,6 +772,16 @@ class Worker {
                 if (head && !dest.encryption && head.size === localSize && localSize > 0) {
                     queue.markDone(job.id, { bytes: head.size, remotePath });
                     _bumpDestStats(this.destinationId, head.size, 1);
+                    if (job.snapshot_path && (dest.mode === 'snapshot' || dest.mode === 'manual')) {
+                        await _applySnapshotRetention(
+                            dest,
+                            job,
+                            remotePath,
+                            head.size,
+                            provider,
+                            ctx,
+                        );
+                    }
                     _broadcast({
                         type: 'backup_done',
                         destinationId: this.destinationId,
@@ -795,9 +791,6 @@ class Worker {
                         bytes: head.size,
                         skipped: true,
                     });
-                    if (job.snapshot_path) {
-                        await _finalizeSnapshotJob(this.destinationId, job.snapshot_path);
-                    }
                     return;
                 }
             } catch {
@@ -827,7 +820,17 @@ class Worker {
                 ctx,
             );
             queue.markDone(job.id, { bytes: result.bytes, remotePath: result.remotePath });
-            _bumpDestStats(this.destinationId, result.bytes, 1, true);
+            _bumpDestStats(this.destinationId, result.bytes, 1);
+            if (job.snapshot_path && (dest.mode === 'snapshot' || dest.mode === 'manual')) {
+                await _applySnapshotRetention(
+                    dest,
+                    job,
+                    result.remotePath || remotePath,
+                    result.bytes,
+                    provider,
+                    ctx,
+                );
+            }
             _broadcast({
                 type: 'backup_done',
                 destinationId: this.destinationId,
@@ -841,9 +844,6 @@ class Worker {
                 level: 'info',
                 msg: `uploaded ${remotePath} (${result.bytes} B) → #${this.destinationId}`,
             });
-            if (job.snapshot_path) {
-                await _finalizeSnapshotJob(this.destinationId, job.snapshot_path);
-            }
         } catch (e) {
             const msg = e?.message || String(e);
             const { willRetry, nextRetryAt } = queue.markRetry(job.id, msg);
@@ -907,10 +907,16 @@ function _scheduleSnapshot(dest) {
     // with `*` and integer values. For full cron grammar we'd pull a
     // dependency, but the dashboard restricts the field to a small set
     // of presets in practice. We re-evaluate every 30 s, which is plenty
-    // since the smallest cron unit is a minute.
+    // since the smallest cron unit is a minute — but that also means two
+    // ticks land in every matching minute, so remember the minute we fired.
+    let firedMinute = -1;
     const handle = setInterval(() => {
         if (_snapshotInflight.has(dest.id)) return;
-        if (_cronMatches(dest.cron, new Date())) {
+        const now = new Date();
+        const minute = Math.floor(now.getTime() / 60_000);
+        if (minute === firedMinute) return;
+        if (_cronMatches(dest.cron, now)) {
+            firedMinute = minute;
             _kickSnapshotRun(_loadDestRow(dest.id)).catch((e) => {
                 _log({
                     source: 'backup',
@@ -973,10 +979,7 @@ async function _kickSnapshotRun(dest) {
         const stamp = _isoCompact(new Date());
         const archivePath = path.join(SNAPSHOTS_DIR, `snapshot-${stamp}.tar.gz`);
         await _buildSnapshotArchive(archivePath);
-        // Enqueue the upload. Retention + staging cleanup run in the
-        // worker after a successful (or size-skip) snapshot upload via
-        // `_finalizeSnapshotJob` — not on a timer that can race the
-        // upload or be lost on process restart.
+        // Enqueue the upload.
         const remotePath = `snapshots/${path.basename(archivePath)}`;
         queue.enqueue({
             destinationId: dest.id,
@@ -984,6 +987,7 @@ async function _kickSnapshotRun(dest) {
             remotePath,
         });
         _wakeWorker(dest.id);
+        // Retention runs once the upload lands — see _applySnapshotRetention.
         _log({
             source: 'backup',
             level: 'info',
@@ -1150,128 +1154,121 @@ async function _writeTarGz(srcDir, archivePath) {
     await finished;
 }
 
+// Archives this module names — retention never touches anything else.
+const SNAPSHOT_NAME_RE = /^snapshot-\d{8}-\d{6}\.tar\.gz$/;
+
 /**
- * After a snapshot job succeeds (upload or size-skip): drop the local
- * staging archive, then prune remote + leftover staging to retain_count.
- * Best-effort — never fails the upload job.
+ * Snapshot-mode retention, run right after a snapshot upload landed (or
+ * was skipped because the remote already had it):
+ *   1. delete the local staging archive under data/backups/, unless another
+ *      queued job still needs the same file;
+ *   2. prune remote `snapshots/snapshot-YYYYMMDD-HHMMSS.tar.gz` down to
+ *      retain_count (newest by the timestamp in the name — some providers
+ *      report mtime 0);
+ *   3. set the Files / Size counters to what's left on the remote.
+ * Never throws — the upload itself already succeeded.
  */
-async function _finalizeSnapshotJob(destinationId, snapshotPath) {
-    if (snapshotPath) {
+async function _applySnapshotRetention(dest, job, remotePath, bytes, provider, ctx) {
+    const destId = dest.id;
+    const warn = (msg) => _log({ source: 'backup', level: 'warn', msg });
+
+    // `job.snapshot_path` is null for the boot-time backlog pass, which has
+    // no specific upload to piggyback on — just list + prune + reconcile.
+    const local = job.snapshot_path;
+    if (local) {
         try {
-            await fsp.unlink(snapshotPath);
-        } catch (e) {
-            if (e?.code !== 'ENOENT') {
-                _log({
-                    source: 'backup',
-                    level: 'warn',
-                    msg: `staging unlink failed for ${snapshotPath}: ${e.message}`,
-                });
+            if (
+                path.dirname(path.resolve(local)) === path.resolve(SNAPSHOTS_DIR) &&
+                SNAPSHOT_NAME_RE.test(path.basename(local))
+            ) {
+                const stillQueued = getDb()
+                    .prepare(`
+                SELECT 1 FROM backup_jobs
+                 WHERE snapshot_path = ? AND id != ? AND status IN ('pending', 'uploading')
+                 LIMIT 1
+            `)
+                    .get(local, job.id);
+                if (!stillQueued) await fsp.unlink(local);
             }
+        } catch (e) {
+            if (e.code !== 'ENOENT') warn(`could not delete ${local}: ${e.message}`);
         }
     }
+
     try {
-        await _applyRetention(destinationId);
-    } catch (e) {
+        const snaps = [];
+        for await (const item of provider.list('snapshots/', ctx)) {
+            const name = String(item.name || '')
+                .replace(/\\/g, '/')
+                .replace(/^\/+/, '');
+            const base = path.posix.basename(name);
+            if (name === `snapshots/${base}` && SNAPSHOT_NAME_RE.test(base)) {
+                snaps.push({ name, base, size: Number(item.size) || 0 });
+            }
+        }
+        // A listing can lag the upload that just finished.
+        const uploaded = path.posix.basename(String(remotePath).replace(/\\/g, '/'));
+        if (SNAPSHOT_NAME_RE.test(uploaded) && !snaps.some((s) => s.base === uploaded)) {
+            snaps.push({ name: `snapshots/${uploaded}`, base: uploaded, size: Number(bytes) || 0 });
+        }
+        snaps.sort((a, b) => (a.base < b.base ? 1 : a.base > b.base ? -1 : 0));
+
+        const keep = Math.max(1, Number(dest.retain_count) || 7);
+        const remaining = snaps.slice(0, keep);
+        let pruned = 0;
+        for (const item of snaps.slice(keep)) {
+            try {
+                await provider.delete(item.name, ctx);
+                pruned += 1;
+            } catch (e) {
+                remaining.push(item);
+                warn(`retention could not delete ${item.name} on #${destId}: ${e.message}`);
+            }
+        }
+        const failed = snaps.length - keep - pruned;
         _log({
             source: 'backup',
-            level: 'warn',
-            msg: `retention prune failed for #${destinationId}: ${e.message}`,
+            level: 'info',
+            msg:
+                `retention on #${destId}: listed ${snaps.length}, kept ${Math.min(keep, snaps.length)}, ` +
+                `pruned ${pruned}${failed > 0 ? `, ${failed} delete(s) failed` : ''}`,
         });
+        const totalBytes = remaining.reduce((sum, s) => sum + s.size, 0);
+        getDb()
+            .prepare('UPDATE backup_destinations SET total_files = ?, total_bytes = ? WHERE id = ?')
+            .run(remaining.length, totalBytes, Number(destId));
+        _broadcast({
+            type: 'backup_destination_updated',
+            destination: _scrubDest(_loadDestRow(destId)),
+        });
+    } catch (e) {
+        warn(`retention failed for #${destId}: ${e.message}`);
     }
 }
 
-/** Remote snapshot archive names (with or without a `snapshots/` prefix). */
-const SNAPSHOT_REMOTE_RE = /(?:^|\/)snapshot-\d{8}-\d{6}\.tar\.gz$/i;
-
 /**
- * Keep the newest `retain_count` archives under remote `snapshots/` and
- * prune leftover local `data/backups/snapshot-*.tar.gz` staging files.
- * Applies to snapshot and manual modes (same archive layout).
- * Reconciles destination total_files/total_bytes to the kept remotes so
- * the UI card is not a lifetime upload counter.
- *
- * Exported for unit tests.
+ * Boot-time retention backlog pass for snapshot/manual destinations. A
+ * `retain_count` lowered between restarts (or a backlog left over from
+ * before retention existed) would otherwise only get trimmed once the
+ * next snapshot upload lands — this runs the same list+prune+reconcile
+ * logic immediately at boot, without a specific job to piggyback on.
  */
-export async function _applyRetention(destinationId) {
-    const dest = _loadDestRow(destinationId);
-    if (!dest || !dest.enabled) return;
-    if (dest.mode !== 'snapshot' && dest.mode !== 'manual') return;
-    const keep = Math.max(1, Number(dest.retain_count) || 7);
+async function _reconcileRetentionBacklog(dest) {
+    const ProviderClass = PROVIDER_CLASSES[dest.provider];
+    if (!ProviderClass) return;
     let cfg;
     try {
         cfg = _decryptCfgOrThrow(dest);
     } catch {
-        return;
+        return; // undecryptable (share secret rotated) — same as elsewhere, skip
     }
-    const ProviderClass = PROVIDER_CLASSES[dest.provider];
-    if (!ProviderClass) return;
     const provider = new ProviderClass();
-    const ctx = { destinationId, log: _log, signal: new AbortController().signal };
+    const ctx = { destinationId: dest.id, log: _log, signal: new AbortController().signal };
     try {
         await provider.init(cfg, ctx);
-        const items = [];
-        for await (const item of provider.list('snapshots/', ctx)) {
-            if (!SNAPSHOT_REMOTE_RE.test(String(item?.name || ''))) continue;
-            items.push(item);
-        }
-        items.sort((a, b) => {
-            const dm = (Number(b.mtime) || 0) - (Number(a.mtime) || 0);
-            if (dm !== 0) return dm;
-            return String(b.name || '').localeCompare(String(a.name || ''));
-        });
-        const keepItems = items.slice(0, keep);
-        const toDelete = items.slice(keep);
-        const remaining = [...keepItems];
-        let pruned = 0;
-        for (const item of toDelete) {
-            try {
-                await provider.delete(item.name, ctx);
-                pruned += 1;
-                _log({
-                    source: 'backup',
-                    level: 'info',
-                    msg: `retention pruned ${item.name} on #${destinationId}`,
-                });
-            } catch (e) {
-                remaining.push(item);
-                _log({
-                    source: 'backup',
-                    level: 'warn',
-                    msg: `retention delete failed for ${item.name} on #${destinationId}: ${e.message}`,
-                });
-            }
-        }
-        _setDestStats(
-            destinationId,
-            remaining.reduce((s, it) => s + (Number(it.size) || 0), 0),
-            remaining.length,
-        );
-        _log({
-            source: 'backup',
-            level: 'info',
-            msg: `retention: listed ${items.length}, keep ${keep}, pruned ${pruned} on #${destinationId}`,
-        });
+        await _applySnapshotRetention(dest, { snapshot_path: null }, null, 0, provider, ctx);
     } finally {
         await provider.close().catch(() => {});
-    }
-    await _pruneLocalStaging(keep);
-}
-
-/** Cap leftover local snapshot staging files; never touches db-pre-update-*. */
-async function _pruneLocalStaging(keep) {
-    let names;
-    try {
-        names = await fsp.readdir(SNAPSHOTS_DIR);
-    } catch (e) {
-        if (e?.code === 'ENOENT') return;
-        throw e;
-    }
-    const snaps = names
-        .filter((n) => /^snapshot-\d{8}-\d{6}\.tar\.gz$/.test(n))
-        .sort()
-        .reverse();
-    for (const name of snaps.slice(keep)) {
-        await fsp.unlink(path.join(SNAPSHOTS_DIR, name)).catch(() => {});
     }
 }
 
@@ -1292,6 +1289,11 @@ function _decryptCfgOrThrow(dest) {
     return decryptConfig(dest.config_blob, shareSecret);
 }
 
+function _secretFields(provider) {
+    const schema = PROVIDER_CLASSES[provider]?.configSchema || [];
+    return new Set(schema.filter((f) => f.secret).map((f) => f.name));
+}
+
 function _scrubDest(row) {
     if (!row) return null;
     return {
@@ -1310,45 +1312,7 @@ function _scrubDest(row) {
         totalBytes: Number(row.total_bytes || 0),
         totalFiles: Number(row.total_files || 0),
         createdAt: row.created_at,
-        // Non-secret connection fields for the edit wizard. Secrets are
-        // omitted — the UI leaves those blank ("keep existing").
-        config: _publicConfig(row),
     };
-}
-
-/** Decrypt + strip secret schema fields. Returns {} if decrypt fails. */
-function _publicConfig(row) {
-    try {
-        const cfg = _decryptCfgOrThrow(row);
-        const schema = PROVIDER_CLASSES[row.provider]?.configSchema || [];
-        const secretNames = new Set(
-            schema.filter((f) => f.secret || f.type === 'password').map((f) => f.name),
-        );
-        const out = {};
-        for (const [k, v] of Object.entries(cfg || {})) {
-            if (secretNames.has(k)) continue;
-            out[k] = v;
-        }
-        return out;
-    } catch {
-        return {};
-    }
-}
-
-/** Merge patch.config onto the stored blob, keeping existing secrets when
- *  the patch omits them or sends blanks (edit-wizard "leave blank to keep"). */
-function _mergeConfigPatch(dest, patchConfig) {
-    const existing = _decryptCfgOrThrow(dest);
-    const schema = PROVIDER_CLASSES[dest.provider]?.configSchema || [];
-    const secretNames = new Set(
-        schema.filter((f) => f.secret || f.type === 'password').map((f) => f.name),
-    );
-    const merged = { ...existing };
-    for (const [k, v] of Object.entries(patchConfig || {})) {
-        if (secretNames.has(k) && (v == null || String(v) === '')) continue;
-        merged[k] = v;
-    }
-    return merged;
 }
 
 function _bumpDestStats(id, bytes, files) {
@@ -1362,30 +1326,6 @@ function _bumpDestStats(id, bytes, files) {
          WHERE id = ?
     `)
         .run(Number(bytes) || 0, Number(files) || 1, Date.now(), Number(id));
-}
-
-/** Absolute replace of destination size counters (post-retention reconcile). */
-function _setDestStats(id, bytes, files) {
-    getDb()
-        .prepare(`
-        UPDATE backup_destinations
-           SET total_bytes = ?,
-               total_files = ?
-         WHERE id = ?
-    `)
-        .run(Math.max(0, Number(bytes) || 0), Math.max(0, Number(files) || 0), Number(id));
-}
-
-/** Clear sticky Error pill after a destination-level success (e.g. Run now). */
-function _markSuccessOnDest(id) {
-    getDb()
-        .prepare(`
-        UPDATE backup_destinations
-           SET last_success_at = ?,
-               last_error = NULL
-         WHERE id = ?
-    `)
-        .run(Date.now(), Number(id));
 }
 
 function _markFailureOnDest(id, error) {
@@ -1419,7 +1359,9 @@ function _validateInput(input) {
         encryption: !!input.encryption,
         passphrase: input.passphrase || null,
         mode,
-        cron: input.cron || null,
+        // Cron only means anything for snapshot mode — mirror/manual never
+        // store one, even if the (hidden) form field still had a value.
+        cron: mode === 'snapshot' ? input.cron || null : null,
         retainCount: input.retainCount || input.retain_count || 7,
     };
 }

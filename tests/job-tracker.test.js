@@ -1,64 +1,11 @@
 import { describe, it, expect } from 'vitest';
-import { createJobTracker, _shortProgress } from '../src/core/job-tracker.js';
+import { createJobTracker, flattenStatus } from '../src/core/job-tracker.js';
 
 function flushAsync(times = 4) {
     let p = Promise.resolve();
     for (let i = 0; i < times; i++) p = p.then(() => undefined);
     return p;
 }
-
-describe('_shortProgress', () => {
-    it('formats the common {processed,total} shape (dedup/integrity/faststart/server.js convention)', () => {
-        expect(_shortProgress({ processed: 12, total: 594 })).toBe('12/594');
-    });
-
-    it('falls back to {scanned,total} so the AI/faces scan-runner convention is not always "0/N"', () => {
-        // scan-runner.js emits { scanned, total }, never `processed` — this
-        // used to render as "0/594" forever regardless of real progress.
-        expect(_shortProgress({ scanned: 213, total: 594 })).toBe('213/594');
-    });
-
-    it('prefers `processed` over `scanned` when both are present', () => {
-        expect(_shortProgress({ processed: 5, scanned: 1, total: 10 })).toBe('5/10');
-    });
-
-    it('includes stage when present', () => {
-        expect(_shortProgress({ scanned: 3, total: 10, stage: 'video phase' })).toBe(
-            '3/10 video phase',
-        );
-    });
-
-    it('returns empty string for missing/invalid input', () => {
-        expect(_shortProgress(null)).toBe('');
-        expect(_shortProgress({})).toBe('');
-        expect(_shortProgress({ stage: 'starting' })).toBe('starting');
-    });
-
-    it('appends currentVideo decode progress (video scan progress reporting)', () => {
-        expect(
-            _shortProgress({
-                scanned: 101,
-                total: 592,
-                currentVideo: { name: 'clip.mp4', pct: 42, framesDecoded: 3412, totalFrames: 8120 },
-            }),
-        ).toBe('101/592 video: clip.mp4 42% (3412/8120 frames)');
-    });
-
-    it('omits pct/frames when they are not finite yet (job just registered)', () => {
-        expect(
-            _shortProgress({
-                scanned: 101,
-                total: 592,
-                currentVideo: { name: 'clip.mp4', pct: null, framesDecoded: null, totalFrames: null },
-            }),
-        ).toBe('101/592 video: clip.mp4');
-    });
-
-    it('ignores currentVideo without a name (cleared / malformed payload)', () => {
-        expect(_shortProgress({ scanned: 101, total: 592, currentVideo: {} })).toBe('101/592');
-        expect(_shortProgress({ scanned: 101, total: 592, currentVideo: null })).toBe('101/592');
-    });
-});
 
 describe('createJobTracker', () => {
     it('rejects construction without a kind', () => {
@@ -131,35 +78,6 @@ describe('createJobTracker', () => {
         expect(t.isRunning()).toBe(false);
     });
 
-    // Regression test for a bug where the dedup scan route's onProgress
-    // wrapper attached `running: true` to every progress tick (to expose
-    // it on the flattened WS payload). That value got folded into
-    // `_state.progress` and, unlike `_state.running`, was never cleared
-    // when the run finished — so a status endpoint that flattens
-    // `{...snap, ...snap.progress}` (server.js's dedup/reindex/thumbs/
-    // faststart status routes) would report `running: true` forever
-    // after the very first completed run, including on a brand-new
-    // client's first status check. Guard the tracker's own contract:
-    // `progress` must not leak stale fields past a completed run.
-    it('clears accumulated progress fields once a run finishes, even if runFn injects a `running` key', async () => {
-        const t = createJobTracker({ kind: 'leaky', broadcast: () => {} });
-        t.tryStart(async ({ onProgress }) => {
-            // Mirrors server.js's `onProgress: (p) => onProgress({ ...p, running: true })`.
-            onProgress({ stage: 'working', processed: 1, total: 1, running: true });
-            return { done: true };
-        });
-        await flushAsync(10);
-        const s = t.getStatus();
-        expect(s.running).toBe(false);
-        // The bug: this would previously still be `true`, left over from
-        // the last onProgress payload merged into `_state.progress`.
-        expect(s.progress.running).toBeUndefined();
-        // Simulate the server.js status-endpoint merge pattern that a
-        // fresh page load / hub card hits — must not resurrect `running`.
-        const flattened = { ...(s.progress || {}), ...s };
-        expect(flattened.running).toBe(false);
-    });
-
     it('subsequent tryStart works after a previous run completed', async () => {
         const t = createJobTracker({ kind: 'reusable', broadcast: () => {} });
         t.tryStart(async () => ({ run: 1 }));
@@ -182,6 +100,40 @@ describe('createJobTracker', () => {
         expect(done).toBeTruthy();
         expect(done.rows).toBe(42);
         expect(done.freedBytes).toBe(1024);
+    });
+
+    it('a finished run does not report running through its last progress tick', async () => {
+        const t = createJobTracker({ kind: 'scan', broadcast: () => {} });
+        t.tryStart(async ({ onProgress }) => {
+            onProgress({ running: true, stage: 'hashing', processed: 3, total: 3 });
+            return { ok: true };
+        });
+        await flushAsync(10);
+        const snap = t.getStatus();
+        expect(snap.running).toBe(false);
+        expect(snap.progress).toEqual({ stage: 'hashing', processed: 3, total: 3 });
+        // The legacy flat shape some status endpoints still build.
+        expect({ ...snap, ...snap.progress }.running).toBe(false);
+
+        const flat = flattenStatus(snap);
+        expect(flat.running).toBe(false);
+        expect(flat.stage).toBe('done');
+        expect(flat.processed).toBe(3);
+        expect(flat.total).toBe(3);
+    });
+
+    it('flattenStatus keeps the snapshot stage + error after a failed run', async () => {
+        const t = createJobTracker({ kind: 'fail', broadcast: () => {} });
+        t.tryStart(async ({ onProgress }) => {
+            onProgress({ stage: 'building', processed: 1, total: 9 });
+            throw new Error('disk full');
+        });
+        await flushAsync(10);
+        const flat = flattenStatus(t.getStatus());
+        expect(flat.running).toBe(false);
+        expect(flat.stage).toBe('error');
+        expect(flat.error).toBe('disk full');
+        expect(flat.processed).toBe(1);
     });
 
     it('progress events broadcast to every subscriber via the supplied broadcast fn', async () => {

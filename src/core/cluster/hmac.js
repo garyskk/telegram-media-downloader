@@ -20,7 +20,7 @@
 
 import crypto from 'crypto';
 import { getClusterToken, getSelfPeerId } from './identity.js';
-import { getSharedSecret } from './peers.js';
+import { getSharedSecret, getPeer } from './peers.js';
 
 export const REPLAY_WINDOW_MS = 60 * 1000; // ±60s clock-skew tolerance
 const RECENT_TUPLE_TTL_MS = 5 * 60 * 1000; // forget seen-sigs after 5 min
@@ -111,7 +111,7 @@ export function signRequest({
  * stringifying a parsed JSON object would change whitespace and break
  * the hash. The express integration captures `req.rawBody` upstream.
  */
-export function verifyRequest(req, { expectedToken = null, now = null } = {}) {
+export function verifyRequest(req, { expectedToken = null, now = null, pairedOnly = false } = {}) {
     const headers = req?.headers || {};
     const peerId = headers['x-peer-id'];
     const tsRaw = headers['x-peer-ts'];
@@ -133,12 +133,21 @@ export function verifyRequest(req, { expectedToken = null, now = null } = {}) {
     // peers that haven't re-paired yet, and finally accept an explicit
     // expectedToken from the handshake bootstrap path. A request matches
     // if it verifies under ANY of the three keys.
+    // `expectedToken` may be a list (a pairing-code handshake: the
+    // code-derived keys, see identity.pairingKeysFor).
     const candidates = [];
-    if (expectedToken) candidates.push(expectedToken);
+    for (const tok of Array.isArray(expectedToken) ? expectedToken : [expectedToken]) {
+        if (tok && !candidates.includes(tok)) candidates.push(tok);
+    }
     const pairSecret = getSharedSecret(peerId);
     if (pairSecret) candidates.push(pairSecret);
+    // With pairedOnly (set by the server's peer gate) the legacy global
+    // token only vouches for an already-paired peer (a known peers row);
+    // an unknown X-Peer-Id must not authenticate with it. The handshake
+    // route passes the token explicitly via expectedToken.
     const legacy = getClusterToken();
-    if (legacy && !candidates.includes(legacy)) candidates.push(legacy);
+    if (legacy && !candidates.includes(legacy) && (!pairedOnly || getPeer(String(peerId))))
+        candidates.push(legacy);
     if (!candidates.length) return { ok: false, reason: 'no_secret' };
 
     const path = req.originalUrl || req.url || '/';

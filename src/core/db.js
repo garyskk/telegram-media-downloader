@@ -68,7 +68,6 @@ export function getDb() {
                 kvSet,
                 insertSession,
                 listSessions,
-                pushQueueBacklog,
             });
         } catch (e) {
             // eslint-disable-next-line no-console
@@ -126,6 +125,111 @@ function _readPackageVersion() {
     }
 }
 
+// Indexes added after v2.24.5. CREATE INDEX on an existing library is one
+// synchronous statement (~0.4 s for all four at 150k rows on SSD, roughly
+// linear, several seconds per index on a 1M+ row library on a NAS disk), so
+// on a big DB they are NOT built inside initSchema — that would delay the
+// first healthcheck after an upgrade. initSchema builds them inline only
+// for small libraries (fresh installs, tests); otherwise the web server
+// builds the missing ones one at a time after it is listening
+// (buildDeferredIndex). Every query is correct without them, just slower,
+// and IF NOT EXISTS makes an interrupted build simply resume next boot.
+export const DEFERRED_INDEXES = [
+    // Bulk delete / 404 auto-prune / single-file delete / backup resolve a
+    // row by its exact stored path; without this each lookup is a full
+    // table scan (~15 ms at 150k rows — seconds for a 1000-tile delete).
+    {
+        name: 'idx_file_path',
+        sql: 'CREATE INDEX IF NOT EXISTS idx_file_path ON downloads(file_path)',
+    },
+    // Per-group aggregates behind the sidebar (/api/groups, /api/downloads)
+    // and the group-name refresh passes: GROUP BY group_id reading only
+    // group_name + file_size never touches the table b-tree.
+    {
+        name: 'idx_group_name_size',
+        sql: 'CREATE INDEX IF NOT EXISTS idx_group_name_size ON downloads(group_id, group_name, file_size)',
+    },
+    // Pinned-first with a type tab: WHERE file_type = ? ORDER BY pinned DESC, created_at DESC, id DESC
+    {
+        name: 'idx_gallery_type_pinned_date',
+        sql: 'CREATE INDEX IF NOT EXISTS idx_gallery_type_pinned_date ON downloads(file_type, pinned DESC, created_at DESC, id DESC)',
+    },
+    // Per-group pinned-first: WHERE group_id = ? ORDER BY pinned DESC, created_at DESC
+    {
+        name: 'idx_gallery_group_pinned_date',
+        sql: 'CREATE INDEX IF NOT EXISTS idx_gallery_group_pinned_date ON downloads(group_id, pinned DESC, created_at DESC, id DESC)',
+    },
+];
+// Below this many rows (by MAX(id), an O(log n) upper bound) all deferred
+// indexes build inline in well under 150 ms.
+const DEFERRED_INDEX_INLINE_MAX_ROWS = 50_000;
+
+/** Deferred indexes that don't exist yet, in build order. */
+export function listMissingDeferredIndexes() {
+    const have = new Set(
+        getDb()
+            .prepare(
+                `SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'downloads'`,
+            )
+            .all()
+            .map((r) => r.name),
+    );
+    return DEFERRED_INDEXES.filter((idx) => !have.has(idx.name));
+}
+
+// kv marker written (and committed) before each background CREATE INDEX
+// and removed afterwards. CREATE INDEX is one transaction, so a process
+// killed mid-build (e.g. autoheal restarting a container whose healthcheck
+// the build starved, on a huge library on a slow disk) leaves no index but
+// does leave the marker — the next start then skips that build instead of
+// walking into the same kill again and again.
+const INDEX_ATTEMPT_KV_PREFIX = 'index_build_attempt:';
+
+/**
+ * Build one deferred index (no-op if it already exists).
+ * @returns {number} elapsed ms
+ */
+export function buildDeferredIndex(name) {
+    const idx = DEFERRED_INDEXES.find((i) => i.name === name);
+    if (!idx) throw new Error(`unknown deferred index ${name}`);
+    const marker = INDEX_ATTEMPT_KV_PREFIX + idx.name;
+    kvSet(marker, { startedAt: Date.now() });
+    const t0 = Date.now();
+    try {
+        getDb().exec(idx.sql);
+    } finally {
+        // Also on a thrown error: this process survived, so the attempt
+        // wasn't the kind that kills it — retrying later is safe.
+        kvDelete(marker);
+    }
+    return Date.now() - t0;
+}
+
+/**
+ * What the background builder should do at startup:
+ *   build        — missing indexes to build now
+ *   interrupted  — missing indexes whose previous attempt never finished
+ *                  (process killed mid-build); not retried automatically
+ * Stale markers of indexes that did get built are cleared.
+ * @returns {{ build: object[], interrupted: Array<object & { attemptedAt: number|null }> }}
+ */
+export function planDeferredIndexBuilds() {
+    const missing = new Set(listMissingDeferredIndexes().map((i) => i.name));
+    const build = [];
+    const interrupted = [];
+    for (const idx of DEFERRED_INDEXES) {
+        const key = INDEX_ATTEMPT_KV_PREFIX + idx.name;
+        const marker = kvGet(key);
+        if (!missing.has(idx.name)) {
+            if (marker != null) kvDelete(key);
+            continue;
+        }
+        if (marker != null) interrupted.push({ ...idx, attemptedAt: marker.startedAt ?? null });
+        else build.push(idx);
+    }
+    return { build, interrupted };
+}
+
 function initSchema() {
     // Downloads Table
     db.exec(`
@@ -172,11 +276,6 @@ function initSchema() {
         'ALTER TABLE downloads ADD COLUMN nsfw_score REAL',
         'ALTER TABLE downloads ADD COLUMN nsfw_checked_at INTEGER',
         'ALTER TABLE downloads ADD COLUMN nsfw_whitelist INTEGER DEFAULT 0',
-        // user_deleted: set to 1 when the operator manually deletes a file via
-        // the viewer. The row is kept (not DELETEd) so isDownloaded() still
-        // returns true for this (group_id, message_id) pair, preventing
-        // backfill from re-downloading the file from Telegram.
-        'ALTER TABLE downloads ADD COLUMN user_deleted INTEGER DEFAULT 0',
     ];
     for (const sql of migrations) {
         try {
@@ -185,6 +284,18 @@ function initSchema() {
             /* column already exists */
         }
     }
+    // Intentional deletes leave (group_id, message_id) here so backfill
+    // still treats the message as downloaded after the downloads row is gone.
+    db.exec(`
+        CREATE TABLE IF NOT EXISTS download_tombstones (
+            group_id TEXT NOT NULL,
+            message_id INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY (group_id, message_id)
+        );
+    `);
+    retireUserDeletedColumn(db);
+    retireEnhancementFaceSchema(db);
     try {
         db.exec(
             'CREATE INDEX IF NOT EXISTS idx_filename_size ON downloads(group_id, file_name, file_size)',
@@ -263,6 +374,18 @@ function initSchema() {
         db.exec(
             'CREATE INDEX IF NOT EXISTS idx_gallery_pinned_date ON downloads(pinned DESC, created_at DESC, id DESC)',
         );
+    } catch {}
+    // Newer indexes: built right here on small libraries, after the web
+    // server is listening on big ones (see DEFERRED_INDEXES).
+    try {
+        const maxId = db.prepare('SELECT MAX(id) AS m FROM downloads').get()?.m || 0;
+        if (maxId <= DEFERRED_INDEX_INLINE_MAX_ROWS) {
+            for (const idx of DEFERRED_INDEXES) {
+                try {
+                    db.exec(idx.sql);
+                } catch {}
+            }
+        }
     } catch {}
     // Seekbar scan: WHERE file_type = 'video' AND file_path IS NOT NULL (LEFT JOIN seekbar_sprites)
     try {
@@ -415,30 +538,29 @@ function initSchema() {
     } catch {
         /* column already present */
     }
+    // Face coordinates in the EXIF-oriented frame (1) vs the legacy frame
+    // older sidecars produced (NULL). Only the face-crop endpoints read it.
+    // ADD COLUMN is a schema-only change in SQLite — O(1) on any table size.
+    try {
+        db.exec('ALTER TABLE faces ADD COLUMN exif_oriented INTEGER');
+    } catch {
+        /* column already present */
+    }
+    // Video faces: seconds into the clip of the frame the face came from,
+    // so its crop can seek there (NULL for photos and for older rows).
+    try {
+        db.exec('ALTER TABLE faces ADD COLUMN frame_time_sec REAL');
+    } catch {
+        /* column already present */
+    }
     // gender classification — 'male' | 'female' | null (from insightface genderage model).
     try {
         db.exec('ALTER TABLE faces ADD COLUMN gender TEXT');
     } catch {
         /* column already present */
     }
-    // Video-sourced faces: timestamp (seconds) of the sampled frame the
-    // bbox was detected on. Used by crop endpoints to seek ffmpeg to the
-    // correct frame instead of always using frame 0 (which produced black/
-    // wrong crops when the face appeared later in the video).
-    try {
-        db.exec('ALTER TABLE faces ADD COLUMN frame_time_sec REAL');
-    } catch {
-        /* column already present */
-    }
     try {
         db.exec('ALTER TABLE people ADD COLUMN gender TEXT');
-    } catch {
-        /* column already present */
-    }
-    // Operator-pinned People avatar. When set and still belonging to this
-    // person, listPeople / person face crop use it instead of auto-pick.
-    try {
-        db.exec('ALTER TABLE people ADD COLUMN cover_face_id INTEGER');
     } catch {
         /* column already present */
     }
@@ -461,23 +583,6 @@ function initSchema() {
         CREATE INDEX IF NOT EXISTS idx_peer_face_centroids_label
             ON peer_face_centroids(label) WHERE label IS NOT NULL;
     `);
-
-    // Durable face-cluster exclusion denylist. Survives clearAllPeople() /
-    // Phase B recluster so unwanted identities do not reappear as People.
-    // Cleared on full faces reindex (embedding space may change with model).
-    db.exec(`
-        CREATE TABLE IF NOT EXISTS excluded_people (
-            id                 INTEGER PRIMARY KEY AUTOINCREMENT,
-            embedding_centroid BLOB    NOT NULL,
-            label              TEXT,
-            created_at         INTEGER NOT NULL
-        );
-    `);
-    try {
-        db.exec('ALTER TABLE excluded_people ADD COLUMN cover_face_id INTEGER');
-    } catch {
-        /* column already present */
-    }
 
     // Seekbar sprite cache (v2.17). One row per indexed video; sprite +
     // JSON metadata live on disk under data/seekbar/. Opt-in via
@@ -703,6 +808,31 @@ function initSchema() {
         );
     `);
 
+    // Chat access state (src/core/chat-access.js) — one row per chat that
+    // at least one account couldn't open (left / banned / private /
+    // deleted / restricted / migrated). A chat with no row is fine. Kept
+    // out of kv['config'] so a re-check never rewrites the config (and
+    // never syncs to cluster peers, whose accounts differ). Wrapped so a
+    // read-only or odd DB can't stop the app from starting — the module
+    // falls back to memory.
+    try {
+        db.exec(`
+            CREATE TABLE IF NOT EXISTS chat_access (
+                chat_id       TEXT    PRIMARY KEY,
+                state         TEXT    NOT NULL,
+                code          TEXT,
+                detail        TEXT,
+                migrated_to   TEXT,
+                first_seen_at INTEGER,
+                checked_at    INTEGER NOT NULL,
+                next_check_at INTEGER,
+                checks        INTEGER NOT NULL DEFAULT 0,
+                accounts      TEXT,
+                updated_at    INTEGER NOT NULL
+            );
+        `);
+    } catch {}
+
     // Dashboard session tokens. Replaces data/web-sessions.json so the GC
     // sweep can use an indexed expires_at scan instead of rewriting the
     // whole file every login/logout. Role is constrained — anything other
@@ -719,17 +849,20 @@ function initSchema() {
         CREATE INDEX IF NOT EXISTS idx_web_sessions_role    ON web_sessions(role);
     `);
 
-    // Spilled-queue rows. Replaces data/logs/queue_backlog.jsonl so a hard
-    // crash mid-spill can't tear a JSON line, and rehydrate is an indexed
-    // SELECT + DELETE instead of a full-file rewrite. Worker pulls FIFO via
-    // `ORDER BY id ASC LIMIT N`, deletes the popped rows in the same tx.
-    db.exec(`
-        CREATE TABLE IF NOT EXISTS queue_backlog (
-            id         INTEGER PRIMARY KEY AUTOINCREMENT,
-            job        TEXT    NOT NULL,
-            created_at INTEGER NOT NULL
-        );
-    `);
+    // The old download-queue spillover table. Its rows were JSON-serialised
+    // jobs that included the live gramJS client — API hash and MTProto auth
+    // key in plaintext — and could never be downloaded after a reload
+    // anyway. The spillover is gone; drop the table and zero its pages so
+    // the credentials don't linger in the file's free list.
+    if (
+        db
+            .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'queue_backlog'")
+            .get()
+    ) {
+        db.pragma('secure_delete = ON');
+        db.exec('DROP TABLE queue_backlog');
+        db.pragma('secure_delete = OFF');
+    }
 
     // Auto-update audit log. One row per /api/update click. The row is
     // INSERTed when the route hands off to watchtower (status='triggered')
@@ -920,7 +1053,6 @@ function initSchema() {
         db.prepare(
             'SELECT token, role, issued_at, expires_at, last_seen FROM web_sessions LIMIT 0',
         ).all();
-        db.prepare('SELECT id, job, created_at FROM queue_backlog LIMIT 0').all();
         db.prepare(
             'SELECT id, from_version, to_version, started_at, finished_at, status, error_code, error_msg, backup_path, backup_bytes FROM update_history LIMIT 0',
         ).all();
@@ -947,9 +1079,22 @@ function initSchema() {
         db.prepare('SELECT owner_peer_id FROM downloads LIMIT 0').all();
     } catch (e) {
         throw new Error(
-            `DB schema migration incomplete — kv / web_sessions / queue_backlog / update_history / cluster tables not ready: ${e.message}`,
+            `DB schema migration incomplete — kv / web_sessions / update_history / cluster tables not ready: ${e.message}`,
         );
     }
+
+    // One-off: long videos used to be marked seekbar-"failed" when the
+    // sprite encode timed out (the timeout read as a broken file). Drop the
+    // failed markers once so the next seekbar scan retries them; files that
+    // really are broken get marked again.
+    try {
+        if (!db.prepare("SELECT 1 FROM kv WHERE key = 'seekbar_failed_reset'").get()) {
+            db.prepare("DELETE FROM seekbar_sprites WHERE format = 'failed'").run();
+            db.prepare(
+                "INSERT OR REPLACE INTO kv (key, value, updated_at) VALUES ('seekbar_failed_reset', 'true', ?)",
+            ).run(Date.now());
+        }
+    } catch {}
 
     // FK enforcement is per-connection in SQLite — flip it on once we know
     // the table exists. Without this, ON DELETE CASCADE silently no-ops.
@@ -988,7 +1133,6 @@ export function getShareLinkForServe(id, now = Date.now()) {
           FROM share_links s
           JOIN downloads d ON d.id = s.download_id
          WHERE s.id = ?
-           AND (d.user_deleted IS NULL OR d.user_deleted = 0)
     `)
         .get(Number(id));
     if (!row) return null;
@@ -1044,7 +1188,7 @@ export function listShareLinks({
     offset = 0,
     search = null,
 } = {}) {
-    const where = ['(d.user_deleted IS NULL OR d.user_deleted = 0)'];
+    const where = [];
     const args = [];
     if (downloadId != null) {
         where.push('s.download_id = ?');
@@ -1085,7 +1229,7 @@ export function listShareLinks({
  * `hasMore` envelope without a second round trip.
  */
 export function countShareLinks({ downloadId = null, includeRevoked = true, search = null } = {}) {
-    const where = ['(d.user_deleted IS NULL OR d.user_deleted = 0)'];
+    const where = [];
     const args = [];
     if (downloadId != null) {
         where.push('s.download_id = ?');
@@ -1186,11 +1330,11 @@ export function getRescueStats() {
     const db = getDb();
     const pending = db
         .prepare(
-            `SELECT COUNT(*) as c FROM downloads WHERE pending_until IS NOT NULL AND rescued_at IS NULL AND (user_deleted IS NULL OR user_deleted = 0)`,
+            `SELECT COUNT(*) as c FROM downloads WHERE pending_until IS NOT NULL AND rescued_at IS NULL`,
         )
         .get().c;
     const rescued = db
-        .prepare(`SELECT COUNT(*) as c FROM downloads WHERE rescued_at IS NOT NULL AND (user_deleted IS NULL OR user_deleted = 0)`)
+        .prepare(`SELECT COUNT(*) as c FROM downloads WHERE rescued_at IS NOT NULL`)
         .get().c;
     return { pending, rescued, lastSweepCleared: _rescueLastSwept };
 }
@@ -1223,33 +1367,43 @@ function _prep(sql) {
 }
 
 export function isDownloaded(groupId, messageId) {
-    return !!_prep('SELECT 1 FROM downloads WHERE group_id = ? AND message_id = ? LIMIT 1').get(
-        String(groupId),
-        Number(messageId),
-    );
+    const gid = String(groupId);
+    const mid = Number(messageId);
+    return !!_prep(
+        `SELECT 1 FROM downloads WHERE group_id = ? AND message_id = ?
+         UNION ALL
+         SELECT 1 FROM download_tombstones WHERE group_id = ? AND message_id = ?
+         LIMIT 1`,
+    ).get(gid, mid, gid, mid);
 }
 
 /**
- * Min + max message_id for one group in the downloads table.
+ * Min + max message_id for one group across downloads and tombstones.
  *
  * Powers the v2.3.34 smart-resume path in the history backfill: we tell
  * gramJS `iterMessages({ maxId: minMessageId - 1 })` so the iterator
  * skips every message we already have on disk and resumes from the
  * oldest hole. Same idea in reverse with `minId: maxMessageId + 1` for
- * the post-monitor-restart catch-up flow.
+ * the post-monitor-restart catch-up flow. Tombstones keep a deleted
+ * message inside that range so pull-older and catch-up do not walk it again.
  *
- * Returns `{ minMessageId: null, maxMessageId: null, count: 0 }` for an
- * empty group so the caller can default to "first-time backfill" (no
- * range filter, iterate from newest).
+ * `count` is distinct message ids we already know, including tombstones.
+ * Returns `{ minMessageId: null, maxMessageId: null, count: 0 }` for a
+ * group that has never been seen so the caller can default to a
+ * first-time backfill (no range filter, iterate from newest).
  */
 export function getMessageIdRange(groupId) {
+    const gid = String(groupId);
     const r = getDb()
         .prepare(`
         SELECT MIN(message_id) AS min_id, MAX(message_id) AS max_id, COUNT(*) AS n
-          FROM downloads
-         WHERE group_id = ?
+          FROM (
+                SELECT message_id FROM downloads WHERE group_id = ?
+                UNION
+                SELECT message_id FROM download_tombstones WHERE group_id = ?
+          )
     `)
-        .get(String(groupId));
+        .get(gid, gid);
     return {
         minMessageId: r?.min_id ?? null,
         maxMessageId: r?.max_id ?? null,
@@ -1269,7 +1423,7 @@ export function getAllDownloads(limit = 50, offset = 0, type = 'all', opts = {})
     const lim = Math.max(1, Math.min(500, parseInt(limit, 10) || 50));
     const off = Math.max(0, parseInt(offset, 10) || 0);
     const typeMap = { images: 'photo', videos: 'video', documents: 'document', audio: 'audio' };
-    const clauses = ['(d.user_deleted IS NULL OR d.user_deleted = 0)'];
+    const clauses = [];
     const params = [];
     if (type !== 'all' && typeMap[type]) {
         clauses.push('d.file_type = ?');
@@ -1296,8 +1450,9 @@ export function getAllDownloads(limit = 50, offset = 0, type = 'all', opts = {})
 }
 
 export function getDownloads(groupId, limit = 50, offset = 0, type = 'all', opts = {}) {
-    let query =
-        'SELECT d.*, sb.duration_sec FROM downloads d LEFT JOIN seekbar_sprites sb ON sb.download_id = d.id WHERE d.group_id = ? AND (d.user_deleted IS NULL OR d.user_deleted = 0)';
+    // One WHERE for the page and the COUNT, so every filter (type, pinned)
+    // applies to the pagination total too.
+    let where = ' WHERE d.group_id = ?';
     const params = [groupId];
 
     if (type !== 'all') {
@@ -1308,86 +1463,61 @@ export function getDownloads(groupId, limit = 50, offset = 0, type = 'all', opts
             audio: 'audio',
         };
         if (typeMap[type]) {
-            query += ' AND d.file_type = ?';
+            where += ' AND d.file_type = ?';
             params.push(typeMap[type]);
         }
     }
 
-    if (opts.pinnedOnly) query += ' AND d.pinned = 1';
-    else if (opts.unpinnedOnly) query += ' AND d.pinned = 0';
+    if (opts.pinnedOnly) where += ' AND d.pinned = 1';
+    else if (opts.unpinnedOnly) where += ' AND d.pinned = 0';
 
-    query += opts.pinnedFirst
-        ? ' ORDER BY d.pinned DESC, d.created_at DESC LIMIT ? OFFSET ?'
-        : ' ORDER BY d.created_at DESC LIMIT ? OFFSET ?';
-    params.push(limit, offset);
+    const orderBy = opts.pinnedFirst
+        ? ' ORDER BY d.pinned DESC, d.created_at DESC'
+        : ' ORDER BY d.created_at DESC';
 
     const rows = getDb()
-        .prepare(query)
-        .all(...params);
-
-    let countQuery =
-        'SELECT COUNT(*) as total FROM downloads d WHERE d.group_id = ? AND (d.user_deleted IS NULL OR d.user_deleted = 0)';
-    const countParams = [groupId];
-
-    if (type !== 'all') {
-        const typeMap = {
-            images: 'photo',
-            videos: 'video',
-            documents: 'document',
-            audio: 'audio',
-        };
-        if (typeMap[type]) {
-            countQuery += ' AND d.file_type = ?';
-            countParams.push(typeMap[type]);
-        }
-    }
-    if (opts.pinnedOnly) countQuery += ' AND d.pinned = 1';
-    else if (opts.unpinnedOnly) countQuery += ' AND d.pinned = 0';
+        .prepare(
+            `SELECT d.*, sb.duration_sec FROM downloads d LEFT JOIN seekbar_sprites sb ON sb.download_id = d.id${where}${orderBy} LIMIT ? OFFSET ?`,
+        )
+        .all(...params, limit, offset);
 
     const total = getDb()
-        .prepare(countQuery)
-        .get(...countParams).total;
+        .prepare(`SELECT COUNT(*) as total FROM downloads d${where}`)
+        .get(...params).total;
 
     return { files: rows, total };
 }
 
-const _DOWNLOAD_TYPE_MAP = {
-    images: 'photo',
-    videos: 'video',
-    documents: 'document',
-    audio: 'audio',
-};
-
 /** Shared WHERE fragments for listDownloadIds* (same filters as getAllDownloads). */
 function _downloadIdWhere(type = 'all', opts = {}, { groupId } = {}) {
-    const clauses = ['(d.user_deleted IS NULL OR d.user_deleted = 0)'];
+    const clauses = [];
     const params = [];
     if (groupId != null && groupId !== '') {
         clauses.push('d.group_id = ?');
         params.push(String(groupId));
     }
-    if (type !== 'all' && _DOWNLOAD_TYPE_MAP[type]) {
+    if (type !== 'all' && _FEDERATED_TYPE_MAP[type]) {
         clauses.push('d.file_type = ?');
-        params.push(_DOWNLOAD_TYPE_MAP[type]);
+        params.push(_FEDERATED_TYPE_MAP[type]);
     }
     if (opts.pinnedOnly) clauses.push('d.pinned = 1');
     else if (opts.unpinnedOnly) clauses.push('d.pinned = 0');
-    return { where: ' WHERE ' + clauses.join(' AND '), params };
+    const where = clauses.length ? ' WHERE ' + clauses.join(' AND ') : '';
+    return { where, params };
 }
 
 /**
  * All matching download PKs for the current gallery filters — no LIMIT.
- * Used by the player shuffle playlist so random mode covers the full
- * library, not just the ~100-item grid page.
+ * Shuffle uses this so the playlist covers the full library, not the loaded page.
  *
  * @returns {{ ids: number[], total: number }}
  */
 export function listDownloadIds(type = 'all', opts = {}) {
     const { where, params } = _downloadIdWhere(type, opts);
-    const db = getDb();
-    const ids = db.prepare(`SELECT d.id AS id FROM downloads d${where} ORDER BY d.id ASC`).all(
-        ...params,
-    ).map((r) => r.id);
+    const ids = getDb()
+        .prepare(`SELECT d.id AS id FROM downloads d${where} ORDER BY d.id ASC`)
+        .all(...params)
+        .map((r) => r.id);
     return { ids, total: ids.length };
 }
 
@@ -1397,17 +1527,17 @@ export function listDownloadIds(type = 'all', opts = {}) {
  */
 export function listDownloadIdsForGroup(groupId, type = 'all', opts = {}) {
     const { where, params } = _downloadIdWhere(type, opts, { groupId });
-    const db = getDb();
-    const ids = db.prepare(`SELECT d.id AS id FROM downloads d${where} ORDER BY d.id ASC`).all(
-        ...params,
-    ).map((r) => r.id);
+    const ids = getDb()
+        .prepare(`SELECT d.id AS id FROM downloads d${where} ORDER BY d.id ASC`)
+        .all(...params)
+        .map((r) => r.id);
     return { ids, total: ids.length };
 }
 
 /**
  * Fetch full download rows (+ seekbar duration) by PK, preserving the
- * caller's id order. Soft-deleted rows are excluded. Chunks IN lists
- * at 500 to stay under SQLite variable limits.
+ * caller's id order. Missing ids are skipped. Chunks IN lists at 500
+ * to stay under SQLite variable limits.
  *
  * @param {Array<number|string>} ids
  * @returns {Array<object>}
@@ -1433,13 +1563,11 @@ export function getDownloadsByIds(ids) {
             .prepare(
                 `SELECT d.*, sb.duration_sec FROM downloads d
                  LEFT JOIN seekbar_sprites sb ON sb.download_id = d.id
-                 WHERE d.id IN (${ph})
-                   AND (d.user_deleted IS NULL OR d.user_deleted = 0)`,
+                 WHERE d.id IN (${ph})`,
             )
             .all(...slice);
         for (const r of rows) byId.set(r.id, r);
     }
-    // Preserve request order (including duplicates if the caller asked).
     const out = [];
     const emitted = new Set();
     for (const raw of ids) {
@@ -1488,15 +1616,50 @@ export function getPeerDownloadsByKeys(keys) {
     return out;
 }
 
+// Optional narrowing shared by the local and federated search paths:
+// group, gallery type tab (`images` / `videos` / `documents` / `audio`)
+// and pinned-only / unpinned-only. `col` prefixes the column names (`d.` for the aliased
+// local query, '' for the bare federated sub-selects).
+function _searchNarrowing(opts, col) {
+    const parts = [];
+    const params = [];
+    if (opts.groupId) {
+        parts.push(`${col}group_id = ?`);
+        params.push(String(opts.groupId));
+    }
+    const fileType =
+        opts.type && opts.type !== 'all' ? _FEDERATED_TYPE_MAP[opts.type] || null : null;
+    if (fileType) {
+        parts.push(`${col}file_type = ?`);
+        params.push(fileType);
+    }
+    if (opts.pinnedOnly) parts.push(`${col}pinned = 1`);
+    else if (opts.unpinnedOnly) parts.push(`${col}pinned = 0`);
+    return { parts, params };
+}
+
+// `%` / `_` in the user's text are literal characters in a file name, not
+// wildcards.
+function _likePattern(raw) {
+    return `%${String(raw).replace(/[\\%_]/g, (c) => `\\${c}`)}%`;
+}
+
 /**
- * Full-text-ish search over downloaded files. LIKE-based; cheap on the
- * sub-100k row counts we expect.
+ * Search downloaded files by file name / chat name. FTS5 prefix match
+ * first; when that finds nothing (a word in the middle of a file name,
+ * scripts without spaces such as Thai) or FTS5 is unavailable, a
+ * substring LIKE match.
  *
  * @param {string} query  user input
  * @param {object} [opts]
  * @param {number} [opts.limit=50]
  * @param {number} [opts.offset=0]
  * @param {string} [opts.groupId]  optional restrict to one group
+ * @param {string} [opts.type]     'all' | 'images' | 'videos' | 'documents' | 'audio'
+ * @param {boolean} [opts.pinnedOnly]
+ * @param {boolean} [opts.unpinnedOnly]
+ * @param {boolean} [opts.pinnedFirst]
+ * @param {'relevance'|'newest'} [opts.order='relevance']  FTS rank or newest first
  */
 export function searchDownloads(query, opts = {}) {
     const limit = Math.max(1, Math.min(500, parseInt(opts.limit, 10) || 50));
@@ -1505,6 +1668,10 @@ export function searchDownloads(query, opts = {}) {
     if (!raw) return { files: [], total: 0 };
 
     const db = getDb();
+    const narrow = _searchNarrowing(opts, 'd.');
+    const extraWhere = narrow.parts.length ? ` AND ${narrow.parts.join(' AND ')}` : '';
+    const pinnedOrder = opts.pinnedFirst ? 'd.pinned DESC, ' : '';
+    const newestOrder = `${pinnedOrder}d.created_at DESC, d.id DESC`;
 
     // Try FTS5 first (fast). Falls back to LIKE if FTS table doesn't exist
     // (e.g. SQLite build without FTS5 extension — rare but possible).
@@ -1517,44 +1684,40 @@ export function searchDownloads(query, opts = {}) {
             .map((t) => `"${t}"*`)
             .join(' ');
         if (ftsQuery) {
-            const groupFilter = opts.groupId ? ' AND d.group_id = ?' : '';
-            const params = [ftsQuery, ...(opts.groupId ? [String(opts.groupId)] : [])];
-            const rows = db
-                .prepare(
-                    `SELECT d.*, sb.duration_sec FROM downloads d
-                     LEFT JOIN seekbar_sprites sb ON sb.download_id = d.id
-                     INNER JOIN downloads_fts fts ON fts.rowid = d.id
-                     WHERE downloads_fts MATCH ?${groupFilter}
-                     AND (d.user_deleted IS NULL OR d.user_deleted = 0)
-                     ORDER BY fts.rank
-                     LIMIT ? OFFSET ?`,
-                )
-                .all(...params, limit, offset);
+            const params = [ftsQuery, ...narrow.params];
+            const orderBy = opts.order === 'newest' ? newestOrder : `${pinnedOrder}fts.rank`;
             const total = db
                 .prepare(
                     `SELECT COUNT(*) as c FROM downloads d
                      INNER JOIN downloads_fts fts ON fts.rowid = d.id
-                     WHERE downloads_fts MATCH ?${groupFilter}
-                     AND (d.user_deleted IS NULL OR d.user_deleted = 0)`,
+                     WHERE downloads_fts MATCH ?${extraWhere}`,
                 )
                 .get(...params).c;
-            return { files: rows, total };
+            if (total > 0) {
+                const rows = db
+                    .prepare(
+                        `SELECT d.*, sb.duration_sec FROM downloads d
+                         LEFT JOIN seekbar_sprites sb ON sb.download_id = d.id
+                         INNER JOIN downloads_fts fts ON fts.rowid = d.id
+                         WHERE downloads_fts MATCH ?${extraWhere}
+                         ORDER BY ${orderBy}
+                         LIMIT ? OFFSET ?`,
+                    )
+                    .all(...params, limit, offset);
+                return { files: rows, total };
+            }
         }
     } catch {
         // FTS unavailable — fall through to LIKE
     }
 
-    // LIKE fallback
-    const q = `%${raw}%`;
-    const params = [q, q];
-    let where = '(d.file_name LIKE ? OR d.group_name LIKE ?) AND (d.user_deleted IS NULL OR d.user_deleted = 0)';
-    if (opts.groupId) {
-        where += ' AND d.group_id = ?';
-        params.push(String(opts.groupId));
-    }
+    // LIKE fallback — substring match, newest first.
+    const q = _likePattern(raw);
+    const params = [q, q, ...narrow.params];
+    const where = `(d.file_name LIKE ? ESCAPE '\\' OR d.group_name LIKE ? ESCAPE '\\')${extraWhere}`;
     const rows = db
         .prepare(
-            `SELECT d.*, sb.duration_sec FROM downloads d LEFT JOIN seekbar_sprites sb ON sb.download_id = d.id WHERE ${where} ORDER BY d.created_at DESC LIMIT ? OFFSET ?`,
+            `SELECT d.*, sb.duration_sec FROM downloads d LEFT JOIN seekbar_sprites sb ON sb.download_id = d.id WHERE ${where} ORDER BY ${newestOrder} LIMIT ? OFFSET ?`,
         )
         .all(...params, limit, offset);
     const total = db
@@ -1646,7 +1809,7 @@ export function getAllDownloadsFederated(limit = 50, offset = 0, type = 'all', o
 
     // Build the WHERE clause for both sides. Pinned filter only applies
     // to the local side because peer rows are always pinned=0.
-    const localWhereParts = ['(user_deleted IS NULL OR user_deleted = 0)'];
+    const localWhereParts = [];
     const peerWhereParts = [];
     const localParams = [];
     const peerParams = [];
@@ -1662,7 +1825,7 @@ export function getAllDownloadsFederated(limit = 50, offset = 0, type = 'all', o
         // be locally pinned. Drop a never-true predicate to short-circuit.
         peerWhereParts.push('0 = 1');
     } else if (opts.unpinnedOnly) {
-        // Local unpinned only; peer rows are always pinned=0 so they stay.
+        // Local unpinned only. Peer rows are always pinned=0, so they stay.
         localWhereParts.push('pinned = 0');
     }
     const localWhere = localWhereParts.length ? ' WHERE ' + localWhereParts.join(' AND ') : '';
@@ -1715,7 +1878,7 @@ export function getDownloadsForGroupFederated(
         type !== 'all' && _FEDERATED_TYPE_MAP[type] ? _FEDERATED_TYPE_MAP[type] : null;
     const gid = String(groupId);
 
-    const localWhereParts = ['group_id = ?', '(user_deleted IS NULL OR user_deleted = 0)'];
+    const localWhereParts = ['group_id = ?'];
     const peerWhereParts = ['group_id = ?'];
     const localParams = [gid];
     const peerParams = [gid];
@@ -1777,28 +1940,34 @@ export function searchDownloadsFederated(query, opts = {}) {
     }
     const lim = Math.max(1, Math.min(500, parseInt(opts.limit, 10) || 50));
     const off = Math.max(0, parseInt(opts.offset, 10) || 0);
-    const q = `%${String(query || '').trim()}%`;
+    const q = _likePattern(String(query || '').trim());
 
-    const localWhereParts = ['(file_name LIKE ? OR group_name LIKE ?)', '(user_deleted IS NULL OR user_deleted = 0)'];
-    const peerWhereParts = ['(file_name LIKE ? OR group_name LIKE ?)'];
-    const localParams = [q, q];
-    const peerParams = [q, q];
-    if (opts.groupId) {
-        const gid = String(opts.groupId);
-        localWhereParts.push('group_id = ?');
-        peerWhereParts.push('group_id = ?');
-        localParams.push(gid);
-        peerParams.push(gid);
+    const match = "(file_name LIKE ? ESCAPE '\\' OR group_name LIKE ? ESCAPE '\\')";
+    // Group / type / pinned narrowing. Peer rows are never pinned, so a
+    // pinned-only search drops the peer side entirely.
+    const narrow = _searchNarrowing({ ...opts, pinnedOnly: false, unpinnedOnly: false }, '');
+    const localWhereParts = [match, ...narrow.parts];
+    const peerWhereParts = [match, ...narrow.parts];
+    const localParams = [q, q, ...narrow.params];
+    const peerParams = [q, q, ...narrow.params];
+    if (opts.pinnedOnly) {
+        localWhereParts.push('pinned = 1');
+        peerWhereParts.push('0 = 1');
+    } else if (opts.unpinnedOnly) {
+        localWhereParts.push('pinned = 0');
     }
     const localWhere = ' WHERE ' + localWhereParts.join(' AND ');
     const peerWhere = ' WHERE ' + peerWhereParts.join(' AND ');
+    const orderBy = opts.pinnedFirst
+        ? 'pinned DESC, sort_ts DESC, id DESC'
+        : 'sort_ts DESC, id DESC';
 
     const sql = `
         SELECT * FROM (
             SELECT ${_FED_COLS_LOCAL} FROM downloads d LEFT JOIN seekbar_sprites sb ON sb.download_id = d.id${localWhere}
             UNION ALL
             SELECT ${_FED_COLS_PEER} FROM peer_downloads${peerWhere}
-        ) ORDER BY sort_ts DESC, id DESC LIMIT ? OFFSET ?
+        ) ORDER BY ${orderBy} LIMIT ? OFFSET ?
     `;
     const countSql = `
         SELECT
@@ -1864,6 +2033,43 @@ export function setDownloadPinned(id, pinned) {
 }
 
 /**
+ * Set `pinned` on many rows in one transaction (gallery bulk Pin).
+ * Invalid / duplicate ids are skipped. Returns the ids of the rows that
+ * exist (whether or not their flag actually changed).
+ *
+ * @param {Array<number|string>} ids
+ * @param {boolean} pinned
+ * @returns {number[]}
+ */
+export function setDownloadsPinned(ids, pinned) {
+    const clean = [
+        ...new Set(
+            (Array.isArray(ids) ? ids : [])
+                .map(Number)
+                .filter((n) => Number.isSafeInteger(n) && n > 0),
+        ),
+    ];
+    if (!clean.length) return [];
+    const db = getDb();
+    const found = [];
+    const CHUNK = 500; // well under SQLite's bound-parameter limit
+    db.transaction(() => {
+        for (let i = 0; i < clean.length; i += CHUNK) {
+            const part = clean.slice(i, i + CHUNK);
+            const marks = part.map(() => '?').join(',');
+            const rows = db.prepare(`SELECT id FROM downloads WHERE id IN (${marks})`).all(...part);
+            if (!rows.length) continue;
+            db.prepare(`UPDATE downloads SET pinned = ? WHERE id IN (${marks})`).run(
+                pinned ? 1 : 0,
+                ...part,
+            );
+            for (const r of rows) found.push(r.id);
+        }
+    })();
+    return found;
+}
+
+/**
  * Lookup helper for the bulk-zip endpoint and other id-based admin tools.
  * Returns the row or null. Cheap (PK lookup); safe to call N times in a row.
  */
@@ -1873,217 +2079,233 @@ export function getDownloadById(id) {
     return getDb().prepare('SELECT * FROM downloads WHERE id = ?').get(numId) || null;
 }
 
+const TOMBSTONE_CHUNK = 500;
+
 /**
- * Soft-delete downloads by ids (preferred) or file_paths.
+ * Record (group_id, message_id) for downloads that are about to be removed
+ * on purpose, so isDownloaded() and getMessageIdRange() still see them.
+ * Does not start its own transaction — callers wrap it with the DELETE.
  *
- * The downloads row is kept with `user_deleted=1` so isDownloaded() still
- * returns true and Telegram backfill does not re-fetch the file. Side
- * effects that soft-delete previously left behind are wiped here:
- * faces, image_embeddings, image_tags, seekbar_sprites,
- * video_fingerprints / video_frame_hashes / similar_* rows, and any
- * pending/uploading backup_jobs for those download ids. Orphan people
- * (no remaining faces) are purged afterwards.
- *
- * Returns the number of downloads rows updated.
+ * @param {import('better-sqlite3').Database} database
+ * @param {Array<number|string>} ids
+ * @returns {number}
  */
+function rememberDeletedDownloadsOn(database, ids) {
+    const clean = [
+        ...new Set(
+            (Array.isArray(ids) ? ids : [])
+                .map(Number)
+                .filter((n) => Number.isSafeInteger(n) && n > 0),
+        ),
+    ];
+    if (!clean.length) return 0;
+    const now = Date.now();
+    const insert = database.prepare(
+        `INSERT OR IGNORE INTO download_tombstones (group_id, message_id, created_at)
+         VALUES (?, ?, ?)`,
+    );
+    let n = 0;
+    for (let i = 0; i < clean.length; i += TOMBSTONE_CHUNK) {
+        const slice = clean.slice(i, i + TOMBSTONE_CHUNK);
+        const marks = slice.map(() => '?').join(',');
+        const rows = database
+            .prepare(`SELECT group_id, message_id FROM downloads WHERE id IN (${marks})`)
+            .all(...slice);
+        for (const row of rows) {
+            if (row.group_id == null || row.message_id == null) continue;
+            n += insert.run(String(row.group_id), Number(row.message_id), now).changes;
+        }
+    }
+    return n;
+}
+
+/** Tombstone then return. Safe to call on its own before a raw DELETE. */
+export function rememberDeletedDownloads(ids) {
+    const database = getDb();
+    return database.transaction((idList) => rememberDeletedDownloadsOn(database, idList))(ids);
+}
+
+/**
+ * Databases from the old enhancement branch keep downloads.user_deleted.
+ * Copy the flagged rows into download_tombstones, delete them, and drop
+ * the column. A no-op when the column is already gone.
+ *
+ * @param {import('better-sqlite3').Database} [database]
+ * @returns {{ migrated: number, dropped: boolean }}
+ */
+export function retireUserDeletedColumn(database = getDb()) {
+    const hasColumn = database
+        .prepare('PRAGMA table_info(downloads)')
+        .all()
+        .some((col) => col.name === 'user_deleted');
+    if (!hasColumn) return { migrated: 0, dropped: false };
+
+    const indexes = database
+        .prepare(
+            `SELECT name FROM sqlite_master
+              WHERE type = 'index' AND tbl_name = 'downloads'
+                AND sql LIKE '%user_deleted%'`,
+        )
+        .all();
+    for (const idx of indexes) {
+        const name = String(idx.name).replaceAll('"', '""');
+        database.exec(`DROP INDEX IF EXISTS "${name}"`);
+    }
+
+    const now = Date.now();
+    database.exec(
+        'CREATE TEMP TABLE IF NOT EXISTS _retire_user_deleted (id INTEGER PRIMARY KEY)',
+    );
+    const fill = database.prepare(
+        `INSERT INTO _retire_user_deleted (id)
+         SELECT id FROM downloads WHERE user_deleted = 1 LIMIT ?`,
+    );
+    const copy = database.prepare(
+        `INSERT OR IGNORE INTO download_tombstones (group_id, message_id, created_at)
+         SELECT d.group_id, d.message_id, ?
+           FROM downloads d
+           JOIN _retire_user_deleted r ON r.id = d.id`,
+    );
+    const remove = database.prepare(
+        'DELETE FROM downloads WHERE id IN (SELECT id FROM _retire_user_deleted)',
+    );
+    const clear = database.prepare('DELETE FROM _retire_user_deleted');
+    const step = database.transaction((limit) => {
+        clear.run();
+        fill.run(limit);
+        const copied = copy.run(now).changes;
+        const removed = remove.run().changes;
+        return { copied, removed };
+    });
+    let migrated = 0;
+    for (;;) {
+        const batch = step(TOMBSTONE_CHUNK);
+        migrated += batch.copied;
+        if (batch.removed < TOMBSTONE_CHUNK) break;
+    }
+    database.exec('DROP TABLE IF EXISTS _retire_user_deleted');
+    database.exec('ALTER TABLE downloads DROP COLUMN user_deleted');
+    return { migrated, dropped: true };
+}
+
+/**
+ * Databases from the old enhancement branch keep the face-review schema
+ * this branch does not read: `people.cover_face_id` and `excluded_people`.
+ * Drop both. People rows stay. A no-op when they are already gone.
+ *
+ * @param {import('better-sqlite3').Database} [database]
+ * @returns {{ droppedCover: boolean, droppedExcluded: boolean }}
+ */
+export function retireEnhancementFaceSchema(database = getDb()) {
+    const hasCover = database
+        .prepare('PRAGMA table_info(people)')
+        .all()
+        .some((col) => col.name === 'cover_face_id');
+    if (hasCover) {
+        const indexes = database
+            .prepare(
+                `SELECT name FROM sqlite_master
+                  WHERE type = 'index' AND tbl_name = 'people'
+                    AND sql LIKE '%cover_face_id%'`,
+            )
+            .all();
+        for (const idx of indexes) {
+            const name = String(idx.name).replaceAll('"', '""');
+            database.exec(`DROP INDEX IF EXISTS "${name}"`);
+        }
+        database.exec('ALTER TABLE people DROP COLUMN cover_face_id');
+    }
+
+    const hasExcluded = database
+        .prepare(
+            `SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = 'excluded_people'`,
+        )
+        .get();
+    if (hasExcluded) database.exec('DROP TABLE excluded_people');
+
+    return { droppedCover: hasCover, droppedExcluded: Boolean(hasExcluded) };
+}
+
+/** Bulk-delete by ids (preferred) or file_paths. Returns the number removed.
+ *  Tombstones each removed message so backfill does not fetch it again.
+ *  Also purges orphaned people rows whose faces were cascade-deleted. */
 export function deleteDownloadsBy(opts) {
     const db = getDb();
-    const ids = _resolveSoftDeleteIds(db, opts);
-    if (!ids.length) return 0;
-
-    const soft = db.prepare('UPDATE downloads SET user_deleted = 1 WHERE id = ?');
-    const removed = db.transaction((idList) => {
-        let n = 0;
-        for (const id of idList) n += soft.run(id).changes;
-        _purgeArtifactsForDownloadIds(db, idList);
-        return n;
-    })(ids);
-
-    purgeOrphanPeople();
+    let removed = 0;
+    const dropIds = (ids) => {
+        rememberDeletedDownloadsOn(db, ids);
+        const stmt = db.prepare('DELETE FROM downloads WHERE id = ?');
+        return ids.reduce((n, id) => n + stmt.run(id).changes, 0);
+    };
+    if (Array.isArray(opts?.ids) && opts.ids.length) {
+        removed = db.transaction(() => dropIds(opts.ids))();
+    } else if (Array.isArray(opts?.filePaths) && opts.filePaths.length) {
+        removed = db.transaction(() => {
+            const sel = db.prepare('SELECT id FROM downloads WHERE file_path = ?');
+            const ids = [];
+            for (const p of opts.filePaths) {
+                for (const row of sel.all(p)) ids.push(row.id);
+            }
+            return dropIds(ids);
+        })();
+    }
+    if (removed > 0) {
+        purgeOrphanPeople();
+        // CASCADE drops members of the deleted download. A group left with
+        // fewer than two members is not a pair anymore.
+        _pruneIncompleteSimilarGroups(getDb());
+    }
     return removed;
 }
 
-/**
- * One-shot cleanup for soft-deleted rows that predate face/artifact
- * wiping on delete. Safe to run repeatedly (idempotent).
- *
- * @returns {{ faces:number, embeddings:number, tags:number, seekbar:number, fingerprints:number, backupJobs:number }}
- */
-export function purgeSoftDeletedArtifacts() {
-    const db = getDb();
-    const result = db.transaction(() => {
-        const faces = db
-            .prepare(
-                `DELETE FROM faces WHERE download_id IN (
-                    SELECT id FROM downloads WHERE user_deleted = 1
-                )`,
-            )
-            .run().changes;
-        const embeddings = db
-            .prepare(
-                `DELETE FROM image_embeddings WHERE download_id IN (
-                    SELECT id FROM downloads WHERE user_deleted = 1
-                )`,
-            )
-            .run().changes;
-        const tags = db
-            .prepare(
-                `DELETE FROM image_tags WHERE download_id IN (
-                    SELECT id FROM downloads WHERE user_deleted = 1
-                )`,
-            )
-            .run().changes;
-        const seekbar = db
-            .prepare(
-                `DELETE FROM seekbar_sprites WHERE download_id IN (
-                    SELECT id FROM downloads WHERE user_deleted = 1
-                )`,
-            )
-            .run().changes;
-        const fingerprints = db
-            .prepare(
-                `DELETE FROM video_fingerprints WHERE download_id IN (
-                    SELECT id FROM downloads WHERE user_deleted = 1
-                )`,
-            )
-            .run().changes;
-        db.prepare(
-            `DELETE FROM video_frame_hashes WHERE download_id IN (
-                SELECT id FROM downloads WHERE user_deleted = 1
-            )`,
-        ).run();
-        db.prepare(
-            `DELETE FROM similar_group_members WHERE download_id IN (
-                SELECT id FROM downloads WHERE user_deleted = 1
-            )`,
-        ).run();
-        db.prepare(
-            `DELETE FROM similar_ignores
-              WHERE a_id IN (SELECT id FROM downloads WHERE user_deleted = 1)
-                 OR b_id IN (SELECT id FROM downloads WHERE user_deleted = 1)`,
-        ).run();
-        db.prepare(
-            `DELETE FROM similar_partial_scans WHERE download_id IN (
-                SELECT id FROM downloads WHERE user_deleted = 1
-            )`,
-        ).run();
-        db.prepare(
-            `DELETE FROM similar_video_scans WHERE download_id IN (
-                SELECT id FROM downloads WHERE user_deleted = 1
-            )`,
-        ).run();
-        _pruneIncompleteSimilarGroups(db);
-        const backupJobs = db
-            .prepare(
-                `UPDATE backup_jobs
-                    SET status = 'failed',
-                        error = 'download soft-deleted',
-                        finished_at = ?
-                  WHERE status IN ('pending', 'uploading')
-                    AND download_id IN (
-                        SELECT id FROM downloads WHERE user_deleted = 1
-                    )`,
-            )
-            .run(Date.now()).changes;
-        return { faces, embeddings, tags, seekbar, fingerprints, backupJobs };
-    })();
-    purgeOrphanPeople();
-    return result;
-}
+// Bound parameters per IN (…) list — under SQLite's historical 999 cap.
+const PATH_LOOKUP_CHUNK = 800;
 
-function _resolveSoftDeleteIds(db, opts) {
-    const out = [];
-    const seen = new Set();
-    const push = (id) => {
-        const n = Number(id);
-        if (!Number.isFinite(n) || n <= 0 || seen.has(n)) return;
-        seen.add(n);
-        out.push(n);
-    };
-    if (Array.isArray(opts?.ids)) {
-        for (const id of opts.ids) push(id);
+/**
+ * Resolve download rows by their stored `file_path`. The downloader writes
+ * the host's native separator (`\` on Windows) while the SPA always sends
+ * `/`, so every input is matched in both forms with `file_path IN (…)` —
+ * an `idx_file_path` seek per form instead of the old per-path
+ * `REPLACE(file_path, '\', '/') = ?` full-table scan.
+ *
+ * @param {string[]} paths
+ * @returns {Array<{ id: number, file_path: string }>}
+ */
+export function findDownloadsByPaths(paths) {
+    const wanted = new Set(); // forward-slash forms
+    const forms = new Set();
+    for (const p of Array.isArray(paths) ? paths : []) {
+        if (typeof p !== 'string' || !p) continue;
+        const fwd = p.replace(/\\/g, '/');
+        wanted.add(fwd);
+        forms.add(fwd);
+        forms.add(fwd.replace(/\//g, '\\'));
     }
-    if (Array.isArray(opts?.filePaths) && opts.filePaths.length) {
-        const stmt = db.prepare(
-            `SELECT id FROM downloads
-              WHERE file_path = ?
-                 OR REPLACE(file_path, char(92), '/') = ?`,
-        );
-        for (const p of opts.filePaths) {
-            if (p == null || p === '') continue;
-            const fwd = String(p).replace(/\\/g, '/');
-            for (const row of stmt.all(String(p), fwd)) push(row.id);
+    const lookup = (sql, values) => {
+        const rows = [];
+        for (let i = 0; i < values.length; i += PATH_LOOKUP_CHUNK) {
+            const chunk = values.slice(i, i + PATH_LOOKUP_CHUNK);
+            const stmt = getDb().prepare(sql.replace('%IN%', chunk.map(() => '?').join(',')));
+            rows.push(...stmt.all(...chunk));
+        }
+        return rows;
+    };
+    const out = lookup('SELECT id, file_path FROM downloads WHERE file_path IN (%IN%)', [...forms]);
+    const found = new Set(out.map((r) => String(r.file_path).replace(/\\/g, '/')));
+    const missing = [...wanted].filter((p) => !found.has(p));
+    if (missing.length) {
+        // A row stored with mixed separators matches neither form. The old
+        // per-path REPLACE() lookup found those, so keep doing it for the
+        // leftovers only — one table pass per chunk, not one per path.
+        const ids = new Set(out.map((r) => r.id));
+        for (const r of lookup(
+            `SELECT id, file_path FROM downloads WHERE REPLACE(file_path, '\\', '/') IN (%IN%)`,
+            missing,
+        )) {
+            if (!ids.has(r.id)) out.push(r);
         }
     }
     return out;
-}
-
-/**
- * Live download ids that still point at the same stored path (slash-insensitive).
- * Used as a refcount so unlinking a shared file does not strand sibling rows.
- */
-export function liveIdsSharingFilePath(filePath, { exceptIds = [] } = {}) {
-    const fwd = String(filePath || '').replace(/\\/g, '/');
-    if (!fwd) return [];
-    const except = new Set((exceptIds || []).map(Number).filter((n) => Number.isFinite(n) && n > 0));
-    const bwd = fwd.replace(/\//g, '\\');
-    const rows = getDb()
-        .prepare(
-            `SELECT id FROM downloads
-              WHERE (user_deleted IS NULL OR user_deleted = 0)
-                AND (
-                      file_path = ?
-                   OR file_path = ?
-                   OR REPLACE(file_path, char(92), '/') = ?
-                )`,
-        )
-        .all(fwd, bwd, fwd);
-    return rows.map((r) => r.id).filter((id) => !except.has(id));
-}
-
-/**
- * Tombstone every live download that points at this path and wipe faces /
- * embeddings / tags / seekbar / pending backup jobs. Used when the on-disk
- * file is already gone (crop 404, /files 404) so missing tiles do not linger.
- *
- * Returns the number of downloads rows updated.
- */
-export function pruneDownloadsForMissingPath(filePath) {
-    const ids = liveIdsSharingFilePath(filePath);
-    if (!ids.length) return 0;
-    return deleteDownloadsBy({ ids });
-}
-
-/** Wipe AI / seekbar / pending-backup side effects for soft-deleted ids. */
-function _purgeArtifactsForDownloadIds(db, ids) {
-    if (!ids.length) return;
-    const CHUNK = 500;
-    const now = Date.now();
-    for (let i = 0; i < ids.length; i += CHUNK) {
-        const slice = ids.slice(i, i + CHUNK);
-        const ph = slice.map(() => '?').join(',');
-        db.prepare(`DELETE FROM faces WHERE download_id IN (${ph})`).run(...slice);
-        db.prepare(`DELETE FROM image_embeddings WHERE download_id IN (${ph})`).run(...slice);
-        db.prepare(`DELETE FROM image_tags WHERE download_id IN (${ph})`).run(...slice);
-        db.prepare(`DELETE FROM seekbar_sprites WHERE download_id IN (${ph})`).run(...slice);
-        db.prepare(`DELETE FROM video_frame_hashes WHERE download_id IN (${ph})`).run(...slice);
-        db.prepare(`DELETE FROM video_fingerprints WHERE download_id IN (${ph})`).run(...slice);
-        db.prepare(`DELETE FROM similar_group_members WHERE download_id IN (${ph})`).run(...slice);
-        db.prepare(
-            `DELETE FROM similar_ignores WHERE a_id IN (${ph}) OR b_id IN (${ph})`,
-        ).run(...slice, ...slice);
-        db.prepare(`DELETE FROM similar_partial_scans WHERE download_id IN (${ph})`).run(...slice);
-        db.prepare(`DELETE FROM similar_video_scans WHERE download_id IN (${ph})`).run(...slice);
-        _pruneIncompleteSimilarGroups(db);
-        db.prepare(
-            `UPDATE backup_jobs
-                SET status = 'failed',
-                    error = 'download soft-deleted',
-                    finished_at = ?
-              WHERE status IN ('pending', 'uploading')
-                AND download_id IN (${ph})`,
-        ).run(now, ...slice);
-    }
 }
 
 export function purgeOrphanPeople() {
@@ -2098,7 +2320,7 @@ export function purgeOrphanPeople() {
 
 export function getStats() {
     const r = getDb()
-        .prepare('SELECT COUNT(*) AS count, COALESCE(SUM(file_size), 0) AS size FROM downloads WHERE (user_deleted IS NULL OR user_deleted = 0)')
+        .prepare('SELECT COUNT(*) AS count, COALESCE(SUM(file_size), 0) AS size FROM downloads')
         .get();
     return { totalFiles: r.count, totalSize: r.size };
 }
@@ -2108,7 +2330,7 @@ export function getStats() {
  * Used by the disk rotator to decide whether the cap is exceeded.
  */
 export function getTotalSizeBytes() {
-    const r = getDb().prepare('SELECT COALESCE(SUM(file_size), 0) as size FROM downloads WHERE (user_deleted IS NULL OR user_deleted = 0)').get();
+    const r = getDb().prepare('SELECT COALESCE(SUM(file_size), 0) as size FROM downloads').get();
     return Number(r?.size || 0);
 }
 
@@ -2124,7 +2346,6 @@ export function getOldestDownloads(count = 50) {
             SELECT id, group_id, group_name, file_name, file_size, file_type, file_path, created_at, pinned
             FROM downloads
             WHERE pinned = 0
-              AND (user_deleted IS NULL OR user_deleted = 0)
             ORDER BY created_at ASC, id ASC
             LIMIT ?
         `)
@@ -2132,8 +2353,8 @@ export function getOldestDownloads(count = 50) {
 }
 
 /**
- * Per-group stats card backing query — single index-only scan over
- * `idx_group_message`. Returns the totals the Group → Data tab renders
+ * Per-group stats card backing query — a group_id index range scan, never
+ * a full-table pass. Returns the totals the Group → Data tab renders
  * above its file strip. Cheap enough to call on every modal open.
  *
  * Shape:
@@ -2152,7 +2373,6 @@ export function getGroupStats(groupId) {
                    MAX(created_at) AS lastDownloadAt
               FROM downloads
              WHERE group_id = ?
-               AND (user_deleted IS NULL OR user_deleted = 0)
         `)
             .get(String(groupId)) || {};
     const rows = db
@@ -2160,7 +2380,6 @@ export function getGroupStats(groupId) {
             SELECT file_type, COUNT(*) AS n
               FROM downloads
              WHERE group_id = ?
-               AND (user_deleted IS NULL OR user_deleted = 0)
              GROUP BY file_type
         `)
         .all(String(groupId));
@@ -2177,7 +2396,7 @@ export function getGroupStats(groupId) {
 }
 
 /**
- * Paginated file list for the Group → Data tab. Uses `idx_group_message`
+ * Paginated file list for the Group → Data tab. Uses `idx_gallery_group_date`
  * for the WHERE filter + the index's natural ordering for the LIMIT/OFFSET
  * scan, so a 100k-row group still opens the modal in <500 ms.
  */
@@ -2185,7 +2404,7 @@ export function listGroupFiles({ groupId, limit = 50, offset = 0, type = null } 
     const db = getDb();
     const lim = Math.max(1, Math.min(500, Number(limit) || 50));
     const off = Math.max(0, Number(offset) || 0);
-    const where = ['group_id = ?', '(user_deleted IS NULL OR user_deleted = 0)'];
+    const where = ['group_id = ?'];
     const args = [String(groupId)];
     if (type && typeof type === 'string') {
         where.push('file_type = ?');
@@ -2291,11 +2510,11 @@ export function getNsfwStats(fileTypes, threshold) {
     const placeholders = types.map(() => '?').join(',');
     const db = getDb();
     const total = db
-        .prepare(`SELECT COUNT(*) AS n FROM downloads WHERE file_type IN (${placeholders}) AND (user_deleted IS NULL OR user_deleted = 0)`)
+        .prepare(`SELECT COUNT(*) AS n FROM downloads WHERE file_type IN (${placeholders})`)
         .get(...types).n;
     const scanned = db
         .prepare(
-            `SELECT COUNT(*) AS n FROM downloads WHERE file_type IN (${placeholders}) AND nsfw_checked_at IS NOT NULL AND (user_deleted IS NULL OR user_deleted = 0)`,
+            `SELECT COUNT(*) AS n FROM downloads WHERE file_type IN (${placeholders}) AND nsfw_checked_at IS NOT NULL`,
         )
         .get(...types).n;
     // candidates = LOW-score rows (likely not 18+) — what the admin reviews.
@@ -2305,8 +2524,7 @@ export function getNsfwStats(fileTypes, threshold) {
          WHERE file_type IN (${placeholders})
            AND nsfw_score IS NOT NULL
            AND nsfw_score < ?
-           AND nsfw_whitelist = 0
-           AND (user_deleted IS NULL OR user_deleted = 0)`,
+           AND nsfw_whitelist = 0`,
         )
         .get(...types, Number(threshold)).n;
     // keep = HIGH-score rows (likely 18+) — the curated content stays put.
@@ -2315,16 +2533,15 @@ export function getNsfwStats(fileTypes, threshold) {
             `SELECT COUNT(*) AS n FROM downloads
          WHERE file_type IN (${placeholders})
            AND nsfw_score IS NOT NULL
-           AND nsfw_score >= ?
-           AND (user_deleted IS NULL OR user_deleted = 0)`,
+           AND nsfw_score >= ?`,
         )
         .get(...types, Number(threshold)).n;
     const whitelisted = db
-        .prepare(`SELECT COUNT(*) AS n FROM downloads WHERE nsfw_whitelist = 1 AND (user_deleted IS NULL OR user_deleted = 0)`)
+        .prepare(`SELECT COUNT(*) AS n FROM downloads WHERE nsfw_whitelist = 1`)
         .get().n;
     const lastCheckedAt = db
         .prepare(
-            `SELECT MAX(nsfw_checked_at) AS t FROM downloads WHERE file_type IN (${placeholders}) AND (user_deleted IS NULL OR user_deleted = 0)`,
+            `SELECT MAX(nsfw_checked_at) AS t FROM downloads WHERE file_type IN (${placeholders})`,
         )
         .get(...types).t;
     return { totalEligible: total, scanned, candidates, keep, whitelisted, lastCheckedAt };
@@ -2346,7 +2563,6 @@ export function getUnscannedNsfwBatch(fileTypes, limit = 50) {
          WHERE file_type IN (${placeholders})
            AND nsfw_checked_at IS NULL
            AND nsfw_whitelist = 0
-           AND (user_deleted IS NULL OR user_deleted = 0)
          ORDER BY created_at ASC
          LIMIT ?
     `)
@@ -2415,7 +2631,6 @@ export function getNsfwDeleteCandidates({ fileTypes, threshold, page = 1, limit 
            AND nsfw_score IS NOT NULL
            AND nsfw_score < ?
            AND nsfw_whitelist = 0
-           AND (user_deleted IS NULL OR user_deleted = 0)
     `)
         .get(...types, t);
     const rows = db
@@ -2427,7 +2642,6 @@ export function getNsfwDeleteCandidates({ fileTypes, threshold, page = 1, limit 
            AND nsfw_score IS NOT NULL
            AND nsfw_score < ?
            AND nsfw_whitelist = 0
-           AND (user_deleted IS NULL OR user_deleted = 0)
          ORDER BY nsfw_score ASC, id ASC
          LIMIT ? OFFSET ?
     `)
@@ -2530,13 +2744,12 @@ export function getNsfwTierCounts(fileTypes) {
                COUNT(*) AS total_eligible
               FROM downloads
              WHERE file_type IN (${placeholders})
-               AND (user_deleted IS NULL OR user_deleted = 0)
         `)
         .get(...types);
     const tiers = {};
     for (const t of NSFW_TIERS) tiers[t.id] = row[`tier_${t.id}`] || 0;
     const whitelisted = db
-        .prepare(`SELECT COUNT(*) AS n FROM downloads WHERE nsfw_whitelist = 1 AND (user_deleted IS NULL OR user_deleted = 0)`)
+        .prepare(`SELECT COUNT(*) AS n FROM downloads WHERE nsfw_whitelist = 1`)
         .get().n;
     const scanned = row.scanned || 0;
     const totalEligible = row.total_eligible || 0;
@@ -2580,7 +2793,6 @@ export function getNsfwHistogram(fileTypes, bins = 20) {
               FROM downloads
              WHERE file_type IN (${placeholders})
                AND nsfw_score IS NOT NULL
-               AND (user_deleted IS NULL OR user_deleted = 0)
              GROUP BY bin
         `)
         .all(n, n, n, n, ...types);
@@ -2608,7 +2820,7 @@ export function getNsfwListByTier({
 }) {
     const types = Array.isArray(fileTypes) && fileTypes.length ? fileTypes : ['photo'];
     const placeholders = types.map(() => '?').join(',');
-    const where = [`file_type IN (${placeholders})`, 'nsfw_score IS NOT NULL', '(user_deleted IS NULL OR user_deleted = 0)'];
+    const where = [`file_type IN (${placeholders})`, 'nsfw_score IS NOT NULL'];
     const params = [...types];
     if (fileKind && fileKind !== 'all') {
         where.push('file_type = ?');
@@ -2673,7 +2885,7 @@ export function getNsfwIdsByTier({
 } = {}) {
     const types = Array.isArray(fileTypes) && fileTypes.length ? fileTypes : ['photo'];
     const placeholders = types.map(() => '?').join(',');
-    const where = [`file_type IN (${placeholders})`, 'nsfw_score IS NOT NULL', '(user_deleted IS NULL OR user_deleted = 0)'];
+    const where = [`file_type IN (${placeholders})`, 'nsfw_score IS NOT NULL'];
     const params = [...types];
     if (tier) {
         const bounds = _tierBounds(tier);
@@ -2756,7 +2968,15 @@ export function unwhitelistNsfw(ids) {
  * Rows that haven't been visited yet by the AI indexer. Supports both
  * ``photo`` and ``video`` file types — scan-runner.js processes each in
  * separate loops (batch for photos, one-at-a-time for videos). Sorted
- * oldest-first so a resumed scan picks up backlog before newly-arrived rows.
+ * oldest-first (insertion order) so a resumed scan picks up backlog before
+ * newly-arrived rows.
+ *
+ * Ordered by `id`, not `created_at`: the partial index
+ * `idx_ai_unindexed` only holds rows still waiting, and walks them in
+ * rowid order, so every pick costs O(batch). Ordering by created_at went
+ * through idx_gallery_type_date and stepped over every row the scan had
+ * already stamped — ~90 ms per 16-row pick at 80 % of a 210 k-photo
+ * library, all of it on the event loop.
  */
 export function getUnindexedAiBatch({ fileTypes = ['photo'], limit = 50 } = {}) {
     const types = Array.isArray(fileTypes) && fileTypes.length ? fileTypes : ['photo'];
@@ -2768,8 +2988,7 @@ export function getUnindexedAiBatch({ fileTypes = ['photo'], limit = 50 } = {}) 
          WHERE file_type IN (${placeholders})
            AND ai_indexed_at IS NULL
            AND file_path NOT LIKE '%.part'
-           AND (user_deleted IS NULL OR user_deleted = 0)
-         ORDER BY created_at ASC, id ASC
+         ORDER BY id ASC
          LIMIT ?
     `)
         .all(...types, Math.max(1, Math.min(500, Number(limit) || 50)));
@@ -2785,29 +3004,31 @@ export function setAiIndexedAt(downloadId, now = Date.now()) {
  * Counters for the Maintenance → AI page header. One COUNT per capability
  * + a totalEligible/indexed roll-up so the UI can paint progress bars
  * without per-feature round-trips.
- *
- * `facesEpsilon` — used to exclude denylisted faces from `noiseFaces`
- * (same radius as incremental Phase B exclusion filter). Defaults to
- * buffalo_l production ε (1.05).
  */
-export function getAiCounts({ fileTypes = ['photo'], facesEpsilon = 1.05 } = {}) {
+export function getAiCounts({ fileTypes = ['photo'] } = {}) {
     const types = Array.isArray(fileTypes) && fileTypes.length ? fileTypes : ['photo'];
     const placeholders = types.map(() => '?').join(',');
     const db = getDb();
     const total = db
-        .prepare(`SELECT COUNT(*) AS n FROM downloads WHERE file_type IN (${placeholders}) AND (user_deleted IS NULL OR user_deleted = 0)`)
+        .prepare(`SELECT COUNT(*) AS n FROM downloads WHERE file_type IN (${placeholders})`)
         .get(...types).n;
-    const indexed = db
+    // Count the (small, partially indexed) not-yet-scanned side and
+    // subtract: `ai_indexed_at IS NOT NULL` has no index and visited every
+    // row of the library (~0.7 s at 300 k rows) on each status poll.
+    const unindexedCount = db
         .prepare(
-            `SELECT COUNT(*) AS n FROM downloads WHERE file_type IN (${placeholders}) AND ai_indexed_at IS NOT NULL AND (user_deleted IS NULL OR user_deleted = 0)`,
+            `SELECT COUNT(*) AS n FROM downloads WHERE file_type IN (${placeholders}) AND ai_indexed_at IS NULL`,
         )
         .get(...types).n;
+    const indexed = Math.max(0, total - unindexedCount);
     const withEmbedding = db.prepare(`SELECT COUNT(*) AS n FROM image_embeddings`).get().n;
     const withFaces = db.prepare(`SELECT COUNT(DISTINCT download_id) AS n FROM faces`).get().n;
     const withTags = db.prepare(`SELECT COUNT(DISTINCT download_id) AS n FROM image_tags`).get().n;
     const peopleCount = db.prepare(`SELECT COUNT(*) AS n FROM people`).get().n;
     const totalFaces = db.prepare(`SELECT COUNT(*) AS n FROM faces`).get().n;
-    const noiseFaces = countUnclassifiedFaces(facesEpsilon);
+    const noiseFaces = db
+        .prepare(`SELECT COUNT(*) AS n FROM faces WHERE person_id IS NULL OR person_id = -1`)
+        .get().n;
     return {
         totalEligible: total,
         indexed,
@@ -2818,348 +3039,6 @@ export function getAiCounts({ fileTypes = ['photo'], facesEpsilon = 1.05 } = {})
         peopleCount,
         totalFaces,
         noiseFaces,
-    };
-}
-
-/**
- * Faces with no person that are NOT within `eps` of an excluded centroid.
- * Excluded identities stay `person_id IS NULL` by design; this keeps them
- * out of the Unclassified counter so it reflects true clustering noise.
- * Soft-deleted downloads are excluded (same filter as `listUnclassifiedFaces`)
- * so the KPI/total never claims faces the review grid cannot show.
- */
-export function countUnclassifiedFaces(eps = 1.05) {
-    const db = getDb();
-    const radius = Number.isFinite(eps) && eps > 0 ? Number(eps) : 1.05;
-    const excluded = listExcludedCentroids();
-    const baseSql = `
-        SELECT f.embedding
-          FROM faces f
-          JOIN downloads d ON d.id = f.download_id
-         WHERE (f.person_id IS NULL OR f.person_id = -1)
-           AND (d.user_deleted IS NULL OR d.user_deleted = 0)
-    `;
-    if (!excluded.length) {
-        return db
-            .prepare(
-                `SELECT COUNT(*) AS n
-                   FROM faces f
-                   JOIN downloads d ON d.id = f.download_id
-                  WHERE (f.person_id IS NULL OR f.person_id = -1)
-                    AND (d.user_deleted IS NULL OR d.user_deleted = 0)`,
-            )
-            .get().n;
-    }
-    let n = 0;
-    for (const row of db.prepare(baseSql).iterate()) {
-        if (!_embeddingNearExcluded(row.embedding, excluded, radius)) n += 1;
-    }
-    return n;
-}
-
-/**
- * True when a face embedding blob is within `radius` of any excluded centroid.
- * @param {Buffer|Uint8Array|null|undefined} embeddingBlob
- * @param {Array<{ centroid: Float32Array }>} excluded
- * @param {number} radius
- */
-function _embeddingNearExcluded(embeddingBlob, excluded, radius) {
-    if (!excluded?.length || !embeddingBlob) return false;
-    const dim = embeddingBlob.byteLength / 4;
-    if (!Number.isFinite(dim) || dim < 1) return false;
-    const emb = new Float32Array(embeddingBlob.buffer, embeddingBlob.byteOffset, dim);
-    for (const s of excluded) {
-        if (s.centroid.length !== dim) continue;
-        let sum = 0;
-        for (let i = 0; i < dim; i++) {
-            const d = emb[i] - s.centroid[i];
-            sum += d * d;
-        }
-        if (Math.sqrt(sum) <= radius) return true;
-    }
-    return false;
-}
-
-/**
- * Paginated unclassified face rows for the review grid — same shape as
- * `listFacesForPerson`, omitting faces within `facesEpsilon` of any
- * excluded centroid (matches `countUnclassifiedFaces`).
- *
- * @returns {{ faces: object[], total: number }}
- */
-export function listUnclassifiedFaces({
-    limit = 50,
-    offset = 0,
-    facesEpsilon = 1.05,
-} = {}) {
-    const lim = Math.max(1, Math.min(200, Number(limit) || 50));
-    const off = Math.max(0, Number(offset) || 0);
-    const radius =
-        Number.isFinite(facesEpsilon) && facesEpsilon > 0 ? Number(facesEpsilon) : 1.05;
-    const db = getDb();
-    const excluded = listExcludedCentroids();
-    const total = countUnclassifiedFaces(radius);
-    if (total === 0 || off >= total) return { faces: [], total };
-
-    const stmt = db.prepare(`
-        SELECT f.id AS face_id, f.download_id, f.x, f.y, f.w, f.h, f.quality_score,
-               f.embedding,
-               d.file_name, d.file_type, d.file_path, d.file_size,
-               d.group_id, d.group_name, d.message_id, d.pinned, d.created_at
-          FROM faces f
-          JOIN downloads d ON d.id = f.download_id
-         WHERE (f.person_id IS NULL OR f.person_id = -1)
-           AND (d.user_deleted IS NULL OR d.user_deleted = 0)
-         ORDER BY d.created_at DESC, f.id DESC
-    `);
-    const faces = [];
-    let skipped = 0;
-    for (const row of stmt.iterate()) {
-        if (_embeddingNearExcluded(row.embedding, excluded, radius)) continue;
-        if (skipped < off) {
-            skipped += 1;
-            continue;
-        }
-        const { embedding: _emb, ...rest } = row;
-        faces.push(rest);
-        if (faces.length >= lim) break;
-    }
-    return { faces, total };
-}
-
-/**
- * Nearest existing people for a face embedding (suggestion chips / picker).
- * Also includes people who already have faces on the same download ("clip"),
- * even when outside matchEps — co-occurrence is a strong prior for video
- * frames / multi-face photos where embeddings alone are weak.
- * @returns {{ ok: true, suggestions: Array<{ id: number, label: string|null, faceCount: number, distance: number, sameClip?: boolean }> }
- *   | { ok: false, reason: 'not_found'|'invalid_id'|'no_embedding' }}
- */
-export function suggestPeopleForFace(faceId, { matchEps = 0.4, limit = 5 } = {}) {
-    const fid = Number(faceId);
-    if (!Number.isFinite(fid) || fid <= 0) return { ok: false, reason: 'invalid_id' };
-    const radius = Number.isFinite(matchEps) && matchEps > 0 ? Number(matchEps) : 0.4;
-    const lim = Math.max(1, Math.min(20, Number(limit) || 5));
-    const db = getDb();
-    const row = db
-        .prepare('SELECT download_id, embedding FROM faces WHERE id = ?')
-        .get(fid);
-    if (!row) return { ok: false, reason: 'not_found' };
-    if (!row.embedding) return { ok: false, reason: 'no_embedding' };
-    const dim = row.embedding.byteLength / 4;
-    if (!Number.isFinite(dim) || dim < 1) return { ok: false, reason: 'no_embedding' };
-    const emb = new Float32Array(row.embedding.buffer, row.embedding.byteOffset, dim);
-
-    const _euclid = (a, b) => {
-        let sum = 0;
-        for (let i = 0; i < a.length; i++) {
-            const d = a[i] - b[i];
-            sum += d * d;
-        }
-        return Math.sqrt(sum);
-    };
-
-    /** @type {Map<number, { id: number, label: string|null, faceCount: number, distance: number, sameClip: boolean }>} */
-    const byId = new Map();
-
-    const upsert = (entry) => {
-        const prev = byId.get(entry.id);
-        if (!prev) {
-            byId.set(entry.id, entry);
-            return;
-        }
-        byId.set(entry.id, {
-            ...prev,
-            ...entry,
-            sameClip: prev.sameClip || entry.sameClip,
-            distance: Math.min(prev.distance, entry.distance),
-            label: entry.label ?? prev.label,
-            faceCount: entry.faceCount || prev.faceCount,
-        });
-    };
-
-    // 1) Same-clip co-occurrence: other assigned faces on this download.
-    const siblings = db
-        .prepare(
-            `SELECT f.person_id, f.embedding, p.label, p.face_count
-               FROM faces f
-               JOIN people p ON p.id = f.person_id
-              WHERE f.download_id = ?
-                AND f.id != ?
-                AND f.person_id IS NOT NULL
-                AND f.person_id > 0`,
-        )
-        .all(row.download_id, fid);
-    for (const s of siblings) {
-        if (!s.embedding) continue;
-        const sDim = s.embedding.byteLength / 4;
-        if (sDim !== dim) continue;
-        const sEmb = new Float32Array(s.embedding.buffer, s.embedding.byteOffset, sDim);
-        upsert({
-            id: Number(s.person_id),
-            label: s.label ?? null,
-            faceCount: Number(s.face_count) || 0,
-            distance: _euclid(emb, sEmb),
-            sameClip: true,
-        });
-    }
-
-    // 2) Global centroid matches within matchEps.
-    for (const p of listPeopleCentroids()) {
-        if (p.centroid.length !== dim) continue;
-        const distance = _euclid(emb, p.centroid);
-        if (distance <= radius) {
-            upsert({
-                id: p.id,
-                label: p.label,
-                faceCount: p.faceCount,
-                distance,
-                sameClip: false,
-            });
-        }
-    }
-
-    const matches = [...byId.values()];
-    // Same-clip first (strong prior), then nearest embedding distance.
-    matches.sort((a, b) => {
-        if (a.sameClip !== b.sameClip) return a.sameClip ? -1 : 1;
-        return a.distance - b.distance;
-    });
-    return {
-        ok: true,
-        suggestions: matches.slice(0, lim).map((s) => ({
-            id: s.id,
-            label: s.label,
-            faceCount: s.faceCount,
-            distance: s.distance,
-            ...(s.sameClip ? { sameClip: true } : {}),
-        })),
-    };
-}
-
-/**
- * Nearest other people for a person centroid (merge suggestion chips / picker).
- * Also includes people who share at least one download ("clip") with this
- * person's faces — even outside matchEps — so over-split clusters that
- * still co-occur on the same media surface as merge candidates.
- * @returns {{ ok: true, suggestions: Array<{ id: number, label: string|null, faceCount: number, distance: number, sameClip?: boolean }> }
- *   | { ok: false, reason: 'not_found'|'invalid_id'|'no_embedding' }}
- */
-export function suggestPeopleForPerson(personId, { matchEps = 0.4, limit = 5 } = {}) {
-    const pid = Number(personId);
-    if (!Number.isFinite(pid) || pid <= 0) return { ok: false, reason: 'invalid_id' };
-    const radius = Number.isFinite(matchEps) && matchEps > 0 ? Number(matchEps) : 0.4;
-    const lim = Math.max(1, Math.min(20, Number(limit) || 5));
-    const db = getDb();
-    const row = db
-        .prepare('SELECT id, embedding_centroid FROM people WHERE id = ?')
-        .get(pid);
-    if (!row) return { ok: false, reason: 'not_found' };
-    if (!row.embedding_centroid) return { ok: false, reason: 'no_embedding' };
-    const dim = row.embedding_centroid.byteLength / 4;
-    if (!Number.isFinite(dim) || dim < 1) return { ok: false, reason: 'no_embedding' };
-    const emb = new Float32Array(
-        row.embedding_centroid.buffer,
-        row.embedding_centroid.byteOffset,
-        dim,
-    );
-
-    const _euclid = (a, b) => {
-        let sum = 0;
-        for (let i = 0; i < a.length; i++) {
-            const d = a[i] - b[i];
-            sum += d * d;
-        }
-        return Math.sqrt(sum);
-    };
-
-    /** @type {Map<number, { id: number, label: string|null, faceCount: number, distance: number, sameClip: boolean }>} */
-    const byId = new Map();
-
-    const upsert = (entry) => {
-        const prev = byId.get(entry.id);
-        if (!prev) {
-            byId.set(entry.id, entry);
-            return;
-        }
-        byId.set(entry.id, {
-            ...prev,
-            ...entry,
-            sameClip: prev.sameClip || entry.sameClip,
-            distance: Math.min(prev.distance, entry.distance),
-            label: entry.label ?? prev.label,
-            faceCount: entry.faceCount || prev.faceCount,
-        });
-    };
-
-    // Precompute centroid distances for every other person (used by both
-    // same-clip and global match paths).
-    /** @type {Map<number, { id: number, label: string|null, faceCount: number, distance: number }>} */
-    const centroidById = new Map();
-    for (const p of listPeopleCentroids()) {
-        if (p.id === pid) continue;
-        if (p.centroid.length !== dim) continue;
-        centroidById.set(p.id, {
-            id: p.id,
-            label: p.label,
-            faceCount: p.faceCount,
-            distance: _euclid(emb, p.centroid),
-        });
-    }
-
-    // 1) Same-clip co-occurrence: other people who appear on any download
-    //    that already has a face from this person.
-    const cooccur = db
-        .prepare(
-            `SELECT DISTINCT f2.person_id AS person_id, p.label, p.face_count
-               FROM faces f1
-               JOIN faces f2 ON f2.download_id = f1.download_id
-               JOIN people p ON p.id = f2.person_id
-              WHERE f1.person_id = ?
-                AND f2.person_id IS NOT NULL
-                AND f2.person_id > 0
-                AND f2.person_id != ?`,
-        )
-        .all(pid, pid);
-    for (const s of cooccur) {
-        const otherId = Number(s.person_id);
-        const cent = centroidById.get(otherId);
-        upsert({
-            id: otherId,
-            label: s.label ?? cent?.label ?? null,
-            faceCount: Number(s.face_count) || cent?.faceCount || 0,
-            distance: cent?.distance ?? Number.POSITIVE_INFINITY,
-            sameClip: true,
-        });
-    }
-
-    // 2) Global centroid matches within matchEps.
-    for (const p of centroidById.values()) {
-        if (p.distance <= radius) {
-            upsert({
-                id: p.id,
-                label: p.label,
-                faceCount: p.faceCount,
-                distance: p.distance,
-                sameClip: false,
-            });
-        }
-    }
-
-    const matches = [...byId.values()];
-    matches.sort((a, b) => {
-        if (a.sameClip !== b.sameClip) return a.sameClip ? -1 : 1;
-        return a.distance - b.distance;
-    });
-    return {
-        ok: true,
-        suggestions: matches.slice(0, lim).map((s) => ({
-            id: s.id,
-            label: s.label,
-            faceCount: s.faceCount,
-            distance: Number.isFinite(s.distance) ? s.distance : null,
-            ...(s.sameClip ? { sameClip: true } : {}),
-        })),
     };
 }
 
@@ -3232,11 +3111,10 @@ export function resetAllAiData() {
         const tags = db.prepare('DELETE FROM image_tags').run().changes;
         const faces = db.prepare('DELETE FROM faces').run().changes;
         const people = db.prepare('DELETE FROM people').run().changes;
-        const excluded = db.prepare('DELETE FROM excluded_people').run().changes;
         const requeued = db
             .prepare('UPDATE downloads SET ai_indexed_at = NULL WHERE ai_indexed_at IS NOT NULL')
             .run().changes;
-        return { embeddings, tags, faces, people, excluded, requeued };
+        return { embeddings, tags, faces, people, requeued };
     });
     return tx();
 }
@@ -3279,12 +3157,14 @@ export function insertFace({
     embeddingBlob,
     personId = null,
     qualityScore = null,
+    exifOriented = false,
     frameTimeSec = null,
 }) {
     return getDb()
         .prepare(`
-        INSERT INTO faces (download_id, x, y, w, h, embedding, person_id, quality_score, frame_time_sec)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO faces (download_id, x, y, w, h, embedding, person_id, quality_score,
+                           exif_oriented, frame_time_sec)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `)
         .run(
             Number(downloadId),
@@ -3295,7 +3175,8 @@ export function insertFace({
             embeddingBlob,
             personId == null ? null : Number(personId),
             qualityScore == null ? null : Number(qualityScore),
-            frameTimeSec == null ? null : Number(frameTimeSec),
+            exifOriented ? 1 : null,
+            Number.isFinite(frameTimeSec) ? Number(frameTimeSec) : null,
         );
 }
 
@@ -3315,11 +3196,12 @@ export function deleteFacesForDownload(downloadId) {
 //   2. Loading ALL rows via `.all()` is fine for a 50k-face library
 //      but blows up at million-face scale (~2 GB Node heap).
 //
-// Solution: paginate via LIMIT/OFFSET in 1 000-row chunks. Each chunk's
-// `.all()` releases the connection immediately, so any pending writer
-// (config save, faststart stamp, faces.insert from Phase A's parallel
-// detect) can run between chunks. The caller's `setImmediate` yields
-// land in those windows naturally.
+// Solution: paginate in 1 000-row chunks. Each chunk's `.all()` releases
+// the connection immediately, so any pending writer (config save,
+// faststart stamp, faces.insert from Phase A's parallel detect) can run
+// between chunks. The caller's `setImmediate` yields land in those
+// windows naturally. Keyset (`id > last`) rather than OFFSET, which
+// re-walked every earlier row on each chunk (O(N²) over a full pass).
 //
 // 1 000-row chunk × 2 KB/row = 2 MB working set per pull, well within
 // V8 heap limits at any library size. Total wall time is comparable to
@@ -3329,95 +3211,16 @@ export function* iterateAllFaces({ chunkSize = 1000 } = {}) {
     const db = getDb();
     const stmt = db.prepare(
         `SELECT id, download_id, x, y, w, h, embedding, person_id, gender, quality_score FROM faces
-         ORDER BY id LIMIT ? OFFSET ?`,
+          WHERE id > ? ORDER BY id LIMIT ?`,
     );
-    for (let offset = 0; ; offset += chunkSize) {
-        const chunk = stmt.all(chunkSize, offset);
+    let lastId = -1;
+    while (true) {
+        const chunk = stmt.all(lastId, chunkSize);
         if (!chunk.length) return;
+        lastId = chunk[chunk.length - 1].id;
         for (const row of chunk) yield row;
         if (chunk.length < chunkSize) return;
     }
-}
-
-/** Faces not yet assigned to a person — input for incremental Phase B. */
-export function* iterateUnassignedFaces({ chunkSize = 1000 } = {}) {
-    const db = getDb();
-    const stmt = db.prepare(
-        `SELECT id, download_id, x, y, w, h, embedding, person_id, gender, quality_score FROM faces
-          WHERE person_id IS NULL
-          ORDER BY id LIMIT ? OFFSET ?`,
-    );
-    for (let offset = 0; ; offset += chunkSize) {
-        const chunk = stmt.all(chunkSize, offset);
-        if (!chunk.length) return;
-        for (const row of chunk) yield row;
-        if (chunk.length < chunkSize) return;
-    }
-}
-
-/**
- * Existing people centroids for incremental matching.
- * @returns {Array<{ id: number, label: string|null, centroid: Float32Array, faceCount: number }>}
- */
-export function listPeopleCentroids() {
-    const out = [];
-    const stmt = getDb().prepare(
-        'SELECT id, label, embedding_centroid, face_count FROM people',
-    );
-    for (const r of stmt.iterate()) {
-        if (!r.embedding_centroid) continue;
-        const dim = r.embedding_centroid.byteLength / 4;
-        if (!Number.isFinite(dim) || dim < 1) continue;
-        const c = new Float32Array(dim);
-        const view = new Float32Array(
-            r.embedding_centroid.buffer,
-            r.embedding_centroid.byteOffset,
-            dim,
-        );
-        c.set(view);
-        out.push({
-            id: r.id,
-            label: r.label ?? null,
-            centroid: c,
-            faceCount: Number(r.face_count) || 0,
-        });
-    }
-    return out;
-}
-
-/**
- * Recompute embedding_centroid + face_count from live face rows.
- * @returns {{ ok: boolean, faceCount: number }}
- */
-export function recomputePersonCentroid(personId) {
-    const pid = Number(personId);
-    if (!Number.isFinite(pid) || pid <= 0) return { ok: false, faceCount: 0 };
-    const db = getDb();
-    const rows = db
-        .prepare('SELECT embedding FROM faces WHERE person_id = ?')
-        .all(pid);
-    if (!rows.length) {
-        db.prepare(
-            'UPDATE people SET face_count = 0, updated_at = ? WHERE id = ?',
-        ).run(Date.now(), pid);
-        return { ok: true, faceCount: 0 };
-    }
-    const dim = rows[0].embedding.byteLength / 4;
-    const acc = new Float32Array(dim);
-    for (const r of rows) {
-        const view = new Float32Array(r.embedding.buffer, r.embedding.byteOffset, dim);
-        for (let i = 0; i < dim; i++) acc[i] += view[i];
-    }
-    for (let i = 0; i < dim; i++) acc[i] /= rows.length;
-    const centroidBlob = Buffer.from(acc.buffer);
-    db.prepare(
-        `UPDATE people SET embedding_centroid = ?, face_count = ?, updated_at = ? WHERE id = ?`,
-    ).run(centroidBlob, rows.length, Date.now(), pid);
-    return { ok: true, faceCount: rows.length };
-}
-
-export function countPeople() {
-    return getDb().prepare('SELECT COUNT(*) AS n FROM people').get().n;
 }
 
 /**
@@ -3450,10 +3253,13 @@ export function mergeFacePerson(targetId, otherId) {
         const moved = db
             .prepare('UPDATE faces SET person_id = ? WHERE person_id = ?')
             .run(t, o).changes;
+        const newCount = db.prepare('SELECT COUNT(*) AS n FROM faces WHERE person_id = ?').get(t).n;
+        db.prepare('UPDATE people SET face_count = ?, updated_at = ? WHERE id = ?').run(
+            newCount,
+            Date.now(),
+            t,
+        );
         const deleted = db.prepare('DELETE FROM people WHERE id = ?').run(o).changes;
-        // Refresh centroid from all faces so incremental Phase B matches
-        // the merged identity, not the pre-merge target-only centroid.
-        recomputePersonCentroid(t);
         return { moved, deleted };
     });
     return tx();
@@ -3464,11 +3270,6 @@ export function mergeFacePerson(targetId, otherId) {
  * fresh cluster containing only those faces. The new cluster's
  * centroid is computed from the moved faces' embeddings. Useful when
  * DBSCAN over-grouped two similar-looking people.
- *
- * Surviving source clusters have their centroids recomputed from the
- * remaining faces so incremental Phase B does not keep matching toward
- * the pre-split identity. Stale cover_face_id pointing at a moved face
- * is cleared.
  *
  * Returns `{ personId, moved }` where personId is the new cluster's id.
  */
@@ -3506,24 +3307,19 @@ export function splitFacePerson(faceIds, label = null) {
         const moved = db
             .prepare(`UPDATE faces SET person_id = ? WHERE id IN (${placeholders})`)
             .run(newPersonId, ...ids).changes;
-        const movedIdSet = new Set(rows.map((row) => Number(row.id)));
-        // Drop empty sources; recompute centroids on survivors so
-        // incremental attach does not prefer the pre-split identity.
+        // Update each source cluster's face_count + drop those whose
+        // count hit zero.
         const oldPersonIds = [...new Set(rows.map((r) => r.person_id).filter((x) => x))];
         for (const pid of oldPersonIds) {
             const n = db.prepare('SELECT COUNT(*) AS n FROM faces WHERE person_id = ?').get(pid).n;
             if (n === 0) {
                 db.prepare('DELETE FROM people WHERE id = ?').run(pid);
             } else {
-                const cover = db
-                    .prepare('SELECT cover_face_id FROM people WHERE id = ?')
-                    .get(pid)?.cover_face_id;
-                if (cover != null && movedIdSet.has(Number(cover))) {
-                    db.prepare(
-                        'UPDATE people SET cover_face_id = NULL, updated_at = ? WHERE id = ?',
-                    ).run(now, pid);
-                }
-                recomputePersonCentroid(pid);
+                db.prepare('UPDATE people SET face_count = ?, updated_at = ? WHERE id = ?').run(
+                    n,
+                    now,
+                    pid,
+                );
             }
         }
         return { personId: Number(newPersonId), moved };
@@ -3532,36 +3328,10 @@ export function splitFacePerson(faceIds, label = null) {
 }
 
 /**
- * Face ids belonging to `personId` on any of the given downloads.
- * Used by photo-grid split so selecting a download peels every
- * appearance of that person on that photo (not only the ROW_NUMBER
- * representative shown on the tile).
- *
- * @returns {number[]}
- */
-export function listFaceIdsForPersonDownloads(personId, downloadIds) {
-    const pid = Number(personId);
-    const ids = (Array.isArray(downloadIds) ? downloadIds : [])
-        .map((x) => Number(x))
-        .filter((x) => Number.isFinite(x) && x > 0);
-    if (!Number.isFinite(pid) || pid <= 0 || !ids.length) return [];
-    const placeholders = ids.map(() => '?').join(',');
-    return getDb()
-        .prepare(
-            `SELECT id FROM faces
-              WHERE person_id = ?
-                AND download_id IN (${placeholders})
-              ORDER BY id ASC`,
-        )
-        .all(pid, ...ids)
-        .map((r) => Number(r.id));
-}
-
-/**
  * Move a single face to a different cluster (or to no cluster if
  * `personId` is null). Updates both the source and destination
- * cluster's centroid + face_count. The source cluster is deleted if
- * its count hits zero.
+ * cluster's `face_count`. The source cluster is deleted if its count
+ * hits zero.
  */
 export function reassignFace(faceId, personId) {
     const fid = Number(faceId);
@@ -3580,69 +3350,14 @@ export function reassignFace(faceId, personId) {
             if (n === 0 && p === oldPid) {
                 db.prepare('DELETE FROM people WHERE id = ?').run(p);
             } else {
-                if (p === oldPid) {
-                    const cover = db
-                        .prepare('SELECT cover_face_id FROM people WHERE id = ?')
-                        .get(p)?.cover_face_id;
-                    if (cover != null && Number(cover) === fid) {
-                        db.prepare(
-                            'UPDATE people SET cover_face_id = NULL, updated_at = ? WHERE id = ?',
-                        ).run(now, p);
-                    }
-                }
-                recomputePersonCentroid(p);
+                db.prepare('UPDATE people SET face_count = ?, updated_at = ? WHERE id = ?').run(
+                    n,
+                    now,
+                    p,
+                );
             }
         }
         return { ok: true, oldPersonId: oldPid, newPersonId: pid };
-    });
-    return tx();
-}
-
-/**
- * Permanently delete a single face detection row. If it belonged to a
- * person, refresh that person's centroid (or delete the person when empty)
- * and clear a pinned cover that pointed at this face.
- *
- * @returns {{ ok: true, faceId: number, oldPersonId: number|null, personDeleted: boolean }
- *   | { ok: false, reason: 'invalid_id'|'not_found' }}
- */
-export function deleteFace(faceId) {
-    const fid = Number(faceId);
-    if (!Number.isFinite(fid) || fid <= 0) return { ok: false, reason: 'invalid_id' };
-    const db = getDb();
-    const tx = db.transaction(() => {
-        const before = db.prepare('SELECT id, person_id FROM faces WHERE id = ?').get(fid);
-        if (!before) return { ok: false, reason: 'not_found' };
-        const oldPid = before.person_id == null ? null : Number(before.person_id);
-        db.prepare('DELETE FROM faces WHERE id = ?').run(fid);
-        let personDeleted = false;
-        if (oldPid != null && Number.isFinite(oldPid) && oldPid > 0) {
-            const now = Date.now();
-            const cover = db
-                .prepare('SELECT cover_face_id FROM people WHERE id = ?')
-                .get(oldPid)?.cover_face_id;
-            if (cover != null && Number(cover) === fid) {
-                db.prepare(
-                    'UPDATE people SET cover_face_id = NULL, updated_at = ? WHERE id = ?',
-                ).run(now, oldPid);
-            }
-            const n = db.prepare('SELECT COUNT(*) AS n FROM faces WHERE person_id = ?').get(oldPid).n;
-            if (n === 0) {
-                db.prepare('DELETE FROM people WHERE id = ?').run(oldPid);
-                personDeleted = true;
-            } else {
-                recomputePersonCentroid(oldPid);
-            }
-        }
-        db.prepare(
-            'UPDATE excluded_people SET cover_face_id = NULL WHERE cover_face_id = ?',
-        ).run(fid);
-        return {
-            ok: true,
-            faceId: fid,
-            oldPersonId: oldPid,
-            personDeleted,
-        };
     });
     return tx();
 }
@@ -3704,136 +3419,62 @@ export function clearAllPeople() {
     tx();
 }
 
-export function insertPerson({ label = null, centroidBlob, faceCount = 0, coverFaceId = null }) {
+export function insertPerson({ label = null, centroidBlob, faceCount = 0 }) {
     const now = Date.now();
-    const cover =
-        coverFaceId == null || !Number.isFinite(Number(coverFaceId)) || Number(coverFaceId) <= 0
-            ? null
-            : Number(coverFaceId);
     const r = getDb()
         .prepare(`
-        INSERT INTO people (label, embedding_centroid, face_count, created_at, updated_at, cover_face_id)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO people (label, embedding_centroid, face_count, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?)
     `)
-        .run(label, centroidBlob, Math.max(0, Number(faceCount) || 0), now, now, cover);
+        .run(label, centroidBlob, Math.max(0, Number(faceCount) || 0), now, now);
     return r.lastInsertRowid;
 }
 
-/**
- * Pin a face as this person's People avatar. Face must belong to the person.
- * @returns {{ ok: true, coverFaceId: number }
- *   | { ok: false, reason: 'invalid_id'|'person_not_found'|'face_not_found'|'mismatch' }}
- */
-export function setPersonCoverFace(personId, faceId) {
-    const pid = Number(personId);
-    const fid = Number(faceId);
-    if (!Number.isFinite(pid) || pid <= 0 || !Number.isFinite(fid) || fid <= 0) {
-        return { ok: false, reason: 'invalid_id' };
-    }
-    const db = getDb();
-    const person = db.prepare('SELECT id FROM people WHERE id = ?').get(pid);
-    if (!person) return { ok: false, reason: 'person_not_found' };
-    const face = db.prepare('SELECT id, person_id FROM faces WHERE id = ?').get(fid);
-    if (!face) return { ok: false, reason: 'face_not_found' };
-    if (Number(face.person_id) !== pid) return { ok: false, reason: 'mismatch' };
-    db.prepare('UPDATE people SET cover_face_id = ?, updated_at = ? WHERE id = ?').run(
-        fid,
-        Date.now(),
-        pid,
-    );
-    return { ok: true, coverFaceId: fid };
+// People list orderings. Allow-listed — the SQL is built from these
+// fragments only, never from request input. Every order ends on
+// face_count DESC, id ASC so pages are stable.
+const PEOPLE_SORTS = Object.freeze({
+    face_count: { asc: 'p.face_count ASC', desc: 'p.face_count DESC' },
+    avg_quality: { asc: 'COALESCE(aq.q, 0) ASC', desc: 'COALESCE(aq.q, 0) DESC' },
+    // Unlabelled people first when ascending, last when descending.
+    name: {
+        asc: "(COALESCE(p.label, '') = '') DESC, p.label COLLATE NOCASE ASC",
+        desc: "(COALESCE(p.label, '') = '') ASC, p.label COLLATE NOCASE DESC",
+    },
+});
+
+/** Normalise `sort` / `dir` query values to an allow-listed pair. */
+export function resolvePeopleSort(sort, dir) {
+    const key = Object.hasOwn(PEOPLE_SORTS, sort) ? sort : 'face_count';
+    const d = dir === 'asc' || dir === 'desc' ? dir : key === 'name' ? 'asc' : 'desc';
+    return { sort: key, dir: d };
 }
 
-/** Clear a pinned cover so avatar falls back to auto-pick. */
-export function clearPersonCoverFace(personId) {
-    const pid = Number(personId);
-    if (!Number.isFinite(pid) || pid <= 0) return 0;
-    return getDb()
-        .prepare('UPDATE people SET cover_face_id = NULL, updated_at = ? WHERE id = ?')
-        .run(Date.now(), pid).changes;
-}
-
-/**
- * Snapshot pinned cover face ids before clearAllPeople (Phase B).
- * @returns {number[]}
- */
-export function listPinnedCoverFaceIds() {
-    const rows = getDb()
-        .prepare(
-            `SELECT cover_face_id FROM people
-              WHERE cover_face_id IS NOT NULL`,
-        )
-        .all();
-    return rows
-        .map((r) => Number(r.cover_face_id))
-        .filter((id) => Number.isFinite(id) && id > 0);
-}
-
-/**
- * After Phase B reassigns faces, re-apply pinned covers onto the people
- * that now own those face rows.
- * @param {Iterable<number>} faceIds
- * @returns {number} how many people updated
- */
-export function restorePinnedCoverFaces(faceIds) {
-    const ids = [...new Set([...faceIds].map(Number).filter((id) => Number.isFinite(id) && id > 0))];
-    if (!ids.length) return 0;
-    const db = getDb();
-    const find = db.prepare('SELECT person_id FROM faces WHERE id = ?');
-    const upd = db.prepare(
-        'UPDATE people SET cover_face_id = ?, updated_at = ? WHERE id = ?',
-    );
-    let n = 0;
-    const now = Date.now();
-    const tx = db.transaction(() => {
-        for (const fid of ids) {
-            const row = find.get(fid);
-            const pid = row?.person_id != null ? Number(row.person_id) : null;
-            if (!pid) continue;
-            upd.run(fid, now, pid);
-            n += 1;
-        }
-    });
-    tx();
-    return n;
-}
-
-const PEOPLE_SORT_BY = new Set(['face_count', 'avg_quality', 'name']);
-
-/**
- * List face-cluster people with cover face + counts.
- * @param {{ limit?: number, offset?: number, sortBy?: string, sortDir?: string }} [opts]
- *   `sortBy`: `face_count` (default) | `avg_quality` | `name`
- *   `sortDir`: `desc` (default) | `asc` — shared direction for every field
- */
-export function listPeople({ limit = 500, offset = 0, sortBy = 'face_count', sortDir = 'desc' } = {}) {
+export function listPeople({ limit = 500, offset = 0, sort = 'face_count', dir } = {}) {
     const lim = Math.max(1, Math.min(2000, Number(limit) || 500));
     const off = Math.max(0, Number(offset) || 0);
-    const by = PEOPLE_SORT_BY.has(String(sortBy || '')) ? String(sortBy) : 'face_count';
-    const dir = String(sortDir || '').toLowerCase() === 'asc' ? 'ASC' : 'DESC';
-    // Whitelisted column expressions only — never interpolate raw input.
-    let orderExpr;
-    if (by === 'avg_quality') {
-        orderExpr = `avg_quality ${dir}, p.id ASC`;
-    } else if (by === 'name') {
-        // Unlabeled participate: first on ASC, last on DESC; among them by id.
-        // Labeled sort A↔Z. Empty-group flag uses the opposite dir so the
-        // unlabeled block moves when Asc/Desc flips (not pinned forever).
-        const emptyDir = dir === 'ASC' ? 'DESC' : 'ASC';
-        orderExpr = `(p.label IS NULL OR TRIM(p.label) = '') ${emptyDir}, p.label COLLATE NOCASE ${dir}, p.id ${dir}`;
-    } else {
-        orderExpr = `face_count ${dir}, p.id ASC`;
-    }
+    const order = resolvePeopleSort(sort, dir);
+    const orderSql = `${PEOPLE_SORTS[order.sort][order.dir]}, p.face_count DESC, p.id ASC`;
+    // Only the quality sort needs the per-person average up front; the
+    // page is picked from `people` alone and the heavier per-row columns
+    // (cover face, video count, average) are computed for that page only.
+    const qualityJoin =
+        order.sort === 'avg_quality'
+            ? `LEFT JOIN (SELECT person_id, AVG(quality_score) AS q FROM faces
+                          WHERE person_id IS NOT NULL AND quality_score IS NOT NULL
+                          GROUP BY person_id) aq ON aq.person_id = p.id`
+            : '';
     const db = getDb();
     const rows = db
         .prepare(`
-        SELECT p.id, p.label, p.created_at, p.updated_at,
-               COALESCE((
-                   SELECT COUNT(*) FROM faces fl
-                    JOIN downloads dl ON dl.id = fl.download_id
-                   WHERE fl.person_id = p.id
-                     AND (dl.user_deleted IS NULL OR dl.user_deleted = 0)
-               ), 0) AS face_count,
+        WITH page AS (
+            SELECT p.id, ROW_NUMBER() OVER (ORDER BY ${orderSql}) AS ord
+              FROM people p
+              ${qualityJoin}
+             ORDER BY ord
+             LIMIT ? OFFSET ?
+        )
+        SELECT p.id, p.label, p.face_count, p.created_at, p.updated_at,
                f.download_id AS cover_download_id,
                f.id          AS cover_face_id,
                f.x           AS cover_x,
@@ -3844,45 +3485,23 @@ export function listPeople({ limit = 500, offset = 0, sortBy = 'face_count', sor
                    SELECT COUNT(*) FROM faces fv
                     JOIN downloads dv ON dv.id = fv.download_id
                    WHERE fv.person_id = p.id AND dv.file_type = 'video'
-                     AND (dv.user_deleted IS NULL OR dv.user_deleted = 0)
                ), 0) AS video_face_count,
                COALESCE((
                    SELECT AVG(f3.quality_score) FROM faces f3
-                    JOIN downloads d3 ON d3.id = f3.download_id
                     WHERE f3.person_id = p.id AND f3.quality_score IS NOT NULL
-                      AND (d3.user_deleted IS NULL OR d3.user_deleted = 0)
                ), 0) AS avg_quality
-          FROM people p
+          FROM page
+          JOIN people p ON p.id = page.id
           LEFT JOIN faces f ON f.id = (
             SELECT ff.id FROM faces ff
-              JOIN downloads dff ON dff.id = ff.download_id
              WHERE ff.person_id = p.id
-               AND (dff.user_deleted IS NULL OR dff.user_deleted = 0)
-             ORDER BY
-               CASE WHEN p.cover_face_id IS NOT NULL AND ff.id = p.cover_face_id THEN 0 ELSE 1 END,
-               COALESCE(ff.quality_score, 0) DESC,
-               ff.w * ff.h DESC
+             ORDER BY COALESCE(ff.quality_score, 0) DESC, ff.w * ff.h DESC
              LIMIT 1
           )
-         WHERE (
-               SELECT COUNT(*) FROM faces fex
-                JOIN downloads dex ON dex.id = fex.download_id
-               WHERE fex.person_id = p.id
-                 AND (dex.user_deleted IS NULL OR dex.user_deleted = 0)
-         ) > 0
-         ORDER BY ${orderExpr}
-         LIMIT ? OFFSET ?
+         ORDER BY page.ord
     `)
         .all(lim, off);
-    const total = db.prepare(`
-        SELECT COUNT(*) AS n FROM people p
-         WHERE (
-               SELECT COUNT(*) FROM faces fex
-                JOIN downloads dex ON dex.id = fex.download_id
-               WHERE fex.person_id = p.id
-                 AND (dex.user_deleted IS NULL OR dex.user_deleted = 0)
-         ) > 0
-    `).get().n;
+    const total = db.prepare('SELECT COUNT(*) AS n FROM people').get().n;
     return { people: rows, total };
 }
 
@@ -3895,233 +3514,7 @@ export function renamePerson(id, label) {
 export function deletePerson(id) {
     // ON DELETE SET NULL on faces.person_id keeps face rows around so a
     // re-cluster can re-assign them — we don't lose embeddings.
-    // Temporary only: the next Phase B recluster will recreate the cluster
-    // unless the operator used excludePerson() instead.
     return getDb().prepare('DELETE FROM people WHERE id = ?').run(Number(id)).changes;
-}
-
-/**
- * Durable exclude — snapshot the person's centroid (+ optional label) and
- * best cover face id into `excluded_people`, then drop the people row
- * (faces become unassigned). Incremental Phase B leaves faces within
- * `epsilon` of an excluded centroid unassigned (no attach, no new Person).
- *
- * @returns {{ ok: true, excludedId: number, personId: number, label: string|null, coverFaceId: number|null }
- *   | { ok: false, reason: 'not_found'|'invalid_id' }}
- */
-export function excludePerson(id) {
-    const pid = Number(id);
-    if (!Number.isFinite(pid) || pid <= 0) return { ok: false, reason: 'invalid_id' };
-    const db = getDb();
-    const person = db
-        .prepare('SELECT id, label, embedding_centroid, cover_face_id FROM people WHERE id = ?')
-        .get(pid);
-    if (!person || !person.embedding_centroid) return { ok: false, reason: 'not_found' };
-    // Prefer operator-pinned cover when it still belongs to this person;
-    // otherwise same auto-pick as listPeople / person avatar.
-    let coverFaceId = null;
-    if (person.cover_face_id != null) {
-        const pinned = db
-            .prepare(
-                `SELECT f.id AS face_id
-                   FROM faces f
-                   JOIN downloads d ON d.id = f.download_id
-                  WHERE f.id = ?
-                    AND f.person_id = ?
-                    AND (d.user_deleted IS NULL OR d.user_deleted = 0)`,
-            )
-            .get(Number(person.cover_face_id), pid);
-        if (pinned?.face_id != null) coverFaceId = Number(pinned.face_id);
-    }
-    if (coverFaceId == null) {
-        const cover = db
-            .prepare(
-                `SELECT f.id AS face_id
-                   FROM faces f
-                   JOIN downloads d ON d.id = f.download_id
-                  WHERE f.person_id = ?
-                    AND (d.user_deleted IS NULL OR d.user_deleted = 0)
-                  ORDER BY COALESCE(f.quality_score, 0) DESC, f.w * f.h DESC
-                  LIMIT 1`,
-            )
-            .get(pid);
-        coverFaceId = cover?.face_id != null ? Number(cover.face_id) : null;
-    }
-    const tx = db.transaction(() => {
-        const ins = db
-            .prepare(
-                `INSERT INTO excluded_people (embedding_centroid, label, created_at, cover_face_id)
-                 VALUES (?, ?, ?, ?)`,
-            )
-            .run(person.embedding_centroid, person.label ?? null, Date.now(), coverFaceId);
-        db.prepare('DELETE FROM people WHERE id = ?').run(pid);
-        return {
-            ok: true,
-            excludedId: Number(ins.lastInsertRowid),
-            personId: pid,
-            label: person.label ?? null,
-            coverFaceId,
-        };
-    });
-    return tx();
-}
-
-/** List durable exclusions (no centroid blobs — UI list with cover face). */
-export function listExcludedPeople({ limit = 500, offset = 0 } = {}) {
-    const lim = Math.max(1, Math.min(2000, Number(limit) || 500));
-    const off = Math.max(0, Number(offset) || 0);
-    const db = getDb();
-    // Backfill cover_face_id for legacy exclusions created before the column
-    // existed (or when the person had no faces at exclude time).
-    _backfillExcludedCoverFaces(db);
-    const rows = db
-        .prepare(
-            `SELECT e.id, e.label, e.created_at, e.cover_face_id,
-                    CASE WHEN f.id IS NOT NULL
-                          AND (d.user_deleted IS NULL OR d.user_deleted = 0)
-                         THEN f.id ELSE NULL END AS cover_face_id_live
-               FROM excluded_people e
-               LEFT JOIN faces f ON f.id = e.cover_face_id
-               LEFT JOIN downloads d ON d.id = f.download_id
-              ORDER BY e.created_at DESC, e.id DESC
-              LIMIT ? OFFSET ?`,
-        )
-        .all(lim, off)
-        .map((r) => ({
-            id: r.id,
-            label: r.label,
-            created_at: r.created_at,
-            // Prefer live face id when the row still exists; else null so UI
-            // can fall back to a placeholder (file deleted / reindexed).
-            cover_face_id: r.cover_face_id_live != null ? Number(r.cover_face_id_live) : null,
-        }));
-    const total = db.prepare('SELECT COUNT(*) AS n FROM excluded_people').get().n;
-    return { excluded: rows, total };
-}
-
-/**
- * For excluded rows missing a usable cover_face_id, pick the face whose
- * embedding is closest to the stored centroid and persist it.
- */
-function _backfillExcludedCoverFaces(db) {
-    const missing = db
-        .prepare(
-            `SELECT e.id, e.embedding_centroid
-               FROM excluded_people e
-              WHERE e.cover_face_id IS NULL
-                 OR NOT EXISTS (SELECT 1 FROM faces f WHERE f.id = e.cover_face_id)`,
-        )
-        .all();
-    if (!missing.length) return;
-
-    const faceRows = db
-        .prepare(
-            `SELECT f.id, f.embedding
-               FROM faces f
-               JOIN downloads d ON d.id = f.download_id
-              WHERE (d.user_deleted IS NULL OR d.user_deleted = 0)`,
-        )
-        .all();
-    if (!faceRows.length) return;
-
-    const faces = faceRows.map((r) => {
-        const dim = r.embedding.byteLength / 4;
-        return {
-            id: r.id,
-            emb: new Float32Array(r.embedding.buffer, r.embedding.byteOffset, dim),
-        };
-    });
-
-    const upd = db.prepare('UPDATE excluded_people SET cover_face_id = ? WHERE id = ?');
-    const tx = db.transaction(() => {
-        for (const row of missing) {
-            const dim = row.embedding_centroid.byteLength / 4;
-            const cent = new Float32Array(
-                row.embedding_centroid.buffer,
-                row.embedding_centroid.byteOffset,
-                dim,
-            );
-            let bestId = null;
-            let bestDist = Infinity;
-            for (const f of faces) {
-                if (f.emb.length !== dim) continue;
-                let sum = 0;
-                for (let i = 0; i < dim; i++) {
-                    const d = cent[i] - f.emb[i];
-                    sum += d * d;
-                }
-                const dist = Math.sqrt(sum);
-                if (dist < bestDist) {
-                    bestDist = dist;
-                    bestId = f.id;
-                }
-            }
-            if (bestId != null) upd.run(bestId, row.id);
-        }
-    });
-    tx();
-}
-
-/**
- * Centroids for Phase B denylist matching.
- * @returns {Array<{ id: number, label: string|null, centroid: Float32Array }>}
- */
-export function listExcludedCentroids() {
-    const out = [];
-    const stmt = getDb().prepare(
-        'SELECT id, label, embedding_centroid FROM excluded_people',
-    );
-    for (const r of stmt.iterate()) {
-        if (!r.embedding_centroid) continue;
-        const dim = r.embedding_centroid.byteLength / 4;
-        if (!Number.isFinite(dim) || dim < 1) continue;
-        const c = new Float32Array(dim);
-        const view = new Float32Array(
-            r.embedding_centroid.buffer,
-            r.embedding_centroid.byteOffset,
-            dim,
-        );
-        c.set(view);
-        out.push({ id: r.id, label: r.label ?? null, centroid: c });
-    }
-    return out;
-}
-
-/**
- * True when `centroid` is within `eps` of any excluded centroid.
- * Used by Phase B and tests.
- */
-export function matchExcludedCentroid(centroid, eps = 0.4) {
-    if (!(centroid instanceof Float32Array)) return null;
-    const dim = centroid.length;
-    let best = null;
-    let bestDist = Infinity;
-    for (const s of listExcludedCentroids()) {
-        if (s.centroid.length !== dim) continue;
-        let sum = 0;
-        for (let i = 0; i < dim; i++) {
-            const d = centroid[i] - s.centroid[i];
-            sum += d * d;
-        }
-        const dist = Math.sqrt(sum);
-        if (dist < bestDist && dist <= eps) {
-            bestDist = dist;
-            best = { id: s.id, label: s.label, distance: bestDist };
-        }
-    }
-    return best;
-}
-
-/** Remove one exclusion so the next recluster may recreate the person. */
-export function deleteExcludedPerson(id) {
-    const eid = Number(id);
-    if (!Number.isFinite(eid) || eid <= 0) return 0;
-    return getDb().prepare('DELETE FROM excluded_people WHERE id = ?').run(eid).changes;
-}
-
-/** Wipe the entire exclusion denylist (full faces reindex). */
-export function clearExcludedPeople() {
-    return getDb().prepare('DELETE FROM excluded_people').run().changes;
 }
 
 export function listPhotosForPerson(personId, { limit = 50, offset = 0 } = {}) {
@@ -4131,7 +3524,7 @@ export function listPhotosForPerson(personId, { limit = 50, offset = 0 } = {}) {
     const rows = db
         .prepare(`
         SELECT d.id, d.file_name, d.file_path, d.file_type, d.file_size,
-               d.created_at, d.group_id, d.group_name, d.message_id, d.pinned,
+               d.created_at, d.group_id, d.group_name, d.message_id,
                f.id AS face_id,
                f.x AS face_x, f.y AS face_y, f.w AS face_w, f.h AS face_h
           FROM (
@@ -4141,9 +3534,7 @@ export function listPhotosForPerson(personId, { limit = 50, offset = 0 } = {}) {
                        ORDER BY COALESCE(f2.quality_score, 0) DESC, f2.w * f2.h DESC
                    ) AS rn
               FROM faces f2
-              JOIN downloads d2 ON d2.id = f2.download_id
              WHERE f2.person_id = ?
-               AND (d2.user_deleted IS NULL OR d2.user_deleted = 0)
           ) f
           JOIN downloads d ON d.id = f.download_id
          WHERE f.rn = 1
@@ -4152,49 +3543,9 @@ export function listPhotosForPerson(personId, { limit = 50, offset = 0 } = {}) {
     `)
         .all(Number(personId), lim, off);
     const total = db
-        .prepare(`
-            SELECT COUNT(DISTINCT f.download_id) AS n
-              FROM faces f
-              JOIN downloads d ON d.id = f.download_id
-             WHERE f.person_id = ?
-               AND (d.user_deleted IS NULL OR d.user_deleted = 0)
-        `)
+        .prepare(`SELECT COUNT(DISTINCT download_id) AS n FROM faces WHERE person_id = ?`)
         .get(Number(personId)).n;
     return { files: rows, total };
-}
-
-// Additive companion to listPhotosForPerson() — one row PER FACE instead of
-// one row per source download. Used by the "review faces" grid so an
-// operator can see exactly what the model detected for each appearance,
-// including group photos where several people-cluster faces share one
-// download. Does not touch/replace listPhotosForPerson(); both coexist.
-export function listFacesForPerson(personId, { limit = 50, offset = 0 } = {}) {
-    const lim = Math.max(1, Math.min(200, Number(limit) || 50));
-    const off = Math.max(0, Number(offset) || 0);
-    const db = getDb();
-    const rows = db
-        .prepare(`
-        SELECT f.id AS face_id, f.download_id, f.x, f.y, f.w, f.h, f.quality_score,
-               d.file_name, d.file_type, d.file_path, d.file_size,
-               d.group_id, d.group_name, d.message_id, d.pinned, d.created_at
-          FROM faces f
-          JOIN downloads d ON d.id = f.download_id
-         WHERE f.person_id = ?
-           AND (d.user_deleted IS NULL OR d.user_deleted = 0)
-         ORDER BY d.created_at DESC, f.id DESC
-         LIMIT ? OFFSET ?
-    `)
-        .all(Number(personId), lim, off);
-    const total = db
-        .prepare(`
-            SELECT COUNT(*) AS n
-              FROM faces f
-              JOIN downloads d ON d.id = f.download_id
-             WHERE f.person_id = ?
-               AND (d.user_deleted IS NULL OR d.user_deleted = 0)
-        `)
-        .get(Number(personId)).n;
-    return { faces: rows, total };
 }
 
 // ---- Image tags -----------------------------------------------------------
@@ -4245,18 +3596,12 @@ export function listPhotosForTag(tag, { limit = 50, offset = 0 } = {}) {
           FROM image_tags t
           JOIN downloads d ON d.id = t.download_id
          WHERE t.tag = ?
-           AND (d.user_deleted IS NULL OR d.user_deleted = 0)
          ORDER BY t.score DESC, d.created_at DESC
          LIMIT ? OFFSET ?
     `)
         .all(String(tag), lim, off);
     const total = getDb()
-        .prepare(`
-            SELECT COUNT(*) AS n FROM image_tags t
-              JOIN downloads d ON d.id = t.download_id
-             WHERE t.tag = ?
-               AND (d.user_deleted IS NULL OR d.user_deleted = 0)
-        `)
+        .prepare('SELECT COUNT(*) AS n FROM image_tags WHERE tag = ?')
         .get(String(tag)).n;
     return { files: rows, total };
 }
@@ -4336,55 +3681,6 @@ export function kvList() {
         }
     }
     return out;
-}
-
-// ---- Spilled-queue backlog ------------------------------------------------
-//
-// Replaces data/logs/queue_backlog.jsonl. The downloader spills queued jobs
-// here when the in-memory lane size crosses `advanced.downloader.spilloverThreshold`,
-// and rehydrates from here when worker capacity frees up. SQLite gives us
-// atomic appends, indexed FIFO reads, and a clean DELETE-after-pop tx so a
-// crash mid-rehydrate can't lose or double-deliver a job.
-
-export function pushQueueBacklog(job) {
-    const stmt = _prep(`
-        INSERT INTO queue_backlog (job, created_at) VALUES (?, ?)
-    `);
-    stmt.run(JSON.stringify(job), Date.now());
-}
-
-/**
- * Pop up to `limit` jobs FIFO. Returns the parsed job objects in insertion
- * order. The SELECT + DELETE happen in one transaction so a concurrent
- * worker (rare; we only have one downloader) couldn't take the same row
- * twice.
- */
-export function popQueueBacklog(limit = 1000) {
-    const lim = Math.max(1, Math.min(10000, Number(limit) || 1000));
-    const select = _prep('SELECT id, job FROM queue_backlog ORDER BY id ASC LIMIT ?');
-    const del = _prep('DELETE FROM queue_backlog WHERE id = ?');
-    const out = [];
-    getDb().transaction(() => {
-        const rows = select.all(lim);
-        for (const r of rows) {
-            try {
-                out.push(JSON.parse(r.job));
-            } catch {
-                /* corrupt row — drop it */
-            }
-            del.run(r.id);
-        }
-    })();
-    return out;
-}
-
-export function queueBacklogSize() {
-    const r = _prep('SELECT COUNT(1) AS n FROM queue_backlog').get();
-    return Number(r?.n) || 0;
-}
-
-export function clearQueueBacklog() {
-    return _prep('DELETE FROM queue_backlog').run().changes;
 }
 
 // ---- Auto-update audit ---------------------------------------------------
@@ -5000,7 +4296,6 @@ export function listOwnDownloadsSince({ sinceId = 0, limit = 500 } = {}) {
                 file_hash, status, created_at, nsfw_score
            FROM downloads
           WHERE id > ?
-            AND (user_deleted IS NULL OR user_deleted = 0)
           ORDER BY id ASC
           LIMIT ?`,
     ).all(since, lim);
@@ -5281,7 +4576,6 @@ export function pageMissingSeekbarVideos({ beforeId, limit = 200 } = {}) {
          WHERE d.file_type = 'video'
            AND d.file_path IS NOT NULL
            AND s.download_id IS NULL
-           AND (d.user_deleted IS NULL OR d.user_deleted = 0)
            AND d.id < ?
          ORDER BY d.id DESC
          LIMIT ?
@@ -5309,29 +4603,13 @@ export function pageSeekbarSprites({ beforeId, limit = 200 } = {}) {
 }
 
 export function countSeekbarSprites() {
-    return (
-        Number(
-            getDb()
-                .prepare(
-                    `SELECT COUNT(*) AS n FROM seekbar_sprites s
-                      JOIN downloads d ON d.id = s.download_id
-                     WHERE (d.user_deleted IS NULL OR d.user_deleted = 0)`,
-                )
-                .get().n,
-        ) || 0
-    );
+    return Number(getDb().prepare('SELECT COUNT(*) AS n FROM seekbar_sprites').get().n) || 0;
 }
 
 export function sumSeekbarBytes() {
     return (
         Number(
-            getDb()
-                .prepare(
-                    `SELECT COALESCE(SUM(s.bytes), 0) AS s FROM seekbar_sprites s
-                      JOIN downloads d ON d.id = s.download_id
-                     WHERE (d.user_deleted IS NULL OR d.user_deleted = 0)`,
-                )
-                .get().s,
+            getDb().prepare('SELECT COALESCE(SUM(bytes), 0) AS s FROM seekbar_sprites').get().s,
         ) || 0
     );
 }
@@ -5341,19 +4619,19 @@ export function countVideoDownloads() {
         Number(
             getDb()
                 .prepare(
-                    "SELECT COUNT(*) AS n FROM downloads WHERE file_type = 'video' AND file_path IS NOT NULL AND (user_deleted IS NULL OR user_deleted = 0)",
+                    "SELECT COUNT(*) AS n FROM downloads WHERE file_type = 'video' AND file_path IS NOT NULL",
                 )
                 .get().n,
         ) || 0
     );
 }
 
+
 const _SIMILAR_ALGO = 'pdq-scene-v1';
 const _SIMILAR_ELIGIBLE = `
     d.file_type = 'video'
     AND d.file_path IS NOT NULL
     AND d.file_path NOT LIKE '_clusterref/%'
-    AND (d.user_deleted IS NULL OR d.user_deleted = 0)
 `;
 const _SIMILAR_NEEDS_FP = `
     (
@@ -5408,8 +4686,7 @@ export function countVideoFingerprints() {
                        JOIN downloads d ON d.id = vf.download_id
                       WHERE d.file_type = 'video'
                         AND d.file_path IS NOT NULL
-                        AND d.file_path NOT LIKE '_clusterref/%'
-                        AND (d.user_deleted IS NULL OR d.user_deleted = 0)`,
+                        AND d.file_path NOT LIKE '_clusterref/%'`,
                 )
                 .get().n,
         ) || 0
@@ -5442,62 +4719,6 @@ export function pageSimilarScanVideos({ beforeId, limit = 200 } = {}) {
               LIMIT ?`,
         )
         .all(before, lim);
-}
-
-// ── NSFW hash blocklist ─────────────────────────────────────────────────────
-
-export function addNsfwBlocklistBatch(entries) {
-    if (!entries?.length) return 0;
-    const db = getDb();
-    const stmt = db.prepare(
-        'INSERT OR IGNORE INTO nsfw_hash_blocklist (file_hash, file_name, deleted_at, source) VALUES (?, ?, ?, ?)',
-    );
-    const now = Date.now();
-    const tx = db.transaction(() => {
-        let n = 0;
-        for (const e of entries) {
-            if (!e.fileHash) continue;
-            stmt.run(e.fileHash, e.fileName || null, now, e.source || 'manual');
-            n++;
-        }
-        return n;
-    });
-    return tx();
-}
-
-export function checkNsfwBlocklistHashes(hashes) {
-    if (!hashes?.length) return new Set();
-    const db = getDb();
-    const ph = hashes.map(() => '?').join(',');
-    const rows = db
-        .prepare(`SELECT file_hash FROM nsfw_hash_blocklist WHERE file_hash IN (${ph})`)
-        .all(...hashes);
-    return new Set(rows.map((r) => r.file_hash));
-}
-
-export function getNsfwBlocklistCount() {
-    return Number(getDb().prepare('SELECT COUNT(*) AS n FROM nsfw_hash_blocklist').get()?.n) || 0;
-}
-
-export function clearNsfwBlocklist() {
-    return getDb().prepare('DELETE FROM nsfw_hash_blocklist').run().changes;
-}
-
-export function getDownloadHashesForIds(ids) {
-    if (!ids?.length) return [];
-    const db = getDb();
-    const results = [];
-    for (let i = 0; i < ids.length; i += 500) {
-        const slice = ids.slice(i, i + 500);
-        const ph = slice.map(() => '?').join(',');
-        const rows = db
-            .prepare(
-                `SELECT id, file_hash, file_name FROM downloads WHERE id IN (${ph}) AND file_hash IS NOT NULL`,
-            )
-            .all(...slice);
-        for (const r of rows) results.push(r);
-    }
-    return results;
 }
 
 // ---- Similar clips / video fingerprints ------------------------------------
@@ -5584,7 +4805,7 @@ export function getVideoFrameHashes(downloadId) {
         .all(Number(downloadId));
 }
 
-/** Fingerprinted live videos ready for Analyze (no clusterref / soft-deleted). */
+/** Fingerprinted live videos ready for Analyze (no clusterref). */
 export function listFingerprintsForAnalyze() {
     return getDb()
         .prepare(
@@ -5601,7 +4822,6 @@ export function listFingerprintsForAnalyze() {
               WHERE d.file_type = 'video'
                 AND d.file_path IS NOT NULL
                 AND d.file_path NOT LIKE '_clusterref/%'
-                AND (d.user_deleted IS NULL OR d.user_deleted = 0)
                 AND vf.frame_count > 0
                 AND vf.duration_sec IS NOT NULL
               ORDER BY vf.download_id`,
@@ -5669,9 +4889,7 @@ function _pruneIncompleteSimilarGroups(db) {
             `SELECT g.id AS id
                FROM similar_groups g
                LEFT JOIN similar_group_members m ON m.group_id = g.id
-               LEFT JOIN downloads d
-                 ON d.id = m.download_id
-                AND (d.user_deleted IS NULL OR d.user_deleted = 0)
+               LEFT JOIN downloads d ON d.id = m.download_id
               GROUP BY g.id
              HAVING COUNT(d.id) < 2`,
         )
@@ -5748,7 +4966,6 @@ export function listSimilarGroups({ kind } = {}) {
            JOIN downloads d ON d.id = m.download_id
            LEFT JOIN video_fingerprints vf ON vf.download_id = d.id
           WHERE m.group_id = ?
-            AND (d.user_deleted IS NULL OR d.user_deleted = 0)
           ORDER BY CASE m.role WHEN 'keep' THEN 0 WHEN 'remove' THEN 1 ELSE 2 END,
                    m.download_id`,
     );
@@ -5920,4 +5137,60 @@ export function purgeSimilarAnalyzeRecords() {
         }
         return { groups, videoScans, partialScans };
     })();
+}
+
+// ── NSFW hash blocklist ─────────────────────────────────────────────────────
+
+export function addNsfwBlocklistBatch(entries) {
+    if (!entries?.length) return 0;
+    const db = getDb();
+    const stmt = db.prepare(
+        'INSERT OR IGNORE INTO nsfw_hash_blocklist (file_hash, file_name, deleted_at, source) VALUES (?, ?, ?, ?)',
+    );
+    const now = Date.now();
+    const tx = db.transaction(() => {
+        let n = 0;
+        for (const e of entries) {
+            if (!e.fileHash) continue;
+            stmt.run(e.fileHash, e.fileName || null, now, e.source || 'manual');
+            n++;
+        }
+        return n;
+    });
+    return tx();
+}
+
+export function checkNsfwBlocklistHashes(hashes) {
+    if (!hashes?.length) return new Set();
+    const db = getDb();
+    const ph = hashes.map(() => '?').join(',');
+    const rows = db
+        .prepare(`SELECT file_hash FROM nsfw_hash_blocklist WHERE file_hash IN (${ph})`)
+        .all(...hashes);
+    return new Set(rows.map((r) => r.file_hash));
+}
+
+export function getNsfwBlocklistCount() {
+    return Number(getDb().prepare('SELECT COUNT(*) AS n FROM nsfw_hash_blocklist').get()?.n) || 0;
+}
+
+export function clearNsfwBlocklist() {
+    return getDb().prepare('DELETE FROM nsfw_hash_blocklist').run().changes;
+}
+
+export function getDownloadHashesForIds(ids) {
+    if (!ids?.length) return [];
+    const db = getDb();
+    const results = [];
+    for (let i = 0; i < ids.length; i += 500) {
+        const slice = ids.slice(i, i + 500);
+        const ph = slice.map(() => '?').join(',');
+        const rows = db
+            .prepare(
+                `SELECT id, file_hash, file_name FROM downloads WHERE id IN (${ph}) AND file_hash IS NOT NULL`,
+            )
+            .all(...slice);
+        for (const r of rows) results.push(r);
+    }
+    return results;
 }
