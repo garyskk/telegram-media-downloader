@@ -278,6 +278,14 @@
       "kind": "route"
     },
     {
+      "key": "GET /api/downloads/ids",
+      "kind": "route"
+    },
+    {
+      "key": "POST /api/downloads/by-ids",
+      "kind": "route"
+    },
+    {
       "key": "GET /api/downloads/:groupId",
       "kind": "route"
     },

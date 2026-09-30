@@ -284,6 +284,18 @@ describe('pinned queries', () => {
         expect(downloadsApi.getDownloads('-100555', 50, 0, 'videos').total).toBe(0);
     });
 
+    it('unpinnedOnly returns only unpinned rows', () => {
+        const all = downloadsApi.getAllDownloads(50, 0, 'all', { unpinnedOnly: true });
+        expect(all.files.length).toBeGreaterThan(0);
+        expect(all.files.every((f) => f.pinned === 0)).toBe(true);
+        expect(all.files.some((f) => f.id === pinnedId)).toBe(false);
+
+        const group = downloadsApi.getDownloads('-100555', 50, 0, 'all', { unpinnedOnly: true });
+        expect(group.files.map((f) => f.id)).not.toContain(pinnedId);
+        expect(group.total).toBe(3);
+        expect(group.files.every((f) => f.pinned === 0)).toBe(true);
+    });
+
     it('getOldestDownloads excludes pinned rows', () => {
         const oldest = downloadsApi.getOldestDownloads(100);
         expect(oldest.every((f) => f.pinned === 0)).toBe(true);

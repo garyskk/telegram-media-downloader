@@ -68,6 +68,12 @@ describe('searchDownloads narrowing', () => {
         expect(ids(first)).toEqual([2, 3, 1]);
     });
 
+    it('supports unpinned-only', () => {
+        expect(ids(api.searchDownloads('sunset', { unpinnedOnly: true, order: 'newest' }))).toEqual([
+            3, 1,
+        ]);
+    });
+
     it('matches chat names', () => {
         expect(ids(api.searchDownloads('design', { order: 'newest' }))).toEqual([6, 4, 3]);
     });
@@ -104,5 +110,16 @@ describe('searchDownloads narrowing', () => {
         });
         expect(ids(pinned)).toEqual([2]);
         expect(pinned.total).toBe(1);
+        const unpinned = api.searchDownloadsFederated('sunset', {
+            include: 'peers',
+            unpinnedOnly: true,
+            order: 'newest',
+        });
+        expect(unpinned.files.map((f) => f.file_name)).toEqual([
+            'sunset_peer.jpg',
+            'sunset_poster.jpg',
+            'sunset_beach.jpg',
+        ]);
+        expect(unpinned.total).toBe(3);
     });
 });

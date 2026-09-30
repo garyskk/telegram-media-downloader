@@ -10,9 +10,10 @@
 // Sort & filter: one sheet that combines the type (mirrors the tabs), the
 // pinned mode and the layout. Pinned mode is stored exactly where the old
 // controls kept it, so saved preferences carry over:
-//   all   → state.pinnedFilter = false, localStorage tgdl-pinned-first = '0'
-//   first → state.pinnedFilter = false, localStorage tgdl-pinned-first = '1'
-//   only  → state.pinnedFilter = true  (the old "Pinned" chip; not persisted)
+//   all      → state.pinnedFilter = false, localStorage tgdl-pinned-first = '0'
+//   first    → state.pinnedFilter = false, localStorage tgdl-pinned-first = '1'
+//   only     → state.pinnedFilter = true  (the old "Pinned" chip; not persisted)
+//   unpinned → state.pinnedFilter = 'unpinned' (not persisted; leaves tgdl-pinned-first)
 
 import { state } from './store.js';
 import { openSheet } from './sheet.js';
@@ -35,15 +36,16 @@ export function isPinnedFirst() {
     }
 }
 
-/** 'all' | 'first' | 'only' */
+/** 'all' | 'first' | 'only' | 'unpinned' */
 export function getPinnedMode() {
+    if (state.pinnedFilter === 'unpinned') return 'unpinned';
     if (state.pinnedFilter) return 'only';
     return isPinnedFirst() ? 'first' : 'all';
 }
 
-function setPinnedMode(mode) {
-    state.pinnedFilter = mode === 'only';
-    if (mode !== 'only') {
+export function setPinnedMode(mode) {
+    state.pinnedFilter = mode === 'unpinned' ? 'unpinned' : mode === 'only';
+    if (mode !== 'only' && mode !== 'unpinned') {
         try {
             localStorage.setItem(PINNED_FIRST_KEY, mode === 'first' ? '1' : '0');
         } catch {}
@@ -54,6 +56,7 @@ function setPinnedMode(mode) {
 export function pinnedQs() {
     const mode = getPinnedMode();
     if (mode === 'only') return `&pinned=1${isPinnedFirst() ? '&pinnedFirst=1' : ''}`;
+    if (mode === 'unpinned') return '&pinned=0';
     return mode === 'first' ? '&pinnedFirst=1' : '';
 }
 
@@ -214,9 +217,11 @@ function _syncFilterButton() {
     const text =
         mode === 'only'
             ? i18nT('gallery.filter.state_only', 'Pinned only')
-            : mode === 'first'
-              ? i18nT('gallery.filter.state_first', 'Pinned first')
-              : i18nT('gallery.filter.button', 'Filter');
+            : mode === 'unpinned'
+              ? i18nT('gallery.filter.state_unpinned', 'Unpinned only')
+              : mode === 'first'
+                ? i18nT('gallery.filter.state_first', 'Pinned first')
+                : i18nT('gallery.filter.button', 'Filter');
     if (label) label.textContent = text;
     btn.classList.toggle('is-active', mode !== 'all');
     dot?.classList.toggle('hidden', mode === 'all');
@@ -247,6 +252,12 @@ const PINNED = [
         def: 'Pinned first, then newest',
     },
     { id: 'only', icon: 'ri-pushpin-2-fill', k: 'gallery.filter.pinned_only', def: 'Only pinned' },
+    {
+        id: 'unpinned',
+        icon: 'ri-pushpin-line',
+        k: 'gallery.filter.pinned_unpinned',
+        def: 'Only unpinned',
+    },
 ];
 const LAYOUTS = [
     { id: 'grid', icon: 'ri-layout-grid-line', k: 'header.view_mode.grid', def: 'Grid' },

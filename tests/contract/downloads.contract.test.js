@@ -55,6 +55,8 @@ describe('all-media feed', () => {
         const t = h.t;
         await t.exchange('all pinned=1', 'GET', '/api/downloads/all?pinned=1');
         await t.exchange('all pinned=true', 'GET', '/api/downloads/all?pinned=true');
+        await t.exchange('all pinned=0', 'GET', '/api/downloads/all?pinned=0');
+        await t.exchange('all pinned=false', 'GET', '/api/downloads/all?pinned=false');
         await t.exchange(
             'all pinnedFirst=1 limit 4',
             'GET',
@@ -121,6 +123,7 @@ describe('per-group pages', () => {
         await t.exchange('group alpha type=images', 'GET', `/api/downloads/${a}?type=images`);
         await t.exchange('group alpha type=videos', 'GET', `/api/downloads/${a}?type=videos`);
         await t.exchange('group beta pinned=1', 'GET', `/api/downloads/${G.beta.id}?pinned=1`);
+        await t.exchange('group beta pinned=0', 'GET', `/api/downloads/${G.beta.id}?pinned=0`);
         await t.exchange(
             'group beta pinnedFirst=1',
             'GET',
@@ -149,6 +152,36 @@ describe('per-group pages', () => {
     });
 });
 
+describe('shuffle playlist', () => {
+    it('lists every matching id and hydrates a window', async () => {
+        const t = h.t;
+        await t.exchange('ids all', 'GET', '/api/downloads/ids?type=all');
+        await t.exchange('ids images', 'GET', '/api/downloads/ids?type=images');
+        await t.exchange('ids pinned=0', 'GET', '/api/downloads/ids?pinned=0');
+        await t.exchange('ids pinned=1', 'GET', '/api/downloads/ids?pinned=1');
+        await t.exchange(
+            'ids group alpha',
+            'GET',
+            `/api/downloads/ids?groupId=${G.alpha.id}`,
+        );
+        await t.exchange('ids search IMG', 'GET', '/api/downloads/ids?q=IMG');
+        await t.exchange('ids include=peers guest forced local', 'GET', '/api/downloads/ids?include=peers', {
+            as: 'guest',
+        });
+        await t.exchange('by-ids empty', 'POST', '/api/downloads/by-ids', { body: { ids: [] } });
+        await t.exchange('by-ids local order', 'POST', '/api/downloads/by-ids', {
+            body: { ids: [3, 1, 2, 999999] },
+        });
+        await t.exchange('by-ids guest drops peer keys', 'POST', '/api/downloads/by-ids', {
+            as: 'guest',
+            body: { ids: [1, { id: 1, peer_id: 'peer-x' }] },
+        });
+        await t.exchange('by-ids over cap', 'POST', '/api/downloads/by-ids', {
+            body: { ids: Array.from({ length: 101 }, (_, i) => i + 1) },
+        });
+    });
+});
+
 describe('search', () => {
     it('queries', async () => {
         const t = h.t;
@@ -169,6 +202,7 @@ describe('search', () => {
         await q('search IMG type=images', '?q=IMG&type=images');
         await q('search VID type=videos', '?q=VID&type=videos');
         await q('search IMG pinned=1', '?q=IMG&pinned=1');
+        await q('search IMG pinned=0', '?q=IMG&pinned=0');
         await q('search IMG pinnedFirst order=newest', '?q=IMG&pinnedFirst=1&order=newest');
         await q('search IMG order=newest', '?q=IMG&order=newest');
         await q('search Remote include=peers admin', '?q=Remote&include=peers');

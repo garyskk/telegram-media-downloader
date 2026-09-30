@@ -4,6 +4,7 @@ import { attachSwipe, attachDragDismiss } from './gestures.js';
 import { tf as i18nTf, t as i18nT } from './i18n.js';
 import { getMediaUrl, getDownloadUrl, isPeerRow } from './media-url.js';
 import { api } from './api.js';
+import { pinnedQs } from './gallery-toolbar.js';
 import { pushOverlay, popOverlay } from './overlay-history.js';
 import { ws } from './ws.js';
 import { renderTextInto, renderCodeInto, renderMarkdownInto, langFromExt } from './viewer-text.js';
@@ -296,6 +297,8 @@ let videoPlayer = null;
 // returns `'advance'` the viewer auto-navigates forward (so e.g. `w`
 // whitelist + advance keeps the operator moving without extra clicks).
 let _reviewActions = null;
+// Blocks shuffle for one-file and review sessions (not the gallery).
+let _shuffleBlocked = false;
 // Optional per-row metadata renderer for review mode (e.g. NSFW score
 // badge). Receives the current file and returns an HTML string painted
 // into #viewer-review-meta on every openMediaViewer call.
@@ -312,6 +315,7 @@ let _reviewMetaRender = null;
  */
 export function openMediaViewerSingle(file) {
     if (!file?.fullPath) return;
+    _shuffleBlocked = true;
     state.files = [file];
     openMediaViewer(0);
 }
@@ -334,6 +338,7 @@ export function openMediaViewerSingle(file) {
  */
 export function openMediaViewerForReview(files, index, opts = {}) {
     if (!Array.isArray(files) || !files.length) return;
+    _shuffleBlocked = true;
     state.files = files;
     // Reset filter so navigateMedia walks the full provided list, not whatever
     // gallery tab was active before the maintenance page was opened.
@@ -597,6 +602,7 @@ function _setTypeChip(file) {
 }
 
 export function openMediaViewer(index) {
+    if (_shuffle.active) _shuffle.cursor = index;
     state.currentFileIndex = index;
     const file = state.files[index];
     if (!file) return;
@@ -779,7 +785,9 @@ export function openMediaViewer(index) {
     ]
         .filter(Boolean)
         .join(' • ');
-    document.getElementById('modal-counter').textContent = `${index + 1} / ${state.files.length}`;
+    document.getElementById('modal-counter').textContent = _shuffle.active
+        ? `${index + 1} / ${_shuffle.keys.length}`
+        : `${index + 1} / ${state.files.length}`;
     document.getElementById('modal-download').href = downloadUrl;
     _setTypeChip(file);
 
@@ -2263,11 +2271,14 @@ class VideoPlayer {
 
     _controlsVisible() {
         return (
-            this.controls.style.opacity !== '0' && !this.controls.classList.contains('opacity-0')
+            this.controls.style.opacity !== '0' &&
+            !this.controls.classList.contains('opacity-0') &&
+            !this.controls.classList.contains('controls-collapsed')
         );
     }
 
     _showControls(force = false) {
+        this.controls.classList.remove('controls-collapsed');
         this.controls.style.opacity = '1';
         this.container.style.cursor = '';
         if (!force && SUPPORTS_HOVER && !this.video.paused) {
@@ -2295,6 +2306,7 @@ class VideoPlayer {
             // Don't hide while the speed menu is open.
             if (!this.speedMenu.classList.contains('hidden')) return;
             this.controls.style.opacity = '0';
+            this.controls.classList.add('controls-collapsed');
             this.container.style.cursor = 'none';
         }, delay);
     }
@@ -2629,6 +2641,9 @@ export function closeMediaViewer() {
     // the action toolbar by mistake.
     _reviewActions = null;
     _reviewMetaRender = null;
+    _shuffleBlocked = false;
+    // Shuffle is a gallery mode — closing the player keeps the shuffled order.
+    if (_shuffle.active) _notifyShuffleChange();
     document.getElementById('viewer-review-bar')?.classList.add('hidden');
     document.getElementById('viewer-review-actions')?.classList.add('hidden');
     document.getElementById('viewer-review-meta')?.classList.add('hidden');
@@ -2695,6 +2710,9 @@ async function _togglePinCurrent() {
 
 export function setupViewerEvents() {
     document.getElementById('modal-close')?.addEventListener('click', closeMediaViewer);
+    document.getElementById('modal-shuffle-btn')?.addEventListener('click', () => {
+        void toggleShuffle({ openPlayer: true });
+    });
     document.getElementById('modal-pin')?.addEventListener('click', _togglePinCurrent);
     document.getElementById('modal-prev')?.addEventListener('click', () => navigateMedia(-1));
     document.getElementById('modal-next')?.addEventListener('click', () => navigateMedia(1));
@@ -2955,7 +2973,482 @@ function _crossfadeTransition(callback) {
     }, 100);
 }
 
+// ---- Shuffle playlist (full library) ----------------------------------
+// One session shared by the gallery chip and the player button. The order
+// is the full filtered id set, not the loaded page. Closing the player
+// keeps that order.
+
+const SHUFFLE_HYDRATE_WINDOW = 40;
+
+let _shuffle = {
+    active: false,
+    keys: [],
+    cursor: 0,
+    cache: new Map(),
+    backupFiles: null,
+    backupIndex: 0,
+    backupFilter: 'all',
+    busy: false,
+};
+
+/** @type {null | (() => void)} */
+let _onShuffleChange = null;
+
+function _playlistKey(entry) {
+    if (entry == null) return '';
+    if (typeof entry === 'object') {
+        const id = Number(entry.id);
+        if (!Number.isFinite(id) || id <= 0) return '';
+        const peer = entry.peer_id || entry.peerId || 'self';
+        return `${peer && peer !== 'self' ? peer : 'self'}:${id}`;
+    }
+    const id = Number(entry);
+    if (!Number.isFinite(id) || id <= 0) return '';
+    return `self:${id}`;
+}
+
+function _filePlaylistKey(file) {
+    if (file?.id == null) return '';
+    const peer = file.peer_id || file.peerId || 'self';
+    return _playlistKey({ id: file.id, peer_id: peer });
+}
+
+function _keyToPayload(key) {
+    const i = String(key).indexOf(':');
+    if (i < 0) return null;
+    const peer_id = key.slice(0, i);
+    const id = Number(key.slice(i + 1));
+    if (!Number.isFinite(id) || id <= 0) return null;
+    if (peer_id === 'self') return id;
+    return { id, peer_id };
+}
+
+function _fisherYates(arr) {
+    for (let i = arr.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        const tmp = arr[i];
+        arr[i] = arr[j];
+        arr[j] = tmp;
+    }
+    return arr;
+}
+
+function _buildShuffleOrder(keys, currentKey) {
+    const list = keys.slice();
+    if (!currentKey || !list.length) return _fisherYates(list);
+    const idx = list.indexOf(currentKey);
+    if (idx < 0) return _fisherYates(list);
+    list.splice(idx, 1);
+    _fisherYates(list);
+    list.unshift(currentKey);
+    return list;
+}
+
+function _dropKeyFromOrder(keys, dropKey) {
+    if (!dropKey) return keys.slice();
+    return keys.filter((k) => k !== dropKey);
+}
+
+function _notifyShuffleChange() {
+    try {
+        _onShuffleChange?.();
+    } catch (e) {
+        console.warn('onShuffleChange:', e);
+    }
+}
+
+function _syncShuffleChrome() {
+    const badge = document.getElementById('modal-shuffle-badge');
+    const modalBtn = document.getElementById('modal-shuffle-btn');
+    const gridBtn = document.getElementById('gallery-shuffle-btn');
+    if (badge) badge.classList.toggle('hidden', !_shuffle.active);
+    for (const btn of [modalBtn, gridBtn]) {
+        if (!btn) continue;
+        if (btn === modalBtn) btn.classList.toggle('hidden', _shuffleBlocked);
+        btn.classList.toggle('bg-tg-blue/80', _shuffle.active);
+        btn.classList.toggle('text-white', _shuffle.active);
+        btn.classList.toggle('active', _shuffle.active);
+        btn.setAttribute('aria-pressed', _shuffle.active ? 'true' : 'false');
+    }
+}
+
+function _shuffleScopeQs() {
+    const viewerScope = state.viewerPeerScope;
+    if (viewerScope) return `&include=peers&peerId=${encodeURIComponent(viewerScope)}`;
+    const s = state.galleryScope;
+    if (!s || s === 'local') return '';
+    if (s === 'all') return '&include=peers';
+    return `&include=peers&peerId=${encodeURIComponent(s)}`;
+}
+
+function _shuffleQs() {
+    const type =
+        state.currentFilter && state.currentFilter !== 'all' ? state.currentFilter : 'all';
+    let qs = `type=${encodeURIComponent(type)}${pinnedQs()}${_shuffleScopeQs()}`;
+    if (state.currentGroupId) qs += `&groupId=${encodeURIComponent(state.currentGroupId)}`;
+    if (state.searchQuery) qs += `&q=${encodeURIComponent(state.searchQuery)}`;
+    return qs;
+}
+
+function _canShuffle() {
+    if (_shuffleBlocked || _reviewActions?.length) return false;
+    return true;
+}
+
+function _modalOpen() {
+    const modal = document.getElementById('media-modal');
+    return !!(modal && !modal.classList.contains('hidden'));
+}
+
+async function _hydrateShuffleKeys(keys) {
+    const need = [];
+    for (const k of keys) {
+        if (!_shuffle.cache.has(k)) need.push(k);
+    }
+    if (!need.length) return;
+    for (let i = 0; i < need.length; i += 100) {
+        const slice = need.slice(i, i + 100);
+        const payload = slice.map(_keyToPayload).filter((x) => x != null);
+        if (!payload.length) continue;
+        const res = await api.post('/api/downloads/by-ids', { ids: payload });
+        for (const file of res?.files || []) {
+            const k = _filePlaylistKey(file);
+            if (k) _shuffle.cache.set(k, file);
+        }
+    }
+}
+
+function _materializeShuffleFiles(uptoExclusive) {
+    const end = Math.min(
+        _shuffle.keys.length,
+        Math.max(0, uptoExclusive == null ? _shuffle.keys.length : uptoExclusive),
+    );
+    const files = [];
+    for (let i = 0; i < end; i++) {
+        const f = _shuffle.cache.get(_shuffle.keys[i]);
+        if (!f) break;
+        files.push(f);
+    }
+    state.files = files;
+    state.hasMore = state.files.length < _shuffle.keys.length;
+}
+
+async function _ensureShuffleWindow(centerIdx) {
+    const start = Math.max(0, centerIdx - 2);
+    const end = Math.min(_shuffle.keys.length, Math.max(centerIdx + 1, 0) + SHUFFLE_HYDRATE_WINDOW);
+    await _hydrateShuffleKeys(_shuffle.keys.slice(0, end));
+    if (start > 0) await _hydrateShuffleKeys(_shuffle.keys.slice(start, end));
+    _materializeShuffleFiles(end);
+}
+
+function _findShuffleKeyForFile(file) {
+    if (!file) return '';
+    const direct = _filePlaylistKey(file);
+    if (direct && _shuffle.keys.includes(direct)) return direct;
+    for (const [k, f] of _shuffle.cache) {
+        if (!f) continue;
+        if (file.id != null && f.id === file.id) {
+            const peer = file.peer_id || file.peerId || 'self';
+            const fPeer = f.peer_id || f.peerId || 'self';
+            if (String(peer) === String(fPeer) || (!file.peer_id && !file.peerId)) return k;
+        }
+        if (file.fullPath && (f.fullPath === file.fullPath || f.path === file.fullPath)) return k;
+        if (file.path && (f.path === file.path || f.fullPath === file.path)) return k;
+    }
+    return direct;
+}
+
+function _fileMatchesDeleted(file, dropped) {
+    if (!file || !dropped) return false;
+    if (dropped.id != null) {
+        const peer = file.peer_id || file.peerId || 'self';
+        const dPeer = dropped.peer_id || dropped.peerId || 'self';
+        if (file.id === dropped.id && String(peer) === String(dPeer)) return true;
+        if (!dropped.path && !dropped.fullPath) return false;
+    }
+    if (dropped.path && (file.fullPath === dropped.path || file.path === dropped.path)) return true;
+    if (dropped.fullPath && (file.fullPath === dropped.fullPath || file.path === dropped.fullPath))
+        return true;
+    return false;
+}
+
+async function _enableShuffle({ openPlayer = true } = {}) {
+    if (_shuffle.busy || _shuffle.active) return;
+    if (!_canShuffle()) {
+        showToast(
+            i18nT('toast.viewer_shuffle_unavailable', 'Shuffle is not available here'),
+            'info',
+        );
+        return;
+    }
+    _shuffle.busy = true;
+    try {
+        const current = openPlayer || _modalOpen() ? state.files[state.currentFileIndex] : null;
+        const currentKey = _filePlaylistKey(current);
+        const res = await api.get(`/api/downloads/ids?${_shuffleQs()}`);
+        const rawIds = res?.ids || [];
+        if (!rawIds.length) {
+            showToast(i18nT('toast.viewer_shuffle_empty', 'No files to shuffle'), 'info');
+            return;
+        }
+        const keys = rawIds.map(_playlistKey).filter(Boolean);
+        if (!keys.length) {
+            showToast(i18nT('toast.viewer_shuffle_empty', 'No files to shuffle'), 'info');
+            return;
+        }
+
+        _shuffle.backupFiles = state.files.slice();
+        _shuffle.backupIndex = state.currentFileIndex;
+        _shuffle.backupFilter = state.currentFilter || 'all';
+        for (const f of state.files) {
+            const k = _filePlaylistKey(f);
+            if (k && f?.fullPath) _shuffle.cache.set(k, f);
+        }
+
+        _shuffle.keys = _buildShuffleOrder(keys, currentKey);
+        _shuffle.cursor = 0;
+        _shuffle.active = true;
+
+        const firstEnd = Math.min(
+            _shuffle.keys.length,
+            Math.max(SHUFFLE_HYDRATE_WINDOW, openPlayer ? SHUFFLE_HYDRATE_WINDOW : 100),
+        );
+        await _hydrateShuffleKeys(_shuffle.keys.slice(0, firstEnd));
+        _materializeShuffleFiles(firstEnd);
+        if (!state.files.length) {
+            _disableShuffle({ silent: true });
+            showToast(i18nT('toast.viewer_shuffle_empty', 'No files to shuffle'), 'info');
+            return;
+        }
+        _syncShuffleChrome();
+        _notifyShuffleChange();
+        if (openPlayer) openMediaViewer(0);
+        showToast(
+            i18nTf(
+                'toast.viewer_shuffle_on',
+                { count: _shuffle.keys.length },
+                `Shuffle on · ${_shuffle.keys.length} files`,
+            ),
+            'info',
+        );
+    } catch (e) {
+        console.error('enable shuffle:', e);
+        _disableShuffle({ silent: true });
+        showToast(i18nT('toast.viewer_shuffle_error', 'Could not start shuffle'), 'error');
+    } finally {
+        _shuffle.busy = false;
+    }
+}
+
+function _disableShuffle({ silent = false } = {}) {
+    if (!_shuffle.active && _shuffle.backupFiles == null) {
+        _syncShuffleChrome();
+        _notifyShuffleChange();
+        return;
+    }
+    const backup = _shuffle.backupFiles;
+    const backupIndex = _shuffle.backupIndex;
+    const backupFilter = _shuffle.backupFilter;
+    const wasActive = _shuffle.active;
+    const currentFile = state.files[state.currentFileIndex];
+    const modalWasOpen = _modalOpen();
+    _shuffle = {
+        active: false,
+        keys: [],
+        cursor: 0,
+        cache: new Map(),
+        backupFiles: null,
+        backupIndex: 0,
+        backupFilter: 'all',
+        busy: false,
+    };
+    if (Array.isArray(backup)) {
+        state.files = backup;
+        state.currentFilter = backupFilter || 'all';
+        state.currentFileIndex = Math.max(
+            0,
+            Math.min(backupIndex || 0, Math.max(0, state.files.length - 1)),
+        );
+        state.hasMore = true;
+    }
+    _syncShuffleChrome();
+    _notifyShuffleChange();
+    if (wasActive && modalWasOpen && currentFile) {
+        const restoredIdx = state.files.findIndex(
+            (f) => _filePlaylistKey(f) === _filePlaylistKey(currentFile),
+        );
+        if (restoredIdx >= 0) openMediaViewer(restoredIdx);
+        else if (state.files.length)
+            openMediaViewer(Math.min(state.currentFileIndex, state.files.length - 1));
+        else closeMediaViewer();
+    }
+    if (wasActive && !silent) {
+        showToast(i18nT('toast.viewer_shuffle_off', 'Shuffle off'), 'info');
+    }
+}
+
+export async function toggleShuffle({ openPlayer = true } = {}) {
+    if (_shuffle.active) {
+        _disableShuffle();
+        return;
+    }
+    await _enableShuffle({ openPlayer });
+}
+
+export function isShuffleActive() {
+    return !!_shuffle.active;
+}
+
+export function onShuffleChange(cb) {
+    _onShuffleChange = typeof cb === 'function' ? cb : null;
+}
+
+export function clearShuffleSilent() {
+    if (!_shuffle.active && _shuffle.backupFiles == null) return;
+    _shuffle = {
+        active: false,
+        keys: [],
+        cursor: 0,
+        cache: new Map(),
+        backupFiles: null,
+        backupIndex: 0,
+        backupFilter: 'all',
+        busy: false,
+    };
+    _syncShuffleChrome();
+}
+
+export function removeShuffleFile(fileOrMeta) {
+    if (!_shuffle.active) return false;
+    const file =
+        fileOrMeta && (fileOrMeta.fullPath || fileOrMeta.path || fileOrMeta.id != null)
+            ? fileOrMeta
+            : null;
+    if (!file) return false;
+
+    const wasCurrent =
+        _modalOpen() &&
+        state.files[state.currentFileIndex] &&
+        _fileMatchesDeleted(state.files[state.currentFileIndex], file);
+
+    const key = _findShuffleKeyForFile(file);
+    const beforeLen = _shuffle.keys.length;
+    if (key) {
+        _shuffle.keys = _dropKeyFromOrder(_shuffle.keys, key);
+        _shuffle.cache.delete(key);
+    }
+    for (const [k, f] of [..._shuffle.cache.entries()]) {
+        if (_fileMatchesDeleted(f, file)) {
+            _shuffle.cache.delete(k);
+            _shuffle.keys = _dropKeyFromOrder(_shuffle.keys, k);
+        }
+    }
+    if (Array.isArray(_shuffle.backupFiles)) {
+        _shuffle.backupFiles = _shuffle.backupFiles.filter((f) => !_fileMatchesDeleted(f, file));
+    }
+
+    if (_shuffle.keys.length === beforeLen && !key) {
+        const prev = state.files.length;
+        state.files = state.files.filter((f) => !_fileMatchesDeleted(f, file));
+        if (state.files.length === prev) return false;
+    }
+
+    const keepUpto = Math.max(
+        state.files.length,
+        Math.min(_shuffle.keys.length, _shuffle.cursor + SHUFFLE_HYDRATE_WINDOW),
+    );
+    _materializeShuffleFiles(keepUpto);
+    if (_shuffle.cursor >= state.files.length) {
+        _shuffle.cursor = Math.max(0, state.files.length - 1);
+    }
+    state.currentFileIndex = Math.min(state.currentFileIndex, Math.max(0, state.files.length - 1));
+    _syncShuffleChrome();
+    _notifyShuffleChange();
+
+    if (wasCurrent) {
+        if (!state.files.length) closeMediaViewer();
+        else openMediaViewer(Math.min(_shuffle.cursor, state.files.length - 1));
+    }
+    return true;
+}
+
+export async function loadMoreShuffle() {
+    if (!_shuffle.active || _shuffle.busy) return false;
+    if (state.files.length >= _shuffle.keys.length) {
+        state.hasMore = false;
+        return false;
+    }
+    _shuffle.busy = true;
+    try {
+        const nextEnd = Math.min(_shuffle.keys.length, state.files.length + SHUFFLE_HYDRATE_WINDOW);
+        await _hydrateShuffleKeys(_shuffle.keys.slice(0, nextEnd));
+        const prevLen = state.files.length;
+        _materializeShuffleFiles(nextEnd);
+        return state.files.length > prevLen;
+    } finally {
+        _shuffle.busy = false;
+    }
+}
+
+export function shuffleHasMore() {
+    return _shuffle.active && state.files.length < _shuffle.keys.length;
+}
+
+async function _reshuffleKeepingCurrent() {
+    const current = state.files[state.currentFileIndex];
+    const currentKey = _filePlaylistKey(current);
+    _shuffle.keys = _buildShuffleOrder(_shuffle.keys, currentKey);
+    _shuffle.cursor = 0;
+    await _ensureShuffleWindow(0);
+}
+
+async function navigateShuffle(dir) {
+    if (_shuffle.busy) return;
+    const n = _shuffle.keys.length;
+    if (!n) return;
+
+    let next = _shuffle.cursor + dir;
+    if (next >= n || next < 0) {
+        if (!_isAutoAdvance()) return;
+        _shuffle.busy = true;
+        try {
+            await _reshuffleKeepingCurrent();
+            next = dir > 0 ? 1 : n - 1;
+            if (n === 1) next = 0;
+        } finally {
+            _shuffle.busy = false;
+        }
+    }
+
+    _shuffle.busy = true;
+    try {
+        await _ensureShuffleWindow(Math.max(0, next));
+        if (next >= state.files.length) {
+            if (_isAutoAdvance() && state.files.length) {
+                await _reshuffleKeepingCurrent();
+                next = state.files.length > 1 ? 1 : 0;
+            } else return;
+        }
+        if (!state.files[next]) {
+            next = Math.min(next, state.files.length - 1);
+            if (next < 0) return;
+        }
+        _shuffle.cursor = next;
+        _stopSlideshow();
+        _crossfadeTransition(() => openMediaViewer(next));
+    } catch (e) {
+        console.error('navigate shuffle:', e);
+        showToast(i18nT('toast.viewer_shuffle_error', 'Could not start shuffle'), 'error');
+    } finally {
+        _shuffle.busy = false;
+    }
+}
+
 function navigateMedia(dir) {
+    if (_shuffle.active) {
+        void navigateShuffle(dir);
+        return;
+    }
     const currentFilter = state.currentFilter || 'all';
     const visible =
         currentFilter === 'all' ? state.files : state.files.filter((f) => f.type === currentFilter);

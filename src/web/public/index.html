@@ -535,6 +535,11 @@
                             <i class="ri-close-circle-fill" aria-hidden="true"></i>
                         </button>
                     </div>
+                    <button type="button" id="gallery-shuffle-btn" class="gallery-filter-btn"
+                        data-i18n-title="viewer.shuffle" title="Shuffle" aria-pressed="false">
+                        <i class="ri-shuffle-line" aria-hidden="true"></i>
+                        <span data-i18n="viewer.shuffle">Shuffle</span>
+                    </button>
                     <button type="button" id="gallery-filter-btn" class="gallery-filter-btn" aria-haspopup="dialog"
                         data-i18n-title="gallery.filter.title" title="Sort &amp; filter" aria-label="Sort &amp; filter">
                         <i class="ri-equalizer-line" aria-hidden="true"></i>
@@ -4373,8 +4378,16 @@
                 <div id="modal-continuous-badge" class="hidden bg-tg-blue/80 px-2 py-0.5 rounded-full text-[10px] text-white font-medium flex items-center gap-1">
                     <i class="ri-play-circle-line"></i> AUTO
                 </div>
+                <div id="modal-shuffle-badge" class="hidden bg-tg-blue/80 px-2 py-0.5 rounded-full text-[10px] text-white font-medium flex items-center gap-1">
+                    <i class="ri-shuffle-line"></i> SHUFFLE
+                </div>
             </div>
             <div class="flex gap-2">
+                <button id="modal-shuffle-btn" type="button" title="Shuffle"
+                    class="w-10 h-10 rounded-full bg-black/50 hover:bg-black/70 flex items-center justify-center text-white transition"
+                    data-i18n-title="viewer.shuffle" aria-pressed="false">
+                    <i class="ri-shuffle-line text-xl"></i>
+                </button>
                 <button id="modal-fullscreen-btn"
                     class="w-10 h-10 rounded-full bg-black/50 hover:bg-black/70 flex items-center justify-center text-white transition">
                     <i class="ri-fullscreen-line text-xl"></i>
@@ -4430,12 +4443,15 @@
                 </div>
             </div>
 
-            <!-- Custom Video Player Container -->
+            <!-- Custom Video Player Container.
+                 Column layout: video stage above a docked controls band so
+                 the seekbar never overlays the picture. -->
             <div id="video-container"
-                class="relative w-full h-full flex items-center justify-center bg-black hidden">
+                class="relative w-full h-full flex flex-col bg-black hidden">
+                <div id="video-stage"
+                    class="relative flex-1 min-h-0 w-full flex items-center justify-center">
                 <!-- The hit-target for tap-to-toggle play/pause + tap-to-show-controls.
-                     Sits BEHIND the controls overlay so clicks on buttons / sliders
-                     never bubble to it. -->
+                     Scoped to the stage so it does not cover the docked controls. -->
                 <div id="video-tap-layer" class="absolute inset-0 z-10"></div>
 
                 <video id="modal-video" class="max-w-full max-h-full object-contain w-full h-full relative z-0" playsinline></video>
@@ -4478,8 +4494,9 @@
                         class="px-4 py-2 bg-tg-blue hover:bg-tg-darkBlue rounded-lg text-sm text-white font-medium"
                         data-i18n="viewer.video.retry">Retry</button>
                 </div>
+                </div>
 
-                <!-- Speed menu — opens above the speed button. -->
+                <!-- Speed menu — opens above the speed button (docked controls). -->
                 <div id="video-speed-menu"
                     class="absolute bottom-14 right-2 bg-[#212121]/95 backdrop-blur text-white rounded-lg overflow-hidden hidden z-50 shadow-xl w-32 py-1">
                     <button class="speed-opt flex items-center justify-between px-3 py-1.5 hover:bg-white/10 text-sm w-full" data-speed="0.25"><span>0.25x</span></button>
@@ -4492,17 +4509,16 @@
                     <button class="speed-opt flex items-center justify-between px-3 py-1.5 hover:bg-white/10 text-sm w-full" data-speed="2"><span>2x</span></button>
                 </div>
 
-                <!-- Bottom controls bar. Visibility class `controls-visible` is
-                     toggled by the player JS so we can reliably override the
-                     hover-only behaviour on touch devices. -->
+                <!-- Docked controls below the picture. Auto-hide adds
+                     `.controls-collapsed` so the stage reclaims the space. -->
                 <div id="video-controls"
-                    class="video-controls absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/85 via-black/40 to-transparent transition-opacity duration-200 z-40">
+                    class="video-controls relative shrink-0 w-full bg-black/90 transition-opacity duration-200 z-40">
                     <!-- Seek bar with hover preview. Outer hit-zone is
                          24 px tall so a finger always finds it (matches iOS
                          HIG / Material a11y target). The visual track lives
                          centred inside; bar grows on hover/active for the
                          "premium" YouTube/Netflix scrub feel. -->
-                    <div class="px-3 pt-6 relative">
+                    <div class="px-3 pt-2 relative">
                         <div id="video-progress-hitzone"
                             class="relative w-full h-6 cursor-pointer group/progress touch-none select-none flex items-center"
                             tabindex="0"
@@ -4745,12 +4761,6 @@
         <!-- Bottom Controls Container (Always Visible) -->
         <div id="modal-bottom-controls"
             class="w-full flex-shrink-0 bg-gradient-to-t from-black/90 via-black/60 to-transparent transition-transform duration-300 z-40 pointer-events-auto">
-
-            <!-- Preview Strip -->
-            <div id="preview-strip-container"
-                class="w-full overflow-x-auto py-2 px-4 scrollbar-hide flex justify-center min-h-[72px]">
-                <div id="preview-strip" class="flex gap-2 mx-auto items-center"></div>
-            </div>
 
             <!-- Review-mode action toolbar — only shown when the viewer was
                  opened via openMediaViewerForReview() (e.g. NSFW review).

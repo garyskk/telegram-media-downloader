@@ -80,9 +80,9 @@ import {
     clearGallerySearch,
     setSearchResultCount,
     formatResultCount,
-    isPinnedFirst,
     pinnedQs,
     getPinnedMode,
+    setPinnedMode,
 } from './gallery-toolbar.js';
 
 // ============ Lazy page modules ============
@@ -331,6 +331,12 @@ async function init() {
     setupInfiniteScroll();
 
     Viewer.setupViewerEvents();
+    Viewer.onShuffleChange(() => {
+        if (state.currentPage === 'viewer') renderMediaGrid();
+    });
+    document.getElementById('gallery-shuffle-btn')?.addEventListener('click', () => {
+        void Viewer.toggleShuffle({ openPlayer: false });
+    });
 
     // Expose to window for HTML onclick handlers — pulled UP from after
     // the await chain below because inline `onclick="navigateTo('…')"` on
@@ -396,6 +402,14 @@ async function init() {
     const dropFileFromView = (m) => {
         const droppedPath = m?.path;
         const droppedId = m?.id;
+        if (Viewer.isShuffleActive() && (droppedPath || droppedId != null)) {
+            Viewer.removeShuffleFile(
+                droppedId != null
+                    ? { id: droppedId, peer_id: 'self' }
+                    : { path: droppedPath },
+            );
+            return;
+        }
         if (Array.isArray(state.files) && (droppedPath || droppedId != null)) {
             const isGallery = state.files === _galleryFilesRef;
             for (let i = state.files.length - 1; i >= 0; i--) {
@@ -1876,8 +1890,7 @@ function _galleryViewKey() {
     return [
         state.currentGroupId || '',
         state.currentFilter || 'all',
-        state.pinnedFilter ? 1 : 0,
-        isPinnedFirst() ? 1 : 0,
+        getPinnedMode(),
         _galleryScopeQs(),
         state.searchQuery || '',
     ].join('|');
@@ -2247,6 +2260,7 @@ async function _loadGalleryPage(groupId) {
     // at an empty grid for the duration of the network round-trip. Page 2+
     // adds rows so we don't replace what's already there.
     if (state.page === 1) {
+        Viewer.clearShuffleSilent();
         const grid = document.getElementById('media-grid');
         if (grid) _clearGalleryGrid(grid, renderGallerySkeletons(12));
         const contentArea = document.getElementById('content-area');
@@ -2633,7 +2647,10 @@ function renderMediaGrid(opts = {}) {
         });
         const order = [];
         const headers = new Map();
-        for (const [label, items] of groupFilesByTime(filteredWithIndex)) {
+        const sections = Viewer.isShuffleActive()
+            ? [['', filteredWithIndex]]
+            : groupFilesByTime(filteredWithIndex);
+        for (const [label, items] of sections) {
             if (label && items.length) headers.set(order.length, label);
             for (const it of items) order.push(it.originalIndex);
         }
@@ -2780,11 +2797,13 @@ function renderGalleryEmptyState() {
     }
     if (getPinnedMode() === 'only')
         activeFilters.push(i18nT('gallery.filter.state_only', 'Pinned only'));
+    else if (getPinnedMode() === 'unpinned')
+        activeFilters.push(i18nT('gallery.filter.state_unpinned', 'Unpinned only'));
     const clearFiltersAction = {
         label: i18nT('gallery.filter.clear_filters', 'Clear filters'),
         icon: 'ri-filter-off-line',
         onClick: () => {
-            state.pinnedFilter = false;
+            setPinnedMode('all');
             state.currentFilter = 'all';
             _paintTypeTabs();
             syncGalleryToolbar();
@@ -3937,6 +3956,18 @@ async function confirmDeleteFile() {
                 ? `&id=${encodeURIComponent(file.id)}`
                 : '';
         await api.delete(`/api/file?path=${encodeURIComponent(file.fullPath)}${idQuery}`);
+        if (
+            Viewer.isShuffleActive() &&
+            Viewer.removeShuffleFile({
+                id: file.id,
+                path: file.fullPath || file.path,
+                fullPath: file.fullPath,
+                peer_id: file.peer_id || 'self',
+            })
+        ) {
+            showToast(i18nT('viewer.delete.success', 'File deleted'), 'success');
+            return;
+        }
         // The server broadcasts `file_deleted` BEFORE this response lands,
         // so dropFileFromView() may already have spliced the file out —
         // splicing `currentFileIndex` again removed the NEXT file. Locate
@@ -4472,6 +4503,24 @@ function setupInfiniteScroll() {
 // /api/downloads/all instead of the per-group endpoint.
 function _galleryNearBottom() {
     if (state.currentPage !== 'viewer' || state.loading) return;
+    if (Viewer.isShuffleActive()) {
+        if (Viewer.shuffleHasMore()) {
+            const before = state.files.length;
+            state.loading = true;
+            Viewer.loadMoreShuffle()
+                .then((added) => {
+                    if (added) renderMediaGrid({ append: true, fromIndex: before });
+                })
+                .finally(() => {
+                    state.loading = false;
+                    _recheckLoadMore();
+                });
+        } else if (hasPendingBelow()) {
+            extendBottom();
+            _recheckLoadMore();
+        }
+        return;
+    }
     if (hasPendingBelow()) {
         extendBottom();
         _recheckLoadMore();
