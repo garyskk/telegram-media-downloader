@@ -14,6 +14,12 @@
  * unchanged) so the operation is I/O bound, finishes in seconds for
  * sub-100 MB clips, and produces a bit-for-bit identical playback.
  *
+ * Safari will not decode HEVC tagged `hev1` when the VPS/SPS/PPS live
+ * only in the `hvcC` box (the samples themselves are bare slices).
+ * Those files are remuxed with `-tag:v hvc1` even if `moov` is already
+ * at the front. A real in-band `hev1` (no parameter sets in `hvcC`) is
+ * left alone.
+ *
  * Detection is cheap: read the first 16 bytes, parse the `ftyp` atom
  * size, peek at whatever follows. If it's `moov`, the file is already
  * faststart-optimised and we skip it. If it's `mdat` (or anything other
@@ -317,10 +323,12 @@ async function _renameWithRetry(from, to, { retries = 6 } = {}) {
 // the mp4 muxer has no tag for, so a plain `-map 0` copy fails with this.
 const DATA_TRACK_ERROR = /Could not find tag for codec/i;
 
-async function _remuxInPlace(absPath) {
+async function _remuxInPlace(absPath, { retagHvc1 = false } = {}) {
     const tmp = absPath + '.faststart.tmp';
     // Stream-copy both A and V, only rewrite container metadata. `-y`
     // overwrites any stale .tmp left over from a prior crash.
+    // `-tag:v hvc1` changes the sample-entry fourcc only; the HEVC
+    // bitstreams stay byte-for-byte the same.
     const args = (dropData) => [
         '-hide_banner',
         '-loglevel',
@@ -332,6 +340,7 @@ async function _remuxInPlace(absPath) {
         '-map',
         '0', // copy every stream (video + audio + subs + …)
         ...(dropData ? ['-map', '-0:d'] : []), // … minus data tracks
+        ...(retagHvc1 ? ['-tag:v', 'hvc1'] : []),
         '-movflags',
         '+faststart',
         '-f',
@@ -368,6 +377,151 @@ async function _remuxInPlace(absPath) {
     return tmpStat.size;
 }
 
+// Video sample entries that must not be force-tagged hvc1. A global
+// `-tag:v hvc1` would mislabel these if they share a file with HEVC.
+const OTHER_VIDEO_TAGS = new Set([
+    'avc1',
+    'avc3',
+    'avc4',
+    'vp08',
+    'vp09',
+    'av01',
+    'mp4v',
+    'h263',
+    's263',
+    'encv',
+    'dvh1',
+    'dvhe',
+]);
+
+// Boxes we descend into while looking for a video sample description.
+// `stsd` is parsed on its own; everything else (mdat, stco, …) is skipped
+// by size so a multi-gigabyte file only costs a handful of seeks.
+const HEVC_SCAN_CONTAINERS = new Set(['moov', 'trak', 'mdia', 'minf', 'stbl']);
+
+async function _readExact(fh, pos, len) {
+    const buf = Buffer.alloc(len);
+    const { bytesRead } = await fh.read(buf, 0, len, pos);
+    if (bytesRead < len) return null;
+    return buf;
+}
+
+function _hvccHasParameterSets(hvcc) {
+    // ISO/IEC 14496-15 HEVCDecoderConfigurationRecord. numOfArrays sits at
+    // byte 22, after the profile / level / chroma fields.
+    if (hvcc.length < 23) return false;
+    const numArrays = hvcc[22];
+    let i = 23;
+    const types = new Set();
+    for (let a = 0; a < numArrays && i + 3 <= hvcc.length; a++) {
+        types.add(hvcc[i] & 0x3f);
+        i += 1;
+        const num = hvcc.readUInt16BE(i);
+        i += 2;
+        for (let k = 0; k < num && i + 2 <= hvcc.length; k++) {
+            const nalLen = hvcc.readUInt16BE(i);
+            i += 2 + nalLen;
+        }
+    }
+    return types.has(32) && types.has(33) && types.has(34);
+}
+
+function _entryHasParameterSets(entry) {
+    // VisualSampleEntry is 78 bytes after the 8-byte box header. hvcC is
+    // a child box that follows it.
+    const start = 8 + 78;
+    if (entry.length < start + 8) return false;
+    let off = start;
+    while (off + 8 <= entry.length) {
+        const n = entry.readUInt32BE(off);
+        const type = entry.toString('latin1', off + 4, off + 8);
+        if (n < 8 || off + n > entry.length) return false;
+        if (type === 'hvcC' && _hvccHasParameterSets(entry.subarray(off + 8, off + n))) return true;
+        off += n;
+    }
+    return false;
+}
+
+// One stsd box, header included. `retag` means an hev1 entry whose
+// hvcC already carries VPS+SPS+PPS. `conflict` means some other video
+// codec shares the description, so a blanket hvc1 tag is unsafe.
+function _stsdHevc(box) {
+    const header = box.readUInt32BE(0) === 1 ? 16 : 8;
+    if (box.length < header + 8) return { retag: false, conflict: false };
+    const count = box.readUInt32BE(header + 4);
+    let off = header + 8;
+    let retag = false;
+    let conflict = false;
+    for (let i = 0; i < count && off + 8 <= box.length; i++) {
+        const es = box.readUInt32BE(off);
+        const et = box.toString('latin1', off + 4, off + 8);
+        if (es < 8 || off + es > box.length) break;
+        if (et === 'hev1' && _entryHasParameterSets(box.subarray(off, off + es))) retag = true;
+        else if (OTHER_VIDEO_TAGS.has(et)) conflict = true;
+        off += es;
+    }
+    return { retag, conflict };
+}
+
+async function _scanHevc(fh, start, end) {
+    let retag = false;
+    let pos = start;
+    while (pos + 8 <= end) {
+        const hdr = await _readExact(fh, pos, Math.min(16, end - pos));
+        if (!hdr || hdr.length < 8) return { retag: false, conflict: false };
+        let size = hdr.readUInt32BE(0);
+        const type = hdr.toString('latin1', 4, 8);
+        let header = 8;
+        if (size === 1) {
+            if (hdr.length < 16) return { retag: false, conflict: false };
+            size = Number(hdr.readBigUInt64BE(8));
+            header = 16;
+        } else if (size === 0) {
+            size = end - pos;
+        }
+        if (!Number.isFinite(size) || size < header || pos + size > end) {
+            return { retag: false, conflict: false };
+        }
+        if (type === 'stsd') {
+            if (size > 1024 * 1024) return { retag: false, conflict: false };
+            const box = await _readExact(fh, pos, size);
+            if (!box) return { retag: false, conflict: false };
+            const found = _stsdHevc(box);
+            if (found.conflict) return { retag: false, conflict: true };
+            if (found.retag) retag = true;
+        } else if (HEVC_SCAN_CONTAINERS.has(type)) {
+            const nested = await _scanHevc(fh, pos + header, pos + size);
+            if (nested.conflict) return nested;
+            if (nested.retag) retag = true;
+        }
+        pos += size;
+    }
+    return { retag, conflict: false };
+}
+
+/**
+ * True when the file is HEVC tagged `hev1` with VPS, SPS and PPS stored
+ * in `hvcC` rather than in the samples. Safari plays that layout only
+ * after the sample entry is retagged `hvc1`.
+ */
+async function _needsHvc1Retag(absPath) {
+    let fh;
+    try {
+        fh = await fs.open(absPath, 'r');
+        const stat = await fh.stat();
+        const found = await _scanHevc(fh, 0, stat.size);
+        return found.retag && !found.conflict;
+    } catch {
+        return false;
+    } finally {
+        try {
+            await fh?.close();
+        } catch {
+            /* best-effort */
+        }
+    }
+}
+
 // ---- Public API ----------------------------------------------------------
 
 /**
@@ -402,13 +556,14 @@ export async function optimizeDownload(id) {
     if (!abs) return { status: 'skipped', reason: 'file missing' };
     const ext = path.extname(abs).toLowerCase();
     if (!FASTSTART_EXTS.has(ext)) return { status: 'skipped', reason: 'container not mp4' };
-    if (await _isOptimized(abs)) return { status: 'already' };
     const sig = await _fileSig(abs);
     if (_gaveUp(dlId, sig)) return { status: 'skipped', reason: 'failed before' };
+    const retagHvc1 = await _needsHvc1Retag(abs);
+    if ((await _isOptimized(abs)) && !retagHvc1) return { status: 'already' };
 
     await _sem.acquire();
     try {
-        const newSize = await _remuxInPlace(abs);
+        const newSize = await _remuxInPlace(abs, { retagHvc1 });
         if (_failures()[dlId]) {
             delete _failures()[dlId];
             _saveFailures();
@@ -626,8 +781,14 @@ export async function getStats() {
                 continue;
             }
             const which = await _peekSecondAtom(abs);
-            if (which === 'moov') optimized++;
-            else if (which === 'mdat' || which === 'other') {
+            if (which === 'moov') {
+                // moov is up front, but Safari still can't play an hev1
+                // file whose parameter sets never made it into the samples.
+                const needsRetag = await _needsHvc1Retag(abs);
+                if (needsRetag && _failures()[r.id] && _gaveUp(r.id, await _fileSig(abs))) unknown++;
+                else if (needsRetag) pending++;
+                else optimized++;
+            } else if (which === 'mdat' || which === 'other') {
                 // Given up on (see _recordFailure) — not pending any more.
                 if (_failures()[r.id] && _gaveUp(r.id, await _fileSig(abs))) unknown++;
                 else pending++;

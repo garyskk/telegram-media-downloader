@@ -61,6 +61,53 @@ function writeMp4(abs) {
     fs.writeFileSync(abs, Buffer.concat([ftyp, mdat]));
 }
 
+function box(type, body) {
+    const size = Buffer.alloc(4);
+    size.writeUInt32BE(8 + body.length);
+    return Buffer.concat([size, Buffer.from(type), body]);
+}
+
+// hev1 + hvcC that already holds VPS/SPS/PPS. Safari will not play this
+// layout; the remux has to retag the sample entry to hvc1.
+function writeHev1(abs, { faststart = true, withSets = true } = {}) {
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+    const ftyp = Buffer.concat([
+        Buffer.from([0, 0, 0, 0x18]),
+        Buffer.from('ftypisom'),
+        Buffer.from([0, 0, 2, 0]),
+        Buffer.from('isomiso2'),
+    ]);
+    const hvccHead = Buffer.alloc(23);
+    hvccHead[0] = 1;
+    const arrays = [];
+    if (withSets) {
+        hvccHead[22] = 3;
+        for (const [nalType, nal] of [
+            [32, Buffer.from([0x40, 0x01, 0x0c, 0x01])],
+            [33, Buffer.from([0x42, 0x01, 0x01, 0x01])],
+            [34, Buffer.from([0x44, 0x01, 0xc1])],
+        ]) {
+            const num = Buffer.alloc(2);
+            num.writeUInt16BE(1);
+            const len = Buffer.alloc(2);
+            len.writeUInt16BE(nal.length);
+            arrays.push(Buffer.concat([Buffer.from([nalType]), num, len, nal]));
+        }
+    }
+    const hvcc = box('hvcC', Buffer.concat([hvccHead, ...arrays]));
+    const hev1 = box('hev1', Buffer.concat([Buffer.alloc(78), hvcc]));
+    const count = Buffer.alloc(4);
+    count.writeUInt32BE(1);
+    const stsd = box('stsd', Buffer.concat([Buffer.alloc(4), count, hev1]));
+    const moov = box('moov', box('trak', box('mdia', box('minf', box('stbl', stsd)))));
+    const mdat = Buffer.concat([
+        Buffer.from([0, 0, 0, 0x10]),
+        Buffer.from('mdat'),
+        Buffer.alloc(8, 7),
+    ]);
+    fs.writeFileSync(abs, Buffer.concat(faststart ? [ftyp, moov, mdat] : [ftyp, mdat, moov]));
+}
+
 function addVideo(name) {
     const rel = `g/videos/${name}`;
     const abs = path.join(DATA_DIR, 'downloads', 'g', 'videos', name);
@@ -143,5 +190,36 @@ describe('faststart remux', () => {
         mock.onSpawn = () => ({ code: 0, write: true });
         expect((await faststart.optimizeDownload(id)).status).toBe('optimized');
         expect(mock.calls).toHaveLength(4);
+    });
+
+    it('retags a faststart hev1 file whose parameter sets live only in hvcC', async () => {
+        mock.onSpawn = () => ({ code: 0, write: true });
+        const { id } = addVideo('safari.mp4');
+        writeHev1(path.join(DATA_DIR, 'downloads', 'g', 'videos', 'safari.mp4'));
+        const r = await faststart.optimizeDownload(id);
+        expect(r.status).toBe('optimized');
+        expect(mock.calls).toHaveLength(1);
+        expect(mock.calls[0]).toEqual(expect.arrayContaining(['-tag:v', 'hvc1']));
+    });
+
+    it('leaves a faststart hev1 file alone when hvcC has no parameter sets', async () => {
+        const { id } = addVideo('inband.mp4');
+        writeHev1(path.join(DATA_DIR, 'downloads', 'g', 'videos', 'inband.mp4'), {
+            withSets: false,
+        });
+        const r = await faststart.optimizeDownload(id);
+        expect(r).toEqual({ status: 'already' });
+        expect(mock.calls).toHaveLength(0);
+    });
+
+    it('includes the hvc1 tag when a hev1 file also needs faststart', async () => {
+        mock.onSpawn = () => ({ code: 0, write: true });
+        const { id } = addVideo('late-moov.mp4');
+        writeHev1(path.join(DATA_DIR, 'downloads', 'g', 'videos', 'late-moov.mp4'), {
+            faststart: false,
+        });
+        const r = await faststart.optimizeDownload(id);
+        expect(r.status).toBe('optimized');
+        expect(mock.calls[0]).toEqual(expect.arrayContaining(['-tag:v', 'hvc1', '+faststart']));
     });
 });
