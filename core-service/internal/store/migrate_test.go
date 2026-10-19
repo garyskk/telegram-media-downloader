@@ -83,6 +83,64 @@ func TestStoryKeyMigrationPreservesRowsAndRejectsCollision(t *testing.T) {
 	}
 }
 
+func TestRetireUserDeletedAndEnhancementFaceSchema(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Writer.Close()
+	defer db.Reader.Close()
+	raw := db.Writer
+	if _, err = raw.Exec(`
+		ALTER TABLE downloads ADD COLUMN user_deleted INTEGER DEFAULT 0;
+		INSERT INTO downloads(group_id, message_id, user_deleted) VALUES ('g',5,1),('g',6,0);
+		ALTER TABLE people ADD COLUMN cover_face_id INTEGER;
+		INSERT INTO people(label, embedding_centroid, created_at, updated_at, cover_face_id) VALUES ('Ada', x'00', 1, 1, 9);
+		CREATE TABLE excluded_people (person_id INTEGER PRIMARY KEY);
+		INSERT INTO excluded_people(person_id) VALUES (1);
+	`); err != nil {
+		t.Fatal(err)
+	}
+	if err = retireUserDeleted(ctx, raw); err != nil {
+		t.Fatal(err)
+	}
+	if err = retireEnhancementFaceSchema(ctx, raw); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = RunMigrations(ctx, raw); err != nil {
+		t.Fatal(err)
+	}
+	var cols int
+	if err = raw.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('downloads') WHERE name='user_deleted'`).Scan(&cols); err != nil || cols != 0 {
+		t.Fatalf("user_deleted still present (%d, %v)", cols, err)
+	}
+	var left int
+	if err = raw.QueryRow(`SELECT COUNT(*) FROM downloads WHERE message_id=6`).Scan(&left); err != nil || left != 1 {
+		t.Fatalf("unflagged row %d %v", left, err)
+	}
+	if err = raw.QueryRow(`SELECT COUNT(*) FROM downloads WHERE message_id=5`).Scan(&left); err != nil || left != 0 {
+		t.Fatalf("flagged row remained %d %v", left, err)
+	}
+	var tomb int
+	if err = raw.QueryRow(`SELECT COUNT(*) FROM download_tombstones WHERE group_id='g' AND message_id=5`).Scan(&tomb); err != nil || tomb != 1 {
+		t.Fatalf("tombstone %d %v", tomb, err)
+	}
+	if err = raw.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('people') WHERE name='cover_face_id'`).Scan(&cols); err != nil || cols != 0 {
+		t.Fatalf("cover_face_id %d %v", cols, err)
+	}
+	if err = raw.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='excluded_people'`).Scan(&cols); err != nil || cols != 0 {
+		t.Fatalf("excluded_people %d %v", cols, err)
+	}
+	var peopleName string
+	if err = raw.QueryRow(`SELECT label FROM people`).Scan(&peopleName); err != nil || peopleName != "Ada" {
+		t.Fatalf("people row %q %v", peopleName, err)
+	}
+	if err = raw.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE name='video_fingerprints'`).Scan(&cols); err != nil || cols != 1 {
+		t.Fatalf("fingerprints table %d %v", cols, err)
+	}
+}
+
 func TestOpenCreatesMissingDataDirectory(t *testing.T) {
 	dataDir := filepath.Join(t.TempDir(), "nested", "data")
 	db, err := Open(context.Background(), dataDir)

@@ -9,6 +9,7 @@ import { ws } from './ws.js';
 import { renderTextInto, renderCodeInto, renderMarkdownInto, langFromExt } from './viewer-text.js';
 import { renderArchiveInto } from './viewer-archive.js';
 import { mountTgs } from './tgs.js';
+import { isShuffleActive, shuffleComplete } from './gallery-shuffle.js';
 
 // ---- Seekbar feature flag — lazy, module-scoped --------------------------
 //
@@ -2322,6 +2323,7 @@ class VideoPlayer {
 
     _showControls(force = false) {
         this.controls.style.opacity = '1';
+        this.controls.classList.remove('controls-collapsed');
         this.container.style.cursor = '';
         if (!force && SUPPORTS_HOVER && !this.video.paused) {
             this._scheduleHide();
@@ -2348,6 +2350,7 @@ class VideoPlayer {
             // Don't hide while the speed menu is open.
             if (!this.speedMenu.classList.contains('hidden')) return;
             this.controls.style.opacity = '0';
+            this.controls.classList.add('controls-collapsed');
             this.container.style.cursor = 'none';
         }, delay);
     }
@@ -3009,7 +3012,7 @@ function _crossfadeTransition(callback) {
 }
 
 function navigateMedia(dir) {
-    const currentFilter = state.currentFilter || 'all';
+    const currentFilter = isShuffleActive() ? 'all' : state.currentFilter || 'all';
     const visible =
         currentFilter === 'all' ? state.files : state.files.filter((f) => f.type === currentFilter);
 
@@ -3021,7 +3024,7 @@ function navigateMedia(dir) {
     } else {
         // Wrap around in continuous mode
         let nextVisIdx = visibleIndex + dir;
-        if (_isAutoAdvance()) {
+        if (_isAutoAdvance() && shuffleComplete()) {
             if (nextVisIdx >= visible.length) nextVisIdx = 0;
             else if (nextVisIdx < 0) nextVisIdx = visible.length - 1;
         }

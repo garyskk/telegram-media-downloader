@@ -9,6 +9,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/botnick/telegram-media-downloader/core-service/internal/similar"
+	"github.com/botnick/telegram-media-downloader/core-service/internal/store"
 )
 
 func mediaName(stored string) (string, error) {
@@ -74,6 +77,13 @@ func (a *App) deleteRows(r *http.Request, ids []int64, paths []string) (int64, e
 }
 
 func (a *App) deleteByWhere(r *http.Request, where string, args ...any) (int64, error) {
+	return a.deleteMatching(r, true, where, args...)
+}
+
+// deleteMatching removes catalog rows. Operator deletes record tombstones so
+// catch-up and pull-older do not fetch the message again. A missing file that
+// the server prunes on its own is not a tombstone: it can be fetched again.
+func (a *App) deleteMatching(r *http.Request, tombstone bool, where string, args ...any) (int64, error) {
 	a.mediaMu.RLock()
 	defer a.mediaMu.RUnlock()
 	tx, err := a.db.Writer.BeginTx(r.Context(), nil)
@@ -81,6 +91,11 @@ func (a *App) deleteByWhere(r *http.Request, where string, args ...any) (int64, 
 		return 0, err
 	}
 	defer tx.Rollback()
+	if tombstone {
+		if err = store.RememberDeletedDownloads(r.Context(), tx, where, args...); err != nil {
+			return 0, err
+		}
+	}
 	err = a.queueDeletedAssets(r.Context(), tx, where, args...)
 	if err != nil {
 		return 0, err
@@ -95,6 +110,9 @@ func (a *App) deleteByWhere(r *http.Request, where string, args ...any) (int64, 
 	}
 	count, err := result.RowsAffected()
 	if err != nil {
+		return 0, err
+	}
+	if err = similar.PruneIncompleteGroups(r.Context(), tx); err != nil {
 		return 0, err
 	}
 	if err = tx.Commit(); err != nil {

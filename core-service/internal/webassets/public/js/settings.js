@@ -955,6 +955,22 @@ function combineDiskCap(value, unit) {
 // Settings page. Idempotent — safe to call multiple times.
 export function loadAdvanced(config) {
     const adv = config?.advanced || {};
+    const sc = adv.similarClips || {};
+    const setNum = (id, val) => {
+        const el = document.getElementById(id);
+        if (el && val != null && val !== '') el.value = val;
+    };
+    setNum('setting-adv-similarClips-similarThreshold', sc.similarThreshold ?? 50);
+    setNum('setting-adv-similarClips-durationTolerance', sc.durationTolerance ?? 0.1);
+    setNum('setting-adv-similarClips-durationBucketSec', sc.durationBucketSec ?? 120);
+    setNum('setting-adv-similarClips-sceneThreshold', sc.sceneThreshold ?? 0.1);
+    setNum('setting-adv-similarClips-floorIntervalSec', sc.floorIntervalSec ?? 3);
+    setNum('setting-adv-similarClips-partialMatchRatio', sc.partialMatchRatio ?? 0.5);
+    setNum('setting-adv-similarClips-partialFrameThreshold', sc.partialFrameThreshold ?? 90);
+    setNum('setting-adv-similarClips-partialShortClipSec', sc.partialShortClipSec ?? 300);
+    setNum('setting-adv-similarClips-partialShortMatchRatio', sc.partialShortMatchRatio ?? 0.5);
+    setNum('setting-adv-similarClips-partialReviewMatchRatio', sc.partialReviewMatchRatio ?? 0.35);
+    setNum('setting-adv-similarClips-partialReviewMinMatchedFrames', sc.partialReviewMinMatchedFrames ?? 4);
     const set = (id, val) => {
         const el = document.getElementById(id);
         if (el && val != null) el.value = val;
@@ -1460,6 +1476,32 @@ function _scheduleAutoSave() {
 function _gatherScopedPayload(page) {
     const get = (id) => document.getElementById(id)?.value;
     if (page === 'settings') return _gatherSettingsPayload();
+    if (page === 'maintenance-similar') {
+        const num = (id, def) => {
+            const v = parseFloat(get(id));
+            return Number.isFinite(v) ? v : def;
+        };
+        return {
+            advanced: {
+                similarClips: {
+                    similarThreshold: num('setting-adv-similarClips-similarThreshold', 50),
+                    durationTolerance: num('setting-adv-similarClips-durationTolerance', 0.1),
+                    durationBucketSec: num('setting-adv-similarClips-durationBucketSec', 120),
+                    sceneThreshold: num('setting-adv-similarClips-sceneThreshold', 0.1),
+                    floorIntervalSec: num('setting-adv-similarClips-floorIntervalSec', 3),
+                    partialMatchRatio: num('setting-adv-similarClips-partialMatchRatio', 0.5),
+                    partialFrameThreshold: num('setting-adv-similarClips-partialFrameThreshold', 90),
+                    partialShortClipSec: num('setting-adv-similarClips-partialShortClipSec', 300),
+                    partialShortMatchRatio: num('setting-adv-similarClips-partialShortMatchRatio', 0.5),
+                    partialReviewMatchRatio: num('setting-adv-similarClips-partialReviewMatchRatio', 0.35),
+                    partialReviewMinMatchedFrames: num(
+                        'setting-adv-similarClips-partialReviewMinMatchedFrames',
+                        4,
+                    ),
+                },
+            },
+        };
+    }
     if (page === 'maintenance-thumbs') {
         return {
             advanced: {

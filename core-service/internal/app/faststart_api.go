@@ -88,7 +88,11 @@ func (a *App) handleFaststartStats(w http.ResponseWriter, r *http.Request) {
 		}
 		switch faststartAtom(p) {
 		case "moov":
-			optimized++
+			if faststart.PlaybackReady(p) {
+				optimized++
+			} else {
+				pending++
+			}
 		case "":
 			unknown++
 		default:
@@ -140,7 +144,7 @@ func (a *App) handleFaststartScan(w http.ResponseWriter, r *http.Request) {
 	already, optimized, errored, skipped := 0, 0, 0, 0
 	for _, row := range rows {
 		path := filepath.Join(a.downloadsDir, filepath.FromSlash(row.path))
-		if faststartAtom(path) == "moov" {
+		if faststart.PlaybackReady(path) {
 			already++
 			continue
 		}
@@ -155,6 +159,9 @@ func (a *App) handleFaststartScan(w http.ResponseWriter, r *http.Request) {
 			_ = json.Unmarshal(rec.body.Bytes(), &out)
 			if out["status"] == "optimized" {
 				optimized++
+				if size, ok := out["newSize"].(float64); ok && size > 0 {
+					_, _ = a.db.Writer.ExecContext(r.Context(), `UPDATE downloads SET file_size=? WHERE id=?`, int64(size), row.id)
+				}
 			} else {
 				skipped++
 			}

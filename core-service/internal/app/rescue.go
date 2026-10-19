@@ -6,6 +6,8 @@ import (
 	"errors"
 	"time"
 
+	"github.com/botnick/telegram-media-downloader/core-service/internal/similar"
+	"github.com/botnick/telegram-media-downloader/core-service/internal/store"
 	"github.com/botnick/telegram-media-downloader/core-service/internal/ws"
 )
 
@@ -61,9 +63,15 @@ func (a *App) sweepRescue(ctx context.Context, now time.Time) (int, error) {
 				return 0, err
 			}
 		}
+		if err = store.RememberDeletedDownloads(ctx, tx, "id=?", row.id); err != nil {
+			return 0, err
+		}
 		if _, err = tx.ExecContext(ctx, `DELETE FROM downloads WHERE id=?`, row.id); err != nil {
 			return 0, err
 		}
+	}
+	if err = similar.PruneIncompleteGroups(ctx, tx); err != nil {
+		return 0, err
 	}
 	if len(selected) > 0 {
 		if _, err = tx.ExecContext(ctx, `INSERT INTO kv(key,value,updated_at) VALUES('native_rescue_last',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at`, len(selected), now.UnixMilli()); err != nil {

@@ -1,17 +1,22 @@
 # Telegram Media Downloader 3.x — native Go server (no Node runtime).
-# Same image name, port, data folder and container user as 2.x, so an
-# existing install upgrades with `docker compose pull && docker compose up -d`
-# or the dashboard's "Install update" button.
+# The app image is built from this tree (`build: .`).
+# `docker compose up -d --build` picks up local Dockerfile and source changes.
 #
-# First run: `docker compose up -d`, open http://localhost:3000 from this
-# machine to set the dashboard password, then add a Telegram account.
+# Watchtower is behind profile `autoupdate` and autoheal behind profile
+# `autoheal`, so a plain `up` does not replace this locally built app image.
+# Start them when wanted:
+#   docker compose --profile autoheal --profile autoupdate up -d --build
+#
+# First run: `docker compose up -d --build`, open http://localhost:3000 from
+# this machine to set the dashboard password, then add a Telegram account.
+#
+# To switch back to the published image, comment `build:` and uncomment
+# `image:` and `pull_policy:` below.
 services:
   telegram-downloader:
-    # Prebuilt multi-arch image; `pull_policy: always` makes
-    # `docker compose up -d` pick up each new release. To build from source
-    # instead, replace these two lines with `build: .`.
-    image: ghcr.io/botnick/telegram-media-downloader:latest
-    pull_policy: always
+    build: .
+    # image: ghcr.io/botnick/telegram-media-downloader:latest
+    # pull_policy: always
     container_name: telegram-downloader
     restart: unless-stopped
     stop_grace_period: 60s
@@ -29,8 +34,9 @@ services:
       # empty value when the dashboard is exposed directly.
       - TRUST_PROXY=${TRUST_PROXY:-1}
       - TGDL_SECURE_COOKIES=${TGDL_SECURE_COOKIES:-0}
-      # One-click "Install update" via the watchtower service below. The app
-      # generates the token in ./data/watchtower/; .env can override it.
+      # One-click "Install update" via the watchtower service below (profile
+      # `autoupdate`). The app generates the token in ./data/watchtower/;
+      # .env can override it.
       - WATCHTOWER_URL=${WATCHTOWER_URL:-http://watchtower:8080}
       - WATCHTOWER_HTTP_API_TOKEN=${WATCHTOWER_HTTP_API_TOKEN:-}
       # Optional NSFW sidecar (tgdl-nsfw service below). Empty = not used.
@@ -63,6 +69,8 @@ services:
     image: willfarrell/autoheal:latest
     container_name: telegram-downloader-autoheal
     restart: unless-stopped
+    profiles:
+      - autoheal
     labels:
       - "com.centurylinklabs.watchtower.enable=true"
     # Needs only the docker socket, no network.
@@ -81,15 +89,20 @@ services:
         max-size: "1m"
         max-file: "3"
 
-  # Updater behind Settings → Maintenance → "Install update". It touches only
-  # containers with the watchtower label (all four here, itself included) and
-  # the dashboard never sees the docker socket. Automatic updates: set
+  # Updater behind Settings → Maintenance → "Install update". Profile
+  # `autoupdate` keeps it off a plain `up`, so it does not replace the
+  # locally built app image. Start it with:
+  #   docker compose --profile autoupdate up -d
+  # It touches only containers with the watchtower label, and the dashboard
+  # never sees the docker socket. Automatic updates: set
   # WATCHTOWER_HTTP_API_PERIODIC_POLLS=true in .env (schedule below, 6-field
   # cron in the container TZ; default daily 04:00).
   watchtower:
     image: nickfedor/watchtower:latest
     container_name: telegram-downloader-updater
     restart: unless-stopped
+    profiles:
+      - autoupdate
     labels:
       - "com.centurylinklabs.watchtower.enable=true"
     volumes:

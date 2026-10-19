@@ -218,6 +218,9 @@ func RunMigrations(ctx context.Context, db *sql.DB) (int, error) {
 	if _, err := db.ExecContext(ctx, `UPDATE downloads SET message_id=4294967296+message_id WHERE file_type='stories' AND message_id BETWEEN 1 AND 2147483647`); err != nil {
 		return 0, fmt.Errorf("separate story catalog identifiers: %w", err)
 	}
+	if err := migrateCatalogExtras(ctx, db); err != nil {
+		return 0, err
+	}
 	if err := db.QueryRowContext(ctx, `SELECT version FROM tgdl_schema_meta LIMIT 1`).Scan(&version); err != nil {
 		return 0, fmt.Errorf("read schema version: %w", err)
 	}

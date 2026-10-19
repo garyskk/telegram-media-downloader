@@ -5,6 +5,7 @@ import (
 	"github.com/botnick/telegram-media-downloader/core-service/internal/download"
 	"github.com/botnick/telegram-media-downloader/core-service/internal/engine"
 	"github.com/botnick/telegram-media-downloader/core-service/internal/rescue"
+	"github.com/botnick/telegram-media-downloader/core-service/internal/store"
 	"github.com/botnick/telegram-media-downloader/core-service/internal/telegram"
 	"github.com/botnick/telegram-media-downloader/core-service/internal/ws"
 	"github.com/gotd/td/tg"
@@ -45,6 +46,11 @@ func (a *App) ingestTelegram(ctx context.Context, message *tg.Message, groupID, 
 	if err := rescue.Observe(ctx, a.db.Writer, accountID, groupID, message, engine.Origin(ctx)); err != nil {
 		return download.Record{}, err
 	}
+	if tomb, err := store.Tombstoned(ctx, a.db.Reader, item.GroupID, item.MessageID); err != nil {
+		return download.Record{}, err
+	} else if tomb {
+		return download.Record{}, nil
+	}
 	forward, err := a.forwardCandidate(ctx, item.GroupID, item.MessageID)
 	if err != nil {
 		return download.Record{}, err
@@ -70,6 +76,7 @@ func (a *App) ingestTelegram(ctx context.Context, message *tg.Message, groupID, 
 	if attachment.Type == "video" {
 		// History backfill yields to live downloads in the sprite queue.
 		a.enqueueSeekbar(record.ID, engine.Origin(ctx) != "history")
+		a.enqueueFingerprint(record.ID)
 	}
 	a.queueNSFW(record.ID, payload["key"].(string))
 	// Background face detection; live downloads go ahead of history backfill.

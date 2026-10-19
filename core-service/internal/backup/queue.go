@@ -107,6 +107,9 @@ func (m *Manager) run(ctx context.Context, id int64) error {
 		if _, e = m.opts.Writer.ExecContext(ctx, `UPDATE backup_destinations SET last_error=NULL WHERE id=?`, id); e != nil {
 			return e
 		}
+		if e = m.deleteMirrorOrphans(ctx, d); e != nil {
+			m.Log("warn", fmt.Sprintf("mirror orphan reconcile on #%d: %v", id, e))
+		}
 		m.Log("info", fmt.Sprintf("mirror catch-up enqueued %d jobs for #%d", n, id))
 	} else {
 		// Reserve the archive job before building anything. A crash can restart the
@@ -475,48 +478,93 @@ func (m *Manager) failed(ctx context.Context, d destination, j job, cause error,
 
 var snapshotName = regexp.MustCompile(`^snapshot-\d{8}-\d{6}\.tar\.gz$`)
 
-func (m *Manager) retention(ctx context.Context, d destination, j job, p Provider) error {
-	if d.Mode == "snapshot" {
-		objects, err := p.List(ctx, "snapshots/")
+func (m *Manager) reconcileRetention(ctx context.Context) {
+	ds, err := m.destinations(ctx)
+	if err != nil {
+		return
+	}
+	for _, d := range ds {
+		if ctx.Err() != nil {
+			return
+		}
+		if !d.Enabled || (d.Mode != "snapshot" && d.Mode != "manual") {
+			continue
+		}
+		cfg, err := m.config(ctx, d)
 		if err != nil {
-			m.Log("warn", fmt.Sprintf("retention on #%d: %v", d.ID, err))
+			continue
+		}
+		p, err := m.provider(ctx, d, cfg)
+		if err != nil {
+			continue
+		}
+		if err = m.pruneRemoteSnapshots(ctx, d, p); err != nil {
+			m.Log("warn", fmt.Sprintf("boot retention on #%d: %v", d.ID, err))
+		}
+		_ = p.Close()
+	}
+}
+
+func (m *Manager) deleteMirrorOrphans(ctx context.Context, d destination) error {
+	cfg, err := m.config(ctx, d)
+	if err != nil {
+		return err
+	}
+	p, err := m.provider(ctx, d, cfg)
+	if err != nil {
+		return err
+	}
+	defer p.Close()
+	objects, err := listBackupTree(ctx, p)
+	if err != nil {
+		return err
+	}
+	rows, err := m.opts.Reader.QueryContext(ctx, `SELECT REPLACE(file_path, char(92), '/') FROM downloads WHERE file_path IS NOT NULL AND file_path<>''`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	live := map[string]bool{}
+	for rows.Next() {
+		var path string
+		if err = rows.Scan(&path); err != nil {
 			return err
 		}
-		snapshots := []Object{}
-		for _, o := range objects {
-			if strings.Count(o.Path, "/") == 1 && snapshotName.MatchString(strings.TrimPrefix(o.Path, "snapshots/")) {
-				snapshots = append(snapshots, o)
-			}
+		live[path] = true
+	}
+	if err = rows.Err(); err != nil {
+		return err
+	}
+	for _, object := range objects {
+		path := filepath.ToSlash(object.Path)
+		if path == "snapshots" || strings.HasPrefix(path, "snapshots/") {
+			continue
 		}
-		sort.Slice(snapshots, func(i, j int) bool { return snapshots[i].Path > snapshots[j].Path })
-		var bytes int64
-		kept, pruned, failures := 0, 0, 0
-		for i, o := range snapshots {
-			if i >= max(1, d.Retain) {
-				if e := p.Delete(ctx, o.Path); e == nil {
-					pruned++
-					continue
-				}
-				failures++
-			}
-			kept++
-			bytes += o.Size
+		if live[path] {
+			continue
 		}
-		if _, err = m.opts.Writer.ExecContext(ctx, `UPDATE backup_destinations SET total_bytes=?,total_files=? WHERE id=?`, bytes, kept, d.ID); err != nil {
-			m.Log("warn", fmt.Sprintf("retention statistics: %v", err))
+		if err = p.Delete(ctx, object.Path); err != nil {
+			m.Log("warn", fmt.Sprintf("mirror orphan delete %s on #%d: %v", path, d.ID, err))
+		}
+	}
+	return nil
+}
+
+func listBackupTree(ctx context.Context, p Provider) ([]Object, error) {
+	if _, ok := p.(*localProvider); ok {
+		return p.List(ctx, ".")
+	}
+	return p.List(ctx, "")
+}
+
+func (m *Manager) retention(ctx context.Context, d destination, j job, p Provider) error {
+	if d.Mode == "snapshot" || d.Mode == "manual" {
+		if err := m.pruneRemoteSnapshots(ctx, d, p); err != nil {
 			return err
 		}
-		msg := fmt.Sprintf("retention on #%d: listed %d, kept %d, pruned %d", d.ID, len(snapshots), kept, pruned)
-		if failures > 0 {
-			msg += fmt.Sprintf(", %d delete(s) failed", failures)
-		}
-		m.Log("info", msg)
-		if failures > 0 {
-			return fmt.Errorf("%d snapshot deletions failed", failures)
-		}
-		if fresh, e := m.load(ctx, d.ID); e == nil {
-			m.emit("backup_destination_updated", map[string]any{"destination": m.scrub(fresh)})
-		}
+	}
+	if j.ID == 0 {
+		return nil
 	}
 	if j.Snapshot.Valid && snapshotName.MatchString(filepath.Base(j.Snapshot.String)) && filepath.Dir(j.Snapshot.String) == filepath.Join(m.opts.DataDir, "backups") {
 		if err := os.Remove(j.Snapshot.String); err != nil && !errors.Is(err, fs.ErrNotExist) {
@@ -525,4 +573,48 @@ func (m *Manager) retention(ctx context.Context, d destination, j job, p Provide
 	}
 	_, err := m.opts.Writer.ExecContext(ctx, `DELETE FROM native_backup_retention WHERE job_id=?`, j.ID)
 	return err
+}
+
+func (m *Manager) pruneRemoteSnapshots(ctx context.Context, d destination, p Provider) error {
+	objects, err := p.List(ctx, "snapshots/")
+	if err != nil {
+		m.Log("warn", fmt.Sprintf("retention on #%d: %v", d.ID, err))
+		return err
+	}
+	snapshots := []Object{}
+	for _, o := range objects {
+		if strings.Count(o.Path, "/") == 1 && snapshotName.MatchString(strings.TrimPrefix(o.Path, "snapshots/")) {
+			snapshots = append(snapshots, o)
+		}
+	}
+	sort.Slice(snapshots, func(i, j int) bool { return snapshots[i].Path > snapshots[j].Path })
+	var bytes int64
+	kept, pruned, failures := 0, 0, 0
+	for i, o := range snapshots {
+		if i >= max(1, d.Retain) {
+			if e := p.Delete(ctx, o.Path); e == nil {
+				pruned++
+				continue
+			}
+			failures++
+		}
+		kept++
+		bytes += o.Size
+	}
+	if _, err = m.opts.Writer.ExecContext(ctx, `UPDATE backup_destinations SET total_bytes=?,total_files=? WHERE id=?`, bytes, kept, d.ID); err != nil {
+		m.Log("warn", fmt.Sprintf("retention statistics: %v", err))
+		return err
+	}
+	msg := fmt.Sprintf("retention on #%d: listed %d, kept %d, pruned %d", d.ID, len(snapshots), kept, pruned)
+	if failures > 0 {
+		msg += fmt.Sprintf(", %d delete(s) failed", failures)
+	}
+	m.Log("info", msg)
+	if failures > 0 {
+		return fmt.Errorf("%d snapshot deletions failed", failures)
+	}
+	if fresh, e := m.load(ctx, d.ID); e == nil {
+		m.emit("backup_destination_updated", map[string]any{"destination": m.scrub(fresh)})
+	}
+	return nil
 }

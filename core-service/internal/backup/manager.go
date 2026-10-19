@@ -111,8 +111,12 @@ func NewManager(ctx context.Context, opts Options) (*Manager, error) {
 			m.start(d.ID)
 		}
 	}
-	m.wg.Add(1 + cleanupWorkers)
+	m.wg.Add(2 + cleanupWorkers)
 	go m.schedule()
+	go func() {
+		defer m.wg.Done()
+		m.reconcileRetention(m.ctx)
+	}()
 	for range cleanupWorkers {
 		go m.cleanupTransfers()
 	}
@@ -310,6 +314,9 @@ func (m *Manager) Create(ctx context.Context, input map[string]any) (map[string]
 		mode = "mirror"
 	}
 	cron := text(input["cron"])
+	if mode != "snapshot" {
+		cron = ""
+	}
 	if mode == "snapshot" && cron == "" {
 		return nil, errors.New("snapshot mode requires a cron expression")
 	}
@@ -426,6 +433,9 @@ func (m *Manager) Update(ctx context.Context, id int64, patch map[string]any) (m
 	}
 	if v, ok := patch["cron"]; ok {
 		d.Cron = sql.NullString{String: text(v), Valid: text(v) != ""}
+	}
+	if d.Mode != "snapshot" {
+		d.Cron = sql.NullString{}
 	}
 	if d.Mode == "snapshot" && !d.Cron.Valid {
 		return nil, errors.New("snapshot mode requires a cron expression")

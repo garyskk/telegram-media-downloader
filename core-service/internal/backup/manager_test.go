@@ -621,3 +621,50 @@ func TestSnapshotRetentionOutboxResumesAfterRestart(t *testing.T) {
 		t.Fatalf("retained snapshot lost: %v", err)
 	}
 }
+
+func TestMirrorDropsCronAndDeletesRemoteOrphans(t *testing.T) {
+	m, db, dir := fixtureManager(t, nil)
+	target := filepath.Join(dir, "target")
+	if err := os.MkdirAll(filepath.Join(target, "snapshots"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"keep.bin", "orphan.bin", "snapshots/snapshot-20260101-000000.tar.gz"} {
+		if err := os.WriteFile(filepath.Join(target, name), []byte("x"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	created, err := m.Create(context.Background(), map[string]any{
+		"name": "mirror", "provider": "local", "mode": "mirror", "cron": "* * * * *",
+		"config": map[string]any{"rootPath": target},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created["cron"] != nil {
+		t.Fatalf("mirror stored cron %#v", created["cron"])
+	}
+	addSource(t, db, dir, "keep.bin", "live", 1)
+	id := created["id"].(int64)
+	if _, err = m.Update(context.Background(), id, map[string]any{"mode": "manual", "cron": "0 * * * *"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = m.Update(context.Background(), id, map[string]any{"mode": "mirror"}); err != nil {
+		t.Fatal(err)
+	}
+	var cron sql.NullString
+	if err = db.Reader.QueryRow(`SELECT cron FROM backup_destinations WHERE id=?`, id).Scan(&cron); err != nil || cron.Valid {
+		t.Fatalf("cron after mode change: %+v %v", cron, err)
+	}
+	if err = m.Run(context.Background(), id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = os.Stat(filepath.Join(target, "orphan.bin")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("orphan remains: %v", err)
+	}
+	if _, err = os.Stat(filepath.Join(target, "keep.bin")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = os.Stat(filepath.Join(target, "snapshots/snapshot-20260101-000000.tar.gz")); err != nil {
+		t.Fatal(err)
+	}
+}

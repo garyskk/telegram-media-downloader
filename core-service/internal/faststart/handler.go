@@ -5,6 +5,7 @@
 package faststart
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -152,28 +153,29 @@ func optimize(ctx context.Context, path, ffmpeg string) (response, error) {
 	if err != nil {
 		return response{}, err
 	}
-	if atom == "moov" {
-		return response{Status: "already"}, nil
-	}
 	if atom == "" {
 		return response{}, errors.New("ffmpeg: input is not a valid MP4 container")
 	}
+	retag, extract := SafariHevcRewrite(path)
+	if PlaybackReady(path) {
+		return response{Status: "already"}, nil
+	}
+	fragmented := hasTopLevelBox(path, "moof")
 
 	tmp := path + ".faststart.tmp"
 	_ = os.Remove(tmp)
-	args := func(dropData bool) []string {
-		out := []string{"-hide_banner", "-loglevel", "error", "-i", path, "-c", "copy", "-map", "0"}
-		if dropData {
-			out = append(out, "-map", "-0:d")
+	run := func(dropData bool) error {
+		if extract {
+			return remuxHevcExtract(ctx, path, tmp, ffmpeg, dropData)
 		}
-		return append(out, "-movflags", "+faststart", "-f", "mp4", "-y", tmp)
+		return runFFmpeg(ctx, streamCopyArgs(path, dropData, mp4Tail(tmp, retag)), ffmpeg)
 	}
-	if err := runFFmpeg(ctx, args(false), ffmpeg); err != nil {
+	if err := run(false); err != nil {
 		if !strings.Contains(err.Error(), dataTrackError) {
 			_ = os.Remove(tmp)
 			return response{}, err
 		}
-		if err = runFFmpeg(ctx, args(true), ffmpeg); err != nil {
+		if err = run(true); err != nil {
 			_ = os.Remove(tmp)
 			return response{}, err
 		}
@@ -191,11 +193,38 @@ func optimize(ctx context.Context, path, ffmpeg string) (response, error) {
 		_ = os.Remove(tmp)
 		return response{}, fmt.Errorf("ffmpeg: output size sanity check failed: src=%d tmp=%d", srcStat.Size(), tmpStat.Size())
 	}
+	if extract && !hevcExtractVerified(tmp) {
+		_ = os.Remove(tmp)
+		return response{}, errors.New("ffmpeg: HEVC remux did not produce hvc1 with VPS/SPS/PPS")
+	}
+	if fragmented && !progressiveLayout(tmp) {
+		_ = os.Remove(tmp)
+		return response{}, errors.New("ffmpeg: remux left movie fragments in place")
+	}
 	if err := renameWithRetry(ctx, tmp, path); err != nil {
 		_ = os.Remove(tmp)
 		return response{}, err
 	}
 	return response{Status: "optimized", NewSize: tmpStat.Size()}, nil
+}
+
+// PlaybackReady reports an MP4 the HTML5 player can use as-is. The moov
+// atom is already second, there is no movie fragment, and Safari does not
+// need an HEVC sample-entry rewrite. A fragmented file still starts with
+// moov, but that moov has an empty sample table and the samples live in
+// moof/mdat pairs. iOS Safari reports MEDIA_ERR_DECODE for that layout, so
+// it is not faststart.
+func PlaybackReady(path string) bool {
+	if !progressiveLayout(path) {
+		return false
+	}
+	retag, extract := SafariHevcRewrite(path)
+	return !retag && !extract
+}
+
+func progressiveLayout(path string) bool {
+	atom, err := secondAtom(path)
+	return err == nil && atom == "moov" && !hasTopLevelBox(path, "moof")
 }
 
 func secondAtom(path string) (string, error) {
@@ -226,7 +255,102 @@ func secondAtom(path string) (string, error) {
 	return string(head[sz+4 : sz+8]), nil
 }
 
-func runFFmpeg(ctx context.Context, args []string, requested string) error {
+// hevcInBandBSF copies in-band VPS/SPS/PPS into container extradata.
+// extract_extradata on ffmpeg 5.1 only sees Annex B start codes, so the
+// length-prefixed MP4 samples have to be converted first. -tag:v hvc1 then
+// makes the muxer write those sets into hvcC.
+const hevcInBandBSF = "hevc_mp4toannexb,extract_extradata"
+
+func streamCopyArgs(input string, dropData bool, extra []string) []string {
+	out := []string{"-hide_banner", "-loglevel", "error", "-i", input, "-c", "copy", "-map", "0"}
+	if dropData {
+		out = append(out, "-map", "-0:d")
+	}
+	return append(out, extra...)
+}
+
+func mp4Tail(output string, retag bool) []string {
+	tail := make([]string, 0, 8)
+	if retag {
+		tail = append(tail, "-tag:v", "hvc1")
+	}
+	return append(tail, "-movflags", "+faststart", "-f", "mp4", "-y", output)
+}
+
+func remuxHevcExtract(ctx context.Context, path, tmp, requested string, dropData bool) error {
+	bin, err := ffmpegBin(requested)
+	if err != nil {
+		return err
+	}
+	has, err := ffmpegHasExtractExtradata(ctx, bin)
+	if err != nil {
+		return err
+	}
+	if has {
+		extra := append([]string{"-bsf:v", hevcInBandBSF}, mp4Tail(tmp, true)...)
+		return runFFmpeg(ctx, streamCopyArgs(path, dropData, extra), requested)
+	}
+	return remuxHevcAnnexB(ctx, path, tmp, requested, dropData)
+}
+
+func remuxHevcAnnexB(ctx context.Context, path, tmp, requested string, dropData bool) error {
+	mid := path + ".faststart.annexb.ts"
+	defer os.Remove(mid)
+	step1 := streamCopyArgs(path, dropData, []string{"-bsf:v", "hevc_mp4toannexb", "-f", "mpegts", "-y", mid})
+	if err := runFFmpeg(ctx, step1, requested); err != nil {
+		return err
+	}
+	return runFFmpeg(ctx, streamCopyArgs(mid, dropData, mp4Tail(tmp, true)), requested)
+}
+
+var (
+	bsfMu    sync.Mutex
+	bsfKnown = map[string]bool{}
+)
+
+func ffmpegHasExtractExtradata(ctx context.Context, bin string) (bool, error) {
+	bsfMu.Lock()
+	if v, ok := bsfKnown[bin]; ok {
+		bsfMu.Unlock()
+		return v, nil
+	}
+	bsfMu.Unlock()
+	has, err := probeBSF(ctx, bin, "extract_extradata")
+	if err != nil {
+		return false, err
+	}
+	bsfMu.Lock()
+	bsfKnown[bin] = has
+	bsfMu.Unlock()
+	return has, nil
+}
+
+func probeBSF(ctx context.Context, bin, name string) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	cmd := exec.CommandContext(ctx, bin, "-hide_banner", "-h", "bsf="+name)
+	var buf bytes.Buffer
+	cmd.Stdout = &buf
+	cmd.Stderr = &buf
+	err := cmd.Run()
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return false, ctxErr
+	}
+	text := buf.String()
+	if strings.Contains(text, "Unknown bit stream filter") {
+		return false, nil
+	}
+	if strings.Contains(text, "Bit stream filter "+name) {
+		return true, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("ffmpeg: %s", err.Error())
+	}
+	return false, nil
+}
+
+func ffmpegBin(requested string) (string, error) {
 	bin := strings.TrimSpace(requested)
 	if bin == "" {
 		bin = strings.TrimSpace(os.Getenv("FFMPEG_PATH"))
@@ -235,8 +359,16 @@ func runFFmpeg(ctx context.Context, args []string, requested string) error {
 		var err error
 		bin, err = exec.LookPath("ffmpeg")
 		if err != nil {
-			return fmt.Errorf("ffmpeg: executable not found")
+			return "", fmt.Errorf("ffmpeg: executable not found")
 		}
+	}
+	return bin, nil
+}
+
+func runFFmpeg(ctx context.Context, args []string, requested string) error {
+	bin, err := ffmpegBin(requested)
+	if err != nil {
+		return err
 	}
 	cmd := exec.CommandContext(ctx, bin, args...)
 	var stderr limitedBuffer

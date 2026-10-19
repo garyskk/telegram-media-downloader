@@ -27,6 +27,8 @@ func registerGalleryRoutes(mux *http.ServeMux, a *App) {
 	mux.Handle("GET /api/downloads", guard(http.HandlerFunc(a.handleAPIDownloads)))
 	mux.Handle("GET /api/downloads/all", guard(http.HandlerFunc(a.handleAPIDownloadsAll)))
 	mux.Handle("GET /api/downloads/search", guard(http.HandlerFunc(a.handleAPIDownloadsSearch)))
+	mux.Handle("GET /api/downloads/ids", guard(http.HandlerFunc(a.handleAPIDownloadIDs)))
+	mux.Handle("POST /api/downloads/by-ids", guard(http.HandlerFunc(a.handleAPIDownloadsByIDs)))
 	mux.Handle("GET /api/downloads/{id}", guard(http.HandlerFunc(a.handleAPIDownloadsGroup)))
 	mux.Handle("GET /api/groups", guard(http.HandlerFunc(a.handleAPIGroups)))
 	mux.Handle("GET /api/groups/{id}/stats", guard(http.HandlerFunc(a.handleAPIGroupStats)))
