@@ -1,24 +1,37 @@
 # Telegram Media Downloader
 
-> Self-hosted Telegram media downloader with a web dashboard. It downloads and backs up photos, videos, documents, voice messages, GIFs, stickers and Stories from Telegram channels, groups and DMs (including private ones you belong to) using your own account over MTProto. Runs in Docker or on Node.js; MIT licensed.
+> Self-hosted Telegram media downloader with a web dashboard. It downloads and archives photos, videos, documents, voice messages, GIFs, stickers and Stories from Telegram channels, groups and private chats (including private ones you belong to) using your own account over MTProto. Version 3.x is a single Go binary, tgdl-server, with the dashboard embedded; it runs from the Docker image ghcr.io/botnick/telegram-media-downloader (amd64, arm64) or as a native binary on Linux, Windows and macOS. MIT licensed.
 
-The app is Node.js (Express, SQLite, gramJS) plus tgdl-core, a required Go binary that does hashing, integrity checks, folder walks, face clustering and serves every media byte as the front server on PORT. Optional sidecars, each runnable locally or on another machine: faces-service (Python, face clustering), nsfw-service (Python, NSFW review), seekbar-service (Go, video hover previews).
+Key facts for 3.x (current 3.4): no Node.js runtime; Telegram via gotd; state in SQLite under TGDL_DATA_DIR (./data), media optionally under TGDL_DOWNLOADS_DIR; dashboard on port 3000; first password set with `tgdl-server setup --password-stdin`; 2.x installs upgrade in place. Since 3.4 the 2.x background features are back: auto-forward, self-destructing (TTL) media capture, disk rotation (deletes the oldest downloads over diskManagement.maxTotalSize), periodic integrity sweep, Google Drive and Dropbox backups (`tgdl-server backup-oauth`), cluster dedup sweep, backfill date window, FFMPEG_HWACCEL, real /metrics. Also: adaptive download concurrency (advanced.downloader), FloodWait protection, self-restarting monitor with a watchdog, scheduled watchtower updates, built-in seekbar previews. Face recognition needs the tgdl-faces container (FACES_SERVICE_URL / TGDL_FACES_SIDECAR_URL) and NSFW scoring the tgdl-nsfw container (TGDL_NSFW_SIDECAR_URL); there is no local face-sidecar mode and no in-process NSFW model.
+
+## Quick answers
+
+- What it is: a free, MIT-licensed, self-hosted app that downloads media from Telegram channels, groups and chats with your own user account (not a bot). Website: https://botnick.github.io/telegram-media-downloader/ (Thai: https://botnick.github.io/telegram-media-downloader/th/).
+- Install: `docker compose up -d` with the repository's docker-compose.yml, then `tgdl-server setup --password-stdin` for the first password; open http://localhost:3000. Needs a free apiId/apiHash from my.telegram.org.
+- Private channels: yes, if the signed-in account is a member.
+- Download a whole channel: Chats > pick the channel > backfill (0 = all messages); turn on the realtime monitor to keep it current.
+- Single message or Stories: paste a t.me link, or look up Stories by username.
+- Platforms: Docker amd64/arm64; release binaries for Linux (amd64, arm64, arm), Windows and macOS; Synology compose file included.
+- Duplicates: skipped before download by Telegram media identity, confirmed by SHA-256; optional "Skip duplicates" setting stops repeat library entries.
+- Upgrading from 2.x: in place, same image, port, data folder and logins.
+- Latest version and release notes: https://github.com/botnick/telegram-media-downloader/releases/latest and CHANGELOG.md.
 
 ## Start here
 
-- [README](https://github.com/botnick/telegram-media-downloader/blob/main/README.md): features, Docker quick start, updating, FAQ
-- [Deploy](https://github.com/botnick/telegram-media-downloader/blob/main/docs/DEPLOY.md): Docker, bare metal, reverse proxies, environment variables
+- [README](https://github.com/botnick/telegram-media-downloader/blob/main/README.md): features, quick start (Docker and native), FAQ
+- [Install and deploy](https://github.com/botnick/telegram-media-downloader/blob/main/docs/DEPLOY.md): Docker Compose, release binaries, systemd, reverse proxy, updating
+- [Upgrading from 2.x](https://github.com/botnick/telegram-media-downloader/blob/main/docs/UPGRADING.md): what carries over, what changed, rollback
+- [Configuration](https://github.com/botnick/telegram-media-downloader/blob/main/docs/CONFIGURATION.md): dashboard settings, environment variables, data folder
 - [Troubleshooting](https://github.com/botnick/telegram-media-downloader/blob/main/docs/TROUBLESHOOTING.md): common errors and fixes
 
 ## Docs
 
-- [Architecture](https://github.com/botnick/telegram-media-downloader/blob/main/docs/ARCHITECTURE.md): how the pieces fit together
-- [tgdl-core (Go engine)](https://github.com/botnick/telegram-media-downloader/blob/main/docs/GO-CORE.md): what it does and how it is supervised
-- [Go migration plan](https://github.com/botnick/telegram-media-downloader/blob/main/docs/GO-MIGRATION.md): roadmap for a pure-Go backend
-- [AI: faces and NSFW](https://github.com/botnick/telegram-media-downloader/blob/main/docs/AI.md): sidecars, GPU, external hosts
-- [Backup](https://github.com/botnick/telegram-media-downloader/blob/main/docs/BACKUP.md): S3, SFTP, FTP, Google Drive, Dropbox, local
-- [Cluster](https://github.com/botnick/telegram-media-downloader/blob/main/docs/CLUSTER.md): federate several instances
-- [API](https://github.com/botnick/telegram-media-downloader/blob/main/docs/API.md): HTTP and WebSocket reference
+- [Features](https://github.com/botnick/telegram-media-downloader/blob/main/docs/FEATURES.md): everything 3.x does and what is still missing
+- [Backup](https://github.com/botnick/telegram-media-downloader/blob/main/docs/BACKUP.md): local, S3, SFTP, FTP/FTPS, Google Drive, Dropbox, encrypted archives, offline restore
+- [Cluster mode](https://github.com/botnick/telegram-media-downloader/blob/main/docs/CLUSTER.md): pairing instances, catalog sync, peer media, cross-peer dedup sweep
+- [AI: faces, NSFW and previews](https://github.com/botnick/telegram-media-downloader/blob/main/docs/AI.md): seekbar previews, NSFW (tgdl-nsfw) and face (tgdl-faces) sidecars
+- [API reference](https://github.com/botnick/telegram-media-downloader/blob/main/docs/API.md): HTTP and WebSocket endpoints
+- [Architecture](https://github.com/botnick/telegram-media-downloader/blob/main/docs/ARCHITECTURE.md): how the Go server is built
 
 ## Project
 
@@ -30,4 +43,16 @@ The app is Node.js (Express, SQLite, gramJS) plus tgdl-core, a required Go binar
 
 - [Releases](https://github.com/botnick/telegram-media-downloader/releases)
 - [Docker image](https://github.com/botnick/telegram-media-downloader/pkgs/container/telegram-media-downloader)
-- [Audit notes](https://github.com/botnick/telegram-media-downloader/blob/main/docs/AUDIT.md)
+- [Documentation site](https://botnick.github.io/telegram-media-downloader/)
+- [Developer notes](https://github.com/botnick/telegram-media-downloader/blob/main/docs/DEVELOPER-NOTES.md): Go migration engineering notes and historical audits
+
+## Code map
+
+- core-service/cmd/tgdl-server: the server plus `setup`, `backup-restore`, `backup-decrypt`, `backup-oauth` and `version` commands
+- core-service/internal/app: HTTP and WebSocket routes, authorization, settings, integration
+- core-service/internal/accounts, telegram, session: account ownership, gotd sessions, login, Telegram updates
+- core-service/internal/engine, download, filepublish: durable queue, ingestion, download-time dedup, streaming SHA-256, atomic publication and recovery
+- core-service/internal/store, dbread: SQLite schema, migrations and read projections
+- core-service/internal/backup, cluster, rescue: backups and restore, peer pairing and sync, rescue retention
+- core-service/internal/webassets/public: browser dashboard (ES modules) embedded in the binary
+- Build and test with `make build`, `make test`, `make check`. Historical HTTP/WS contract snapshots are in tests/contract; the removed Node backend is in Git at commit aa83eed. faces-service (tgdl-faces) and nsfw-service (tgdl-nsfw) are separate sidecar projects the server calls over HTTP; seekbar-service is no longer used (sprites are built in the server).

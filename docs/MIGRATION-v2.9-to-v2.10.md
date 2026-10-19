@@ -1,7 +1,10 @@
 ---
-title: "Migrating v2.9 to v2.10"
-description: "How to re-pair cluster peers when upgrading from v2.9 to v2.10."
-nav_order: 12
+title: "Cluster v2.9 to v2.10"
+description: "How to re-pair cluster peers when upgrading from v2.9 to v2.10 (per-peer secrets replaced the shared token)."
+parent: "Developer notes"
+nav_order: 19
+sitemap: false
+noindex: true
 ---
 
 # Migrating cluster pairings from v2.9 to v2.10

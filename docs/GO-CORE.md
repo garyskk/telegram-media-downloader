@@ -1,10 +1,15 @@
 ---
-title: "tgdl-core (Go engine)"
-description: "What tgdl-core does, how it is installed and supervised, and how it serves media as the front server."
-nav_order: 9
+title: "tgdl-core (2.x companion)"
+description: "The tgdl-core Go helper used by the 2.x Node app for hashing, walks and media serving; replaced by tgdl-server in 3.0."
+parent: "Developer notes"
+nav_order: 4
+sitemap: false
+noindex: true
 ---
 
 # Go core (`tgdl-core`)
+
+> **Historical note.** This describes `tgdl-core`, the Go helper that the 2.x Node.js app started next to itself. 3.0 replaced both with the single `tgdl-server` binary and no longer builds or ships `tgdl-core`. See [Architecture](ARCHITECTURE.md).
 
 `tgdl-core` (source: [`core-service/`](https://github.com/botnick/telegram-media-downloader/blob/main/core-service/README.md)) is the
 app's Go engine. The Node app starts it, talks to it over HTTP on
@@ -17,9 +22,51 @@ Node's single thread:
 | `fs.stat` of many files | Verify files, the boot and hourly integrity sweep | `POST /v1/fs/stat-batch` |
 | recursive `fs.readdir` + `fs.stat` | Re-index from disk, the disk-usage figure while the library is empty | `POST /v1/fs/walk` |
 | DBSCAN over face embeddings | face scan, Re-cluster | `POST /v1/dbscan` |
+| STORE-mode bulk ZIP streaming | bulk downloads | `POST /v1/zip` (optional feature) |
+| MP4 faststart remux | automatic video optimization and maintenance sweep | `POST /v1/faststart` (optional feature) |
+| Media thumbnail decode/scale/WebP encode | gallery and thumbnail maintenance jobs | `POST /v1/thumb/{video,image,audio}` (optional feature) |
+| Video seekbar sprite decode/scale/tile/encode | seekbar maintenance and auto-generation | `POST /v1/seekbar` (optional feature) |
+| Read-only group aggregate projection | `/api/groups` and `/api/downloads` sidebar reads | `POST /v1/db/group-aggregates` (optional feature) |
+| Read-only library totals | `/api/stats` database totals | `POST /v1/db/stats` (optional feature) |
+| Read-only group data | `/api/groups/:id/stats` and `/api/groups/:id/files` | `POST /v1/db/group-stats`, `/v1/db/group-files` (optional feature) |
+| Group cleanup id queue | `/api/groups/:id/purge` and `/api/groups/:id/delete-files` | `POST /v1/db/group-download-ids` (optional feature) |
+| Read-only local gallery | `/api/downloads/all` with `include=local` | `POST /v1/db/downloads/all` (optional feature) |
+| Read-only group gallery | `/api/downloads/:groupId` with `include=local` | `POST /v1/db/downloads/group` (optional feature) |
+| Bulk download row projection | bulk delete and bulk ZIP row reads | `POST /v1/db/downloads/by-ids` (optional feature) |
+| Read-only local search | `/api/downloads/search` with `include=local` | `POST /v1/db/downloads/search` (optional feature) |
+| Read-only share-link list | `/api/share/links` | `POST /v1/db/share-links` (optional feature) |
+| Read-only update history | `/api/update/history` | `POST /v1/db/update-history` (optional feature) |
+| Read-only NSFW tier counters | `/api/maintenance/nsfw/v2/tiers` | `POST /v1/db/nsfw-tiers` (optional feature) |
+| Read-only NSFW histogram | `/api/maintenance/nsfw/v2/histogram` | `POST /v1/db/nsfw-histogram` (optional feature) |
+| Read-only NSFW review list | `/api/maintenance/nsfw/v2/list` | `POST /v1/db/nsfw-list` (optional feature) |
+| NSFW scan queue | NSFW maintenance scanner's unscanned rows | `POST /v1/db/nsfw-candidates` (optional feature) |
+| Read-only people list | `/api/ai/people` with local scope | `POST /v1/db/people` (optional feature) |
+| Read-only thumbnail maintenance catalog | `/api/maintenance/thumbs/list` | `POST /v1/db/thumbs-list` (optional feature) |
+| Read-only seekbar sprite catalog | `/api/maintenance/seekbar/list` | `POST /v1/db/seekbar-list` (optional feature) |
+| Read-only face boxes | `/api/ai/faces/by-download/:id` | `POST /v1/db/faces-by-download` (optional feature) |
+| Read-only people grouping | `/api/ai/group-by-person` | `POST /v1/db/person-groups` (optional feature) |
+| Read-only person gallery | `/api/ai/people/:id/photos` | `POST /v1/db/person-photos` (optional feature) |
+| AI maintenance counters | `/api/ai/status` counts | `POST /v1/db/ai-counts` (optional feature) |
+| AI indexing queue | face scan and AI auto-scan unindexed rows | `POST /v1/db/ai-candidates` (optional feature) |
+| Seekbar build queue | seekbar maintenance sweep's missing-video page | `POST /v1/db/seekbar-candidates` (optional feature) |
+| Faststart build queue | video optimization maintenance sweep's catalog page/count | `POST /v1/db/faststart-candidates`, `POST /v1/db/faststart-stats` (optional feature) |
+| Disk quota rotator | oldest unpinned rows for quota cleanup | `POST /v1/db/disk-rotator-candidates` (optional feature) |
+| Face clustering input | keyset-paged face embeddings and quality weights | `POST /v1/db/face-embeddings` (optional feature) |
+| Integrity sweep queue | boot/hourly file verification catalog page | `POST /v1/db/integrity-candidates` (optional feature) |
+| Dedup hash queue | maintenance hash catch-up page | `POST /v1/db/dedup-candidates` (optional feature) |
+| Dedup hash groups | maintenance duplicate grouping page | `POST /v1/db/dedup-groups`, `/v1/db/dedup-files` (optional feature) |
+| Recovery group counters | `/api/maintenance/recovery/list` grouped DB stats | `POST /v1/db/recovery-stats` (optional feature) |
+| Cluster catalog delta | `/api/cluster/downloads/since` local rows | `POST /v1/db/cluster-downloads-since` (optional feature) |
+| Cluster catalog page | `/api/cluster/downloads` local rows | `POST /v1/db/cluster-downloads` (optional feature) |
+| Cluster catalog search | `/api/cluster/search` and `/api/cluster/search/peer` local rows | `POST /v1/db/cluster-search` (optional feature) |
+| Telegram media identity lookup | downloader pre-download dedup candidate rows | `POST /v1/db/telegram-media-candidates` (optional feature) |
+| Content hash lookup | downloader post-write dedup candidate | `POST /v1/db/file-hash-candidates` (optional feature) |
+| Filename/size lookup | downloader legacy dedup candidate | `POST /v1/db/file-name-candidates` (optional feature) |
 | the dashboard port | every `/files` and `/photos` byte and cached thumbnails served from Go; everything else proxied to Node | `tgdl-core front` ([below](#front-server-tgdl-core-front)) |
 
-It is the **only** implementation of these. The Node code it replaced (the
+For the required features it is the **only** implementation. Optional
+features are used when advertised and retain a compatibility path during
+upgrades. The Node code it replaced (the
 hash worker pool, the `Promise.all(fs.stat)` sweep, the recursive folder
 walks, the DBSCAN worker) is removed; Node keeps thin client calls.
 
@@ -41,14 +88,15 @@ walks, the DBSCAN worker) is removed; Node keeps thin client calls.
    code path and error table, not Go's `os.Stat` (which, for example,
    reports an offline network share as "does not exist" where Node says
    `UNKNOWN`).
-4. **Only the app's media folders.** The app passes its download folders
-   as `TGDL_CORE_ALLOW_ROOTS`; a path outside them (as written or after
-   resolving links) gets `EOUTSIDE` and Node answers that one path with
-   plain `fs` — so the result is still exactly what `fs` says. That is a
-   link inside a download folder pointing elsewhere (a folder on another
-   disk, `/dev/null`, …); a dangling one is `ENOENT` either way, and the
-   integrity sweep never sees `EOUTSIDE` (it prunes only on `ENOENT` /
-   `ENOTDIR`). No roots = nothing is read.
+4. **Only the app's media folders.** The app passes its download folders and
+   thumbnail and seekbar caches as `TGDL_CORE_ALLOW_ROOTS`; a path outside them (as written
+   or after resolving links) gets `EOUTSIDE` and Node answers that one path
+   with plain `fs` — so the result is still exactly what `fs` says. The Go
+   thumbnail route may write only its requested temporary output beneath the
+   thumbnail root. That is a link inside a media folder pointing elsewhere (a
+   folder on another disk, `/dev/null`, …); a dangling one is `ENOENT` either
+   way, and the integrity sweep never sees `EOUTSIDE` (it prunes only on
+   `ENOENT` / `ENOTDIR`). No roots = nothing is read or written.
 5. **Can't outlive the app.** It exits when its stdin pipe closes, binds
    `127.0.0.1` only (the front server also binds the app's `PORT`), and
    needs a per-spawn token for everything but `/health`.
@@ -72,7 +120,7 @@ walks, the DBSCAN worker) is removed; Node keeps thin client calls.
 
 Lookup order, env overrides (`TGDL_CORE_BIN`, `TGDL_CORE_RELEASE_URL`,
 `TGDL_CORE_ALLOW_ROOTS`, `TGDL_CORE_SKIP_INSTALL`): see
-[core-service/README.md](https://github.com/botnick/telegram-media-downloader/blob/main/core-service/README.md#how-the-app-finds-it).
+[core-service/README.md in v2.32.1](https://github.com/botnick/telegram-media-downloader/blob/v2.32.1/core-service/README.md#how-the-app-finds-it).
 
 ## When it can't run
 
@@ -111,11 +159,12 @@ the log if set).
   `downloading`, `binary_missing`, `unsupported`, `exited`, `unhealthy`,
   `stopped`), `problem` (`{message, fix}` or null), `version` /
   `expectedVersion`, `platform`, `binary` (path + source), `allowRoots`,
-  `restarts`, `features.<hash|stat|walk|dbscan>.available`.
+  `restarts`, `features.<hash|stat|walk|dbscan>.available`; optional
+  features are negotiated directly by their callers.
 - `GET /api/monitor/status` → `core`: `{state, fix}` while someone needs to
   act (drives the banner; no local paths).
 - `/metrics`: `tgdl_gocore_calls_total{feature,result}` — `feature` is
-  `hash` / `stat` / `walk` / `dbscan`, `result` is `ok`, `file_error`,
+  `hash` / `stat` / `walk` / `dbscan` / `zip` / `faststart` / `thumb` / `seekbar` / `db`, `result` is `ok`, `file_error`,
   `outside`, `timeout` or `error`.
 
 ## Parity
@@ -159,7 +208,9 @@ NTFS on NVMe, warm cache, Node 22. Every pair produced identical results.
   reason. On a cold cache, a spinning disk or a network share, where each
   stat waits on the disk, its 16 parallel stats (libuv: 4) are the
   difference.
-- DBSCAN uses every core but one; the result doesn't depend on how many.
+- DBSCAN defaults to at most 8 workers so a face scan leaves CPU for the
+  Telegram engine and dashboard; `TGDL_DBSCAN_WORKERS` tunes it explicitly.
+  The result doesn't depend on how many workers are used.
 - tgdl-core's working set: 8 MB idle, ~20 MB for the 50 000-file stat
   sweep and walks, 34 MB for DBSCAN 5 000 × 512, 75 MB for 20 000 × 512
   (it holds the 40 MB of embeddings).

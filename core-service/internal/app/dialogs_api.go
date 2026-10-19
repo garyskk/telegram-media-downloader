@@ -1,0 +1,258 @@
+package app
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/botnick/telegram-media-downloader/core-service/internal/auth"
+	"github.com/botnick/telegram-media-downloader/core-service/internal/engine"
+	"github.com/botnick/telegram-media-downloader/core-service/internal/telegram"
+)
+
+func registerDialogRoutes(mux *http.ServeMux, a *App) {
+	mux.Handle("GET /api/dialogs", a.requireSession(http.HandlerFunc(a.handleDialogs)))
+}
+
+func (a *App) handleDialogs(w http.ResponseWriter, r *http.Request) {
+	dialogs, err := a.browseDialogs(r.Context())
+	if err != nil {
+		if a.output != nil {
+			fmt.Fprintf(a.output, "Telegram dialogs unavailable: %v\n", err)
+		}
+		saved, savedErr := telegram.SavedSessions(a.dataDir)
+		if errors.Is(err, errNoAccounts) || (savedErr == nil && len(saved) == 0) {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "no_account", "message": "No Telegram account configured"})
+		} else if errors.Is(err, errNoAPICredentials) {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "no_api_credentials", "message": "Configure Telegram API credentials in Settings first"})
+		} else if errors.Is(err, engine.ErrEngineNotRunning) {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "not_connected", "message": "Telegram client not connected"})
+		} else {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "dialogs_unavailable", "message": "Could not read Telegram chats. Check the account connection and try again."})
+		}
+		return
+	}
+	accessByID := a.loadDialogAccess(r)
+	cfg, err := a.config.Load(r.Context())
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	groups, _ := cfg["groups"].([]any)
+	groupByID := map[string]map[string]any{}
+	for _, raw := range groups {
+		if group, ok := raw.(map[string]any); ok {
+			groupByID[toString(group["id"])] = group
+		}
+	}
+	allowDM := false
+	if value, ok := cfg["allowDmDownloads"].(bool); ok {
+		allowDM = value
+	}
+	result := make([]map[string]any, 0, len(dialogs))
+	for _, dialog := range dialogs {
+		dmDisabled := (dialog.Type == "user" || dialog.Type == "bot") && !allowDM
+		if dmDisabled && !blockingChatState(dialog.Access.State) {
+			continue
+		}
+		group := groupByID[dialog.ID]
+		filters := map[string]any{"photos": true, "videos": true, "files": true, "links": true, "voice": false, "gifs": false, "stickers": false}
+		if configured, ok := group["filters"].(map[string]any); ok {
+			for key, value := range configured {
+				filters[key] = value
+			}
+		}
+		autoForward := map[string]any{"enabled": false, "destination": nil, "deleteAfterForward": false}
+		if configured, ok := group["autoForward"].(map[string]any); ok {
+			for key, value := range configured {
+				autoForward[key] = value
+			}
+		}
+		var members any
+		if dialog.Members != nil {
+			members = *dialog.Members
+		}
+		access, knownAccess := accessByID[dialog.ID]
+		if !knownAccess {
+			access = legacyDialogAccess(group)
+		}
+		if dialog.Access.State != "" {
+			access = liveDialogAccess(dialog)
+		}
+		if sess, ok := auth.SessionFromContext(r.Context()); ok && sess.Role == "guest" {
+			if _, ok := access["accounts"].([]map[string]any); ok {
+				access["accounts"] = []map[string]any{}
+			}
+		}
+		result = append(result, map[string]any{
+			"id": dialog.ID, "name": dialog.Name, "type": dialog.Type, "username": dialog.Username,
+			"archived": dialog.Archived, "members": members, "enabled": group != nil && group["enabled"] == true,
+			"inConfig": group != nil, "suspended": group != nil && group["suspended"] == true,
+			"filters": filters, "autoForward": autoForward, "photoUrl": "/api/groups/" + dialog.ID + "/photo", "accountIds": dialog.AccountIDs,
+			"access": access, "dmDisabled": dmDisabled,
+		})
+	}
+	accountList := make([]map[string]any, 0)
+	accountIDs := map[string]bool{}
+	if rawAccounts, ok := cfg["accounts"].([]any); ok {
+		for _, raw := range rawAccounts {
+			if account, ok := raw.(map[string]any); ok {
+				id := toString(account["id"])
+				if id == "" || accountIDs[id] {
+					continue
+				}
+				accountIDs[id] = true
+				accountList = append(accountList, map[string]any{"id": id, "name": firstNonEmpty(toString(account["name"]), toString(account["username"]), id), "phone": toString(account["phone"]), "username": toString(account["username"])})
+			}
+		}
+	}
+	if saved, savedErr := telegram.SavedSessions(a.dataDir); savedErr == nil {
+		for _, session := range saved {
+			if session.ID == "" || accountIDs[session.ID] {
+				continue
+			}
+			accountIDs[session.ID] = true
+			accountList = append(accountList, map[string]any{"id": session.ID, "name": session.ID, "phone": "", "username": ""})
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"success": true, "dialogs": result, "allowDM": allowDM, "accounts": accountList})
+}
+
+func (a *App) browseDialogs(ctx context.Context) ([]engine.Dialog, error) {
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	// Pair startup with acquiring a run lease. Account changes, purge and the
+	// idle-job drain cannot slip between them. Release the operation lock before
+	// network reads so account removal/shutdown can cancel a slow listing.
+	a.monitorOp.Lock()
+	version := a.dialogVersion
+	observedAt := time.Now().UnixMilli()
+	var session *engine.DialogSession
+	var err error
+	user, _ := auth.SessionFromContext(ctx)
+	if user.Role == "admin" {
+		err = a.startTelegramEngine(ctx, false)
+	}
+	if err == nil {
+		session, err = a.monitor.OpenDialogs(ctx)
+	}
+	a.monitorOp.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	// Keep the connection available for subsequent browsing. Monitor stop,
+	// account changes and shutdown retain ownership of its lifetime.
+	defer session.Close()
+	// Access aggregation needs every account's full list; a UI cap could hide
+	// a readable account and incorrectly mark the chat unavailable.
+	dialogs, err := session.List(-1)
+	if err != nil {
+		return nil, err
+	}
+	a.monitorOp.Lock()
+	defer a.monitorOp.Unlock()
+	if err := session.Err(); err != nil {
+		return nil, err
+	}
+	if version != a.dialogVersion {
+		return nil, errors.New("chat list changed; refresh to load current chats")
+	}
+	if err := a.saveDialogAccess(ctx, dialogs, observedAt); err != nil {
+		return nil, err
+	}
+	return dialogs, nil
+}
+
+func (a *App) loadDialogAccess(r *http.Request) map[string]map[string]any {
+	result, _ := a.readDialogAccess(r.Context())
+	return result
+}
+
+func (a *App) readDialogAccess(ctx context.Context) (map[string]map[string]any, error) {
+	result := map[string]map[string]any{}
+	rows, err := a.db.Reader.QueryContext(ctx, `SELECT chat_id,state,code,detail,migrated_to,first_seen_at,checked_at,next_check_at,checks,accounts FROM chat_access`)
+	if err != nil {
+		return result, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id, state string
+		var code, detail, migrated, accountsJSON sql.NullString
+		var firstSeen, checked, nextCheck sql.NullInt64
+		var checks int
+		if err := rows.Scan(&id, &state, &code, &detail, &migrated, &firstSeen, &checked, &nextCheck, &checks, &accountsJSON); err != nil {
+			return result, err
+		}
+		accounts := []map[string]any{}
+		var accountMap map[string]struct {
+			State  string `json:"state"`
+			Code   string `json:"code"`
+			Detail string `json:"detail"`
+			At     int64  `json:"at"`
+		}
+		if accountsJSON.Valid && json.Unmarshal([]byte(accountsJSON.String), &accountMap) == nil {
+			for accountID, account := range accountMap {
+				if accountID == "_" {
+					continue
+				}
+				var code any
+				if account.Code != "" {
+					code = account.Code
+				}
+				accounts = append(accounts, map[string]any{"id": accountID, "state": account.State, "code": code, "detail": account.Detail, "at": account.At})
+			}
+		}
+		sort.Slice(accounts, func(i, j int) bool { return accounts[i]["id"].(string) < accounts[j]["id"].(string) })
+		access := map[string]any{"state": state, "code": dialogNullableString(code), "detail": dialogNullableString(detail), "migratedTo": dialogNullableString(migrated), "firstSeenAt": dialogNullableInt(firstSeen), "checkedAt": dialogNullableInt(checked), "nextCheckAt": dialogNullableInt(nextCheck), "checks": checks, "accounts": accounts}
+		result[id] = access
+	}
+	return result, rows.Err()
+}
+
+func legacyDialogAccess(group map[string]any) map[string]any {
+	if group == nil || (group["suspended"] != true && group["_resolveFailedAt"] == nil) {
+		return map[string]any{"state": "ok"}
+	}
+	state := "banned"
+	code := any(nil)
+	if reason := toString(group["_resolveFailedReason"]); reason != "" {
+		if index := strings.IndexByte(reason, ':'); index >= 0 && index+1 < len(reason) {
+			code = reason[index+1:]
+			if code == "USER_NOT_PARTICIPANT" {
+				state = "left"
+			} else if code == "CHANNEL_PRIVATE" {
+				state = "private"
+			}
+		}
+	}
+	return map[string]any{"state": state, "code": code, "detail": nil, "migratedTo": nil, "firstSeenAt": group["_resolveFailedAt"], "checkedAt": group["_resolveFailedAt"], "nextCheckAt": nil, "checks": 0, "accounts": []map[string]any{}, "legacy": true}
+}
+
+func dialogNullableString(value sql.NullString) any {
+	if !value.Valid || strings.TrimSpace(value.String) == "" {
+		return nil
+	}
+	return value.String
+}
+
+func dialogNullableInt(value sql.NullInt64) any {
+	if !value.Valid {
+		return nil
+	}
+	return value.Int64
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}

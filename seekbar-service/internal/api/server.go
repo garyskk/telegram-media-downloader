@@ -751,7 +751,7 @@ func (s *Server) handleDeleteSprite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	removed := 0
-	for _, ext := range []string{".webp", ".jpg", ".json", ".fp.raw"} {
+	for _, ext := range []string{".webp", ".jpg", ".json"} {
 		p := filepath.Join(s.cfg.Storage.OutputDir, id+ext)
 		if err := os.Remove(p); err == nil {
 			removed++

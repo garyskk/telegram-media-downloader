@@ -58,7 +58,7 @@ func TestHealthIsOpen(t *testing.T) {
 		t.Fatalf("unexpected body %v", body)
 	}
 	feats, _ := body["features"].([]any)
-	want := []string{"hash", "stat", "walk", "dbscan"}
+	want := []string{"hash", "hash-batch", "tar-gz", "stat", "walk", "remove-tree", "dbscan", "zip", "faststart", "thumb", "seekbar", "db"}
 	if len(feats) != len(want) {
 		t.Fatalf("features = %v", body["features"])
 	}
@@ -74,9 +74,62 @@ func TestEverythingElseNeedsToken(t *testing.T) {
 	for _, c := range []struct{ method, path, tok string }{
 		{"POST", "/v1/hash", ""},
 		{"POST", "/v1/hash", "wrong"},
+		{"POST", "/v1/hash-batch", ""},
+		{"POST", "/v1/tar-gz", ""},
 		{"POST", "/v1/fs/stat-batch", ""},
 		{"POST", "/v1/fs/walk", ""},
+		{"POST", "/v1/fs/remove-tree", ""},
 		{"POST", "/v1/dbscan", ""},
+		{"POST", "/v1/zip", ""},
+		{"POST", "/v1/faststart", ""},
+		{"POST", "/v1/thumb/video", ""},
+		{"POST", "/v1/thumb/image", ""},
+		{"POST", "/v1/thumb/audio", ""},
+		{"POST", "/v1/seekbar", ""},
+		{"POST", "/v1/db/group-aggregates", ""},
+		{"POST", "/v1/db/stats", ""},
+		{"POST", "/v1/db/group-stats", ""},
+		{"POST", "/v1/db/group-files", ""},
+		{"POST", "/v1/db/group-download-ids", ""},
+		{"POST", "/v1/db/downloads/all", ""},
+		{"POST", "/v1/db/downloads/group", ""},
+		{"POST", "/v1/db/downloads/by-ids", ""},
+		{"POST", "/v1/db/downloads/search", ""},
+		{"POST", "/v1/db/share-links", ""},
+		{"POST", "/v1/db/update-history", ""},
+		{"POST", "/v1/db/nsfw-tiers", ""},
+		{"POST", "/v1/db/nsfw-histogram", ""},
+		{"POST", "/v1/db/nsfw-list", ""},
+		{"POST", "/v1/db/nsfw-candidates", ""},
+		{"POST", "/v1/db/people", ""},
+		{"POST", "/v1/db/thumbs-list", ""},
+		{"POST", "/v1/db/seekbar-list", ""},
+		{"POST", "/v1/db/faces-by-download", ""},
+		{"POST", "/v1/db/person-groups", ""},
+		{"POST", "/v1/db/person-photos", ""},
+		{"POST", "/v1/db/face-embeddings", ""},
+		{"POST", "/v1/db/ai-counts", ""},
+		{"POST", "/v1/db/ai-candidates", ""},
+		{"POST", "/v1/db/ai-pending", ""},
+		{"POST", "/v1/db/quality-candidates", ""},
+		{"POST", "/v1/db/recovery-stats", ""},
+		{"POST", "/v1/db/cluster-downloads", ""},
+		{"POST", "/v1/db/cluster-downloads-since", ""},
+		{"POST", "/v1/db/cluster-search", ""},
+		{"POST", "/v1/db/telegram-media-candidates", ""},
+		{"POST", "/v1/db/file-hash-candidates", ""},
+		{"POST", "/v1/db/file-name-candidates", ""},
+		{"POST", "/v1/db/dedup-stats", ""},
+		{"POST", "/v1/db/seekbar-stats", ""},
+		{"POST", "/v1/db/seekbar-candidates", ""},
+		{"POST", "/v1/db/faststart-candidates", ""},
+		{"POST", "/v1/db/faststart-stats", ""},
+		{"POST", "/v1/db/disk-rotator-candidates", ""},
+		{"POST", "/v1/db/integrity-candidates", ""},
+		{"POST", "/v1/db/integrity-check", ""},
+		{"POST", "/v1/db/dedup-candidates", ""},
+		{"POST", "/v1/db/dedup-groups", ""},
+		{"POST", "/v1/db/dedup-files", ""},
 		{"GET", "/v1/stats", ""},
 		{"GET", "/nope", ""},
 		{"POST", "/health", ""},
@@ -119,6 +172,41 @@ func TestHashRoute(t *testing.T) {
 	}
 	if roots, _ := h["roots"].([]any); len(roots) != 1 {
 		t.Fatalf("stats roots = %v", h["roots"])
+	}
+}
+
+func TestHashBatchRoute(t *testing.T) {
+	dir := t.TempDir()
+	ts := newTestServer(t, dir)
+	first := filepath.Join(dir, "first.bin")
+	second := filepath.Join(dir, "second.bin")
+	if err := os.WriteFile(first, []byte("first"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(second, []byte("second"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, body := do(t, "POST", ts.URL+"/v1/hash-batch", token, map[string]any{
+		"paths": []string{first, filepath.Join(dir, "missing.bin"), second},
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d body %v", resp.StatusCode, body)
+	}
+	results, ok := body["results"].([]any)
+	if !ok || len(results) != 3 {
+		t.Fatalf("results = %v", body["results"])
+	}
+	firstResult, _ := results[0].(map[string]any)
+	missingResult, _ := results[1].(map[string]any)
+	secondResult, _ := results[2].(map[string]any)
+	if firstResult["sha256"] == "" || secondResult["sha256"] == "" || missingResult["code"] != "ENOENT" {
+		t.Fatalf("batch results = %v", results)
+	}
+
+	resp, body = do(t, "POST", ts.URL+"/v1/hash-batch", token, map[string]any{"paths": []string{}})
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("empty batch status %d body %v", resp.StatusCode, body)
 	}
 }
 

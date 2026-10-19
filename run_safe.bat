@@ -1,27 +1,5 @@
 @echo off
-title Telegram Auto-Downloader (Safe Mode)
-color 0A
-
-:start
-cls
-echo ========================================================
-echo   Telegram Auto-Downloader - Auto Restart Mode
-echo   Protecting against crashes and network failures...
-echo ========================================================
-echo.
-
-:: Run the downloader
-node src/index.js history
-
-:: Check exit code
-if %ERRORLEVEL% NEQ 0 (
-    echo.
-    echo [!] Process crashed with code %ERRORLEVEL%
-    echo [!] Restarting in 5 seconds...
-    timeout /t 5 >nul
-    goto start
-)
-
-echo.
-echo [!] Process finished normally.
-pause
+rem Native launcher (Windows). Downloads the matching tgdl-server release on
+rem first run after upgrading from 2.x; see watchdog.ps1.
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0watchdog.ps1" %*
+exit /b %ERRORLEVEL%

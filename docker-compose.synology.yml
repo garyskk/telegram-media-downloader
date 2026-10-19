@@ -1,35 +1,44 @@
+# Synology (DSM Container Manager). Adjust the /volume… path to your share.
+# /dev/dri passes the iGPU through; the entrypoint joins its group itself.
 services:
   telegram-downloader:
+    # Prebuilt multi-arch image; `pull_policy: always` makes
+    # `docker compose up -d` pick up each new release. To build from source
+    # instead, replace these two lines with `build: .`.
     image: ghcr.io/botnick/telegram-media-downloader:latest
     pull_policy: always
     container_name: telegram-downloader
     restart: unless-stopped
+    stop_grace_period: 60s
     ports:
+      # Container always listens on 3000; change the host side in .env.
       - "${TGDL_PORT:-3000}:3000"
-    entrypoint: ["/usr/bin/tini", "--", "/bin/sh", "/patch-docker-entrypoint.sh"]
-    command: ["node", "src/web/server.js"]
     volumes:
       - /volume3/Downloads/telegram-media-downloader/data:/app/data
-      - /volume3/Downloads/telegram-media-downloader/patch-docker-entrypoint.sh:/patch-docker-entrypoint.sh:ro
+      # Split-disk setup: mount the media disk and set TGDL_DOWNLOADS_DIR.
+      # - /mnt/hdd/downloads:/mnt/hdd/downloads
     devices:
       - /dev/dri:/dev/dri
     environment:
-      - NODE_ENV=production
       - TZ=${TZ:-UTC}
-      - TGDL_DEBUG=${TGDL_DEBUG:-}
+      - TGDL_DOWNLOADS_DIR=${TGDL_DOWNLOADS_DIR:-}
+      # Trust one reverse-proxy hop (Caddy / Traefik / nginx). Set to an
+      # empty value when the dashboard is exposed directly.
       - TRUST_PROXY=${TRUST_PROXY:-1}
+      - TGDL_SECURE_COOKIES=${TGDL_SECURE_COOKIES:-0}
+      # One-click "Install update" via the watchtower service below. The app
+      # generates the token in ./data/watchtower/; .env can override it.
       - WATCHTOWER_URL=${WATCHTOWER_URL:-http://watchtower:8080}
       - WATCHTOWER_HTTP_API_TOKEN=${WATCHTOWER_HTTP_API_TOKEN:-}
-      - FFMPEG_HWACCEL=${FFMPEG_HWACCEL:-vaapi}
-      - FACES_SERVICE_URL=http://tgdl-faces:8011
-      - TGDL_FACES_SIDECAR_TOKEN=${TGDL_FACES_API_TOKEN:-}
-      - TGDL_GO_CORE=${TGDL_GO_CORE:-}
-      - TGDL_GO_FEATURES=${TGDL_GO_FEATURES:-}
+      # Optional NSFW sidecar (tgdl-nsfw service below). Empty = not used.
+      - TGDL_NSFW_SIDECAR_URL=${TGDL_NSFW_SIDECAR_URL:-}
+      - TGDL_NSFW_API_TOKEN=${TGDL_NSFW_API_TOKEN:-}
     labels:
       - "com.centurylinklabs.watchtower.enable=true"
+      # The autoheal service restarts the container if it stops answering.
       - "autoheal=true"
     healthcheck:
-      test: ["CMD", "node", "scripts/healthcheck.js"]
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/health"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -47,52 +56,19 @@ services:
         max-file: "5"
         compress: "true"
 
-  tgdl-faces:
-    image: ghcr.io/botnick/tgdl-faces:latest
-    pull_policy: always
-    container_name: tgdl-faces
-    restart: unless-stopped
-    volumes:
-      - /volume3/Downloads/telegram-media-downloader/data/downloads:/app/data/downloads:ro
-      - /volume3/Downloads/telegram-media-downloader/data/faces-service/models:/root/.cache/tgdl-faces/models
-    environment:
-      - TGDL_FACES_HOST=0.0.0.0
-      - TGDL_FACES_PORT=8011
-      - TGDL_FACES_ALLOW_ROOTS=/app/data/downloads
-      - TGDL_FACES_MODELS_DIR=/root/.cache/tgdl-faces/models
-      - TGDL_FACES_THROTTLE_MS=${TGDL_FACES_THROTTLE_MS:-0}
-      - TGDL_FACES_API_TOKEN=${TGDL_FACES_API_TOKEN:-}
-      - TZ=${TZ:-UTC}
-    healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:8011/health || exit 1"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 90s
-    labels:
-      - "com.centurylinklabs.watchtower.enable=true"
-    deploy:
-      resources:
-        limits:
-          memory: ${TGDL_FACES_MEM_LIMIT:-2g}
-        reservations:
-          memory: 512m
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "5"
-
   autoheal:
-    image: willfarrell/autoheal:1.2.0
+    image: willfarrell/autoheal:latest
     container_name: telegram-downloader-autoheal
     restart: unless-stopped
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+    # Needs only the docker socket, no network.
     network_mode: none
     environment:
       - AUTOHEAL_CONTAINER_LABEL=autoheal
       - AUTOHEAL_INTERVAL=30
       - AUTOHEAL_START_PERIOD=60
-      - AUTOHEAL_DEFAULT_STOP_TIMEOUT=10
+      - AUTOHEAL_DEFAULT_STOP_TIMEOUT=60
       - TZ=${TZ:-UTC}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
@@ -102,13 +78,17 @@ services:
         max-size: "1m"
         max-file: "3"
 
-  # Idle updater for the dashboard's Install update button (API-only, no
-  # polling, no ports). nickfedor fork: the archived containrrr image fails
-  # on Docker Engine 29+ ("client version 1.25 is too old").
+  # Updater behind Settings → Maintenance → "Install update". It touches only
+  # containers with the watchtower label (all four here, itself included) and
+  # the dashboard never sees the docker socket. Automatic updates: set
+  # WATCHTOWER_HTTP_API_PERIODIC_POLLS=true in .env (schedule below, 6-field
+  # cron in the container TZ; default daily 04:00).
   watchtower:
-    image: nickfedor/watchtower:1.22
+    image: nickfedor/watchtower:latest
     container_name: telegram-downloader-updater
     restart: unless-stopped
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       # Only the generated token folder, never the DB/sessions.
@@ -118,12 +98,39 @@ services:
         condition: service_healthy
     environment:
       - WATCHTOWER_HTTP_API_ENDPOINTS=update
-      # Default = path of the token file the app generates; watchtower reads
-      # the file's contents. A token set in .env is used as-is instead.
       - WATCHTOWER_HTTP_API_TOKEN=${WATCHTOWER_HTTP_API_TOKEN:-/run/tgdl/api-token}
       - WATCHTOWER_HTTP_API_PERIODIC_POLLS=${WATCHTOWER_HTTP_API_PERIODIC_POLLS:-false}
+      - WATCHTOWER_SCHEDULE=${WATCHTOWER_SCHEDULE:-0 0 4 * * *}
       - WATCHTOWER_LABEL_ENABLE=true
       - WATCHTOWER_CLEANUP=true
       - WATCHTOWER_INCLUDE_RESTARTING=true
       - WATCHTOWER_NO_STARTUP_MESSAGE=true
       - TZ=${TZ:-UTC}
+
+  # Optional NSFW scanning (Maintenance → NSFW review). To enable it,
+  # uncomment this service and the volumes: block below, set
+  # TGDL_NSFW_SIDECAR_URL=http://tgdl-nsfw:8012 in .env, then
+  # `docker compose up -d`. The first start downloads the model (a few
+  # minutes). GPU hosts can use the :gpu-latest tag. See docs/AI.md.
+  # tgdl-nsfw:
+  #   image: ghcr.io/botnick/tgdl-nsfw:latest
+  #   container_name: telegram-downloader-nsfw
+  #   restart: unless-stopped
+  #   labels:
+  #     - "com.centurylinklabs.watchtower.enable=true"
+  #   environment:
+  #     # Same value as TGDL_NSFW_API_TOKEN above when set in .env.
+  #     - TGDL_NSFW_API_TOKEN=${TGDL_NSFW_API_TOKEN:-}
+  #     # Read files by path instead of receiving uploads (optional).
+  #     - TGDL_NSFW_ALLOW_ROOTS=/app/data/downloads
+  #   volumes:
+  #     - /volume3/Downloads/telegram-media-downloader/data/downloads:/app/data/downloads:ro
+  #     - tgdl-nsfw-models:/root/.cache/huggingface
+  #   logging:
+  #     driver: "json-file"
+  #     options:
+  #       max-size: "10m"
+  #       max-file: "3"
+
+# volumes:
+#   tgdl-nsfw-models:

@@ -9,7 +9,7 @@ CREATE TABLE downloads (
             file_type TEXT, -- photo, video, document
             file_path TEXT,
             status TEXT DEFAULT 'completed',
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP, ttl_seconds INTEGER, file_hash TEXT, pinned INTEGER DEFAULT 0, pending_until INTEGER, rescued_at INTEGER, nsfw_score REAL, nsfw_checked_at INTEGER, nsfw_whitelist INTEGER DEFAULT 0, ai_indexed_at INTEGER, owner_peer_id TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP, ttl_seconds INTEGER, file_hash TEXT, pinned INTEGER DEFAULT 0, pending_until INTEGER, rescued_at INTEGER, nsfw_score REAL, nsfw_checked_at INTEGER, nsfw_whitelist INTEGER DEFAULT 0, telegram_media_kind TEXT, telegram_media_id TEXT, telegram_media_size INTEGER, ai_indexed_at INTEGER, owner_peer_id TEXT,
             UNIQUE(group_id, message_id)
         );
 
@@ -40,6 +40,8 @@ CREATE INDEX idx_gallery_group_type_date ON downloads(group_id, file_type, creat
 CREATE INDEX idx_gallery_type_date ON downloads(file_type, created_at DESC, id DESC);
 
 CREATE INDEX idx_gallery_pinned_date ON downloads(pinned DESC, created_at DESC, id DESC);
+
+CREATE INDEX idx_telegram_media ON downloads(telegram_media_kind, telegram_media_id, telegram_media_size, id);
 
 CREATE INDEX idx_file_path ON downloads(file_path);
 
@@ -169,85 +171,6 @@ CREATE TABLE seekbar_sprites (
         );
 
 CREATE INDEX idx_seekbar_generated_at ON seekbar_sprites(generated_at);
-
-CREATE TABLE video_fingerprints (
-            download_id     INTEGER PRIMARY KEY,
-            duration_sec    REAL,
-            aggregate_hash  TEXT,
-            frame_count     INTEGER NOT NULL DEFAULT 0,
-            algo            TEXT    NOT NULL DEFAULT 'pdq-scene-v1',
-            indexed_at      INTEGER NOT NULL,
-            file_hash       TEXT,
-            FOREIGN KEY (download_id) REFERENCES downloads(id) ON DELETE CASCADE
-        );
-
-CREATE INDEX video_fingerprints_file_hash_idx
-            ON video_fingerprints(file_hash);
-
-CREATE INDEX video_fingerprints_aggregate_hash_idx
-            ON video_fingerprints(aggregate_hash);
-
-CREATE TABLE video_frame_hashes (
-            download_id INTEGER NOT NULL,
-            t_sec       REAL    NOT NULL,
-            phash       TEXT    NOT NULL,
-            PRIMARY KEY (download_id, t_sec),
-            FOREIGN KEY (download_id) REFERENCES downloads(id) ON DELETE CASCADE
-        );
-
-CREATE INDEX video_frame_hashes_download_id_idx
-            ON video_frame_hashes(download_id);
-
-CREATE TABLE similar_groups (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            kind        TEXT    NOT NULL CHECK (kind IN ('similar', 'partial', 'partial_review')),
-            confidence  REAL,
-            offset_sec  REAL,
-            created_at  INTEGER NOT NULL
-        );
-
-CREATE TABLE similar_group_members (
-            group_id    INTEGER NOT NULL,
-            download_id INTEGER NOT NULL,
-            role        TEXT    NOT NULL CHECK (role IN ('keep', 'remove', 'review')),
-            reason      TEXT,
-            PRIMARY KEY (group_id, download_id),
-            FOREIGN KEY (group_id) REFERENCES similar_groups(id) ON DELETE CASCADE,
-            FOREIGN KEY (download_id) REFERENCES downloads(id) ON DELETE CASCADE
-        );
-
-CREATE INDEX similar_group_members_download_id_idx
-            ON similar_group_members(download_id);
-
-CREATE TABLE similar_ignores (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            a_id        INTEGER NOT NULL,
-            b_id        INTEGER NOT NULL,
-            kind        TEXT    NOT NULL CHECK (kind IN ('similar', 'partial', 'partial_review')),
-            ignored_at  INTEGER NOT NULL,
-            note        TEXT,
-            UNIQUE (kind, a_id, b_id),
-            CHECK (a_id < b_id),
-            FOREIGN KEY (a_id) REFERENCES downloads(id) ON DELETE CASCADE,
-            FOREIGN KEY (b_id) REFERENCES downloads(id) ON DELETE CASCADE
-        );
-
-CREATE TABLE similar_partial_scans (
-            download_id INTEGER PRIMARY KEY,
-            frame_count INTEGER NOT NULL,
-            scanned_at  INTEGER NOT NULL,
-            FOREIGN KEY (download_id) REFERENCES downloads(id) ON DELETE CASCADE
-        );
-
-CREATE TABLE similar_video_scans (
-            download_id INTEGER PRIMARY KEY,
-            file_hash   TEXT,
-            frame_count INTEGER NOT NULL,
-            algo        TEXT    NOT NULL,
-            config_key  TEXT    NOT NULL,
-            scanned_at  INTEGER NOT NULL,
-            FOREIGN KEY (download_id) REFERENCES downloads(id) ON DELETE CASCADE
-        );
 
 CREATE TABLE queue (
             id INTEGER PRIMARY KEY AUTOINCREMENT,

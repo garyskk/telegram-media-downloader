@@ -1,40 +1,66 @@
 # Contributing
 
-How to set up a dev environment, what CI checks, and the ground rules for a pull request.
+Thanks for helping. The whole application is the Go module in
+[`core-service/`](core-service/) (Go 1.26). The browser dashboard lives in
+`core-service/internal/webassets/public/` and is embedded into the server at
+build time; there is no Node.js or npm build step.
 
-```bash
-git clone https://github.com/botnick/telegram-media-downloader.git
-cd telegram-media-downloader
-npm ci
-npm run doctor       # verify Node/ABI/SQLite/port/ffmpeg before you go further
-npm run lint
-npm test
-npm start            # dashboard at http://localhost:3000
+## Build, run, test
+
+```sh
+make build      # core-service/tgdl-server
+make run        # build, then start it with ./runner.sh (data in ./data)
+make test       # go test ./...
+make check      # gofmt, go vet and race tests: run before every commit
 ```
 
-Requires **Node.js 22+** (24 LTS recommended). `npm ci` downloads the pinned **tgdl-core** (the required Go binary) for your platform and verifies its checksum. To build it from source instead (or when you change `core-service/`), install the **Go toolchain** (1.22 or newer) and run `npm run build:core`. If `npm run doctor` reports `NODE_MODULE_VERSION` mismatch on `better-sqlite3` after a Node upgrade, run `npm rebuild better-sqlite3`.
+For a focused change, run the affected package first
+(`go -C core-service test ./internal/<package>/...`) and widen the checks as
+the change requires.
 
-## Submitting a change
+## Where things live
 
-1. Branch off `main` (`feat/...`, `fix/...`).
-2. Run `npm run lint && npm test && npm run doctor` before pushing.
-3. Add tests for non-trivial changes (vitest, see `tests/`). If you touch an HTTP route or WebSocket event, run the API contract suite, `npm run test:contract` (see [`tests/contract/README.md`](tests/contract/README.md)); `npm run test:contract:update` re-records the snapshots when a change is intended.
-4. Use [Conventional Commits](https://www.conventionalcommits.org/) (`feat(web): …`, `fix(downloader): …`).
-5. Add a line under `## [Unreleased]` in [`CHANGELOG.md`](CHANGELOG.md) for anything users or operators would notice.
-6. Open a PR against `main`. The template asks for a short description + how you verified the change. CI (lint, the contract suite, the big-data guard `npm run check:oom`, tests on Linux + Windows, Docker build, CodeQL) must be green before merge.
+| Path | What |
+|---|---|
+| `core-service/cmd/tgdl-server` | Server entry point and CLI commands |
+| `core-service/internal/app` | HTTP/WebSocket routes, authorization, settings |
+| `core-service/internal/telegram`, `accounts`, `session` | gotd accounts, login, sessions, updates |
+| `core-service/internal/engine`, `download`, `filepublish` | Durable queue, dedup, publication |
+| `core-service/internal/store`, `dbread` | SQLite schema, migrations, read queries |
+| `core-service/internal/backup`, `cluster`, `rescue` | Backups, cluster peers, rescue mode |
+| `core-service/internal/webassets/public` | Dashboard (ES modules, prebuilt CSS, locales `en`/`th`) |
+| `docs/` | User docs and the GitHub Pages site (Jekyll, just-the-docs) |
 
-### Ground rules for changes
+See [Architecture](docs/ARCHITECTURE.md) and the
+[developer notes](docs/DEVELOPER-NOTES.md) for design details.
 
-- **Updating must never hurt an existing install.** No manual steps, no data loss, config keys / env vars / routes keep working, and migrations must be safe on a 1M-row database (never block the event loop for seconds — the Docker healthcheck restarts the container).
-- **Sidecars ship first.** When the app starts depending on a new `faces-`, `nsfw-` or `seekbar-` sidecar version, tag and release the sidecar before the app release that uses it, and keep the app working with the previous sidecar version where possible.
+## Guidelines
 
-## Code style
+- Browser scripts are native ES modules: edit them directly and rebuild. Add
+  plain CSS for new styles; no bundler or CSS compiler is used.
+- Reuse the existing packages for account/session ownership, queue work, path
+  confinement and configuration. Keep Telegram IDs lossless.
+- Changes must preserve existing data folders, reject unauthorized requests and
+  come with tests for the behaviour they touch. New tests go in the Go packages.
+- `tests/contract/` holds historical HTTP/WebSocket snapshots of the 2.x
+  release for reference; it is not an executable suite. The removed Node
+  backend is in Git at commit `aa83eed`.
+- `faces-service/`, `nsfw-service/` and `seekbar-service/` are separate
+  projects with their own release workflows.
+- User-visible changes need a `CHANGELOG.md` entry; keep
+  `core-service/internal/webassets/public/CHANGELOG.md` identical to it.
 
-- ES Modules everywhere (`"type": "module"`).
-- Telegram IDs are strings; large ints overflow `Number.MAX_SAFE_INTEGER`.
-- Reuse existing utilities — `sanitizeName`, `loadConfig`, `safeResolveDownload`, `web-auth`, `SecureSession`. Don't reinvent.
-- The Lefthook pre-commit hook runs `biome check --write` on every staged file, so lint + format fixups happen automatically. Run `npm run check` manually if you want to apply them across the whole repo.
+## CI and releases
 
-Security issues → [`SECURITY.md`](SECURITY.md), not the public tracker.
+CI checks formatting, vet and race tests, builds the server and cross-compiles
+every release target. The Docker workflow tests a fresh non-root container
+(health, embedded setup page, clean shutdown) before publishing
+`ghcr.io/botnick/telegram-media-downloader` for amd64 and arm64. Version tags
+run `scripts/build-server-release.sh`, which builds the release archives and
+`SHA256SUMS`.
 
-Be respectful and keep the discussion technical — see [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md).
+## Pull requests
+
+Describe what changed, how you verified it and any remaining limitations. Fill
+in the [pull request template](.github/PULL_REQUEST_TEMPLATE.md). Security
+issues go through [SECURITY.md](SECURITY.md), not public PRs.

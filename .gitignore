@@ -1,10 +1,10 @@
-# Dependencies
+# Obsolete tool caches (keep accidental installs out of Git)
 node_modules/
 .pnp/
 .pnp.js
 .yarn/install-state.gz
 
-# Lockfiles from package managers we don't use (we use npm)
+# Lockfiles from unused package managers
 yarn.lock
 pnpm-lock.yaml
 
@@ -99,4 +99,6 @@ seekbar-service/seekbar-cli
 # Go core (core-service/) build artefacts
 core-service/bin/
 core-service/dist/
+core-service/tgdl-server
+core-service/tgdl-server.exe
 faces-service/tgdl-faces-win-x64.spec

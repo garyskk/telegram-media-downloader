@@ -4,9 +4,320 @@ All notable changes to this project are documented here. The format is based on 
 
 ## [Unreleased]
 
+## [3.4.15] — 2026-10-18
+
+### Changed
+- **A large file downloads several parts at once** ([#111](https://github.com/botnick/telegram-media-downloader/issues/111)). Each file was fetched one 1 MiB part at a time, waiting for each part before asking for the next, so a single file's speed was set by the round trip to Telegram's datacenter rather than by bandwidth: about 1.3 MB/s far from the datacenter, whatever the plan. A file larger than one part now keeps up to 4 part requests in flight and still writes the parts in order, so the bandwidth limit, duplicate check and `.part` file behave as before; at most 4 MiB per file waits in memory. If Telegram answers an account with `FLOOD_WAIT` during a file, that account's next files use half as many parts at once, and it climbs back by one after 8 files without one. `TGDL_DOWNLOAD_THREADS` sets the ceiling (1–16); `1` restores one part at a time. Downloads with `TGDL_VERIFY_CHUNKS=1` still fetch one part at a time.
+- **Telegram library updated to gotd v0.162.0** (from v0.115.0): the current Telegram API layer and the library's downloader timeout and reconnect fixes. Saved Telegram sessions keep working; no new sign-in is needed. `TGDL_TELEGRAM_DEBUG` logs are now JSON lines from Go's standard logger.
+- **Built with Go 1.27.2** (server binaries and Docker image).
+
+### Service worker
+- `VERSION = 'v34150'`
+
+## [3.4.14] — 2026-10-14
+
+### Added
+- **Settings → Download → Skip duplicates** (`download.skipDuplicates`, off by default). A photo or video that is reposted, or forwarded to another monitored chat, was never downloaded twice, but each message still got its own library entry pointing at the same file, so the gallery filled with repeats. With the option on, media already in the library under another message is not catalogued again: a forward of the same Telegram media is skipped before any download, and a re-upload with the same bytes is downloaded once to learn its hash and then dropped. A message that already has an entry is still updated normally, links you paste are always added, and an entry whose file is missing never causes a skip.
+
+### Service worker
+- `VERSION = 'v34140'`
+
+## [3.4.13] — 2026-10-14
+
 ### Fixed
+- **Find duplicates stopped part-way on large libraries.** The scan hashed every unhashed file inside the request that started it; behind a proxy that ends requests after about 100 s (Cloudflare), the rest of the scan could no longer save its hashes. It now runs in the background — the page follows its progress as before — and Stop actually stops it. A second scan is not started while one runs.
+
+### Service worker
+- `VERSION = 'v34130'`
+
+## [3.4.12] — 2026-10-14
+
+### Fixed
+- **The disk cap deleted downloads while the disk was well under it.** Library size was the sum of every row's size, but rows for the same media (reposts, forwards, deduplicated downloads) share one file, so a shared file was counted once per row. On a library of about 3.75 TB of files this read as more than 5 TB, and the disk cap (`diskManagement.maxTotalSize`) kept deleting the oldest downloads. Library size now counts each file on disk once, and a rotated row whose file another row still uses no longer counts as space freed.
+- **The dashboard showed the library larger than it is,** for the same reason. Total size and disk usage now match the files on disk.
+
+### Service worker
+- `VERSION = 'v34120'`
+
+## [3.4.11] — 2026-10-13
+
+### Added
+- **Stickers show as pictures and animated stickers play.** Sticker tiles were a document icon and opened as "no preview". Static stickers now show their thumbnail and open as images, video stickers play in the video player, and animated stickers (`.tgs`) are drawn in the browser — still in the gallery until hovered, playing in the viewer. This includes the animated stickers 2.x saved under a `.webp` name, which are recognised by content; no file is renamed. The player (lottie-web, light build) is loaded from cdnjs the first time an animated sticker is shown.
+
+### Fixed
+- **A file with no possible thumbnail ran ffmpeg on every view.** A damaged video or an animated sticker was handed to ffmpeg again each time its tile appeared. The failure is now remembered until the file changes, so the tile's request returns at once.
+
+### Service worker
+- `VERSION = 'v34110'`
+
+## [3.4.10] — 2026-10-13
+
+### Fixed
+- **Queued items failed when the main Telegram connection dropped.** Each item's message is refreshed on the main connection before its download; a drop failed that request ("broken pipe", "engine forcibly closed") and, during a burst, used up the item's five attempts in seconds. The refresh is now asked again once the connection is back (six tries, about 16 s).
+
+### Service worker
+- `VERSION = 'v34100'`
+
+## [3.4.9] — 2026-10-13
+
+### Fixed
+- **A dropped download connection failed every file using it.** Under load Telegram closes download connections ("engine forcibly closed", "broken pipe", "connection dead"); each file in flight lost an attempt and, during a burst, ran out of attempts within seconds. A part whose connection died is now requested again on another pooled connection (up to six times, with a short backoff) before the file's attempt fails.
+
+### Service worker
+- `VERSION = 'v3490'`
+
+## [3.4.8] — 2026-10-13
+
+### Fixed
+- **One refused file throttled the whole account.** Telegram can answer `FLOOD_WAIT` for a single file on every request. The download was retried forever, and every refusal closed the account's flood gate, so all other downloads got one request per wait and the worker count stayed at its minimum. A file still refused after the inline retries now fails its attempt like any other error (and ends as failed after the usual retries); waits longer than a minute remain account-wide and are rescheduled as before.
+
+### Service worker
+- `VERSION = 'v3480'`
+
+## [3.4.7] — 2026-10-13
+
+### Fixed
+- **Downloads were about eight times slower than 2.x.** Per-chunk hash verification made every request fetch a 128 KiB hash-sized part instead of 1 MiB, and Telegram limits download requests by count (on the affected account: about five requests, then a 3–9 s `FLOOD_WAIT`). Verification is now off by default, so each request carries 1 MiB again. MTProto already authenticates every response. Set `TGDL_VERIFY_CHUNKS=1` to turn it back on.
+- **A file could sit at 0 bytes for its whole attempt.** With verification on, the library re-requested chunk hashes in a loop under flood waits without fetching any data. This no longer happens with the default setting.
+
+### Service worker
+- `VERSION = 'v3470'`
+
+## [3.4.6] — 2026-10-13
+
+### Fixed
+- **Photo thumbnails were blank in the gallery.** The thumbnail renderer seeked to 1 s before grabbing a frame, as it does for videos; on a still image ffmpeg exits successfully with an 8-byte non-WebP file, which was cached and served. Stills are no longer seeked, and a cached thumbnail that is not a real WebP is rendered again on its next request — no maintenance step is needed.
+
+### Service worker
+- `VERSION = 'v3460'`
+
+## [3.4.5] — 2026-10-13
+
+### Fixed
+- **Downloads failed in bursts with "engine forcibly closed".** Every file opened and closed its own Telegram connection pool (a new connection, and for other datacenters a new authorization export, per file). Downloads now share one long-lived pool per datacenter, which removes the bursts and the per-file connection setup.
+- **Chats whose files have no chunk hashes no longer download twice.** After the first `VOLUME_LOC_NOT_FOUND`, later files of that chat skip per-chunk verification straight away.
+
+### Added
+- `TGDL_TELEGRAM_DEBUG=1` (or `debug`) writes the MTProto client's own log to stderr for troubleshooting.
+
+### Service worker
+- `VERSION = 'v3450'`
+
+## [3.4.4] — 2026-10-13
+
+Same changes as 3.4.3, which had no release archives (a timing-sensitive test failed in the release build).
+
+### Fixed
+- **Some videos always failed with `VOLUME_LOC_NOT_FOUND`.** Telegram keeps no per-chunk hashes for certain files and refuses them partway through a transfer. Such a file is now remembered and its next attempt downloads without per-chunk verification; the whole file's SHA-256 is still checked afterwards. Press **Retry all** on the Queue page for items that already failed.
+- **A dropped connection during a background channel repair restarted the whole monitor.** The repair now retries on its own (after 30 s, 2 min, then every 5 min).
+
+### Changed
+- Downloads request 1 MiB parts (Telegram's maximum) instead of 512 KiB, halving the round trips per file.
+
+### Service worker
+- `VERSION = 'v3440'`
+
+## [3.4.2] — 2026-10-13
+
+### Fixed
+- **The monitor could sit in "starting" for a long time after a restart.** Channels with recorded gaps were all repaired before any download began. They are now repaired in the background (one repair at a time) while monitoring and downloads start immediately.
+
+### Service worker
+- `VERSION = 'v3420'`
+
+## [3.4.1] — 2026-10-13
+
+### Fixed
+- **The monitor still stopped on channel gaps found while catching up.** 3.2.1 covered gaps reported by live updates; a gap found by the catch-up request itself ("Telegram history recovery required for channel …") still stopped the account. Both paths now record the gap, repair the channel in the background and keep downloading.
+
+### Service worker
+- `VERSION = 'v3410'`
+
+## [3.4.0] — 2026-10-13
+
+Everything 2.x did in the background is back.
+
+### Added
+- **Auto-forward** (`autoForward` per chat) re-uploads each newly downloaded file to its destination (`me`, an id, `@username`, a t.me link, or the "Telegram Downloader Storage" channel), paced through the flood guard; destinations that refuse posts pause and retry after 1 h, 6 h and 24 h. `deleteAfterForward` removes only the local copy, never anything on Telegram.
+- **Self-destructing media** jumps to the front of the queue and its timer is stored, as in 2.x.
+- **Disk rotation** (`diskManagement.enabled` + `maxTotalSize`): when the library is over the cap, the oldest downloads are deleted until it fits — never pinned or rescued files, files still downloading, or files shared with another chat. Status under Settings and `GET /api/maintenance/disk-rotator/status`.
+- **Periodic integrity sweep** (`advanced.integrity.intervalMin`, minimum 60 min) removes catalog rows whose files are gone, and refuses to prune when more than half the library looks missing.
+- **Google Drive and Dropbox backup destinations**, reusing destinations configured in 2.x; resumable uploads and checksum verification. `tgdl-server backup-oauth gdrive|dropbox` prints a refresh token on a headless server.
+- **Cluster dedup sweep and conflict resolution** (Maintenance → Cluster), peer-side delete and peer thumbnails.
+- **Backfill date window**: optional From/To dates on the backfill sheet (`offsetDate` / `minDate` on `POST /api/history`).
+
+### Fixed
+- `FFMPEG_HWACCEL` (vaapi/qsv/cuda) is honoured again for thumbnails and seekbars, falling back to the CPU when hardware decoding fails.
+- `/metrics` reports the real accounts, active downloads, queue size and workers instead of zeros.
+
+### Service worker
+- `VERSION = 'v3400'`
+
+## [3.3.0] — 2026-10-13
+
+### Added
+- **Face recognition works again** with an external `tgdl-faces` sidecar (`FACES_SERVICE_URL`, `TGDL_FACES_SIDECAR_URL` or the dashboard's External URL): sidecar status and doctor, Scan / Cancel, background detection of new downloads, auto-scan, re-clustering (names carry over), health/provider/detect tests, model preload and quality backfill. Faces and people from 2.x are reused as they are. Local mode (auto-downloading a sidecar binary) is not available in 3.x; run the `tgdl-faces` container instead.
+
+### Service worker
+- `VERSION = 'v3300'`
+
+## [3.2.1] — 2026-10-13
+
+### Fixed
+- **A channel gap no longer stops all monitoring.** When Telegram reports that a channel's missed updates are too old to replay ("requires history recovery"), the server records the gap durably and repairs that channel's history in the background while every other chat keeps downloading. Before, the whole monitor stopped and restarted once per affected channel, which after a restart could cycle through many channels.
+
+### Service worker
+- `VERSION = 'v3210'`
+
+## [3.2.0] — 2026-10-12
+
+### Added
+- **Video seekbar previews are generated again**, now with ffmpeg inside the server (no sidecar needed): automatically after each video download when `advanced.seekbar.enabled`/`autoOnDownload` are on, plus a backlog builder, rebuild, per-video regenerate, stats and health under Maintenance → Seekbar. Sprites use the same files and rows as 2.x, so existing previews keep working.
+- **NSFW scanning and review work again** through the `nsfw-service` sidecar (`ghcr.io/botnick/tgdl-nsfw`): set `TGDL_NSFW_SIDECAR_URL` (or `advanced.nsfw.sidecarUrl`). Scan/cancel, auto-check of new downloads, model preload, the hash blocklist, and the review tiers with bulk delete/whitelist are all back. Without a sidecar the NSFW tab says so instead of failing; 2.x scores stay reviewable.
+
+### Fixed
+- A cancelled seekbar build reports "done (cancelled)" instead of an error.
+
+### Service worker
+- `VERSION = 'v3200'`
+
+## [3.1.0] — 2026-10-12
+
+### Changed
+- **Downloads scale up again, as in 2.x.** The number of files downloading at once starts at **Concurrent Downloads** and, while the queue is long, grows by up to 3 every few seconds to `advanced.downloader.maxConcurrency` (default 20); when the queue empties it shrinks back toward `minConcurrency` (default 3), and a Telegram FloodWait drops it to the minimum at once. The status bar's worker count shows the current number. Set `maxConcurrency` to the same value as Concurrent Downloads to keep a fixed number.
+
+### Service worker
+- `VERSION = 'v3100'`
+
+## [3.0.10] — 2026-10-10
+
+### Fixed
+- **Monitoring could stay off after an update.** A watchdog now checks every minute: while monitoring is switched on (it is, until you press Stop), a monitor found stopped for any reason — a start interrupted during a restart, a run that ended without an error, a maintenance action — is started again. It never interrupts a purge, an account change or a start already in progress. Monitor state changes are now written to the server log.
+
+### Service worker
+- `VERSION = 'v30100'`
+
+## [3.0.9] — 2026-10-10
+
+### Fixed
+- **Starting the monitor could silently fall back to "stopped".** A start that first repairs missed channel history can take many minutes, and it was tied to the dashboard request: when the request timed out (60 s in the dashboard) or the tab closed, the whole start was cancelled. Start and Restart now run on the server and continue on their own; the dashboard gets the current state (usually "starting") and follows the live status. Resuming after Recovery no longer has a 30 s limit either.
+
+### Service worker
+- `VERSION = 'v3090'`
+
+## [3.0.8] — 2026-10-10
+
+### Fixed
+- **Backfills stopped with "history queue made no progress before the stall deadline" while downloads were running.** With several backfills feeding one queue and large videos, the queue could stay full for longer than the stall window. Bytes still arriving now count as progress, so only a queue that really stopped moving is aborted.
+
+### Service worker
+- `VERSION = 'v3080'`
+
+## [3.0.7] — 2026-10-10
+
+### Fixed
+- **Leaving chats that are already gone on Telegram failed.** Chats left, removed or deleted earlier stay in the app's list but no longer appear in the account's dialogs; leaving them reported "dialog is not in the selected account's current dialogs", and the bulk dialog skipped chats no account holds. Such chats now count as left and are removed from the app (and their files deleted when chosen), one at a time or in bulk with any connected account.
+
+### Service worker
+- `VERSION = 'v3070'`
+
+## [3.0.6] — 2026-10-09
+
+### Fixed
+- **Install update could fail on large libraries.** The pre-update database snapshot had 60 s; a 2.3 GB database took 57 s on a NAS. The default is now 15 minutes (`UPDATE_SNAPSHOT_TIMEOUT_MS` still overrides it).
+
+### Service worker
+- `VERSION = 'v3060'`
+
+## [3.0.5] — 2026-10-09
+
+### Added
+- **Automatic updates for the whole stack.** In the bundled compose files, autoheal and watchtower now track `:latest` and carry the watchtower label, so watchtower keeps all four containers current, itself included. Set `WATCHTOWER_HTTP_API_PERIODIC_POLLS=true` in `.env` to update on a schedule (`WATCHTOWER_SCHEDULE`, default daily 04:00); **Install update** keeps working either way.
+
+### Fixed
+- **"New version available" never appeared.** The update check asks GitHub releases again (newest stable `vX.Y.Z`, cached 10 minutes) instead of always reporting the check as unreachable.
+
+### Service worker
+- `VERSION = 'v3050'`
+
+## [3.0.4] — 2026-10-09
+
+### Fixed
+- **The monitor stayed stopped after an error.** When Telegram reports a gap in a channel ("requires history recovery") or a connection drops, the monitor now restarts on its own while monitoring is switched on — after 5 s, then 30 s, 1 min and every 5 min if it keeps failing. The restart repairs the channel's missed messages first. Stopping the monitor by hand still keeps it stopped.
+
+### Service worker
+- `VERSION = 'v3040'`
+
+## [3.0.3] — 2026-10-09
+
+### Fixed
+- **Settings → Tools → Recovery said "N chats can't be reached" but Open showed an empty page.** Those chats are reviewed on **Chats → Deleted / unavailable** (where they can be left in bulk); Open now goes there whenever the card reports unreachable chats. The Recovery page itself still hides entries you chose to ignore.
+
+### Service worker
+- `VERSION = 'v3030'`
+
+## [3.0.2] — 2026-10-09
+
+Upgrades from long-running 2.x installs.
+
+### Fixed
+- **Downloads failed with `no such column: d.telegram_media_kind` on databases first created by early 2.x releases.** On start the server now adds every column, table and index of the current schema that an older database lacks (columns are only added, never changed or removed). Use **Retry all** on the Queue page for items that failed on 3.0.0/3.0.1.
+- **The status bar showed `dev` instead of the build commit.** `/api/version` now reports the Docker build's commit and time, or the commit a binary was built from.
+
+### Service worker
+- `VERSION = 'v3020'`
+
+## [3.0.1] — 2026-10-09
+
+Telegram FloodWait protection for downloads and every other Telegram request.
+
+### Fixed
+- **FloodWait is respected again.** Each account's requests (including the per-datacenter download connections) pass one flood gate and a request-rate limit. A wait of up to 60 s is slept through and retried, as 2.x did; a longer wait pauses only that account's queue until Telegram allows it again, and the affected item is rescheduled for that moment without using up one of its retry attempts.
+- **Add-account wizard:** a cancellation racing a submitted step could leave the flow in an error state without a message.
+
+### Service worker
+- `VERSION = 'v3010'`
+
+## [3.0.0] — 2026-10-09
+
+One native Go server replaces the Node backend: a single `tgdl-server` binary (or the Docker image) runs the dashboard, Telegram accounts, downloads, backups and maintenance. Existing data folders and Telegram sessions are reused in place.
+
+### Upgrading from 2.x
+- **Nothing to change.** `docker compose pull && docker compose up -d`, the dashboard's *Install update* button, or `git pull` + restart keep the same image name, port, `./data` folder, container user (`node`, uid 1000), `.env`, dashboard password, signed-in browsers, share links and Telegram logins. Saved gramJS logins are converted once to `data/sessions/native/`; the originals stay in place.
+- **2.x compose files keep working.** Their `node scripts/healthcheck.js` healthcheck and Synology's `node src/web/server.js` command are mapped to the Go server, and the entrypoint again fixes data ownership and joins the `/dev/dri` group before dropping privileges.
+- **Split-disk installs:** `TGDL_DOWNLOADS_DIR` is honoured for serving, backups, purge and reset.
+- **Without Docker:** `./runner.sh`, `run_safe.bat`, `npm start` and `pm2 start ecosystem.config.cjs` download and verify the matching `tgdl-server` release on first start; no Node or Go toolchain is needed.
+- **Not yet in 3.0:** Google Drive and Dropbox backup destinations; hardware-accelerated thumbnails (`FFMPEG_HWACCEL` is ignored, thumbnails use the CPU); new face detection, NSFW scoring and seekbar previews (results from 2.x stay visible). Roll back by restoring `data/backups/db-pre-update-*.sqlite` with 2.32.1.
+
+### Changed — runtime
+- **Node.js is gone.** No `npm install`, Node runtime, gramJS or proxy process is shipped. Native archives for Linux, Windows and macOS (amd64/arm64, plus Linux arm and 386) and the Docker image (now also arm64) each contain one executable with the dashboard embedded.
+- **Telegram runs on gotd (MTProto in Go).**
+
+### Added
+- **Leave dead chats in bulk.** The Chats page's *Deleted / unavailable* tab has *Select* and *Select all*. Leave the selected chats from one confirmed account, either keeping downloaded files or deleting their files, download history and settings (typed count required). Removals run one at a time, stop if Telegram asks to wait, and only chats Telegram confirms are cleaned up. Chats that still work are never removed in bulk.
+- **Deleted, restricted and inaccessible chats are separated** into their own tab with Telegram's reason, *Check again*, and a per-chat *Leave / remove from Telegram* for the selected account. Dead rows no longer show Backfill or an idle Monitor switch.
+- **Media facts for duplicate detection.** Each download records MIME type, width × height, duration, forward origin and Telegram's stripped thumbnail, so re-uploaded copies can be matched later. Existing Telegram-ID and SHA-256 deduplication is unchanged.
+- **Native backups:** local, S3, SFTP, FTP/FTPS and TGDB encrypted archives with verified publication, crash recovery and offline restore.
+- **Native cluster peers:** pairing, durable catalog sync and ranged media transport.
+- **Native Stories, URL downloads, history backfill and jobs-only account runs** on a durable work queue that survives restarts.
+- **Live aggregate bandwidth limit** across all downloads, and Telegram connections through configured proxies.
+
+### Changed
+- **Duplicates are skipped before download** by Telegram media identity, then confirmed by SHA-256 after transfer.
+- **Chat list and profile photos load without starting the monitor**; photos download lazily and are cached.
+- **Dashboard sessions are revoked server-side** and their WebSockets closed; HTTP security headers and bounded compression are applied natively.
+- Thumbnails, faststart, purge and recovery cleanup run in Go.
+
+### Removed
+- Unused settings, the Node development toolchain and the contract-only test harness.
+
+### Fixed
+- **One-click update** works on the Go server: watchtower ping, DB integrity check, verified pre-update snapshot, trigger and update history, including the update that came from 2.x.
+- **An old single-account `session.enc` left beside migrated accounts** is ignored as 2.x did, instead of stopping the monitor with a duplicated-key error.
 - **Release notes show the newest versions right after an update.** The in-app viewer could show a copy of the changelog the browser kept for up to an hour, so a freshly updated dashboard listed older releases only. It now revalidates the file on every open.
 
+### Service worker
+- `VERSION = 'v3000'`
 ## [2.32.1] — 2026-09-30
 
 One-click update works again on the watchtower sidecar; LOCATION_INVALID downloads recover.
@@ -314,7 +625,7 @@ Data-safety, security and performance release — nothing can wipe or orphan you
 - **Redesigned release notes** (click the version in the status bar): one card per version with its date and summary, sections tagged by kind (Security, Fixed, Performance, …) with counts on collapsed cards, the installed version marked, older versions collapsed, and a search box. Maintainer-only details (the empty "Unreleased" heading, service-worker cache versions) are no longer shown.
 
 ### Fixed
-- **`npm run pre-download-models` failed with `Cannot find module`** ([#64](https://github.com/botnick/telegram-media-downloader/issues/64)). `scripts/pre-download-models.js` was referenced since v2.15 but never committed. It now exists and seeds the NSFW model cache with the configured model + precision (no-op when an NSFW sidecar is configured). The Docker build no longer runs it: `/app/data` is hidden by the `./data` bind-mount at runtime, so a build-time download never reached the running container. See [DEPLOY.md](docs/DEPLOY.md#split-disk-setup) for offline seeding.
+- **`npm run pre-download-models` failed with `Cannot find module`** ([#64](https://github.com/botnick/telegram-media-downloader/issues/64)). `scripts/pre-download-models.js` was referenced since v2.15 but never committed. It now exists and seeds the NSFW model cache with the configured model + precision (no-op when an NSFW sidecar is configured). The Docker build no longer runs it: `/app/data` is hidden by the `./data` bind-mount at runtime, so a build-time download never reached the running container. See [DEPLOY.md](docs/DEPLOY.md) for offline seeding.
 - **NSFW "Precision" setting was ignored.** Scans and preloads always loaded the `q8` variant because the server dropped `advanced.nsfw.dtype` when building the scan config.
 - **Face scan marked photos "no faces" whenever the sidecar was away.** Connection errors, timeouts, 5xx and "model still loading" all counted as a finished scan, so a sidecar restart, an OOM kill, or the auto-resume after a container restart (which fires seconds after boot, long before an auto-spawned sidecar is ready) permanently stamped every photo it touched with zero faces. Rows are now stamped only once the sidecar actually answered for the file; while it is down the scan waits for it (`TGDL_FACES_SIDECAR_WAIT_MS`, default 5 min), then stops with an error and resumes where it left off next time. A file that keeps crashing or timing out the sidecar is retried on its own and then skipped for that run — never marked scanned. New downloads made while the sidecar is down are left for the next scan instead of being stamped. If an earlier scan finished suspiciously fast with no faces, run **Reindex** once the sidecar is reachable.
 - **Face clustering blocked the whole server.** Phase B (DBSCAN over every face) ran on the event loop — ~3.5 s at 3 000 faces, minutes at 20 000 — long enough to fail the Docker healthcheck, get the container restarted by autoheal, auto-resume the scan, and block again. It now runs on a worker thread (event-loop delay during clustering: 3.5 s → 12 ms). Clusters are bit-for-bit the same.
@@ -726,7 +1037,7 @@ Monitor state resume on restart + dedup scan responsiveness fix.
 - **Dedup scan freezes dashboard** — the grouping phase (GROUP BY + 500 set-building queries) blocked the event loop without yielding; added `setImmediate` yields before/after the heavy query and every 50 sets so WS progress events flush to the browser.
 
 ### Changed
-- **Vitest config** — added `vitest.config.js` to exclude `.claude/worktrees` from test discovery (stale worktree copies caused port conflicts on cluster e2e tests).
+- **Vitest config** — added `vitest.config.js` to exclude `agent worktrees` from test discovery (stale worktree copies caused port conflicts on cluster e2e tests).
 
 ### Service worker
 - `VERSION = 'v2191'`
@@ -930,7 +1241,7 @@ Final OOM-safety pass — closes the one remaining stack-overflow risk in cluste
 
 ## [2.13.1] — 2026-05-10
 
-OOM-safety sweep across every SQL / HTTP / render path that handles "lots of data". Triggered by a `FATAL ERROR: Reached heap limit Allocation failed` inside `Statement::JS_all` on a 1M-row library. Every affected surface now streams or paginates; CLAUDE.md documents the rule for future feature work.
+OOM-safety sweep across every SQL / HTTP / render path that handles "lots of data". Triggered by a `FATAL ERROR: Reached heap limit Allocation failed` inside `Statement::JS_all` on a 1M-row library. Every affected surface now streams or paginates; the contributor guide documents the rule for future feature work.
 
 ### Fixed
 - **`monitor.js` resolves synthetic `unknown:foo` group ids before probing.** Recovery groups (created by `reindexFromDisk` when files exist on disk but the DB was empty) were getting "Skipping … — no account has access" on every config reload because `getMessages('unknown:…')` always throws. The resolver now walks each loaded client's dialogs, matches `sanitizeName(title) === folderName`, rewrites `group.id` to the canonical numeric id in memory + kv['config'] + downloads.group_id, and probes with the real id.
@@ -944,7 +1255,7 @@ OOM-safety sweep across every SQL / HTTP / render path that handles "lots of dat
 
 ### Added
 - `src/core/util/streaming.js` — `streamRows` (the canonical iterator-batched-drain helper), `lruCap`, `paginate`. Mirrored in `src/web/public/js/utils.js` (`lruSet`, `lruCap`).
-- `CLAUDE.md → "Big-data patterns"` section — four invariants every new feature must respect (LIMIT/iterate, yield-every-N, capped caches, virtualised lists). Code review enforces them; CI does not.
+- Big-data contributor guidelines — four invariants every new feature must respect (LIMIT/iterate, yield-every-N, capped caches, virtualised lists). Code review enforces them; CI does not.
 
 ### Internal
 - SW bumped `v2135` → `v2136`.

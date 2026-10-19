@@ -1,266 +1,167 @@
-# core-service (`tgdl-core`)
+# tgdl-server (Go)
 
-The Go engine of
-[telegram-media-downloader](https://github.com/botnick/telegram-media-downloader).
-The Node app spawns it, talks to it over HTTP on `127.0.0.1`, and relies on
-it for:
+`cmd/tgdl-server` is the Telegram Media Downloader application: one Go binary
+that serves the embedded dashboard (`internal/webassets/public`), the HTTP API,
+media and WebSocket connections, and owns SQLite and the Telegram (gotd)
+accounts. It never starts or proxies to a Node.js server. ffmpeg is the only
+external program it calls (thumbnails and MP4 faststart).
 
-| Feature (`/health.features`) | Route | Used by |
-|---|---|---|
-| `hash` | `POST /v1/hash` | download-time dedup, the duplicate scan, the NSFW hash blocklist |
-| `stat` | `POST /v1/fs/stat-batch` | the integrity sweep (Verify files, boot + hourly) |
-| `walk` | `POST /v1/fs/walk` | Re-index from disk, the disk-usage fallback of `/api/stats` |
-| `dbscan` | `POST /v1/dbscan` | face clustering (scan runner Phase B) |
+User documentation: [install and deploy](../docs/DEPLOY.md),
+[configuration](../docs/CONFIGURATION.md) and [features](../docs/FEATURES.md).
+`cmd/tgdl-core` and the `api`, `front`, `dbscan` and `seekbar` packages belong
+to the 2.x companion binary; they are not built for 3.x releases.
 
-A second process of the same binary, `tgdl-core front`, serves the app's
-`PORT` ([Front server](#front-server-front)).
+## Run
 
-It is the only implementation of these — the Node code it replaced is gone
-— so every answer must be the one Node gave: same digests, the same
-`fs.stat` / `fs.readdir` results and error codes, the same clusters. See
-[docs/GO-CORE.md](../docs/GO-CORE.md) for how that is proven and what the
-app does when tgdl-core can't run.
-
-tgdl-core never writes `db.sqlite` (Node is the only writer; the front
-server reads `web_sessions` over a read-only connection), and it only
-reads files inside the directories the app allows (`TGDL_CORE_ALLOW_ROOTS`).
-
-## Commands
-
-```
-tgdl-core serve               run the HTTP service (settings from env, below)
-tgdl-core front               run the front server on the app's PORT (env, below)
-tgdl-core version             print "tgdl-core <version> <os>/<arch> <go version>"
-tgdl-core hash [--json] <path>...
-                              print SHA-256 digests like sha256sum (debugging)
+```sh
+TGDL_DATA_DIR=/var/lib/telegram-media-downloader PORT=3000 \
+  ./tgdl-server
 ```
 
-## Environment (`serve`)
+`TGDL_DATA_DIR` is required. The server creates `db.sqlite` and applies the
+same idempotent schema used by existing installations. `PORT` defaults to
+`3000`; `TGDL_SESSION_TTL_DAYS` defaults to 7. The existing session cookie
+name is preserved as `tg_dl_session`.
 
-The Node app passes only these (never argv, so the token doesn't show up
-in `ps`), plus the few OS variables a Go binary needs (`PATH`,
-`SystemRoot`, temp dirs, `GOMAXPROCS`/`GOMEMLIMIT`/`GOGC` if you set them).
+Commands:
 
-| Variable | Default | Meaning |
-|---|---|---|
-| `TGDL_CORE_TOKEN` | — (required) | Shared secret; every route except `/health` needs it as `X-API-Token`. The app mints a new one per spawn. |
-| `TGDL_CORE_ALLOW_ROOTS` | empty = refuse everything | Directories files may be read from, separated like `PATH` (`:` on Linux / macOS, `;` on Windows; quote an entry containing `;` on Windows). The app passes the downloads dir, `<data dir>/downloads` and a custom `download.path`, plus anything in its own `TGDL_CORE_ALLOW_ROOTS`. Anything else is refused with `EOUTSIDE` and the app reads that path itself. |
-| `TGDL_CORE_PORT` | `0` | Port on `127.0.0.1`; `0` picks a free one. The bound address is printed as one JSON line on stdout: `{"event":"listening","addr":"127.0.0.1:NNNNN","version":"0.4.0","pid":123}`. |
-| `TGDL_CORE_WATCH_STDIN` | off | `1`: exit when stdin reaches EOF. The app keeps the pipe open, so when the app dies (crash, `kill -9`, Task Manager) tgdl-core exits instead of lingering as an orphan — Windows doesn't reap children with their parent. |
-| `HASH_WORKER_POOL_SIZE` | `min(8, max(2, ⌊cpus/2⌋))` | Files hashed at once (`parseInt`, values ≥ 1 capped at 32). |
-| `TGDL_CORE_LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error`, to stderr. |
-
-## Front server (`front`)
-
-`tgdl-core front` serves the app's public `PORT`: local media from
-`/files`, `/photos` and the thumbnail cache itself, everything else
-proxied to the Node server on `127.0.0.1` (see
-[docs/GO-CORE.md](../docs/GO-CORE.md#front-server-tgdl-core-front)). Code in
-`internal/front`. The app starts it with these (never argv):
-
-| Variable | Meaning |
-|---|---|
-| `TGDL_CORE_TOKEN` | Control-channel token (`X-API-Token`), required. |
-| `TGDL_FRONT_LISTEN` | Public address, `:<PORT>`. Can't bind → exit status 3 and `{"event":"error","code":"EADDRINUSE",…}` on stdout. |
-| `TGDL_FRONT_UPSTREAM` | The Node server, `127.0.0.1:<port>` (loopback only). |
-| `TGDL_FRONT_UPSTREAM_TOKEN` | Sent to Node as `X-Tgdl-Front` with the client's address; Node trusts that address only with this token. The same token authenticates the events Go posts to Node afterwards (`X-Tgdl-Notify`: session renewal, a missing file to prune) — Go never writes the database. |
-| `TGDL_FRONT_TRUST_PROXY` | The app's Express `trust proxy` value (`TRUST_PROXY`, default `loopback`). |
-| `TGDL_FRONT_DB` | `db.sqlite`, opened read-only for `web_sessions`. |
-| `TGDL_FRONT_DOWNLOADS_DIR`, `TGDL_FRONT_PHOTOS_DIR`, `TGDL_FRONT_THUMBS_DIR` | What `/files`, `/photos` and `/api/thumbs/:id` resolve against. |
-| `TGDL_CORE_ALLOW_ROOTS` | Every file served must be inside one of these. |
-| `TGDL_CORE_PORT`, `TGDL_CORE_WATCH_STDIN`, `TGDL_CORE_LOG_LEVEL` | As for `serve`. |
-
-Control channel (`127.0.0.1:<TGDL_CORE_PORT>`, `X-API-Token`):
-`GET /health`, `POST /v1/front/state` (Node pushes the share secret,
-whether auth is set up, Force HTTPS, the `/api` rate-limit switch and the
-response headers its middlewares produce for each fast-path route — on
-boot and on every config change, re-checked every 2 s), `GET
-/v1/front/stats`.
-
-## HTTP API
-
-Errors are `{"error":{"code":"ENOENT","message":"…"}}`.
-
-| Route | Auth | |
-|---|---|---|
-| `GET /health` | open | `{ok, service:"tgdl-core", version, features:["hash","stat","walk","dbscan"], pid, go, platform, hash:{concurrency, roots}, fs:{maxBatch, fastStat}}` (`roots` is a count) |
-| `POST /v1/hash` | token | Body `{"path":"/abs/file"}` → `{"sha256","size","mtimeMs"}` |
-| `POST /v1/fs/stat-batch` | token | Body `{"paths":["/abs/a", …]}` (≤ 1000) → `{"results":[…]}`, see below |
-| `POST /v1/fs/walk` | token | Body `{"root","maxDepth","stat","entries"}` → NDJSON stream, see below |
-| `POST /v1/dbscan` | token | Query `n, dim, eps, minPts, weights=0|1`, binary body → NDJSON stream, see below |
-| `GET /v1/stats` | token | Counters: `{uptimeSec, hash:{…}, fs:{statCalls, statPaths, walks, walkFiles}}` |
-
-### `/v1/hash`
-
-| Status | Codes | Meaning |
-|---|---|---|
-| 200 | — | Digest of the whole file, read until EOF (identical to `crypto.createHash('sha256')` over `fs.createReadStream`). |
-| 400 | `EINVAL` | Bad body, empty or relative path, NUL byte. |
-| 401 | `EAUTH` | Missing / wrong token (also for unknown routes). |
-| 403 | `EOUTSIDE` | Not inside an allowed root, as written or after resolving symlinks / junctions. |
-| 422 | `ENOENT`, `EACCES`, `EISDIR`, `ENOTDIR`, `ELOOP`, `ENAMETOOLONG`, `EMFILE`, `EBUSY`, `EIO` | The file can't be read. |
-| 503 | `EQUEUEFULL` | More than 1024 requests waiting for a hash slot. |
-
-### `/v1/fs/stat-batch` — `fs.stat`, exactly
-
-Each result is `{"ok":true,"size":N,"mtimeMs":F,"isFile":B,"isDir":B}` or
-`{"code":"…"}`, in request order. `code` is what Node's `fs.stat` puts in
-`err.code` for the same path on the same OS — `src/core/integrity.js`
-deletes a library row on `ENOENT` / `ENOTDIR` and on nothing else, so this
-is the part that must never be wrong:
-
-- **Windows**: the same calls in the same order as libuv 1.51
-  (`fs__stat_impl_from_path`): `GetFileInformationByName` when the OS has
-  it (found the way libuv finds it), else / then `CreateFileW` with
-  `FILE_READ_ATTRIBUTES` + `NtQueryVolumeInformationFile` /
-  `NtQueryInformationFile`, and on access-denied / sharing-violation the
-  parent directory listing (`fs__stat_directory`) — on the `\\?\` path
-  Node builds. The Win32 error is named by `uverr_windows.go`, generated
-  from libuv's `uv_translate_sys_error` (all 100 cases; anything else is
-  `UNKNOWN`). Directories report size 0, like libuv. `mtimeMs` reproduces
-  Node's 32-bit `tv_sec` on Windows, including its wrap for dates before
-  1970. Go's own `os.Stat` is not used: it reports an offline network
-  share (`ERROR_BAD_NETPATH`) as "does not exist", which libuv — and so
-  Node — reports as `UNKNOWN`.
-- **Linux / macOS**: `lstat` then `stat` for links, `errno` named from
-  libuv's `UV_ERRNO_MAP` (`ESTALE` and anything else outside it is
-  `UNKNOWN`, as in Node).
-- `EOUTSIDE`: the path (as written, its parent folder with links resolved,
-  or the link itself) is outside the allowed roots. Paths with a NUL byte
-  get `ERR_INVALID_ARG_VALUE`, relative ones `EINVAL`.
-
-`tests/gocore-fs.errors.test.js` compares every situation it can set up on
-the OS it runs on against Node's own `fs.stat`, live.
-
-### `/v1/fs/walk` — recursive `fs.readdir(…, {withFileTypes})` (+ `fs.stat`)
-
-Request: `root` (absolute, inside a root), `maxDepth` (entries of the root
-are depth 1; directories at `maxDepth` are listed, not entered; `0` = no
-limit), `stat` (`none` | `files`: entries that are files | `nondir`: every
-entry that is not a directory, following links), `entries` (default `true`;
-`false` sends only the summary). Streams one JSON object per line, in the
-order a recursive Node walk visits them — depth first, pre-order, each
-directory in libuv's order (file-system order on Windows, `strcmp` order
-elsewhere):
-
-```
-{"t":"d","p":"group/images"}                                   a directory entry
-{"t":"f","p":"group/images/a.jpg","k":"file","ok":true,"size":N,"mtimeMs":F,"isFile":true,"isDir":false}
-{"t":"f","p":"group/link","k":"link","code":"EOUTSIDE"}        any other entry (k: file|link|char|…)
-{"t":"e","p":"group/locked","code":"EACCES"}                   a directory that could not be listed ("" = root)
-{"t":"end","dirs":N,"files":N,"errors":N,"stated":N,"bytes":N,"outside":["group/link"]}
+```sh
+./tgdl-server version
+./tgdl-server help
+./tgdl-server setup --password-stdin < password-file   # first dashboard password, via the running server
+./tgdl-server backup-restore --help                     # offline snapshot restore
+./tgdl-server backup-decrypt --help                     # decrypt a TGDB archive
 ```
 
-`p` is relative to the root with `/` separators; names are what Node would
-see (invalid UTF-8 / lone UTF-16 surrogates as U+FFFD). Links are entries,
-never entered. `bytes` sums the stat'ed entries that are files. A stream
-without an `end` line was cut off.
+## HTTP and WebSocket surface
 
-### `/v1/dbscan` — face clustering
+- `GET /health` reports readiness without authentication.
+- `POST /api/auth/setup`, `POST /api/login`, `POST /api/logout`, and
+  `GET /api/auth_check` manage the compatible scrypt/session flow.
+- `GET /` and asset paths serve the embedded SPA.
+- `GET /` or `GET /ws` upgrades an authenticated session; events
+  are bounded and role-filtered so a slow browser cannot block workers.
+  Revocation, expiry and shutdown close the owned connection; password changes
+  invalidate old admin sessions. See [session lifetime and compatibility](../docs/GO-WEBSOCKET-SESSIONS.md).
+- Native periodic status/statistics pushes and rescue retention use owned,
+  bounded workers. Source-delete receipts survive queued transfers and restart;
+  expiry retains pinned and shared-file owners. See
+  [rescue behavior, events and limitations](../docs/GO-RESCUE.md).
+- `/v1/db/*` exposes the read projections used by the gallery, maintenance,
+  AI, NSFW, integrity, dedup and cluster surfaces. They run directly against
+  a query-only pool, require an admin session and are not a public API.
+- Pin mutations, job status/cancellation and SQLite backup
+  are owned by Go and commit before broadcasting their event.
+- Cluster pairing, durable request replay checks, automatic paged catalog pulls
+  and ranged peer-file proxying run in Go. Signed peer sockets wake durable
+  add/edit/delete reconciliation, including disconnect recovery and native restore
+  epoch changes. Discovery and failover are not implemented. See [cluster mode](../docs/CLUSTER.md) and [cluster internals](../docs/GO-CLUSTER.md).
+- `/api/history` runs native durable backfills using the shared account/queue
+  engine, including jobs-only operation, cancellation and restart resumption.
+  See [history limits, semantics and validation](../docs/GO-HISTORY.md).
+- `/api/download/url` reads fresh Telegram messages through the same account
+  pool and persists explicit URL work before acknowledgement, including when
+  live monitoring is off. See [link behavior and validation](../docs/GO-URL-DOWNLOADS.md).
+- Dialog resync and group refresh read current Telegram names and avatars through
+  the shared accounts. Maintenance restart joins old transfers before opening new
+  accounts. See [behavior, limits and measurements](../docs/GO-MONITOR-MAINTENANCE.md).
+- Stories listing and selected downloads use the same native accounts and durable
+  dedup queue, with distinct story/message keys. The proxy test performs a bounded
+  TCP probe. See [story behavior and compatibility](../docs/GO-STORIES.md).
+- Configured SOCKS4/5 and MTProxy connections now cover accounts, login and media
+  DCs. Handshakes are bounded and invalid settings cannot silently select direct
+  connections. See [proxy configuration and verification](../docs/GO-PROXIES.md).
 
-Query `n` (≤ 524 288), `dim` (≤ 4 096, n × dim ≤ 2²⁸), `eps`, `minPts`,
-`weights=1` when per-face float64 weights follow the n × dim float32
-embeddings in the body (little endian). Over those limits: 413 `EINVAL`;
-bad parameters or a body that is not exactly the size they call for: 400
-`EINVAL`, both before anything is allocated. One clustering runs at a time (4 may wait; more → 503
-`EQUEUEFULL`). The answer streams `{"t":"progress","done":D,"n":N}` about
-once a second, then
-`{"t":"result","count":C,"noiseCount":K,"starts":b64,"members":b64,"centroids":b64}`
-— int32 / int32 / float32, the packing of the old Node cluster worker —
-or `{"t":"error",…}`. It is a line-by-line port of
-`src/core/ai/dbscan.js`: the same visit order and queue, float64 sums in
-dimension order with no fused multiply-add, the same `_rejectBound` early
-exit, Float32 centroid arithmetic. Neighbour lists are computed on all
-cores ahead of use and consumed in the exact sequential order, so the
-result does not depend on the number of cores. A client that disconnects
-stops the work.
+- Native local, S3, SFTP and FTP/FTPS mirror/snapshot backups cover durable enqueue,
+  destination controls, retry/pause, cron and retention. S3 uses bounded multipart
+  uploads and checksums; SFTP persists host keys and publishes complete files.
+  Shared upload pacing respects network deadlines, and a durable journal cleans
+  owned multipart uploads/temporary files after process death or destination
+  edits/deletion. FTP verifies uploaded content before rename, requires MLSD,
+  and supports explicit/implicit TLS without downgrading the selected mode.
+  TGDB v1 encrypted uploads and offline `backup-decrypt`/`backup-restore`
+  commands use bounded buffers and authenticate before publishing output.
+  Google Drive and Dropbox are not available in 3.0. See [backup](../docs/BACKUP.md)
+  and [backup internals](../docs/GO-BACKUP.md).
 
-## Implementation notes
+## Data safety
 
-- Containment (`internal/hash/roots.go`): checked as written first (a path
-  outside every root is refused without touching the file system), then
-  with links resolved — for hashing via `filepath.EvalSymlinks`, for stats
-  per directory (a plain directory under an inside directory is inside;
-  only a link costs a full resolution; verdicts are reused for 2 s). Each
-  check is `filepath.Rel` + `filepath.IsLocal` (UNC share roots compared
-  without a trailing separator: `filepath.Rel` never returns for that
-  pair). Residual race: someone who can write inside a root could swap a
-  directory for a link between the check and the read; that needs write
-  access to the downloads folder, which is already the app's own data.
-- Windows files are opened with `FILE_SHARE_DELETE` and the `\\?\`
-  prefix, like libuv: the app can delete or rename a file while tgdl-core
-  reads it, and paths over 260 characters work.
-- No `WriteTimeout`: a multi-GB hash or a 50 k-face clustering
-  legitimately takes minutes; the client's deadline cancels the request
-  context instead.
+SQLite uses WAL, `synchronous=NORMAL`, `busy_timeout=5000` and foreign keys.
+Schema creation is embedded and idempotent. Application ingestion looks up
+Telegram identities in the existing catalog before network I/O, retaining a
+separate message reference for each forward. Verified hashes include OS file
+identity/change metadata; active coordination is bounded by the worker limit.
+Transfers write a sibling `.part` file, sync it, then publish through directory
+handles with an exclusive rename. A durable journal recovers completed files
+when registration fails, and message generations prevent stale recovery from
+reverting edits. Cancelled transfers remove their partial files.
 
-## Build
+Backups use SQLite `VACUUM INTO` and publish a timestamped file only after the
+snapshot is complete; each result includes byte count and SHA-256.
 
-```bash
-npm run build:core                  # host binary → core-service/bin/tgdl-core-<slug>(.exe)
-npm run build:core -- --release     # all targets → core-service/dist/*.tar.gz + SHA256SUMS
-npm run install:core                # what `npm install` runs: download, else build, else explain
-cd core-service && go vet ./... && go test ./...
+## Telegram engine boundary
+
+`internal/telegram` extracts photo/document metadata directly from MTProto
+messages and provides an account-bound gotd media transport. `App.IngestTelegram`
+connects that metadata to the durable library, existing gallery files and
+WebSocket events. Integration tests use a fixture byte transport. The adapter
+does not dial during construction; network activity starts from `Run`.
+
+Monitor start/stop/restart now owns native gotd account connections and a durable
+SQLite work queue. Existing encrypted sessions are imported into a separate
+native directory; duplicate authentication keys and simultaneous servers using
+the same data directory are refused. Workers use their source account, refresh
+expired references, recheck filters and publish through the ingestion library.
+The queue snapshot reports actual byte progress and persists recent outcomes.
+SIGINT/SIGTERM stops HTTP acceptance, joins workers and closes browser sockets.
+
+Telegram cursors are stored per account/user/channel. Difference payloads are
+durably accepted before gotd can advance a cursor; persistence failures latch
+account shutdown. Oversized update gaps preserve a history-recovery marker and
+prevent restart until repaired. Channel-gap repair, account login, account
+pinning, proxies and durable queue controls are implemented. Tests use injected
+accounts and actual gotd update processing with fake RPCs; the
+[migration status](../docs/GO-MIGRATION-STATUS.md) records the pre-release
+evidence.
+
+Transfer attempts have a deadline of two minutes plus one second per 16 KiB,
+capped at 24 hours, so internal RPC retries cannot occupy a worker forever.
+Shutdown/edit cancellation returns work to pending without spending a retry;
+a transfer deadline consumes one of the configured attempts. Queued Telegram
+payloads stay private: the dashboard receives a bounded field projection.
+Set `TGDL_SECURE_COOKIES=1` when serving behind HTTPS.
+Set `TGDL_BIND_HOST=127.0.0.1` to restrict the native listener to local clients
+when a same-host reverse proxy exposes the dashboard. This accepts a literal
+IPv4/IPv6 address; `PORT` sets the port separately. An empty value listens on
+all interfaces.
+For a specific non-loopback interface, configure the initial password while
+bound to loopback, then restart with the intended bind address. The setup command
+never sends the password to a remote address or a different loopback service.
+Native HTTP policy now honors `TRUST_PROXY`, live HTTPS/CSP/API-limit settings,
+and bounded gzip/deflate/Brotli response compression. Compose forwards these
+options. See [HTTP policy, verification and limits](../docs/GO-HTTP-SECURITY.md).
+
+References:
+
+- [gotd introduction](https://gotd.dev/docs/intro/)
+- [gotd first client](https://gotd.dev/docs/getting-started/first-client/)
+- [Telegram API](https://core.telegram.org/api)
+- [Telegram update sequence and differences](https://core.telegram.org/api/updates)
+- [Pinned gotd update manager](https://github.com/gotd/td/tree/v0.115.0/telegram/updates)
+- [Go net/http](https://pkg.go.dev/net/http)
+- [modernc SQLite](https://pkg.go.dev/modernc.org/sqlite)
+
+## Development checks
+
+From the repository root:
+
+```sh
+make test     # go test ./...
+make check    # gofmt, go vet, go test -race ./...
+make build    # core-service/tgdl-server
 ```
 
-`npm test` builds tgdl-core from this tree (Go on PATH; cached by a hash of
-the sources) and runs every suite against it — including the Node-vs-Go
-parity suites (`tests/gocore-*.test.js`).
-
-Go 1.22+ (CI and releases use 1.25). CGO is off, so every target
-cross-compiles from any host:
-
-| Slug | GOOS/GOARCH |
-|---|---|
-| `win-x64` | windows/amd64 |
-| `win-arm64` | windows/arm64 |
-| `linux-x64` | linux/amd64 |
-| `linux-arm64` | linux/arm64 |
-| `linux-arm` | linux/arm, GOARM=7 (Raspberry Pi 2+, 32-bit ARM NAS) |
-| `linux-x86` | linux/386 (Synology DSM x86, older NAS) |
-| `mac-arm64` | darwin/arm64 |
-| `mac-x64` | darwin/amd64 |
-
-Other hosts (32-bit Windows, ARMv6, FreeBSD, …) get no binary: build one
-with Go and point `TGDL_CORE_BIN` at it.
-
-## How the app finds it
-
-`src/core/gocore/spawn.js`, first hit wins:
-
-1. `TGDL_CORE_BIN` — an explicit path; when set, nothing else is tried.
-2. `/app/bin/tgdl-core` — built into the Docker image.
-3. `core-service/bin/tgdl-core-<slug>` — `npm run build:core`, used only
-   when it reports the pinned version.
-4. `data/core-service/bin/tgdl-core-<slug>` — `npm install`
-   (`scripts/install-core.js`) or the app itself at startup downloads the
-   GitHub release `core-v<CORE_VERSION>` (`tgdl-core-<slug>.tar.gz`),
-   verified against the release's `SHA256SUMS`, with a `.version` marker so
-   a `CORE_VERSION` bump fetches the new build. `TGDL_CORE_RELEASE_URL`
-   overrides the release URL (mirrors, air-gapped installs).
-
-## Releasing
-
-1. Bump `Version` in `internal/version/version.go` and `CORE_VERSION` in
-   `src/core/gocore/spawn.js` together (a test checks they match), and
-   add a line to `CHANGELOG.md` below.
-2. Push the tag `core-v<version>`. `.github/workflows/release-core-service.yml`
-   checks the tag against `CORE_VERSION`, runs the Go tests, builds the
-   eight tarballs + `SHA256SUMS`, smoke-runs the Linux binary and attaches
-   it all to the release (never marked Latest).
-3. Only then release an app version that pins it.
-
-## Changelog
-
-- **0.4.0** — `front` answers the rare cases itself: 412 / 416 / ranges,
-  symlinks inside `TGDL_CORE_ALLOW_ROOTS`, a missing file (404) and a session
-  due for renewal. Node is told afterwards (it alone writes the database);
-  the `X-Tgdl-Accel` hand-back is gone.
-- **0.3.0** — `front`: the app's front server on `PORT` — `/files`,
-  `/photos` and cached thumbnails served from Go, everything else proxied
-  to the Node server ([Front server](#front-server-front)).
-- **0.2.0** — `stat` (`/v1/fs/stat-batch`), `walk` (`/v1/fs/walk`) and
-  `dbscan` (`/v1/dbscan`); builds for `linux-arm` (ARMv7) and `mac-x64`;
-  containment no longer hangs on a UNC share root and no longer re-resolves
-  missing roots on every request.
-- **0.1.0** — `hash` (`/v1/hash`).
+Historical HTTP/WebSocket contract snapshots of the 2.x release remain under
+`tests/contract/` as reference data. They are never copied into the
+production image, and the production process tree contains only `tgdl-server`
+(plus ffmpeg while it generates media).

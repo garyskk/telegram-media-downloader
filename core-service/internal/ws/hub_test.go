@@ -1,0 +1,109 @@
+package ws
+
+import (
+	"encoding/json"
+	"testing"
+	"time"
+)
+
+func TestWireEventUsesPayloadEnvelopeAndOmitsRoles(t *testing.T) {
+	raw, err := json.Marshal(Event{Type: "file_deleted", Roles: []string{"admin"}, Payload: map[string]any{"id": 5}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	payload, ok := decoded["payload"].(map[string]any)
+	if len(decoded) != 2 || decoded["type"] != "file_deleted" || !ok || payload["id"] != float64(5) {
+		t.Fatalf("wire event: %s", raw)
+	}
+}
+
+func TestWireEventCanPreserveFlatLegacyFields(t *testing.T) {
+	raw, err := json.Marshal(Event{Type: "download_pinned", Flat: true, Payload: map[string]any{"id": 5}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if len(decoded) != 2 || decoded["id"] != float64(5) || decoded["type"] != "download_pinned" {
+		t.Fatalf("flat wire event: %s", raw)
+	}
+}
+
+func TestHubBroadcastDoesNotBlockAndHonorsRole(t *testing.T) {
+	h := NewHub(4)
+	admin := h.Add("admin")
+	guest := h.Add("guest")
+	h.Broadcast(Event{Type: "secret", Roles: []string{"admin"}, Payload: map[string]any{"ok": true}})
+	select {
+	case <-admin.Events():
+	case <-time.After(time.Second):
+		t.Fatal("admin did not receive event")
+	}
+	select {
+	case <-guest.Events():
+		t.Fatal("guest received admin event")
+	case <-time.After(10 * time.Millisecond):
+	}
+	h.Remove(admin)
+	h.Remove(guest)
+}
+
+func TestHubCloseAlsoRejectsNewSubscribers(t *testing.T) {
+	h := NewHub(1)
+	c := h.Add("admin")
+	h.Close()
+	h.Close()
+	h.Remove(c)
+	if _, ok := <-c.Events(); ok {
+		t.Fatal("subscriber not closed")
+	}
+	c = h.Add("guest")
+	if _, ok := <-c.Events(); ok {
+		t.Fatal("subscriber added after shutdown")
+	}
+	h.Broadcast(Event{Type: "ignored"})
+}
+
+func TestBatchFitsOneQueueSlotAndFiltersEveryFrame(t *testing.T) {
+	h := NewHub(1)
+	defer h.Close()
+	admin, guest := h.Add("admin"), h.Add("guest")
+	events := make([]Event, 0, 501)
+	for i := 0; i < 500; i++ {
+		events = append(events, Event{Type: "file_deleted", Payload: i})
+	}
+	events = append(events, Event{Type: "secret", Roles: []string{"admin"}})
+	h.BroadcastBatch(events)
+	// A slow consumer's next transaction cannot grow its queue or block.
+	h.BroadcastBatch(events)
+	for _, c := range []*Client{admin, guest} {
+		batch := <-c.Events()
+		if _, err := json.Marshal(batch); err == nil {
+			t.Fatal("internal batch leaked onto wire")
+		}
+		frames := batch.Frames()
+		want := 500
+		if c.Role() == "admin" {
+			want++
+		}
+		if len(frames) != want {
+			t.Fatalf("%s received %d frames", c.Role(), len(frames))
+		}
+		for i := 0; i < 500; i++ {
+			if frames[i].Type != "file_deleted" || frames[i].Payload != i {
+				t.Fatal("batch lost ordering", i, frames[i])
+			}
+		}
+		select {
+		case <-c.Events():
+			t.Fatal("queue grew past capacity")
+		default:
+		}
+	}
+}
