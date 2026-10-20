@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"path/filepath"
 	"strconv"
@@ -301,6 +302,7 @@ func (a *App) startSimilar(name, progressEvent, doneEvent, lastKey, pendingKey s
 	slot.status["stage"] = "start"
 	slot.status["startedAt"] = time.Now().UnixMilli()
 	a.similarJobs.mu.Unlock()
+	a.logSimilar("info", "%s starting", name)
 	_ = similar.PutKV(a.ctx, a.db.Writer, pendingKey, similar.MarshalResult(map[string]any{"startedAt": time.Now().UnixMilli()}))
 	go func() {
 		progress := func(p map[string]any) {
@@ -380,6 +382,7 @@ func (a *App) startSimilar(name, progressEvent, doneEvent, lastKey, pendingKey s
 			_ = json.Unmarshal(encoded, &payload)
 			payload["finishedAt"] = finished
 		}
+		a.logSimilarResult(name, result, err)
 		a.hub.Broadcast(ws.Event{Type: doneEvent, Flat: true, Payload: payload})
 	}()
 	return true
@@ -391,7 +394,68 @@ func (a *App) stopSimilar(name string) {
 	cancel := slot.cancel
 	a.similarJobs.mu.Unlock()
 	if cancel != nil {
+		a.logSimilar("info", "%s stopping", name)
 		cancel()
+	}
+}
+
+// logSimilar records one Similar clips line. Stdout keeps the [similar]
+// prefix used by the other maintenance helpers. The same line is broadcast
+// on the admin log stream so the Logs page can filter source "similar".
+func (a *App) logSimilar(level, format string, args ...any) {
+	if level != "info" && level != "warn" && level != "error" {
+		level = "info"
+	}
+	msg := fmt.Sprintf(format, args...)
+	if a.output != nil {
+		fmt.Fprintf(a.output, "[similar] %s\n", msg)
+	}
+	if a.hub == nil {
+		return
+	}
+	a.hub.Broadcast(ws.Event{
+		Type:  "log",
+		Flat:  true,
+		Roles: []string{"admin"},
+		Payload: map[string]any{
+			"source": "similar",
+			"level":  level,
+			"msg":    msg,
+			"ts":     time.Now().UnixMilli(),
+		},
+	})
+}
+
+func (a *App) logSimilarResult(name string, result any, err error) {
+	switch {
+	case err != nil && !errors.Is(err, context.Canceled):
+		a.logSimilar("error", "%s failed: %v", name, err)
+	case errors.Is(err, context.Canceled) || similarRunCancelled(result):
+		a.logSimilar("info", "%s cancelled", name)
+	default:
+		a.logSimilar("info", "%s finished: %s", name, similarResultSummary(result))
+	}
+}
+
+func similarRunCancelled(result any) bool {
+	switch r := result.(type) {
+	case similar.ScanResult:
+		return r.Cancelled
+	case similar.AnalyzeResult:
+		return r.Cancelled
+	default:
+		return false
+	}
+}
+
+func similarResultSummary(result any) string {
+	switch r := result.(type) {
+	case similar.ScanResult:
+		return fmt.Sprintf("processed=%d generated=%d skipped=%d errored=%d", r.Processed, r.Generated, r.Skipped, r.Errored)
+	case similar.AnalyzeResult:
+		return fmt.Sprintf("similarGroups=%d comparedPairs=%d skipped=%d partialGroups=%d partialReviewGroups=%d", r.SimilarGroups, r.ComparedPairs, r.Skipped, r.PartialGroups, r.PartialReviewGroups)
+	default:
+		return "ok"
 	}
 }
 
@@ -435,7 +499,14 @@ func (a *App) fingerprintOne(ctx context.Context, id int64) {
 		return
 	}
 	duration, frames, err := similar.GenerateFingerprint(ctx, abs, cfg)
-	if err != nil || len(frames) == 0 {
+	if err != nil {
+		if ctx.Err() == nil && !errors.Is(err, context.Canceled) {
+			a.logSimilar("warn", "fingerprint failed for download %d: %v", id, err)
+		}
+		return
+	}
+	if len(frames) == 0 {
+		a.logSimilar("warn", "fingerprint produced no frames for download %d", id)
 		return
 	}
 	fileHash := ""
@@ -447,6 +518,7 @@ func (a *App) fingerprintOne(ctx context.Context, id int64) {
 		hexes[i] = f.Phash
 	}
 	if err = similar.UpsertFingerprint(ctx, a.db.Writer, id, duration, similar.XORAggregate(hexes), len(frames), fileHash); err != nil {
+		a.logSimilar("warn", "fingerprint save failed for download %d: %v", id, err)
 		return
 	}
 	_ = similar.ReplaceFrames(ctx, a.db.Writer, id, frames)

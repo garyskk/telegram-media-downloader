@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -107,6 +108,62 @@ func TestSimilarIgnoreGroupsAndPurge(t *testing.T) {
 	var fps int
 	if err = a.db.Reader.QueryRow(`SELECT COUNT(*) FROM video_fingerprints`).Scan(&fps); err != nil || fps != 0 {
 		t.Fatalf("fingerprints remain %d %v", fps, err)
+	}
+}
+
+func TestSimilarGroupMembersExposeDateAndPin(t *testing.T) {
+	a, err := newConfiguredTestApp(context.Background(), Config{DataDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	if _, err = a.db.Writer.Exec(`INSERT INTO downloads(id,group_id,message_id,file_path,file_type,file_size,file_name,pinned,created_at) VALUES
+		(1,'g',1,'a.mp4','video',100,'a.mp4',1,'2024-05-06 07:08:09'),
+		(2,'g',2,'b.mp4','video',80,'b.mp4',0,'2024-05-07 08:09:10')`); err != nil {
+		t.Fatal(err)
+	}
+	err = similar.InsertGroup(context.Background(), a.db.Writer, similar.Group{
+		Kind: "similar", Confidence: 0.9,
+		Members: []similar.Member{{DownloadID: 1, Role: "keep"}, {DownloadID: 2, Role: "remove"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := httptest.NewRecorder()
+	a.handleSimilarGroups(w, httptest.NewRequest(http.MethodGet, "/api/maintenance/similar/groups?kind=similar", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("groups %d %s", w.Code, w.Body.String())
+	}
+	var body struct {
+		Groups []struct {
+			Members []struct {
+				DownloadID int64  `json:"download_id"`
+				CreatedAt  string `json:"created_at"`
+				Pinned     bool   `json:"pinned"`
+			} `json:"members"`
+		} `json:"groups"`
+	}
+	if err = json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.Groups) != 1 || len(body.Groups[0].Members) != 2 {
+		t.Fatalf("groups %#v", body.Groups)
+	}
+	got := map[int64]struct {
+		created string
+		pinned  bool
+	}{}
+	for _, m := range body.Groups[0].Members {
+		got[m.DownloadID] = struct {
+			created string
+			pinned  bool
+		}{m.CreatedAt, m.Pinned}
+	}
+	if got[1].created != "2024-05-06 07:08:09" || !got[1].pinned {
+		t.Fatalf("pinned member %#v", got[1])
+	}
+	if got[2].created != "2024-05-07 08:09:10" || got[2].pinned {
+		t.Fatalf("unpinned member %#v", got[2])
 	}
 }
 

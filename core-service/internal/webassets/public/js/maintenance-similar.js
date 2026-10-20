@@ -274,7 +274,8 @@ function _memberToViewerFile(m) {
         file_type: fileType,
         size: Number(m.file_size) || 0,
         sizeFormatted: formatBytes(Number(m.file_size) || 0),
-        modified: null,
+        modified: m.created_at || null,
+        pinned: !!m.pinned,
         peer_id: 'self',
     };
 }

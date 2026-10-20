@@ -374,7 +374,7 @@ func ListGroups(ctx context.Context, db execer, kind string) ([]map[string]any, 
 		return []map[string]any{}, nil
 	}
 	members := map[int64][]map[string]any{}
-	mrows, err := db.QueryContext(ctx, `SELECT m.group_id, m.download_id, m.role, m.reason, d.file_name, d.file_size, d.file_path, d.file_hash, d.file_type, vf.duration_sec
+	mrows, err := db.QueryContext(ctx, `SELECT m.group_id, m.download_id, m.role, m.reason, d.file_name, d.file_size, d.file_path, d.file_hash, d.file_type, vf.duration_sec, CAST(d.created_at AS TEXT), d.pinned
 		FROM similar_group_members m JOIN downloads d ON d.id=m.download_id
 		LEFT JOIN video_fingerprints vf ON vf.download_id=d.id
 		ORDER BY m.group_id, CASE m.role WHEN 'keep' THEN 0 WHEN 'remove' THEN 1 ELSE 2 END, m.download_id`)
@@ -386,12 +386,13 @@ func ListGroups(ctx context.Context, db execer, kind string) ([]map[string]any, 
 		var gid, did int64
 		var role string
 		var reason, name, path, hash, kindName sql.NullString
-		var size sql.NullInt64
+		var size, pinned sql.NullInt64
 		var dur sql.NullFloat64
-		if err = mrows.Scan(&gid, &did, &role, &reason, &name, &size, &path, &hash, &kindName, &dur); err != nil {
+		var created sql.NullString
+		if err = mrows.Scan(&gid, &did, &role, &reason, &name, &size, &path, &hash, &kindName, &dur, &created, &pinned); err != nil {
 			return nil, err
 		}
-		row := map[string]any{"group_id": gid, "download_id": did, "role": role, "reason": nullString(reason), "file_name": nullString(name), "file_size": nullInt(size), "file_path": nullString(path), "file_hash": nullString(hash), "file_type": nullString(kindName), "duration_sec": nullFloat(dur)}
+		row := map[string]any{"group_id": gid, "download_id": did, "role": role, "reason": nullString(reason), "file_name": nullString(name), "file_size": nullInt(size), "file_path": nullString(path), "file_hash": nullString(hash), "file_type": nullString(kindName), "duration_sec": nullFloat(dur), "created_at": nullString(created), "pinned": pinned.Valid && pinned.Int64 != 0}
 		members[gid] = append(members[gid], row)
 	}
 	if err = mrows.Err(); err != nil {

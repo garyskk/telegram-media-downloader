@@ -109,21 +109,27 @@ func getSimilarStatus(t *testing.T, a *App) map[string]any {
 
 func readSimilarEvent(t *testing.T, ch <-chan ws.Event) map[string]any {
 	t.Helper()
-	select {
-	case ev := <-ch:
-		raw, err := json.Marshal(ev)
-		if err != nil {
-			t.Fatal(err)
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case ev := <-ch:
+			raw, err := json.Marshal(ev)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var msg map[string]any
+			if err = json.Unmarshal(raw, &msg); err != nil {
+				t.Fatal(err)
+			}
+			// Job lifecycle lines share this socket with progress frames.
+			if msg["type"] == "log" {
+				continue
+			}
+			return msg
+		case <-deadline:
+			t.Fatal("timed out waiting for similar event")
 		}
-		var msg map[string]any
-		if err = json.Unmarshal(raw, &msg); err != nil {
-			t.Fatal(err)
-		}
-		return msg
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for similar event")
 	}
-	return nil
 }
 
 func asInt(v any) int {
