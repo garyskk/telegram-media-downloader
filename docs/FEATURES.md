@@ -100,6 +100,12 @@ This page lists what the current 3.x release (3.4) does. Detailed guides:
 
 - Library with thumbnails, search, type filters, pinning, bulk delete and bulk
   ZIP download.
+- **Shuffle** on the gallery toolbar, and the same button in the player. It
+  reshuffles the current gallery (type tab, chat, search and pinned filter)
+  one page at a time. The next page is another random batch and does not
+  repeat files already shown. The player moves through that grid order.
+  Turning shuffle off restores the previous order. Changing the tab, chat or
+  search leaves shuffle.
 - Full-screen viewer and video player; MP4 files are rewritten for instant
   streaming (faststart). Hover previews on the video scrub bar (seekbar
   sprites, built with ffmpeg in the server).
@@ -198,7 +204,9 @@ do them. Saved settings are kept, so nothing is lost if they return.
   [Cluster mode](CLUSTER.md#limitations).
 - **Backups**: in-dashboard restore (restore is offline with
   `tgdl-server backup-restore`). See [Backup](BACKUP.md#limits-and-whats-not-in-3x).
-- **Live log viewer**: Maintenance → Logs only browses log files left by 2.x;
-  3.x logs to standard output (`docker compose logs`).
+- **Full live log buffer**: Maintenance → Logs still lists log files left by
+  2.x. The live tail only shows sources that broadcast a `log` event (backup,
+  and similar clips). It does not replay lines from before the page was
+  opened. Everything else is standard output (`docker compose logs`).
 - The `rateLimits` and `pollingInterval` settings are stored but have no
   effect.

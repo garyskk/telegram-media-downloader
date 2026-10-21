@@ -9,7 +9,7 @@ import { ws } from './ws.js';
 import { renderTextInto, renderCodeInto, renderMarkdownInto, langFromExt } from './viewer-text.js';
 import { renderArchiveInto } from './viewer-archive.js';
 import { mountTgs } from './tgs.js';
-import { isShuffleActive, shuffleComplete } from './gallery-shuffle.js';
+import { isShuffleActive, loadShuffleBatch, shuffleComplete, shuffleHasMore } from './gallery-shuffle.js';
 
 // ---- Seekbar feature flag — lazy, module-scoped --------------------------
 //
@@ -3011,6 +3011,40 @@ function _crossfadeTransition(callback) {
     }, 100);
 }
 
+// The open player stays on the same file when it is still in the gallery
+// order. Otherwise it moves to the first tile of that order. A null previous
+// only refreshes the counter after a later batch was appended.
+export function followGallery(previous) {
+    const modal = document.getElementById('media-modal');
+    if (!modal || modal.classList.contains('hidden') || !state.files.length) return;
+    const counter = document.getElementById('modal-counter');
+    const idOf = (f) => (f && f.id != null ? `${f.peer_id || 'self'}:${f.id}` : '');
+    if (previous == null) {
+        if (counter) counter.textContent = `${state.currentFileIndex + 1} / ${state.files.length}`;
+        return;
+    }
+    const want = idOf(previous);
+    const idx = want ? state.files.findIndex((f) => idOf(f) === want) : -1;
+    if (idx >= 0) {
+        state.currentFileIndex = idx;
+        if (counter) counter.textContent = `${idx + 1} / ${state.files.length}`;
+        return;
+    }
+    // The open file is not on the gallery. Show the gallery item the index
+    // already points at (the first shuffled tile, or the pre-shuffle item).
+    const fallback = Math.min(Math.max(state.currentFileIndex, 0), state.files.length - 1);
+    openMediaViewer(fallback);
+}
+
+async function extendShuffle() {
+    const from = state.files.length;
+    const added = await loadShuffleBatch();
+    if (added > 0) {
+        _stopSlideshow();
+        _crossfadeTransition(() => openMediaViewer(from));
+    }
+}
+
 function navigateMedia(dir) {
     const currentFilter = isShuffleActive() ? 'all' : state.currentFilter || 'all';
     const visible =
@@ -3022,17 +3056,25 @@ function navigateMedia(dir) {
     if (visibleIndex < 0) {
         newIndex = state.currentFileIndex + dir;
     } else {
-        // Wrap around in continuous mode
+        // Wrap around in continuous mode once the shuffled deck is fully loaded.
         let nextVisIdx = visibleIndex + dir;
         if (_isAutoAdvance() && shuffleComplete()) {
             if (nextVisIdx >= visible.length) nextVisIdx = 0;
             else if (nextVisIdx < 0) nextVisIdx = visible.length - 1;
         }
         const nextVisible = visible[nextVisIdx];
-        if (!nextVisible) return;
+        if (!nextVisible) {
+            if (dir > 0 && isShuffleActive() && shuffleHasMore()) extendShuffle();
+            return;
+        }
         newIndex = state.files.indexOf(nextVisible);
     }
-    if (newIndex < 0 || newIndex >= state.files.length) return;
+    if (newIndex < 0 || newIndex >= state.files.length) {
+        if (dir > 0 && newIndex >= state.files.length && isShuffleActive() && shuffleHasMore()) {
+            extendShuffle();
+        }
+        return;
+    }
 
     _stopSlideshow();
     _crossfadeTransition(() => openMediaViewer(newIndex));

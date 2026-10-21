@@ -88,6 +88,15 @@ import {
     pinnedQs,
     getPinnedMode,
 } from './gallery-toolbar.js';
+import {
+    abandonShuffle,
+    initGalleryShuffle,
+    isShuffleActive,
+    loadShuffleBatch,
+    shuffleBusy,
+    shuffleHasMore,
+    shuffleTotal,
+} from './gallery-shuffle.js';
 
 // ============ Lazy page modules ============
 //
@@ -2248,6 +2257,9 @@ function loadGroupFiles(groupId) {
 // One page of the gallery — a chat (groupId) or All Media (null), or the
 // search results for either while the toolbar holds a query.
 async function _loadGalleryPage(groupId) {
+    // A fresh chronological page replaces the grid. Drop a shuffle session
+    // without restoring its backup — this load owns state.files.
+    if (state.page === 1) abandonShuffle();
     state.loading = true;
     const seq = state.page === 1 ? ++_galleryLoadSeq : _galleryLoadSeq;
 
@@ -2641,9 +2653,15 @@ function renderMediaGrid(opts = {}) {
         });
         const order = [];
         const headers = new Map();
-        for (const [label, items] of groupFilesByTime(filteredWithIndex)) {
-            if (label && items.length) headers.set(order.length, label);
-            for (const it of items) order.push(it.originalIndex);
+        // Shuffle order is the deck order. Time sections would split it
+        // back into Today / Yesterday and undo the random batches.
+        if (isShuffleActive()) {
+            for (const it of filteredWithIndex) order.push(it.originalIndex);
+        } else {
+            for (const [label, items] of groupFilesByTime(filteredWithIndex)) {
+                if (label && items.length) headers.set(order.length, label);
+                for (const it of items) order.push(it.originalIndex);
+            }
         }
         if (opts.keepScroll) rerenderGalleryWindow(order, headers);
         else resetGalleryWindow(order, headers);
@@ -4064,9 +4082,16 @@ function setupMediaTabs() {
     });
     _paintTypeTabs();
     setupGalleryToolbar({ reload: _reloadGallery, setType: setGalleryType });
-    import('./gallery-shuffle.js')
-        .then((m) => m.initGalleryShuffle())
-        .catch((e) => console.error('gallery shuffle', e));
+    initGalleryShuffle({
+        batchSize: () => FILES_PER_PAGE,
+        paint: (opts) => {
+            renderMediaGrid(opts || {});
+            if (isShuffleActive()) _setGallerySubtitle(shuffleTotal());
+        },
+        followPlayer: (previous) => Viewer.followGallery(previous),
+        subtitle: (total) => _setGallerySubtitle(total),
+        galleryTotal: () => _galleryTotal,
+    });
 }
 
 // ============ Utils ============
@@ -4516,10 +4541,16 @@ function setupInfiniteScroll() {
 // page. currentGroupId === null on the All-Media surface — page through
 // /api/downloads/all instead of the per-group endpoint.
 function _galleryNearBottom() {
-    if (state.currentPage !== 'viewer' || state.loading) return;
+    if (state.currentPage !== 'viewer' || state.loading || shuffleBusy()) return;
     if (hasPendingBelow()) {
         extendBottom();
         _recheckLoadMore();
+        return;
+    }
+    // Shuffle pages are random slices of the deck, excluding every id
+    // already shown. The chronological loader must not append here.
+    if (isShuffleActive()) {
+        if (shuffleHasMore()) loadShuffleBatch();
         return;
     }
     if (!state.hasMore) return;

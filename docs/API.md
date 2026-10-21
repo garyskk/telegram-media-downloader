@@ -141,6 +141,8 @@ Deleted, restricted and unreachable chats.
 | `GET` | `/api/downloads` | Guest | Downloads overview. |
 | `GET` | `/api/downloads/all` | Guest | Paged list of all downloads (gallery). |
 | `GET` | `/api/downloads/search` | Guest | Search downloads. |
+| `GET` | `/api/downloads/ids` | Guest | Every id in the current gallery, with no page cap. Same filters as the gallery list: `type`, `groupId`, `q`, `pinned`, and `order=newest`. An admin may pass `include=peers` to add paired peers; on a chat, `peerId` limits that to one peer. Returns `{ids, total}`. A local id is a number; with peers, an id is `{id, peer_id}`. |
+| `POST` | `/api/downloads/by-ids` | Admin | Gallery tiles for up to 100 ids, in request order. Body `{ids}` uses the same id shape as `GET /api/downloads/ids`. A missing id is skipped. A non-`self` peer id is dropped unless the session is admin. Over 100 ids is 400. |
 | `GET` | `/api/downloads/{id}` | Guest | Downloads of one chat (`{id}` is the chat ID). |
 | `POST` | `/api/downloads/{id}/pin` | Admin | Pin or unpin one download. |
 | `POST` | `/api/downloads/pin` | Admin | Pin or unpin several downloads. |

@@ -1,20 +1,30 @@
 // One shuffle session shared by the gallery chip and the player.
-// The full filtered library comes from GET /api/downloads/ids; tiles are
-// filled in windows of 100 via POST /api/downloads/by-ids.
+// The deck is the full filtered id list, shuffled once. The grid shows one
+// batch at a time; the next page takes the next batch and never repeats an
+// earlier one. The player walks that same grid order.
 
 import { state } from './store.js';
 import { api } from './api.js';
 import { showToast } from './utils.js';
 import { t as i18nT, tf as i18nTf } from './i18n.js';
 import { pinnedQs } from './gallery-toolbar.js';
+import { shuffleIds, takeBatch } from './gallery-shuffle-order.js';
 
 const session = {
     active: false,
     busy: false,
+    generation: 0,
     keys: [],
-    cache: new Map(),
-    backupFiles: null,
-    backupIndex: 0,
+    cursor: 0,
+    backup: null,
+};
+
+const hooks = {
+    batchSize: () => 100,
+    paint: () => {},
+    followPlayer: () => {},
+    subtitle: () => {},
+    galleryTotal: () => null,
 };
 
 function scopeQs() {
@@ -37,15 +47,9 @@ function keyOf(raw) {
     return `self:${raw}`;
 }
 
-function fisherYates(list) {
-    const arr = list.slice();
-    for (let i = arr.length - 1; i > 0; i--) {
-        const j = Math.floor(Math.random() * (i + 1));
-        const tmp = arr[i];
-        arr[i] = arr[j];
-        arr[j] = tmp;
-    }
-    return arr;
+function batchSize() {
+    const n = Number(hooks.batchSize()) || 100;
+    return Math.max(1, Math.min(100, n));
 }
 
 function syncChrome() {
@@ -58,110 +62,200 @@ function syncChrome() {
     }
 }
 
-async function hydrate(keys) {
-    const missing = keys.filter((k) => !session.cache.has(keyOf(k)));
-    for (let i = 0; i < missing.length; i += 100) {
-        const slice = missing.slice(i, i + 100);
-        const res = await api.post('/api/downloads/by-ids', { ids: slice });
-        for (const file of res?.files || []) {
-            session.cache.set(keyOf(file.id != null ? { id: file.id, peer_id: file.peer_id } : file), file);
-            session.cache.set(`${file.peer_id || 'self'}:${file.id}`, file);
-        }
-        if (!session.active) return;
-    }
+function scrollGalleryTop() {
+    const el = document.getElementById('content-area');
+    if (el) el.scrollTop = 0;
 }
 
-function materialize() {
-    const files = [];
-    for (const key of session.keys) {
-        const file = session.cache.get(keyOf(key));
-        if (!file) break;
-        files.push(file);
+// Files come back in request order. A missing id is dropped; the rest keep
+// the deck order.
+function orderedFiles(keys, returned) {
+    const byKey = new Map();
+    for (const file of returned || []) {
+        byKey.set(`${file.peer_id || 'self'}:${file.id}`, file);
     }
-    state.files = files;
-    state.hasMore = files.length < session.keys.length;
+    const files = [];
+    for (const key of keys) {
+        const file = byKey.get(keyOf(key));
+        if (file) files.push(file);
+    }
+    return files;
+}
+
+// Next slice of the deck. Null means this session was cancelled mid-fetch.
+async function nextFiles(limit, gen) {
+    let guard = 0;
+    while (session.cursor < session.keys.length && guard < 5) {
+        guard++;
+        const page = takeBatch(session.keys, session.cursor, limit);
+        session.cursor = page.cursor;
+        if (!page.batch.length) return [];
+        const res = await api.post('/api/downloads/by-ids', { ids: page.batch });
+        if (gen !== session.generation) return null;
+        const files = orderedFiles(page.batch, res?.files);
+        if (files.length) return files;
+    }
+    return [];
+}
+
+function clearSession() {
+    session.active = false;
+    session.keys = [];
+    session.cursor = 0;
+    session.backup = null;
 }
 
 export function isShuffleActive() {
     return session.active;
 }
 
+export function shuffleBusy() {
+    return session.busy;
+}
+
+export function shuffleHasMore() {
+    return session.active && session.cursor < session.keys.length;
+}
+
+// True when auto-advance may wrap: shuffle is off, or the deck is fully loaded.
 export function shuffleComplete() {
-    return !session.active || state.files.length >= session.keys.length;
+    return !session.active || !shuffleHasMore();
 }
 
-async function openAt(index) {
-    const { openMediaViewer } = await import('./viewer.js');
-    openMediaViewer(index);
+export function shuffleTotal() {
+    return session.active ? session.keys.length : 0;
 }
 
-export async function toggleShuffle({ openPlayer = true } = {}) {
+// A chronological gallery reload owns state.files. Drop the session without
+// putting the pre-shuffle list back.
+export function abandonShuffle() {
+    if (!session.active && !session.busy) return;
+    session.generation++;
+    session.busy = false;
+    clearSession();
+    syncChrome();
+}
+
+function applyBackup() {
+    const backup = session.backup;
+    clearSession();
+    if (!backup) return null;
+    state.files = backup.files;
+    state.page = backup.page;
+    state.hasMore = backup.hasMore;
+    state.currentFileIndex = backup.index;
+    return backup;
+}
+
+function disableShuffle() {
+    const previous = state.files[state.currentFileIndex] || null;
+    session.generation++;
+    const backup = applyBackup();
+    syncChrome();
+    scrollGalleryTop();
+    hooks.paint({});
+    if (backup) hooks.subtitle(backup.total);
+    hooks.followPlayer(previous);
+    showToast(i18nT('toast.viewer_shuffle_off', 'Shuffle off'), 'info');
+}
+
+export async function loadShuffleBatch() {
+    if (!session.active || session.busy || !shuffleHasMore()) return 0;
+    session.busy = true;
+    const gen = session.generation;
+    const from = state.files.length;
+    try {
+        const files = await nextFiles(batchSize(), gen);
+        if (files == null || gen !== session.generation || !session.active) return 0;
+        if (!files.length) {
+            state.hasMore = false;
+            return 0;
+        }
+        state.files = state.files.concat(files);
+        state.hasMore = shuffleHasMore();
+        hooks.paint({ append: true, fromIndex: from });
+        hooks.followPlayer(null);
+        return files.length;
+    } catch (e) {
+        console.error('shuffle', e);
+        return 0;
+    } finally {
+        if (gen === session.generation) session.busy = false;
+    }
+}
+
+export async function toggleShuffle() {
     if (session.busy) return;
     if (session.active) {
-        const backup = session.backupFiles;
-        const backupIndex = session.backupIndex;
-        session.active = false;
-        session.keys = [];
-        session.cache = new Map();
-        session.backupFiles = null;
-        if (Array.isArray(backup)) {
-            state.files = backup;
-            state.currentFileIndex = Math.max(0, Math.min(backupIndex, Math.max(0, backup.length - 1)));
-            state.hasMore = true;
-        }
-        syncChrome();
-        showToast(i18nT('toast.viewer_shuffle_off', 'Shuffle off'), 'info');
+        disableShuffle();
         return;
     }
     session.busy = true;
+    const gen = session.generation;
     try {
         const res = await api.get(`/api/downloads/ids?${shuffleQs()}`);
+        if (gen !== session.generation) return;
         const raw = res?.ids || [];
         if (!raw.length) {
             showToast(i18nT('toast.viewer_shuffle_empty', 'No files to shuffle'), 'info');
             return;
         }
-        session.backupFiles = state.files.slice();
-        session.backupIndex = state.currentFileIndex || 0;
-        session.keys = fisherYates(raw);
-        session.cache = new Map();
+        const previous = state.files[state.currentFileIndex] || null;
+        session.backup = {
+            files: state.files.slice(),
+            page: state.page,
+            hasMore: state.hasMore,
+            index: state.currentFileIndex || 0,
+            total: hooks.galleryTotal(),
+        };
+        session.keys = shuffleIds(raw);
+        session.cursor = 0;
         session.active = true;
-        await hydrate(session.keys.slice(0, 100));
-        materialize();
-        if (!state.files.length) {
-            session.active = false;
-            state.files = session.backupFiles || [];
-            session.backupFiles = null;
+        const files = await nextFiles(batchSize(), gen);
+        if (files == null || gen !== session.generation) return;
+        if (!files.length) {
+            clearSession();
+            syncChrome();
             showToast(i18nT('toast.viewer_shuffle_empty', 'No files to shuffle'), 'info');
             return;
         }
+        state.files = files;
+        state.page = 1;
+        state.currentFileIndex = 0;
+        state.hasMore = shuffleHasMore();
         syncChrome();
+        scrollGalleryTop();
+        hooks.paint({});
+        hooks.followPlayer(previous);
         showToast(
             i18nTf('toast.viewer_shuffle_on', { count: session.keys.length }, `Shuffle on · ${session.keys.length} files`),
             'info',
         );
-        if (openPlayer) await openAt(0);
-        if (session.keys.length > 100) {
-            hydrate(session.keys).then(() => {
-                if (session.active) materialize();
-            });
-        }
     } catch (e) {
         console.error('shuffle', e);
-        session.active = false;
-        if (session.backupFiles) state.files = session.backupFiles;
-        session.backupFiles = null;
-        syncChrome();
-        showToast(i18nT('toast.viewer_shuffle_error', 'Could not start shuffle'), 'error');
+        if (gen === session.generation) {
+            const backup = applyBackup();
+            syncChrome();
+            if (backup) {
+                hooks.paint({});
+                hooks.subtitle(backup.total);
+            }
+            showToast(i18nT('toast.viewer_shuffle_error', 'Could not start shuffle'), 'error');
+        }
     } finally {
-        session.busy = false;
+        if (gen === session.generation) session.busy = false;
     }
 }
 
-export function initGalleryShuffle() {
+let wired = false;
+
+export function initGalleryShuffle(nextHooks = {}) {
+    Object.assign(hooks, nextHooks);
+    if (wired) return;
+    wired = true;
     for (const id of ['gallery-shuffle-btn', 'modal-shuffle-btn']) {
         document.getElementById(id)?.addEventListener('click', () => {
-            toggleShuffle({ openPlayer: true });
+            toggleShuffle();
         });
     }
 }

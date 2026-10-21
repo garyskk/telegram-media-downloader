@@ -512,8 +512,10 @@ so keep the system clocks synced (NTP).
   - Started by hand: the terminal.
 
   `data/logs/` contains only log files left over from 2.x. **Maintenance →
-  Logs** can still browse those files, but the live log viewer stays empty in
-  3.x. Use the commands above instead.
+  Logs** browses those files and tails live `log` events. That tail includes
+  backup and similar clips (`[similar]` on standard output, source `similar`
+  on the page). Lines from before you open the page are not replayed. Other
+  jobs are only in the commands above.
 - **No debug switch:** `TGDL_DEBUG` and `DEBUG` from 2.x have no effect.
 - **Version:** `tgdl-server version` prints the version, OS/CPU and Go
   version.

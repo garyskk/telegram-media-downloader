@@ -94,7 +94,10 @@ intend a deploy-time override.
 
 Progress is decode-bound (no hover WebP encode). JobTracker + WS
 `similar_progress` / `similar_done`. Last-run summary in
-`kv['similar_last_scan']`.
+`kv['similar_last_scan']`. Start, finish, cancel, and failure also
+write a `[similar]` log line (see [Logs](#logs)). A bulk scan counts
+per-file fingerprint errors in `errored=` on the finished line; it does
+not log each file.
 
 ### Analyze
 
@@ -116,7 +119,8 @@ left to the Duplicates page and are not re-checked here.
   `similar_analyze_progress` / `similar_analyze_done`.
   Smith-Waterman runs on a `worker_threads` worker so HTTP/WS stay
   responsive; Stop terminates the in-flight worker. `SIMILAR_ALIGN_WORKER_DISABLE=1`
-  falls back to the main thread.
+  falls back to the main thread. Start, finish, cancel, and failure
+  write a `[similar]` log line (see [Logs](#logs)).
 - **Partial** (checkbox, **on** by default) — high coverage of the
   **shorter** sequence inside a **longer** parent (same-length pairs stay
   on Similar). Clip must have ≥4 scenes and ≥4 matched scenes; coverage
@@ -164,6 +168,34 @@ fingerprint rows stay consistent. Deleting a download cascades those
 rows. Groups with fewer than two live members are dropped so a
 deleted extra does not leave a keep-only card.
 
+## Viewer
+
+Opening a member plays it in the media viewer. The caption date is that
+download's `created_at`, the same value the gallery shows. The pin
+button matches `downloads.pinned`: filled when the file is pinned,
+outline when it is not. The similar list rows still show role, size,
+and duration only.
+
+## Logs
+
+Scan, Analyze, and the background fingerprint for a new download write
+`[similar] …` to standard output and broadcast the same text on the
+admin `log` websocket (`source` `similar`, levels `info` / `warn` /
+`error`). Maintenance → Logs grows a **similar** chip for lines that
+arrive while this browser is subscribed. The recent-log backfill is
+empty, so a run that finished before the page was opened is only in
+`docker compose logs`.
+
+| When | Level | Message |
+|---|---|---|
+| Scan or Analyze starts | info | `scan starting` / `analyze starting` |
+| Run finishes | info | `scan finished: processed=… generated=… skipped=… errored=…` or `analyze finished: similarGroups=… comparedPairs=… skipped=… partialGroups=… partialReviewGroups=…` |
+| Operator stops a run | info | `scan stopping` / `analyze stopping`, then `scan cancelled` / `analyze cancelled` |
+| Run returns an error | error | `scan failed: …` / `analyze failed: …` |
+| A new download's fingerprint fails | warn | `fingerprint failed for download <id>: …` |
+| Fingerprint returns no frames | warn | `fingerprint produced no frames for download <id>` |
+| Fingerprint save fails | warn | `fingerprint save failed for download <id>: …` |
+
 ## Schema
 
 All tables are in the existing `data/db.sqlite` (`CREATE TABLE IF NOT EXISTS`
@@ -195,7 +227,7 @@ All endpoints are admin-only.
 | `GET`  | `/api/maintenance/similar/stats` | Coverage + last scan / analyze |
 | `POST` | `/api/maintenance/similar/analyze` | `{ checkPartialClips?: bool }` |
 | `POST` | `/api/maintenance/similar/analyze/stop` | Cancel Analyze |
-| `GET`  | `/api/maintenance/similar/groups` | Persisted groups |
+| `GET`  | `/api/maintenance/similar/groups` | Persisted groups. Each member includes `created_at` (download time, text) and `pinned` (bool) for the viewer |
 | `POST` | `/api/maintenance/similar/delete` | `{ ids: […] }` |
 | `POST` | `/api/maintenance/similar/ignore` | `{ aId, bId, kind }` |
 | `GET`  | `/api/maintenance/similar/ignore` | List |
@@ -205,7 +237,8 @@ All endpoints are admin-only.
 
 WS: `similar_progress` / `similar_done` (Scan),
 `similar_analyze_progress` / `similar_analyze_done` (Analyze),
-`similar_purged` (Purge records).
+`similar_purged` (Purge records), and admin `log` events with
+`source` `similar` (see [Logs](#logs)).
 
 ## Related subsystem knobs
 
