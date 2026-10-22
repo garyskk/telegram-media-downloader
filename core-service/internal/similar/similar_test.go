@@ -70,6 +70,13 @@ func TestAlignIdenticalAndPartial(t *testing.T) {
 	if !stopped.Cancelled {
 		t.Fatal("expected cancellation")
 	}
+	rights := make([][]Frame, 8)
+	for i := range rights {
+		rights[i] = same
+	}
+	if _, cancelled := parallelAlign(ctx, same, rights, 0); !cancelled {
+		t.Fatal("parallel align kept running after cancel")
+	}
 }
 
 func TestSimilarGroupsSkipExactHashAndPreferLargerFile(t *testing.T) {
@@ -124,6 +131,49 @@ func TestPartialClipInsideLongerVideo(t *testing.T) {
 	}
 	if got.Groups[0].Members[0].DownloadID != 2 || got.Groups[0].Members[0].Role != "keep" {
 		t.Fatalf("parent should be kept: %+v", got.Groups[0].Members)
+	}
+}
+
+func TestPartialMatchesStayInParentOrderWhenParallel(t *testing.T) {
+	h := func(c byte) string { return strings.Repeat(string(c), 64) }
+	clip := []Frame{{0, h('0')}, {1, h('a')}, {2, h('5')}, {3, h('c')}}
+	match := []Frame{{0, h('f')}, {1, h('f')}, {2, h('0')}, {3, h('a')}, {4, h('5')}, {5, h('c')}, {6, h('3')}, {7, h('3')}}
+	other := []Frame{{0, h('f')}, {1, h('f')}, {2, h('f')}, {3, h('f')}, {4, h('3')}, {5, h('3')}, {6, h('3')}, {7, h('3')}}
+	frames := map[int64][]Frame{1: clip}
+	videos := []Video{{ID: 1, DurationSec: 8, FileSize: 10, FileName: "clip.mp4", FrameCount: len(clip)}}
+	var want []int64
+	for id := int64(2); id <= 9; id++ {
+		parent := other
+		if id == 4 || id == 7 {
+			parent = match
+			want = append(want, id)
+		}
+		frames[id] = parent
+		videos = append(videos, Video{ID: id, DurationSec: 20 + float64(id)*10, FileSize: 80, FileName: "parent.mp4", FrameCount: len(parent)})
+	}
+	cfg := Defaults()
+	cfg.PartialReviewMinMatchedFrames = 2
+	got := FindPartialClipGroups(context.Background(), videos, cfg, frames, map[string]bool{}, map[string]bool{}, map[int64]bool{}, map[int64]bool{}, nil, nil)
+	if got.Cancelled {
+		t.Fatalf("cancelled %+v", got)
+	}
+	var gotIDs []int64
+	for _, g := range got.Groups {
+		if len(g.Members) != 2 || g.Members[1].DownloadID != 1 {
+			continue
+		}
+		if g.Kind != "partial" || g.Members[0].Role != "keep" {
+			t.Fatalf("clip group %+v", g)
+		}
+		gotIDs = append(gotIDs, g.Members[0].DownloadID)
+	}
+	if len(gotIDs) != len(want) {
+		t.Fatalf("parents %v want %v", gotIDs, want)
+	}
+	for i, id := range want {
+		if gotIDs[i] != id {
+			t.Fatalf("parents %v want %v", gotIDs, want)
+		}
 	}
 }
 

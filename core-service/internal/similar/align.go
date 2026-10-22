@@ -3,6 +3,8 @@ package similar
 import (
 	"context"
 	"math"
+	"runtime"
+	"sync"
 )
 
 const (
@@ -51,6 +53,53 @@ func scoreOpts(matchHamming float64) alignOpts {
 
 func emptyAlign() Alignment {
 	return Alignment{MeanHamming: math.Inf(1), StartIndexA: -1, StartIndexB: -1}
+}
+
+// parallelAlign runs one Smith-Waterman per right-hand sequence. Results stay
+// in rights order. A cancelled ctx stops scheduling further pairs and drops
+// the in-flight ones once their current row notices.
+func parallelAlign(ctx context.Context, left []Frame, rights [][]Frame, matchHamming float64) ([]Alignment, bool) {
+	out := make([]Alignment, len(rights))
+	if len(rights) == 0 {
+		return out, ctx != nil && ctx.Err() != nil
+	}
+	workers := runtime.GOMAXPROCS(0)
+	if workers > len(rights) {
+		workers = len(rights)
+	}
+	if workers < 1 {
+		workers = 1
+	}
+	jobs := make(chan int)
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for range workers {
+		go func() {
+			defer wg.Done()
+			for i := range jobs {
+				out[i] = AlignHashSequences(ctx, left, rights[i], matchHamming)
+			}
+		}()
+	}
+	cancelled := ctx != nil && ctx.Err() != nil
+	for i := range rights {
+		if ctx != nil && ctx.Err() != nil {
+			cancelled = true
+			break
+		}
+		jobs <- i
+	}
+	close(jobs)
+	wg.Wait()
+	if cancelled || (ctx != nil && ctx.Err() != nil) {
+		return out, true
+	}
+	for i := range out {
+		if out[i].Cancelled {
+			return out, true
+		}
+	}
+	return out, false
 }
 
 // AlignHashSequences runs Smith-Waterman. A match is a Hamming distance at or

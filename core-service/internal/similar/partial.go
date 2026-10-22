@@ -15,33 +15,6 @@ func EffectivePartialMatchRatio(clipDuration float64, cfg Config) float64 {
 	return cfg.PartialMatchRatio
 }
 
-type subMatch struct {
-	Ratio     float64
-	Start     int
-	Matched   int
-	OffsetSec float64
-	Cancelled bool
-}
-
-func bestSubsequence(ctx context.Context, clip, parent []Frame, frameThreshold float64) subMatch {
-	if len(clip) == 0 || len(parent) == 0 || len(clip) > len(parent) {
-		return subMatch{}
-	}
-	r := AlignHashSequences(ctx, clip, parent, frameThreshold)
-	if r.Cancelled {
-		return subMatch{Cancelled: true}
-	}
-	start := r.StartIndexB
-	if start < 0 {
-		start = 0
-	}
-	offset := 0.0
-	if r.HasOffset {
-		offset = r.OffsetBSec
-	}
-	return subMatch{Ratio: r.CoverageA, Start: start, Matched: r.Matched, OffsetSec: offset}
-}
-
 func parentCandidates(clip Video, sorted []Video, bucketSec int) []Video {
 	if bucketSec <= 0 {
 		bucketSec = 120
@@ -192,8 +165,12 @@ func FindPartialClipGroups(ctx context.Context, videos []Video, cfg Config, fram
 			matched int
 			offset  float64
 		}
-		compared := 0
+		var work []Video
+		var rights [][]Frame
 		for _, parent := range parents {
+			if ctx.Err() != nil {
+				return found, true
+			}
 			key := PairKey(clip.ID, parent.ID)
 			if ignored[key] || blocked[key] {
 				continue
@@ -204,37 +181,42 @@ func FindPartialClipGroups(ctx context.Context, videos []Video, cfg Config, fram
 			if DurationsWithinTolerance(clip.DurationSec, parent.DurationSec, cfg.DurationTolerance) {
 				continue
 			}
-			compared++
-			if compared%50 == 0 && ctx.Err() != nil {
-				return found, true
-			}
 			parentFrames := frames[parent.ID]
 			if len(clipFrames) > len(parentFrames) {
 				continue
 			}
-			got := bestSubsequence(ctx, clipFrames, parentFrames, float64(cfg.PartialFrameThreshold))
-			if got.Cancelled || ctx.Err() != nil {
-				return found, true
+			work = append(work, parent)
+			rights = append(rights, parentFrames)
+		}
+		aligned, cancelled := parallelAlign(ctx, clipFrames, rights, float64(cfg.PartialFrameThreshold))
+		if cancelled {
+			return found, true
+		}
+		for i, parent := range work {
+			got := aligned[i]
+			offset := 0.0
+			if got.HasOffset {
+				offset = got.OffsetBSec
 			}
-			offset := got.OffsetSec
 			if got.Matched < cfg.PartialReviewMinMatchedFrames {
 				continue
 			}
-			if got.Ratio >= required {
-				found = append(found, proposal(clip, parent, "partial", got.Ratio, got.Matched, len(clipFrames), offset))
+			key := PairKey(clip.ID, parent.ID)
+			if got.CoverageA >= required {
+				found = append(found, proposal(clip, parent, "partial", got.CoverageA, got.Matched, len(clipFrames), offset))
 				blocked[key] = true
 				continue
 			}
-			if got.Ratio < cfg.PartialReviewMatchRatio {
+			if got.CoverageA < cfg.PartialReviewMatchRatio {
 				continue
 			}
-			if best == nil || got.Ratio > best.ratio {
+			if best == nil || got.CoverageA > best.ratio {
 				best = &struct {
 					parent  Video
 					ratio   float64
 					matched int
 					offset  float64
-				}{parent, got.Ratio, got.Matched, offset}
+				}{parent, got.CoverageA, got.Matched, offset}
 			}
 		}
 		if len(found) == 0 && best != nil {
