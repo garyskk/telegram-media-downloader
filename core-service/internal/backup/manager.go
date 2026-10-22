@@ -169,7 +169,24 @@ func (m *Manager) load(ctx context.Context, id int64) (destination, error) {
 	if errors.Is(err, sql.ErrNoRows) {
 		err = missingDestination(id)
 	}
+	if err != nil {
+		return d, err
+	}
+	err = m.mirrorInventory(ctx, &d)
 	return d, err
+}
+
+// mirrorStoredWhere is the files still stored for a mirror: completed copies of
+// library rows. A later upload of the same file replaces its byte count, and
+// deleting the library row drops it here. The destination columns are a lifetime
+// upload counter, so mirror reads must not trust them.
+const mirrorStoredWhere = `destination_id=? AND status='done' AND download_id IS NOT NULL`
+
+func (m *Manager) mirrorInventory(ctx context.Context, d *destination) error {
+	if d.Mode != "mirror" {
+		return nil
+	}
+	return m.opts.Reader.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(SUM(bytes_uploaded),0) FROM backup_jobs WHERE `+mirrorStoredWhere, d.ID).Scan(&d.Files, &d.Bytes)
 }
 func (m *Manager) destinations(ctx context.Context) ([]destination, error) {
 	rows, err := m.opts.Reader.QueryContext(ctx, `SELECT `+destinationColumns+` FROM backup_destinations ORDER BY id DESC LIMIT 1000`)
@@ -181,6 +198,9 @@ func (m *Manager) destinations(ctx context.Context) ([]destination, error) {
 	for rows.Next() {
 		d, err := scanDestination(rows)
 		if err != nil {
+			return nil, err
+		}
+		if err = m.mirrorInventory(ctx, &d); err != nil {
 			return nil, err
 		}
 		ds = append(ds, d)

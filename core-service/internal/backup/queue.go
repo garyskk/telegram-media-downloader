@@ -61,15 +61,16 @@ func (m *Manager) Retry(ctx context.Context, id int64) (bool, error) {
 		return false, err
 	}
 	var dest int64
-	err := m.opts.Reader.QueryRowContext(ctx, `SELECT destination_id FROM backup_jobs WHERE id=?`, id).Scan(&dest)
-	if errors.Is(err, sql.ErrNoRows) {
+	var status string
+	err := m.opts.Reader.QueryRowContext(ctx, `SELECT destination_id, status FROM backup_jobs WHERE id=?`, id).Scan(&dest, &status)
+	if errors.Is(err, sql.ErrNoRows) || (err == nil && status != "failed") {
 		return false, nil
 	}
 	if err != nil {
 		return false, err
 	}
 	m.stop(dest)
-	_, err = m.opts.Writer.ExecContext(ctx, `UPDATE backup_jobs SET status='pending',attempts=0,error=NULL,started_at=NULL,finished_at=NULL,next_retry_at=NULL WHERE id=?`, id)
+	_, err = m.opts.Writer.ExecContext(ctx, `UPDATE backup_jobs SET status='pending',attempts=0,error=NULL,started_at=NULL,finished_at=NULL,next_retry_at=NULL WHERE id=? AND status='failed'`, id)
 	if d, e := m.load(m.ctx, dest); e == nil && d.Enabled {
 		m.start(dest)
 	}
@@ -397,7 +398,10 @@ func (m *Manager) transfer(ctx context.Context, d destination, j job, p Provider
 				return
 			}
 		}
-		if err == nil {
+		if err == nil && d.Mode == "mirror" {
+			// Count the copy that is stored now. A replacement must not add another file.
+			_, err = tx.ExecContext(ctx, `UPDATE backup_destinations SET total_files=(SELECT COUNT(*) FROM backup_jobs WHERE `+mirrorStoredWhere+`), total_bytes=(SELECT COALESCE(SUM(bytes_uploaded),0) FROM backup_jobs WHERE `+mirrorStoredWhere+`), last_success_at=?, last_error=NULL WHERE id=?`, d.ID, d.ID, time.Now().UnixMilli(), d.ID)
+		} else if err == nil {
 			_, err = tx.ExecContext(ctx, `UPDATE backup_destinations SET total_bytes=total_bytes+?,total_files=total_files+1,last_success_at=?,last_error=NULL WHERE id=?`, result.Bytes, time.Now().UnixMilli(), d.ID)
 		}
 		if err == nil && !j.Download.Valid {
@@ -535,6 +539,8 @@ func (m *Manager) deleteMirrorOrphans(ctx context.Context, d destination) error 
 	if err = rows.Err(); err != nil {
 		return err
 	}
+	removed, failed := 0, 0
+	var removedBytes int64
 	for _, object := range objects {
 		path := filepath.ToSlash(object.Path)
 		if path == "snapshots" || strings.HasPrefix(path, "snapshots/") {
@@ -544,10 +550,60 @@ func (m *Manager) deleteMirrorOrphans(ctx context.Context, d destination) error 
 			continue
 		}
 		if err = p.Delete(ctx, object.Path); err != nil {
+			failed++
 			m.Log("warn", fmt.Sprintf("mirror orphan delete %s on #%d: %v", path, d.ID, err))
+			continue
 		}
+		removed++
+		removedBytes += object.Size
+	}
+	m.recordMirrorPurge(ctx, d.ID, removed, removedBytes, failed)
+	if e := m.storeMirrorInventory(ctx, d.ID); e != nil {
+		m.Log("warn", fmt.Sprintf("mirror inventory on #%d: %v", d.ID, e))
+	} else if fresh, e := m.load(ctx, d.ID); e == nil {
+		m.emit("backup_destination_updated", map[string]any{"destination": m.scrub(fresh)})
 	}
 	return nil
+}
+
+func (m *Manager) recordMirrorPurge(ctx context.Context, id int64, removed int, removedBytes int64, failed int) {
+	word := "files"
+	if removed == 1 {
+		word = "file"
+	}
+	summary := fmt.Sprintf("removed %d %s, %s", removed, word, formatByteSize(removedBytes))
+	if failed > 0 {
+		summary += fmt.Sprintf(", %d failed", failed)
+	}
+	m.Log("info", fmt.Sprintf("mirror purge on #%d: %s", id, summary))
+	if removed == 0 && failed == 0 {
+		return
+	}
+	if _, err := m.opts.Writer.ExecContext(ctx, `INSERT INTO backup_jobs(destination_id,status,remote_path,bytes_uploaded,finished_at) VALUES(?,'purged',?,?,?)`, id, summary, removedBytes, time.Now().UnixMilli()); err != nil {
+		m.Log("warn", fmt.Sprintf("mirror purge log on #%d: %v", id, err))
+	}
+}
+
+func (m *Manager) storeMirrorInventory(ctx context.Context, id int64) error {
+	_, err := m.opts.Writer.ExecContext(ctx, `UPDATE backup_destinations SET total_files=(SELECT COUNT(*) FROM backup_jobs WHERE `+mirrorStoredWhere+`), total_bytes=(SELECT COALESCE(SUM(bytes_uploaded),0) FROM backup_jobs WHERE `+mirrorStoredWhere+`) WHERE id=? AND mode='mirror'`, id, id, id)
+	return err
+}
+
+func formatByteSize(n int64) string {
+	if n < 0 {
+		n = 0
+	}
+	units := []string{"B", "KB", "MB", "GB", "TB"}
+	value := float64(n)
+	unit := 0
+	for value >= 1024 && unit < len(units)-1 {
+		value /= 1024
+		unit++
+	}
+	if unit == 0 {
+		return fmt.Sprintf("%d %s", n, units[unit])
+	}
+	return fmt.Sprintf("%.2f %s", value, units[unit])
 }
 
 func listBackupTree(ctx context.Context, p Provider) ([]Object, error) {
