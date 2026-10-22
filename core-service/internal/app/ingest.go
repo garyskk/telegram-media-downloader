@@ -78,6 +78,9 @@ func (a *App) ingestTelegram(ctx context.Context, message *tg.Message, groupID, 
 		a.enqueueSeekbar(record.ID, engine.Origin(ctx) != "history")
 		a.enqueueFingerprint(record.ID)
 	}
+	if !record.Reused && faststartName(record.Path) {
+		a.enqueueFaststart(record.ID, engine.Origin(ctx) != "history")
+	}
 	a.queueNSFW(record.ID, payload["key"].(string))
 	// Background face detection; live downloads go ahead of history backfill.
 	a.faces.enqueue(record.ID, engine.Origin(ctx) != "history")

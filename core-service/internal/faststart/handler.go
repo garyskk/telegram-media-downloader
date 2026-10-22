@@ -148,6 +148,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	hash.WriteJSON(w, http.StatusOK, result)
 }
 
+// Optimize rewrites path so playback can start before the whole file is read.
+// Status is "already" when the file is already usable, or "optimized" after
+// the stream copy.
+func Optimize(ctx context.Context, path string) (status string, newSize int64, err error) {
+	res, err := optimize(ctx, path, "")
+	if err != nil {
+		return "", 0, err
+	}
+	return res.Status, res.NewSize, nil
+}
+
 func optimize(ctx context.Context, path, ffmpeg string) (response, error) {
 	atom, err := secondAtom(path)
 	if err != nil {

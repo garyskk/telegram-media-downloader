@@ -112,7 +112,20 @@ func (a *App) handleFaststartStats(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"success": true, "ffmpegAvailable": ffmpeg, "lastRun": last, "missing": missing, "optimized": optimized, "pending": pending, "total": len(rows), "unknown": unknown})
 }
 func (a *App) handleFaststartAutoStats(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, 200, map[string]any{"success": true, "ffmpegAvailable": true, "lastAt": nil, "lastError": nil, "lastResult": nil, "already": 0, "errored": 0, "optimized": 0, "skipped": 0, "total": 0})
+	stats, ffmpeg := a.faststartAutoView()
+	var lastAt any
+	if stats.LastAt > 0 {
+		lastAt = stats.LastAt
+	}
+	var lastError any
+	if stats.LastError != "" {
+		lastError = stats.LastError
+	}
+	var lastResult any
+	if stats.LastResult != "" {
+		lastResult = stats.LastResult
+	}
+	writeJSON(w, 200, map[string]any{"success": true, "ffmpegAvailable": ffmpeg, "lastAt": lastAt, "lastError": lastError, "lastResult": lastResult, "already": stats.Already, "errored": stats.Errored, "optimized": stats.Optimized, "skipped": stats.Skipped, "total": stats.Total})
 }
 func (a *App) handleFaststartStatus(w http.ResponseWriter, _ *http.Request) {
 	a.faststartMu.Lock()
