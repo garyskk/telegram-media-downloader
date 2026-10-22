@@ -6,6 +6,7 @@ All notable changes to this project are documented here. The format is based on 
 
 ### Changed
 - **Gallery Shuffle reshuffles the grid instead of opening the player.** Shuffle draws a random page of the current gallery (the type tab, chat, search and pinned filter). The next page is another random batch and leaves out files already shown. The Shuffle button in the player does the same thing, and next and previous follow that grid order. At the end of a page, next loads the following batch and continues into it. Turning Shuffle off restores the order from before. Changing the tab, chat or search leaves shuffle.
+- **Partial clip detection uses every core.** Each shorter clip was aligned with its longer videos one at a time, so that stage of Analyze stayed on a single core. Those alignments now run together, one per core Go is allowed to use, and matches are still recorded in the same order. Stop still cancels the clip in progress. The similar-video stage before it is unchanged.
 
 ## [3.4.15] — 2026-10-18
 

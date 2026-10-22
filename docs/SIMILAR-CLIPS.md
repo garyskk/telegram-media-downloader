@@ -28,10 +28,11 @@ video ──► Seekbar ffmpeg          → data/seekbar/{id}.webp  (player hove
               select scene|floor      video_frame_hashes     (same data/db.sqlite)
               64×64 PDQ-256 + pts
 
-Analyze (Node parent: SQLite / scans / Stop / WS)
-              └─ worker_threads  Smith-Waterman
-                    ├─ similar   (coverage of both ≥ ~0.7, duration ±10%)
-                    └─ partial   (coverage of the shorter sequence)
+Analyze (Go job: SQLite / scans / Stop / WS)
+              ├─ similar   one pair at a time
+              │            (coverage of both ≥ ~0.7, duration ±10%)
+              └─ partial   one clip, every longer parent at once
+                           (GOMAXPROCS Smith-Waterman workers)
 Ignore        → similar_ignores   (kept across Purge records)
 Partial resume → similar_partial_scans
 Delete        → existing dedup.deleteByIds
@@ -117,10 +118,9 @@ left to the Duplicates page and are not re-checked here.
   `partial_review` rows stay. Last-run summary in
   `kv['similar_last_analyze']`. JobTracker + WS
   `similar_analyze_progress` / `similar_analyze_done`.
-  Smith-Waterman runs on a `worker_threads` worker so HTTP/WS stay
-  responsive; Stop terminates the in-flight worker. `SIMILAR_ALIGN_WORKER_DISABLE=1`
-  falls back to the main thread. Start, finish, cancel, and failure
-  write a `[similar]` log line (see [Logs](#logs)).
+  Smith-Waterman for this pass runs one pair at a time on the Analyze
+  job. Stop is noticed between matrix rows. Start, finish, cancel, and
+  failure write a `[similar]` log line (see [Logs](#logs)).
 - **Partial** (checkbox, **on** by default) — high coverage of the
   **shorter** sequence inside a **longer** parent (same-length pairs stay
   on Similar). Clip must have ≥4 scenes and ≥4 matched scenes; coverage
@@ -131,7 +131,13 @@ left to the Duplicates page and are not re-checked here.
   (so a later full video still matches an earlier excerpt). Already-
   grouped `remove`/`review` clips are not reopened. Interrupt-safe via
   `similar_partial_scans`. Exact SHA-256 pairs and `similar_ignores`
-  are skipped.
+  are skipped. Each clip’s longer parents are aligned together, one
+  Smith-Waterman per parent, on `GOMAXPROCS` workers. Matches are still
+  recorded in parent order, including every confirmed parent, so a hit
+  does not end that clip early. Stop stops scheduling further parents;
+  an alignment already running stops at its next row, and that clip is
+  not marked scanned. Progress advances once per clip, after its
+  parents finish.
 
 False-positive pairs go to `similar_ignores` (canonical `a_id < b_id`)
 and survive re-analyze **and** Purge records.
@@ -268,6 +274,11 @@ already-written fingerprints are kept.
 **“No groups after Analyze.”** Scan must finish first (`algo` =
 `pdq-scene-v1`). Photos are ignored. Peer `_clusterref` rows have no
 local file.
+
+**Partial Analyze uses every core and the bar sits on one clip.** That
+step aligns the clip with every longer video at once. The count moves
+when the clip finishes, not after each parent. The similar-video stage
+before it still aligns one pair at a time.
 
 **Short clip not found inside a long video.** Partial search is on by
 default. If the checkbox was turned off, turn it back on. A later full
