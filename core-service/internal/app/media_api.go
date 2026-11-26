@@ -183,7 +183,7 @@ func (a *App) autoPruneMissingFile(r *http.Request, rel string) {
 	if _, err := os.Stat(filepath.Dir(filepath.Join(a.downloadsDir, filepath.FromSlash(rel)))); err != nil {
 		return
 	}
-	if _, err := a.deleteByWhere(r, `REPLACE(file_path,char(92),'/')=?`, filepath.ToSlash(rel)); err == nil {
+	if _, err := a.deleteMatching(r, false, `REPLACE(file_path,char(92),'/')=?`, filepath.ToSlash(rel)); err == nil {
 		a.hub.Broadcast(ws.Event{Type: "file_deleted", Flat: true, Payload: map[string]any{"path": filepath.ToSlash(rel), "autoPruned": true}})
 	}
 }

@@ -12,6 +12,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/botnick/telegram-media-downloader/core-service/internal/similar"
+	"github.com/botnick/telegram-media-downloader/core-service/internal/store"
 	"github.com/botnick/telegram-media-downloader/core-service/internal/ws"
 )
 
@@ -222,6 +224,9 @@ func (a *App) rotateBatch(ctx context.Context, total *int64, capBytes int64, lim
 				return nil, err
 			}
 		}
+		if err = store.RememberDeletedDownloads(ctx, tx, "id=?", row.id); err != nil {
+			return nil, err
+		}
 		if _, err = tx.ExecContext(ctx, `DELETE FROM downloads WHERE id=?`, row.id); err != nil {
 			return nil, err
 		}
@@ -237,6 +242,9 @@ func (a *App) rotateBatch(ctx context.Context, total *int64, capBytes int64, lim
 			remaining -= row.size
 		}
 		deleted = append(deleted, row)
+	}
+	if err = similar.PruneIncompleteGroups(ctx, tx); err != nil {
+		return nil, err
 	}
 	if err = tx.Commit(); err != nil {
 		return nil, err

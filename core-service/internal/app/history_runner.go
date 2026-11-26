@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/botnick/telegram-media-downloader/core-service/internal/engine"
+	"github.com/botnick/telegram-media-downloader/core-service/internal/store"
 	"github.com/botnick/telegram-media-downloader/core-service/internal/telegram"
 	"github.com/botnick/telegram-media-downloader/core-service/internal/ws"
 	"github.com/gotd/td/tg"
@@ -309,9 +310,13 @@ func (a *App) initializeHistory(ctx context.Context, id, accountID string, dialo
 			// A date window is walked whole; files already downloaded in
 			// it are recognised by the library and not fetched again.
 		case j.Mode == "pull-older":
-			err = a.db.Reader.QueryRowContext(ctx, `SELECT COALESCE(MIN(message_id),0) FROM downloads WHERE group_id=? AND message_id BETWEEN 1 AND 2147483647 AND file_type IS NOT 'stories'`, j.GroupID).Scan(&j.cursor)
+			var minID int64
+			minID, _, err = store.MessageBounds(ctx, a.db.Reader, j.GroupID)
+			j.cursor = int(minID)
 		case j.Mode == "catch-up":
-			err = a.db.Reader.QueryRowContext(ctx, `SELECT COALESCE(MAX(message_id),0) FROM downloads WHERE group_id=? AND message_id BETWEEN 1 AND 2147483647 AND file_type IS NOT 'stories'`, j.GroupID).Scan(&j.minID)
+			var maxID int64
+			_, maxID, err = store.MessageBounds(ctx, a.db.Reader, j.GroupID)
+			j.minID = int(maxID)
 		}
 		if err != nil {
 			return err
@@ -387,6 +392,17 @@ func (a *App) checkpointHistory(ctx context.Context, id string, session *engine.
 	defer tx.Rollback()
 	var workID int64
 	var queuedForward bool
+	// A tombstone records an operator delete of a downloaded file. It only
+	// stops the download queue. A direct-scan forward never creates a
+	// downloads row, so it is not suppressed.
+	tombstoned := false
+	if allowed && message != nil {
+		tomb, err := store.Tombstoned(ctx, a.db.Reader, j.GroupID, int64(message.ID))
+		if err != nil {
+			return err
+		}
+		tombstoned = tomb
+	}
 	if allowed {
 		if target.ID != j.GroupID {
 			return errors.New("history filter selected another group")
@@ -397,7 +413,7 @@ func (a *App) checkpointHistory(ctx context.Context, id string, session *engine.
 				return err
 			}
 		}
-		if !directOnly {
+		if !directOnly && !tombstoned {
 			var changed bool
 			workID, changed, err = session.QueueTx(ctx, tx, target, message, j.Mode == "rescan")
 			if err != nil {

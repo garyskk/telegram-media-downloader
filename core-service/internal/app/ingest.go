@@ -9,6 +9,7 @@ import (
 	"github.com/botnick/telegram-media-downloader/core-service/internal/download"
 	"github.com/botnick/telegram-media-downloader/core-service/internal/engine"
 	"github.com/botnick/telegram-media-downloader/core-service/internal/rescue"
+	"github.com/botnick/telegram-media-downloader/core-service/internal/store"
 	"github.com/botnick/telegram-media-downloader/core-service/internal/telegram"
 	"github.com/botnick/telegram-media-downloader/core-service/internal/ws"
 	"github.com/gotd/td/tg"
@@ -56,6 +57,12 @@ func (a *App) ingestTelegramWithForward(ctx context.Context, message *tg.Message
 	}
 	if err := rescue.Observe(ctx, a.db.Writer, accountID, groupID, message, engine.Origin(ctx)); err != nil {
 		return download.Record{}, a.failProcessingAttempt(context.WithoutCancel(ctx), attemptID, err)
+	}
+	// An operator deleted this download earlier: do not fetch it again.
+	if tomb, err := store.Tombstoned(ctx, a.db.Reader, item.GroupID, item.MessageID); err != nil {
+		return download.Record{}, a.failProcessingAttempt(context.WithoutCancel(ctx), attemptID, err)
+	} else if tomb {
+		return download.Record{}, a.finishProcessingAttempt(context.WithoutCancel(ctx), attemptID, "duplicate_skipped", "operator_deleted", "", "not_applicable")
 	}
 	forward, forwardSettings, forwardAccountID, err := a.forwardCandidate(ctx, item.GroupID, item.MessageID)
 	if err != nil {
