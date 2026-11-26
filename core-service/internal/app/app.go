@@ -143,6 +143,7 @@ type App struct {
 	faststartMu          sync.Mutex
 	faststartStatus      map[string]any
 	faststartLastRun     map[string]any
+	similarJobs          *similarJobs
 	thumbMu              sync.Mutex
 	thumbMisses          thumbMissCache
 	thumbBuildStatus     map[string]any
@@ -230,6 +231,7 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 	a.manualForwards = cfg.manualForwards
 	a.httpOptions, a.proxyPolicy, a.apiRL = cfg.HTTP, proxy, newRateLimiter(10000, time.Minute)
 	a.seekbar = newSeekbarState()
+	a.similarJobs = newSimilarJobs()
 	a.faces = newFacesService(a)
 	a.downloadsDir = cfg.DownloadsDir
 	if a.downloadsDir == "" {
@@ -317,6 +319,7 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 	registerSeekbarRoutes(mux, a)
 	registerNSFWRoutes(mux, a)
 	registerMaintenanceRoutes(mux, a)
+	registerSimilarRoutes(mux, a)
 	registerSystemRoutes(mux, a)
 	registerPurgeRoutes(mux, a)
 	registerRecoveryRoutes(mux, a)

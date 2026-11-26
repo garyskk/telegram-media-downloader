@@ -214,6 +214,7 @@ func (a *App) ingestTelegramWithForward(ctx context.Context, message *tg.Message
 	if attachment.Type == "video" {
 		// History backfill yields to live downloads in the sprite queue.
 		a.enqueueSeekbar(record.ID, engine.Origin(ctx) != "history")
+		a.enqueueFingerprint(record.ID)
 	}
 	a.queueNSFW(record.ID, payload["key"].(string))
 	// Background face detection; live downloads go ahead of history backfill.
