@@ -79,6 +79,16 @@ func jsonInt(v any) int {
 	}
 }
 
+// faststartAutoEnabled reports whether new downloads are rewritten in the
+// background. It is off by default: a rewrite changes the file size, so the
+// library skips reuse of the same media arriving for a later message.
+func faststartAutoEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("FASTSTART_AUTO"))) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}
 func (a *App) enqueueFaststart(id int64, realtime bool) {
 	s := a.faststartAuto
 	if s == nil || id <= 0 {
@@ -177,7 +187,7 @@ func (a *App) rewriteDownload(ctx context.Context, id int64) (result, errMsg str
 	if faststart.PlaybackReady(abs) {
 		return "already", ""
 	}
-	status, size, err := faststart.Optimize(ctx, abs)
+	status, _, err := faststart.Optimize(ctx, abs)
 	if err != nil {
 		if ctx.Err() != nil {
 			return "", ""
@@ -188,9 +198,8 @@ func (a *App) rewriteDownload(ctx context.Context, id int64) (result, errMsg str
 		}
 		return "errored", msg
 	}
-	if status == "optimized" && size > 0 {
-		_, _ = a.db.Writer.ExecContext(ctx, `UPDATE downloads SET file_size=? WHERE id=?`, size, id)
-	}
+	// downloads.file_size keeps Telegram's original size: library duplicate
+	// reuse matches on it, so the rewritten size is not stored.
 	if status != "optimized" && status != "already" {
 		return "skipped", ""
 	}

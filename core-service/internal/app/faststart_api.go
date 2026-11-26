@@ -172,9 +172,6 @@ func (a *App) handleFaststartScan(w http.ResponseWriter, r *http.Request) {
 			_ = json.Unmarshal(rec.body.Bytes(), &out)
 			if out["status"] == "optimized" {
 				optimized++
-				if size, ok := out["newSize"].(float64); ok && size > 0 {
-					_, _ = a.db.Writer.ExecContext(r.Context(), `UPDATE downloads SET file_size=? WHERE id=?`, int64(size), row.id)
-				}
 			} else {
 				skipped++
 			}

@@ -67,8 +67,8 @@ func TestDownloadAutoOptimisesVideo(t *testing.T) {
 		t.Fatalf("stats=%#v", body)
 	}
 	var size int64
-	if err = a.db.Reader.QueryRow(`SELECT file_size FROM downloads WHERE id=1`).Scan(&size); err != nil || size != int64(len(autoMP4("mdat"))) {
-		t.Fatalf("rewritten size=%d err=%v", size, err)
+	if err = a.db.Reader.QueryRow(`SELECT file_size FROM downloads WHERE id=1`).Scan(&size); err != nil || size != 1 {
+		t.Fatalf("file_size must stay at the original value, got %d err=%v", size, err)
 	}
 }
 
@@ -86,17 +86,19 @@ func videoDocMessage(id int, channel, doc int64, size int) *tg.Message {
 }
 
 // reingestAfterFaststart downloads one video, lets the automatic faststart
-// rewrite run (or fail, when rewrite is false), then ingests the same Telegram
+// rewrite run (when enabled), then ingests the same Telegram
 // media for a message in another chat. It returns the number of distinct files
 // and the per-row paths.
-func reingestAfterFaststart(t *testing.T, rewrite bool) (files int, paths []string, rewritten bool) {
+func reingestAfterFaststart(t *testing.T, enabled bool) (files int, paths []string, rewritten bool) {
 	t.Helper()
 	dir := t.TempDir()
 	src := append(autoMP4("mdat"), bytes.Repeat([]byte{1}, 176)...)
 	good := append(autoMP4("moov"), bytes.Repeat([]byte{1}, 160)...)
 	script := "#!/bin/sh\ncp \"$0.out\" \"$(eval echo \\${$#})\"\n"
-	if !rewrite {
-		script = "#!/bin/sh\necho boom >&2\nexit 1\n"
+	if enabled {
+		t.Setenv("FASTSTART_AUTO", "1")
+	} else {
+		t.Setenv("FASTSTART_AUTO", "")
 	}
 	ffmpeg := filepath.Join(dir, "ffmpeg")
 	if err := os.WriteFile(ffmpeg, []byte(script), 0o755); err != nil {
@@ -120,7 +122,7 @@ func reingestAfterFaststart(t *testing.T, rewrite bool) (files int, paths []stri
 		t.Fatal(err)
 	}
 	deadline := time.Now().Add(5 * time.Second)
-	for {
+	for enabled {
 		if stats, _ := a.faststartAutoView(); stats.Total == 1 {
 			break
 		}
@@ -129,11 +131,17 @@ func reingestAfterFaststart(t *testing.T, rewrite bool) (files int, paths []stri
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+	var rel string
 	var size int64
-	if err = a.db.Reader.QueryRow(`SELECT file_size FROM downloads WHERE message_id=1`).Scan(&size); err != nil {
+	if err = a.db.Reader.QueryRow(`SELECT file_path, file_size FROM downloads WHERE message_id=1`).Scan(&rel, &size); err != nil {
 		t.Fatal(err)
 	}
-	rewritten = size == int64(len(good))
+	if size != int64(len(src)) {
+		t.Fatalf("file_size=%d, want Telegram's original %d", size, len(src))
+	}
+	if st, serr := os.Stat(filepath.Join(dir, "downloads", rel)); serr == nil {
+		rewritten = st.Size() == int64(len(good))
+	}
 	if _, err = a.ingestTelegram(ctx, videoDocMessage(2, 456, 77, len(src)), "", "Other", "acct1", transport); err != nil {
 		t.Fatal(err)
 	}
@@ -154,24 +162,27 @@ func reingestAfterFaststart(t *testing.T, rewrite bool) (files int, paths []stri
 	return len(seen), paths, rewritten
 }
 
-// A faststart rewrite updates downloads.file_size to the new size, while
-// library.reuse and library.reuseByHash match Telegram's original size. After
-// a rewrite the same media arriving for a second message is therefore saved as
-// a second copy (two files), where plain v3.5.3 reuses the first file. This is
-// a known deviation, recorded in the port findings; library.go is unchanged.
-// The test asserts the control run and the rewrite itself, and logs the
-// re-ingest result so a later fix shows up here.
-func TestFaststartRewriteThenReingestSameMedia(t *testing.T) {
-	baseFiles, basePaths, baseRewritten := reingestAfterFaststart(t, false)
-	if baseRewritten {
-		t.Fatal("control run must not rewrite the file")
+// Automatic faststart is off by default so that duplicate reuse behaves as on
+// plain v3.5.3: the same media arriving for a second message is one file.
+func TestFaststartAutoDefaultOffKeepsReuse(t *testing.T) {
+	files, paths, rewritten := reingestAfterFaststart(t, false)
+	if rewritten {
+		t.Fatal("default run must not rewrite the file")
 	}
-	if baseFiles != 1 {
-		t.Fatalf("control: expected the second message to reuse the first file, got %d files %q", baseFiles, basePaths)
+	if files != 1 {
+		t.Fatalf("expected the second message to reuse the first file, got %d files %q", files, paths)
 	}
+}
+
+// With FASTSTART_AUTO enabled the rewrite changes the file size on disk, so
+// library.reuse skips the file and a second copy is saved. This is documented
+// in .env.example, docs/CONFIGURATION.md and CHANGELOG.md.
+func TestFaststartAutoEnabledRewritesAndSkipsReuse(t *testing.T) {
 	files, paths, rewritten := reingestAfterFaststart(t, true)
 	if !rewritten {
 		t.Fatal("faststart rewrite did not run")
 	}
-	t.Logf("re-ingest after rewrite: %d file(s) %q (control: %d)", files, paths, baseFiles)
+	if files != 2 {
+		t.Fatalf("expected a second copy after a rewrite, got %d files %q", files, paths)
+	}
 }

@@ -223,7 +223,7 @@ func (a *App) ingestTelegramWithForward(ctx context.Context, message *tg.Message
 		a.enqueueSeekbar(record.ID, engine.Origin(ctx) != "history")
 		a.enqueueFingerprint(record.ID)
 	}
-	if !record.Reused && faststartName(record.Path) {
+	if !record.Reused && faststartAutoEnabled() && faststartName(record.Path) {
 		a.enqueueFaststart(record.ID, engine.Origin(ctx) != "history")
 	}
 	a.queueNSFW(record.ID, payload["key"].(string))
