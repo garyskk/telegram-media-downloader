@@ -621,3 +621,135 @@ func TestSnapshotRetentionOutboxResumesAfterRestart(t *testing.T) {
 		t.Fatalf("retained snapshot lost: %v", err)
 	}
 }
+
+func TestMirrorDropsCronAndDeletesRemoteOrphans(t *testing.T) {
+	m, db, dir := fixtureManager(t, nil)
+	target := filepath.Join(dir, "target")
+	if err := os.MkdirAll(filepath.Join(target, "snapshots"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"keep.bin", "orphan.bin", "snapshots/snapshot-20260101-000000.tar.gz"} {
+		if err := os.WriteFile(filepath.Join(target, name), []byte("x"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	created, err := m.Create(context.Background(), map[string]any{
+		"name": "mirror", "provider": "local", "mode": "mirror", "cron": "* * * * *",
+		"config": map[string]any{"rootPath": target},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created["cron"] != nil {
+		t.Fatalf("mirror stored cron %#v", created["cron"])
+	}
+	addSource(t, db, dir, "keep.bin", "live", 1)
+	id := created["id"].(int64)
+	if _, err = m.Update(context.Background(), id, map[string]any{"mode": "manual", "cron": "0 * * * *"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = m.Update(context.Background(), id, map[string]any{"mode": "mirror"}); err != nil {
+		t.Fatal(err)
+	}
+	var cron sql.NullString
+	if err = db.Reader.QueryRow(`SELECT cron FROM backup_destinations WHERE id=?`, id).Scan(&cron); err != nil || cron.Valid {
+		t.Fatalf("cron after mode change: %+v %v", cron, err)
+	}
+	if err = m.Run(context.Background(), id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = os.Stat(filepath.Join(target, "orphan.bin")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("orphan remains: %v", err)
+	}
+	if _, err = os.Stat(filepath.Join(target, "keep.bin")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = os.Stat(filepath.Join(target, "snapshots/snapshot-20260101-000000.tar.gz")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestMirrorTotalsFollowFilesStillStored(t *testing.T) {
+	m, db, dir := fixtureManager(t, nil)
+	target := filepath.Join(dir, "target")
+	id := addLocal(t, m, target, "mirror")
+	addSource(t, db, dir, "keep.bin", "keep", 1)
+	drop := addSource(t, db, dir, "drop.bin", "dropfile", 2)
+	waitBackup(t, m, id, 2, 0)
+	if _, err := db.Writer.Exec(`UPDATE backup_destinations SET total_files=6444, total_bytes=999999 WHERE id=?`, id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Writer.Exec(`DELETE FROM downloads WHERE id=?`, drop); err != nil {
+		t.Fatal(err)
+	}
+	card := listedDestination(t, m, id)
+	if card["totalFiles"] != int64(1) || card["totalBytes"] != int64(len("keep")) {
+		t.Fatalf("card counts lifetime uploads: files=%v bytes=%v", card["totalFiles"], card["totalBytes"])
+	}
+	if err := m.Run(context.Background(), id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(target, "drop.bin")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("purged file remains: %v", err)
+	}
+	card = listedDestination(t, m, id)
+	if card["totalFiles"] != int64(1) || card["totalBytes"] != int64(len("keep")) {
+		t.Fatalf("card after purge: files=%v bytes=%v", card["totalFiles"], card["totalBytes"])
+	}
+	var storedFiles, storedBytes int64
+	if err := db.Reader.QueryRow(`SELECT total_files, total_bytes FROM backup_destinations WHERE id=?`, id).Scan(&storedFiles, &storedBytes); err != nil || storedFiles != 1 || storedBytes != int64(len("keep")) {
+		t.Fatalf("stored totals: %d %d %v", storedFiles, storedBytes, err)
+	}
+	jobs, err := m.Jobs(context.Background(), 0, "", 20, 0, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var purge map[string]any
+	for _, job := range jobs {
+		if job["status"] == "purged" {
+			purge = job
+		}
+	}
+	if purge == nil || purge["bytes_uploaded"] != int64(len("dropfile")) || !strings.Contains(purge["remote_path"].(string), "removed 1 file") {
+		t.Fatalf("purge log: %+v", jobs)
+	}
+	ok, err := m.Retry(context.Background(), purge["id"].(int64))
+	if err != nil || ok {
+		t.Fatalf("purged row retried: %v %v", ok, err)
+	}
+}
+
+func TestMirrorReuploadDoesNotGrowStoredTotals(t *testing.T) {
+	m, db, dir := fixtureManager(t, nil)
+	target := filepath.Join(dir, "target")
+	id := addLocal(t, m, target, "mirror")
+	row := addSource(t, db, dir, "keep.bin", "keep", 1)
+	waitBackup(t, m, id, 1, 0)
+	revised := "keep-revised"
+	if err := os.WriteFile(filepath.Join(dir, "downloads", "keep.bin"), []byte(revised), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Writer.Exec(`UPDATE downloads SET file_hash='rev-2', file_size=? WHERE id=?`, len(revised), row); err != nil {
+		t.Fatal(err)
+	}
+	waitBackup(t, m, id, 1, 0)
+	card := listedDestination(t, m, id)
+	if card["totalFiles"] != int64(1) || card["totalBytes"] != int64(len(revised)) {
+		t.Fatalf("reupload grew the card: files=%v bytes=%v", card["totalFiles"], card["totalBytes"])
+	}
+}
+
+func listedDestination(t *testing.T, m *Manager, id int64) map[string]any {
+	t.Helper()
+	listed, err := m.List(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, dest := range listed {
+		if dest["id"] == id {
+			return dest
+		}
+	}
+	t.Fatalf("destination %d missing", id)
+	return nil
+}
