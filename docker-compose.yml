@@ -46,6 +46,7 @@ services:
       - GOMEMLIMIT=${GOMEMLIMIT:-}
       - TGDL_DOWNLOAD_THREADS=${TGDL_DOWNLOAD_THREADS:-}
       - FASTSTART_CONCURRENCY=${FASTSTART_CONCURRENCY:-}
+      - FASTSTART_AUTO=${FASTSTART_AUTO:-}
     labels:
       - "com.centurylinklabs.watchtower.enable=true"
       # The autoheal service restarts the container if it stops answering.
