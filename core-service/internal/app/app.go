@@ -143,6 +143,7 @@ type App struct {
 	faststartMu          sync.Mutex
 	faststartStatus      map[string]any
 	faststartLastRun     map[string]any
+	faststartAuto        *faststartAuto
 	similarJobs          *similarJobs
 	thumbMu              sync.Mutex
 	thumbMisses          thumbMissCache
@@ -232,6 +233,8 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 	a.httpOptions, a.proxyPolicy, a.apiRL = cfg.HTTP, proxy, newRateLimiter(10000, time.Minute)
 	a.seekbar = newSeekbarState()
 	a.similarJobs = newSimilarJobs()
+	a.faststartAuto = newFaststartAuto()
+	a.loadFaststartAuto(ctx)
 	a.faces = newFacesService(a)
 	a.downloadsDir = cfg.DownloadsDir
 	if a.downloadsDir == "" {

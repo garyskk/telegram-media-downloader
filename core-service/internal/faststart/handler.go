@@ -147,17 +147,29 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	hash.WriteJSON(w, http.StatusOK, result)
 }
 
+// Optimize rewrites path so playback can start before the whole file is read.
+// Status is "already" when the file is already usable, or "optimized" after
+// the stream copy.
+func Optimize(ctx context.Context, path string) (status string, newSize int64, err error) {
+	res, err := optimize(ctx, path, "")
+	if err != nil {
+		return "", 0, err
+	}
+	return res.Status, res.NewSize, nil
+}
+
 func optimize(ctx context.Context, path, ffmpeg string) (response, error) {
 	atom, err := secondAtom(path)
 	if err != nil {
 		return response{}, err
 	}
-	if atom == "moov" {
-		return response{Status: "already"}, nil
-	}
 	if atom == "" {
 		return response{}, errors.New("ffmpeg: input is not a valid MP4 container")
 	}
+	if PlaybackReady(path) {
+		return response{Status: "already"}, nil
+	}
+	fragmented := hasTopLevelBox(path, "moof")
 
 	tmp := path + ".faststart.tmp"
 	_ = os.Remove(tmp)
@@ -191,11 +203,73 @@ func optimize(ctx context.Context, path, ffmpeg string) (response, error) {
 		_ = os.Remove(tmp)
 		return response{}, fmt.Errorf("ffmpeg: output size sanity check failed: src=%d tmp=%d", srcStat.Size(), tmpStat.Size())
 	}
+	if fragmented && !progressiveLayout(tmp) {
+		_ = os.Remove(tmp)
+		return response{}, errors.New("ffmpeg: remux left movie fragments in place")
+	}
 	if err := renameWithRetry(ctx, tmp, path); err != nil {
 		_ = os.Remove(tmp)
 		return response{}, err
 	}
 	return response{Status: "optimized", NewSize: tmpStat.Size()}, nil
+}
+
+// PlaybackReady reports an MP4 the HTML5 player can use as-is. The moov
+// atom is already second and there is no movie fragment. A fragmented file
+// still starts with moov, but that moov has an empty sample table and the
+// samples live in moof/mdat pairs. iOS Safari reports MEDIA_ERR_DECODE for
+// that layout, so it is not faststart.
+func PlaybackReady(path string) bool {
+	return progressiveLayout(path)
+}
+
+func progressiveLayout(path string) bool {
+	atom, err := secondAtom(path)
+	return err == nil && atom == "moov" && !hasTopLevelBox(path, "moof")
+}
+
+func hasTopLevelBox(path, want string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	pos, end := int64(0), info.Size()
+	hdr := make([]byte, 16)
+	for pos+8 <= end {
+		wantN := 16
+		if remain := end - pos; remain < 16 {
+			wantN = int(remain)
+		}
+		n, err := f.ReadAt(hdr[:wantN], pos)
+		if err != nil || n < 8 {
+			return false
+		}
+		size := int64(binary.BigEndian.Uint32(hdr[:4]))
+		typ := string(hdr[4:8])
+		header := int64(8)
+		if size == 1 {
+			if n < 16 {
+				return false
+			}
+			size = int64(binary.BigEndian.Uint64(hdr[8:16]))
+			header = 16
+		} else if size == 0 {
+			size = end - pos
+		}
+		if size < header || pos+size > end {
+			return false
+		}
+		if typ == want {
+			return true
+		}
+		pos += size
+	}
+	return false
 }
 
 func secondAtom(path string) (string, error) {
