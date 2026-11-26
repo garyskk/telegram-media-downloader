@@ -83,6 +83,64 @@ func TestStoryKeyMigrationPreservesRowsAndRejectsCollision(t *testing.T) {
 	}
 }
 
+func TestRetireUserDeletedAndEnhancementFaceSchema(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Writer.Close()
+	defer db.Reader.Close()
+	raw := db.Writer
+	if _, err = raw.Exec(`
+		ALTER TABLE downloads ADD COLUMN user_deleted INTEGER DEFAULT 0;
+		INSERT INTO downloads(group_id, message_id, user_deleted) VALUES ('g',5,1),('g',6,0);
+		ALTER TABLE people ADD COLUMN cover_face_id INTEGER;
+		INSERT INTO people(label, embedding_centroid, created_at, updated_at, cover_face_id) VALUES ('Ada', x'00', 1, 1, 9);
+		CREATE TABLE excluded_people (person_id INTEGER PRIMARY KEY);
+		INSERT INTO excluded_people(person_id) VALUES (1);
+	`); err != nil {
+		t.Fatal(err)
+	}
+	if err = retireUserDeleted(ctx, raw); err != nil {
+		t.Fatal(err)
+	}
+	if err = retireEnhancementFaceSchema(ctx, raw); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = RunMigrations(ctx, raw); err != nil {
+		t.Fatal(err)
+	}
+	var cols int
+	if err = raw.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('downloads') WHERE name='user_deleted'`).Scan(&cols); err != nil || cols != 0 {
+		t.Fatalf("user_deleted still present (%d, %v)", cols, err)
+	}
+	var left int
+	if err = raw.QueryRow(`SELECT COUNT(*) FROM downloads WHERE message_id=6`).Scan(&left); err != nil || left != 1 {
+		t.Fatalf("unflagged row %d %v", left, err)
+	}
+	if err = raw.QueryRow(`SELECT COUNT(*) FROM downloads WHERE message_id=5`).Scan(&left); err != nil || left != 0 {
+		t.Fatalf("flagged row remained %d %v", left, err)
+	}
+	var tomb int
+	if err = raw.QueryRow(`SELECT COUNT(*) FROM download_tombstones WHERE group_id='g' AND message_id=5`).Scan(&tomb); err != nil || tomb != 1 {
+		t.Fatalf("tombstone %d %v", tomb, err)
+	}
+	if err = raw.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('people') WHERE name='cover_face_id'`).Scan(&cols); err != nil || cols != 0 {
+		t.Fatalf("cover_face_id %d %v", cols, err)
+	}
+	if err = raw.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='excluded_people'`).Scan(&cols); err != nil || cols != 0 {
+		t.Fatalf("excluded_people %d %v", cols, err)
+	}
+	var peopleName string
+	if err = raw.QueryRow(`SELECT label FROM people`).Scan(&peopleName); err != nil || peopleName != "Ada" {
+		t.Fatalf("people row %q %v", peopleName, err)
+	}
+	if err = raw.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE name='video_fingerprints'`).Scan(&cols); err != nil || cols != 1 {
+		t.Fatalf("fingerprints table %d %v", cols, err)
+	}
+}
+
 func TestOpenCreatesMissingDataDirectory(t *testing.T) {
 	dataDir := filepath.Join(t.TempDir(), "nested", "data")
 	db, err := Open(context.Background(), dataDir)
@@ -287,5 +345,80 @@ INSERT INTO tgdl_work(account_id,group_id,group_name,message_id,version,identity
 	}
 	if _, err = RunMigrations(ctx, db.Writer); err != nil {
 		t.Fatal(err)
+	}
+}
+
+var catalogExtraTables = []string{
+	"download_tombstones",
+	"video_fingerprints",
+	"video_frame_hashes",
+	"similar_groups",
+	"similar_group_members",
+	"similar_ignores",
+	"similar_partial_scans",
+	"similar_video_scans",
+}
+
+func countCatalogExtraTables(t *testing.T, db *sql.DB) int {
+	t.Helper()
+	n := 0
+	for _, name := range catalogExtraTables {
+		var c int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, name).Scan(&c); err != nil {
+			t.Fatal(err)
+		}
+		n += c
+	}
+	return n
+}
+
+func TestFreshDatabaseCreatesCatalogExtraTables(t *testing.T) {
+	db, err := Open(context.Background(), t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Writer.Close()
+	defer db.Reader.Close()
+	if n := countCatalogExtraTables(t, db.Writer); n != len(catalogExtraTables) {
+		t.Fatalf("catalog extra tables = %d, want %d", n, len(catalogExtraTables))
+	}
+}
+
+func TestCatalogExtraTablesAddedToExistingDatabaseIdempotently(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Writer.Close()
+	defer db.Reader.Close()
+	raw := db.Writer
+	if _, err = raw.Exec(`INSERT INTO downloads(group_id, message_id, source_hash) VALUES ('g',1,'abc'),('g',2,NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	// Recreate the 3.5.3 schema: none of the fork tables exist.
+	for i := len(catalogExtraTables) - 1; i >= 0; i-- {
+		if _, err = raw.Exec(`DROP TABLE IF EXISTS ` + catalogExtraTables[i]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := countCatalogExtraTables(t, raw); n != 0 {
+		t.Fatalf("tables left after drop = %d", n)
+	}
+	for run := 1; run <= 2; run++ {
+		if _, err = RunMigrations(ctx, raw); err != nil {
+			t.Fatalf("run %d: %v", run, err)
+		}
+		if n := countCatalogExtraTables(t, raw); n != len(catalogExtraTables) {
+			t.Fatalf("run %d: catalog extra tables = %d, want %d", run, n, len(catalogExtraTables))
+		}
+		var rows, hashed int
+		if err = raw.QueryRow(`SELECT COUNT(*), COUNT(source_hash) FROM downloads`).Scan(&rows, &hashed); err != nil || rows != 2 || hashed != 1 {
+			t.Fatalf("run %d: downloads rows=%d hashed=%d err=%v", run, rows, hashed, err)
+		}
+		var idx int
+		if err = raw.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_source_hash'`).Scan(&idx); err != nil || idx != 1 {
+			t.Fatalf("run %d: idx_source_hash = %d err=%v", run, idx, err)
+		}
 	}
 }
