@@ -2,6 +2,7 @@ package app
 
 import (
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/url"
@@ -15,7 +16,8 @@ import (
 
 func (a *App) handleAPIDownloadsAll(w http.ResponseWriter, r *http.Request) {
 	page, limit := galleryPageLimit(r.URL.Query(), 500, false)
-	files, total, err := a.queryGalleryFiles(r, galleryQuery{typeName: r.URL.Query().Get("type"), pinnedOnly: truthy(r.URL.Query().Get("pinned")), pinnedFirst: truthy(r.URL.Query().Get("pinnedFirst")), limit: limit, offset: (page - 1) * limit})
+	only, unpinned := galleryPinFlags(r.URL.Query().Get("pinned"))
+	files, total, err := a.queryGalleryFiles(r, galleryQuery{typeName: r.URL.Query().Get("type"), pinnedOnly: only, unpinnedOnly: unpinned, pinnedFirst: truthy(r.URL.Query().Get("pinnedFirst")), limit: limit, offset: (page - 1) * limit})
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "database downloads query failed")
 		return
@@ -25,12 +27,13 @@ func (a *App) handleAPIDownloadsAll(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) handleAPIDownloadsGroup(w http.ResponseWriter, r *http.Request) {
 	groupID := strings.TrimSpace(r.PathValue("id"))
-	if groupID == "" || groupID == "all" || groupID == "search" {
+	if groupID == "" || groupID == "all" || groupID == "search" || groupID == "ids" {
 		http.NotFound(w, r)
 		return
 	}
 	page, limit := galleryPageLimit(r.URL.Query(), 500, true)
-	files, total, err := a.queryGalleryFiles(r, galleryQuery{perGroup: true, groupID: groupID, typeName: r.URL.Query().Get("type"), pinnedOnly: truthy(r.URL.Query().Get("pinned")), pinnedFirst: truthy(r.URL.Query().Get("pinnedFirst")), limit: limit, offset: max(0, (page-1)*limit)})
+	only, unpinned := galleryPinFlags(r.URL.Query().Get("pinned"))
+	files, total, err := a.queryGalleryFiles(r, galleryQuery{perGroup: true, groupID: groupID, typeName: r.URL.Query().Get("type"), pinnedOnly: only, unpinnedOnly: unpinned, pinnedFirst: truthy(r.URL.Query().Get("pinnedFirst")), limit: limit, offset: max(0, (page-1)*limit)})
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "database downloads query failed")
 		return
@@ -45,7 +48,8 @@ func (a *App) handleAPIDownloadsSearch(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"files": []any{}, "total": 0, "page": page, "totalPages": 0})
 		return
 	}
-	files, total, err := a.queryGalleryFiles(r, galleryQuery{newest: r.URL.Query().Get("order") == "newest", search: q, groupID: r.URL.Query().Get("groupId"), typeName: r.URL.Query().Get("type"), pinnedOnly: truthy(r.URL.Query().Get("pinned")), pinnedFirst: truthy(r.URL.Query().Get("pinnedFirst")), limit: limit, offset: (page - 1) * limit})
+	only, unpinned := galleryPinFlags(r.URL.Query().Get("pinned"))
+	files, total, err := a.queryGalleryFiles(r, galleryQuery{newest: r.URL.Query().Get("order") == "newest", search: q, groupID: r.URL.Query().Get("groupId"), typeName: r.URL.Query().Get("type"), pinnedOnly: only, unpinnedOnly: unpinned, pinnedFirst: truthy(r.URL.Query().Get("pinnedFirst")), limit: limit, offset: (page - 1) * limit})
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "database search query failed")
 		return
@@ -54,9 +58,21 @@ func (a *App) handleAPIDownloadsSearch(w http.ResponseWriter, r *http.Request) {
 }
 
 type galleryQuery struct {
-	groupID, search, typeName                 string
-	pinnedOnly, pinnedFirst, newest, perGroup bool
-	limit, offset                             int
+	groupID, search, typeName                               string
+	pinnedOnly, unpinnedOnly, pinnedFirst, newest, perGroup bool
+	limit, offset                                           int
+	collectIDs                                              *[]any
+	federated                                               bool
+}
+
+func galleryPinFlags(value string) (only, unpinned bool) {
+	if truthy(value) {
+		return true, false
+	}
+	if value == "0" || strings.EqualFold(value, "false") {
+		return false, true
+	}
+	return false, false
 }
 
 func galleryPageLimit(values url.Values, cap int, allowNegative bool) (int, int) {
@@ -167,6 +183,38 @@ func (a *App) queryGalleryFiles(r *http.Request, q galleryQuery) ([]map[string]a
 			return nil, 0, err
 		}
 	}
+	if q.collectIDs != nil {
+		idSQL := "SELECT d.id, 'self' AS peer_id"
+		if peers {
+			idSQL = "SELECT d.id, d.peer_id"
+		}
+		rows, err := tx.QueryContext(r.Context(), idSQL+from+" ORDER BY "+order, args...)
+		if err != nil {
+			return nil, 0, err
+		}
+		defer rows.Close()
+		ids := make([]any, 0)
+		for rows.Next() {
+			var id int64
+			var peer string
+			if err := rows.Scan(&id, &peer); err != nil {
+				return nil, 0, err
+			}
+			if peers {
+				ids = append(ids, map[string]any{"id": id, "peer_id": peer})
+			} else {
+				ids = append(ids, id)
+			}
+		}
+		if err := rows.Err(); err != nil {
+			return nil, 0, err
+		}
+		if err := tx.Commit(); err != nil {
+			return nil, 0, err
+		}
+		*q.collectIDs = ids
+		return nil, total, nil
+	}
 	query := "SELECT " + localColumns + from + " ORDER BY " + order + " LIMIT ? OFFSET ?"
 	rows, err := tx.QueryContext(r.Context(), query, append(args, q.limit, q.offset)...)
 	if err != nil {
@@ -261,6 +309,8 @@ func galleryNarrowing(q galleryQuery) (string, []any) {
 	}
 	if q.pinnedOnly {
 		where += " AND d.pinned = 1"
+	} else if q.unpinnedOnly {
+		where += " AND d.pinned = 0"
 	}
 	return where, args
 }
@@ -275,6 +325,132 @@ func galleryGroupFolder(name string) string {
 		}
 		return r
 	}, name)
+}
+
+func (a *App) handleAPIDownloadIDs(w http.ResponseWriter, r *http.Request) {
+	only, unpinned := galleryPinFlags(r.URL.Query().Get("pinned"))
+	var ids []any
+	_, total, err := a.queryGalleryFiles(r, galleryQuery{
+		typeName: r.URL.Query().Get("type"), groupID: r.URL.Query().Get("groupId"), search: strings.TrimSpace(r.URL.Query().Get("q")),
+		pinnedOnly: only, unpinnedOnly: unpinned, newest: r.URL.Query().Get("order") == "newest",
+		collectIDs: &ids,
+	})
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "database downloads query failed")
+		return
+	}
+	if ids == nil {
+		ids = []any{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ids": ids, "total": total})
+}
+
+type galleryKey struct {
+	id   int64
+	peer string
+}
+
+func (a *App) handleAPIDownloadsByIDs(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		IDs []json.RawMessage `json:"ids"`
+	}
+	if decodeBody(w, r, &body) != nil {
+		return
+	}
+	if len(body.IDs) > 100 {
+		writeJSONError(w, http.StatusBadRequest, "ids exceeds 100")
+		return
+	}
+	session, _ := auth.SessionFromContext(r.Context())
+	admin := session.Role == "admin"
+	var keys []galleryKey
+	for _, raw := range body.IDs {
+		var n int64
+		if json.Unmarshal(raw, &n) == nil && n > 0 {
+			keys = append(keys, galleryKey{id: n, peer: "self"})
+			continue
+		}
+		var obj struct {
+			ID   int64  `json:"id"`
+			Peer string `json:"peer_id"`
+		}
+		if json.Unmarshal(raw, &obj) != nil || obj.ID <= 0 {
+			continue
+		}
+		if obj.Peer == "" {
+			obj.Peer = "self"
+		}
+		if obj.Peer != "self" && !admin {
+			continue
+		}
+		keys = append(keys, galleryKey{id: obj.ID, peer: obj.Peer})
+	}
+	files := make([]map[string]any, 0, len(keys))
+	for _, key := range keys {
+		item, ok, err := a.galleryTileByKey(r, key)
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, "database downloads query failed")
+			return
+		}
+		if ok {
+			files = append(files, item)
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"files": files})
+}
+
+func (a *App) galleryTileByKey(r *http.Request, key galleryKey) (map[string]any, bool, error) {
+	config, err := a.config.Load(r.Context())
+	if err != nil {
+		return nil, false, err
+	}
+	groups := configuredGroups(config)
+	var row *sql.Row
+	if key.peer == "self" || key.peer == "" {
+		row = a.db.Reader.QueryRowContext(r.Context(), `SELECT d.id, CAST(d.group_id AS TEXT), d.group_name, d.file_name,
+			d.file_path, d.file_size, d.file_type, CAST(d.created_at AS TEXT), d.pending_until, d.rescued_at, d.pinned,
+			sb.duration_sec, 'self', NULL
+			FROM downloads d LEFT JOIN seekbar_sprites sb ON sb.download_id=d.id WHERE d.id=?`, key.id)
+	} else {
+		row = a.db.Reader.QueryRowContext(r.Context(), `SELECT d.remote_id, d.group_id, d.group_name, d.file_name,
+			d.file_path, d.file_size, d.file_type, d.created_at, NULL, NULL, 0, NULL, d.peer_id, p.name
+			FROM peer_downloads d LEFT JOIN peers p ON p.peer_id=d.peer_id WHERE d.peer_id=? AND d.remote_id=?`, key.peer, key.id)
+	}
+	var id, pinned int64
+	var groupID, groupName, name, filePath, kind, peerID, peerName sql.NullString
+	var size, pending, rescued sql.NullInt64
+	var duration sql.NullFloat64
+	var created any
+	if err = row.Scan(&id, &groupID, &groupName, &name, &filePath, &size, &kind, &created, &pending, &rescued, &pinned, &duration, &peerID, &peerName); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	displayName := groupName.String
+	if configured := toString(groups[groupID.String]["name"]); configured != "" {
+		displayName = configured
+	}
+	fileName, folder := name.String, galleryFolder(kind.String)
+	stored := strings.ReplaceAll(filePath.String, "\\", "/")
+	fullPath := stored
+	if !strings.Contains(fullPath, "/") {
+		fullPath = galleryGroupFolder(displayName) + "/" + folder + "/" + fileName
+	}
+	item := map[string]any{
+		"id": id, "name": nullableString(name), "path": nullableString(filePath), "fullPath": fullPath,
+		"size": nullableInt(size), "sizeFormatted": formatBytes(nullableInt64(size)), "type": folder,
+		"extension": filepath.Ext(fileName), "modified": created, "pendingUntil": nullableInt(pending),
+		"rescuedAt": nullableInt(rescued), "pinned": pinned == 1, "peer_id": peerID.String,
+		"peer_name": nullableString(peerName), "duration": nullableFloat(duration),
+		"groupId": nullableString(groupID),
+	}
+	if displayName != "" {
+		item["groupName"] = displayName
+	} else {
+		item["groupName"] = nil
+	}
+	return item, true, nil
 }
 
 func galleryFolder(fileType string) string {
