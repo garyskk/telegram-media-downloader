@@ -2,6 +2,21 @@
 
 All notable changes to this project are documented here. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+Ported from the `enhancement` fork onto 3.5.3.
+### Added
+- **Similar clips** (Maintenance → Similar clips, `docs/SIMILAR-CLIPS.md`). New videos are fingerprinted after download (PDQ perceptual hashes of scene frames). Analyze groups near-duplicate videos and finds shorter clips contained in longer ones. Partial-clip alignment runs in parallel, one per core Go may use, and matches are recorded in the same order. Stop cancels the clip in progress. Tunable with `TGDL_SIMILAR_*` (see `.env.example`). Backup and similar-clips lines reach the live tail in Maintenance → Logs.
+- **Download tombstones.** Files an operator deletes (gallery delete, NSFW and duplicate sweeps, disk rotation, rescue sweep) are remembered, so live and history ingestion do not download them again. A missing file that is auto-pruned does not create a tombstone. History pull-older and catch-up use the stored message bounds. Direct-scan forwards are not affected.
+- **Automatic faststart for new downloads.** New MP4 downloads are rewritten for instant streaming in the background, with its own stats and a playback-ready check. Fragmented MP4 files are detected and rejected as output.
+- **Gallery Shuffle** reshuffles the grid one random page at a time, without repeats, also from the player. The gallery gets a `pinned=0` (unpinned only) filter, and new `GET /api/downloads/ids` and `POST /api/downloads/by-ids` endpoints.
+### Fixed
+- **Backup mirror accounting.** Mirror totals follow the files still stored. Purge actions are logged, retention counters are reconciled, and cron is cleared for non-snapshot modes. Remote orphans are deleted.
+### Changed
+- Database: new tables `download_tombstones`, `video_fingerprints`, `video_frame_hashes`, `similar_groups`, `similar_group_members`, `similar_ignores`, `similar_partial_scans` and `similar_video_scans`, created automatically and idempotently on start.
+- `docker-compose.yml` builds the app from this tree (`build: .`). Watchtower and autoheal sit behind the profiles `autoupdate` and `autoheal`. Upstream `GOMEMLIMIT`, `TGDL_DOWNLOAD_THREADS` and `FASTSTART_CONCURRENCY` are kept.
+- Service worker cache version `v35300-enh1`.
+### Removed
+- The fork's own HEVC `hvc1` retag and Safari rewrite in faststart are dropped. Use upstream's `TGDL_HEVC_HVC1` relabel at download time. Existing `hev1` files stay as they are.
 ## [3.5.3] — 2026-11-24
 
 ### Fixed
