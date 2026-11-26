@@ -16,9 +16,9 @@ export const TOOL_GROUPS = [
         title: ['tools.group.library', 'Library health'],
         desc: [
             'tools.group.library_desc',
-            'Duplicates, thumbnails, seekbar previews and videos that stream.',
+            'Duplicates, similar clips, thumbnails, seekbar previews and videos that stream.',
         ],
-        tools: ['duplicates', 'thumbs', 'seekbar', 'video'],
+        tools: ['duplicates', 'similar', 'thumbs', 'seekbar', 'video'],
     },
     {
         slug: 'safety',
@@ -48,6 +48,16 @@ export const TOOL_GROUPS = [
 // `name` is the short card title, `desc` the one-liner (both reuse the
 // Maintenance hub strings), `words` extra English search words.
 export const TOOLS = {
+    similar: {
+        icon: 'ri-movie-2-line',
+        accent: 'orange',
+        name: ['nav.maintenance.similar', 'Similar clips'],
+        desc: [
+            'maintenance.hub.similar.body',
+            'Near-duplicate videos and shorter excerpts inside longer videos.',
+        ],
+        words: 'similar clips duplicate video pdq fingerprint partial',
+    },
     duplicates: {
         icon: 'ri-file-copy-2-line',
         accent: 'orange',

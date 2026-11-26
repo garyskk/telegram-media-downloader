@@ -81,6 +81,22 @@ const RUN = {
 };
 
 const LOADERS = {
+    async similar() {
+        const stats = await get('/api/maintenance/similar/stats');
+        const last = stats?.lastAnalyze || stats?.lastScan;
+        let line = never();
+        if (last?.finishedAt) line = lastRun(last.finishedAt);
+        else if (stats?.missing > 0) {
+            line = i18nTf('maintenance.similar.stats.missing', { n: num(stats.missing) }, `${num(stats.missing)} not fingerprinted`);
+        }
+        return {
+            running: false,
+            line,
+            tone: stats?.missing > 0 ? 'warn' : 'muted',
+            run: { label: RUN.scan(), icon: 'ri-search-line', url: '/api/maintenance/similar/scan' },
+            stop: '/api/maintenance/similar/scan/stop',
+        };
+    },
     async duplicates() {
         const [st, stats] = await Promise.all([
             get('/api/maintenance/dedup/status'),
@@ -528,7 +544,7 @@ const LOADERS = {
 };
 
 // Tools that run a background job (and so have an Idle / Running state).
-const JOB_TOOLS = new Set(['duplicates', 'thumbs', 'seekbar', 'video', 'nsfw', 'ai']);
+const JOB_TOOLS = new Set(['duplicates', 'similar', 'thumbs', 'seekbar', 'video', 'nsfw', 'ai']);
 
 // Tools whose loaders are cheap enough for the Tools card's checks.
 const ATTENTION_TOOLS = [
@@ -561,6 +577,7 @@ async function loadInfo(tool, { fresh = false, force = false } = {}) {
 
 // Live job state from the WS, per tool.
 const WS_EVENTS = {
+    similar: ['similar_progress', 'similar_done', 'similar_analyze_progress', 'similar_analyze_done'],
     duplicates: ['dedup_progress', 'dedup_done'],
     thumbs: ['thumbs_progress', 'thumbs_done'],
     seekbar: ['seekbar_progress', 'seekbar_done'],

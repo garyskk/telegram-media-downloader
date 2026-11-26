@@ -168,6 +168,11 @@ function _renderRecentRow(j) {
             cls = 'text-red-400';
             label = i18nT('maintenance.backup.job.failed', 'failed');
             break;
+        case 'purged':
+            icon = 'ri-delete-bin-line';
+            cls = 'text-tg-orange';
+            label = i18nT('maintenance.backup.job.purged', 'purged');
+            break;
         case 'uploading':
             icon = 'ri-loader-4-line';
             cls = 'text-tg-blue animate-spin';
@@ -783,6 +788,7 @@ function _wireWs() {
     });
     ws.on('backup_destination_updated', () => {
         _refreshDestinations().catch(() => {});
+        _refreshRecent().catch(() => {});
     });
     ws.on('backup_destination_removed', () => {
         _refreshDestinations().catch(() => {});

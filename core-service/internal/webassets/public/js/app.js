@@ -1140,6 +1140,16 @@ function renderPage(page, params = {}) {
         import('./tools-hub.js')
             .then((m) => m.showGroupPage(params))
             .catch((e) => console.error('tools group', e));
+    } else if (page === 'maintenance-similar') {
+        _setPageText('title', 'maintenance.similar.page_title', 'Similar clips');
+        _setPageText(
+            'subtitle',
+            'maintenance.similar.subtitle',
+            'Near-duplicate videos and shorter excerpts inside longer videos',
+        );
+        import('./maintenance-similar.js')
+            .then((m) => m.init())
+            .catch((e) => console.error('maintenance-similar', e));
     } else if (page === 'maintenance-duplicates') {
         _setPageText('title', 'maintenance.duplicates.title', 'Find duplicate files');
         _setPageText(
@@ -1802,6 +1812,7 @@ const PAGE_HEADER_ICON = {
     queue: 'ri-list-check-2',
     settings: 'ri-settings-3-line',
     maintenance: 'ri-tools-line',
+    'maintenance-similar': 'ri-movie-2-line',
     'maintenance-duplicates': 'ri-file-copy-2-line',
     'maintenance-thumbs': 'ri-image-line',
     'maintenance-seekbar': 'ri-movie-line',
