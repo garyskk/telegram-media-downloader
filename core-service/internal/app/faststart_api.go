@@ -134,16 +134,16 @@ func (a *App) handleFaststartStatus(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, 200, s)
 }
 
-func (a *App) handleFaststartScan(w http.ResponseWriter, r *http.Request) {
-	a.mediaMu.RLock()
-	defer a.mediaMu.RUnlock()
-	started := time.Now()
+func (a *App) handleFaststartScan(w http.ResponseWriter, _ *http.Request) {
 	a.faststartMu.Lock()
+	if running, _ := a.faststartStatus["running"].(bool); running {
+		a.faststartMu.Unlock()
+		writeJSON(w, http.StatusConflict, map[string]any{"error": "Optimise sweep already running", "code": "ALREADY_RUNNING"})
+		return
+	}
 	previousAttempts, _ := a.faststartStatus["attempts"].(int)
 	previousSuccesses, _ := a.faststartStatus["successes"].(int)
-	a.faststartMu.Unlock()
-	rows, _ := a.videoRows(r.Context())
-	a.faststartMu.Lock()
+	started := time.Now()
 	status := faststartIdleStatus()
 	status["attempts"] = previousAttempts + 1
 	status["running"] = true
@@ -151,19 +151,33 @@ func (a *App) handleFaststartScan(w http.ResponseWriter, r *http.Request) {
 	status["startedAt"] = started.UnixMilli()
 	a.faststartStatus = cloneConfigValue(status).(map[string]any)
 	a.faststartMu.Unlock()
+	// The sweep can take minutes. Run it detached from the request so
+	// proxies and clients do not time out. Progress and completion go out
+	// over WebSocket (faststart_progress / faststart_done).
+	go a.runFaststartScan(started, status, previousSuccesses)
+	writeJSON(w, http.StatusAccepted, map[string]any{"started": true, "success": true})
+}
+func (a *App) runFaststartScan(started time.Time, status map[string]any, previousSuccesses int) {
+	ctx := a.ctx
+	a.mediaMu.RLock()
+	defer a.mediaMu.RUnlock()
+	rows, _ := a.videoRows(ctx)
 	a.hub.Broadcast(ws.Event{Type: "faststart_progress", Flat: true, Payload: map[string]any{"total": len(rows)}})
 	roots, _ := hash.NewRoots([]string{a.downloadsDir})
 	handler := &faststart.Handler{Roots: roots}
 	already, optimized, errored, skipped := 0, 0, 0, 0
-	for _, row := range rows {
+	for i, row := range rows {
+		if ctx.Err() != nil {
+			break
+		}
+		a.hub.Broadcast(ws.Event{Type: "faststart_progress", Flat: true, Payload: map[string]any{"total": len(rows), "processed": i, "optimized": optimized}})
 		path := filepath.Join(a.downloadsDir, filepath.FromSlash(row.path))
 		if faststart.PlaybackReady(path) {
 			already++
 			continue
 		}
 		body, _ := json.Marshal(map[string]any{"path": path})
-		req := r.Clone(r.Context())
-		req.Method = http.MethodPost
+		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, "/v1/faststart", nil)
 		req.Body = io.NopCloser(bytes.NewReader(body))
 		rec := &responseCapture{header: make(http.Header), body: bytes.NewBuffer(nil), status: 200}
 		handler.ServeHTTP(rec, req)
@@ -199,5 +213,4 @@ func (a *App) handleFaststartScan(w http.ResponseWriter, r *http.Request) {
 	a.faststartLastRun = map[string]any{"already": already, "errored": errored, "finishedAt": finished.UnixMilli(), "optimized": optimized, "scanned": len(rows), "skipped": skipped}
 	a.faststartMu.Unlock()
 	a.hub.Broadcast(ws.Event{Type: "faststart_done", Flat: true, Payload: map[string]any{"already": already, "durationMs": finished.Sub(started).Milliseconds(), "errored": errored, "kind": "faststart", "optimized": optimized, "scanned": len(rows), "skipped": skipped}})
-	writeJSON(w, 200, map[string]any{"started": true, "success": true})
 }
